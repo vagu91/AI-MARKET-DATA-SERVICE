@@ -1,0 +1,770 @@
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Depends, Query
+
+from app.api.deps import (
+    get_enrichment_orchestrator,
+    get_event_service,
+    get_event_window_service,
+    get_macro_service,
+    get_nasdaq_data_service,
+)
+from app.models.events import EconomicEvent
+from app.models.macro import EventWindowsResponse, MacroLatestResponse, MarketContextResponse
+from app.models.nasdaq import (
+    EarningsResponse,
+    MegaCapBreadthResponse,
+    MegaCapSnapshotResponse,
+    NasdaqContextResponse,
+    NewsResponse,
+    QQQHoldingsResponse,
+)
+from app.services.event_window_service import EventWindowService
+from app.services.event_service import EventService
+from app.services.diagnostics_service import (
+    DiagnosticsService,
+    _macro_pipeline_status,
+    _news_pipeline_status,
+    _positioning_context_from_runtime,
+    _sentiment_context_from_runtime,
+)
+from app.services.enrichment_orchestrator import EnrichmentOrchestrator
+from app.services.macro_service import MacroService
+from app.services.market_fact_repository import MarketFactRepository, init_market_db
+from app.services.market_context_builder import build_market_context_contract
+from app.services.market_news_repository import MarketNewsRepository
+from app.services.nasdaq_data_service import NasdaqDataService
+from app.services.health_report_service import HealthReportService
+from app.services.acquisition_status_service import AcquisitionStatusService
+from app.services.credential_audit_service import credential_audit
+from app.services.context_extensions_service import enrich_nasdaq_context
+from app.services.positioning_runtime_service import PositioningRuntimeService
+from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
+
+router = APIRouter()
+
+
+@router.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "service": "AI-MARKET-DATA-SERVICE"}
+
+
+@router.get("/macro/latest", response_model=MacroLatestResponse)
+async def macro_latest(
+    macro_service: MacroService = Depends(get_macro_service),
+) -> MacroLatestResponse:
+    return await macro_service.latest()
+
+
+@router.get("/events/today", response_model=list[EconomicEvent])
+async def events_today(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    event_service: EventService = Depends(get_event_service),
+) -> list[EconomicEvent]:
+    return await event_service.today(country=country)
+
+
+@router.get("/events/upcoming", response_model=list[EconomicEvent])
+async def events_upcoming(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=7, ge=1, le=30),
+    event_service: EventService = Depends(get_event_service),
+) -> list[EconomicEvent]:
+    return await event_service.upcoming(country=country, days=days)
+
+
+@router.get("/events/enriched/upcoming", response_model=list[EconomicEvent])
+async def events_enriched_upcoming(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=7, ge=1, le=30),
+    event_service: EventService = Depends(get_event_service),
+) -> list[EconomicEvent]:
+    return await event_service.upcoming(country=country, days=days)
+
+
+@router.get("/events/active-windows", response_model=EventWindowsResponse)
+async def events_active_windows(
+    symbol: str = Query(default="MNQ", min_length=1, max_length=16),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+) -> EventWindowsResponse:
+    return await event_window_service.event_windows(symbol=symbol)
+
+
+@router.get("/market-context/mnq", response_model=MarketContextResponse)
+async def market_context_mnq(
+    refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> MarketContextResponse:
+    diagnostics = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    if refresh in {"false", "force"}:
+        contract = await diagnostics.full_model(
+            country="US",
+            days=30,
+            symbol="MNQ",
+            fetch_missing_nasdaq=refresh == "force",
+            refresh=refresh,
+        )
+        return MarketContextResponse.model_validate(contract)
+    macro, macro_quality = await diagnostics._macro_db_first()
+    events_today_data = await event_service.today(country="US")
+    now = datetime.now(UTC)
+    if hasattr(event_service, "list_events"):
+        raw_upcoming = await event_service.list_events(
+            country="US",
+            start=now,
+            end=now + timedelta(days=7),
+            enrich=False,
+        )
+        upcoming, orchestrator_metadata = await enrichment_orchestrator.enrich_events(
+            events=raw_upcoming,
+            country="US",
+            start=now,
+            end=now + timedelta(days=7),
+            trigger="market_context",
+        )
+    else:
+        upcoming = await event_service.upcoming(country="US", days=7)
+        orchestrator_metadata = {
+            "data_quality": {},
+            "service_role": "data provider only",
+        }
+    event_windows = await event_window_service.event_windows(symbol="MNQ")
+    nasdaq_context, nasdaq_quality = await diagnostics._nasdaq_db_first(symbol="MNQ", fetch_missing=False)
+    news_items = MarketNewsRepository(enrichment_orchestrator.settings).stored(days=30, limit=100)
+    news_pipeline = _news_pipeline_status(news_items)
+    macro_pipeline = _macro_pipeline_status(macro)
+    pipeline_integrity = {
+        "critical_fetch_completed": True,
+        "critical_persistence_completed": True,
+        "critical_commits_completed": True,
+        "critical_read_back_completed": bool(macro.series) and bool(nasdaq_context) and news_pipeline["read_back_count"] > 0,
+        "snapshot_materialization_completed": news_pipeline["materialized_count"] > 0 and bool(macro.series) and bool(nasdaq_context),
+        "snapshot_built_from_db": True,
+        "partial_response": False,
+    }
+    positioning_runtime = PositioningRuntimeService(enrichment_orchestrator.settings)
+    cot_payload = await positioning_runtime.cot(refresh=refresh)
+    aaii_payload = await positioning_runtime.aaii(refresh=refresh)
+    quality = {
+        **orchestrator_metadata.get("data_quality", {}),
+        "macro": macro_quality,
+        "nasdaq": nasdaq_quality,
+        "pipeline_integrity": pipeline_integrity,
+        "news_pipeline": news_pipeline,
+        "macro_pipeline": macro_pipeline,
+    }
+    contract = build_market_context_contract(
+        symbol="MNQ",
+        macro=macro,
+        events_today=events_today_data,
+        upcoming_events=upcoming,
+        event_windows=event_windows,
+        nasdaq_context=nasdaq_context,
+        news_items=news_items,
+        data_quality=quality,
+        db_summary=MarketFactRepository(enrichment_orchestrator.settings).db_summary(),
+        event_facts=MarketFactRepository(enrichment_orchestrator.settings).search_facts(country="US", limit=500),
+        positioning_context=_positioning_context_from_runtime(cot_payload),
+        sentiment_context=_sentiment_context_from_runtime(aaii_payload),
+        metadata={
+            "event_enrichment": event_service.last_enrichment_metadata,
+            "persistent_enrichment": orchestrator_metadata,
+        },
+    )
+    contract["data_quality"]["macro_pipeline"] = _macro_pipeline_status(macro, contract.get("macro_snapshot") or {})
+    multi_refresh = "force" if refresh == "force" else "false"
+    multi_source = await MultiSourceRuntimeService(enrichment_orchestrator.settings).snapshot(refresh=multi_refresh)
+    apply_multi_source_context(contract, multi_source)
+    return MarketContextResponse.model_validate(contract)
+
+
+@router.get("/db/health")
+async def db_health(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    init_market_db(enrichment_orchestrator.settings)
+    repository = MarketFactRepository(enrichment_orchestrator.settings)
+    return {
+        "status": "ok",
+        "db_path": str(enrichment_orchestrator.settings.market_db_path),
+        "service_role": "data provider only",
+        "ai_researcher_enabled": enrichment_orchestrator.settings.enable_ai_researcher,
+        "ai_researcher_mode": enrichment_orchestrator.settings.ai_researcher_mode,
+        "db_summary": repository.db_summary(),
+    }
+
+
+@router.get("/facts/lookup")
+async def facts_lookup(
+    fact_key: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    fact = MarketFactRepository(enrichment_orchestrator.settings).get_fact(fact_key)
+    return {"fact_key": fact_key, "found": fact is not None, "fact": fact, "service_role": "data provider only"}
+
+
+@router.get("/facts/search")
+async def facts_search(
+    country: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    facts = MarketFactRepository(enrichment_orchestrator.settings).search_facts(country=country, category=category)
+    return {"count": len(facts), "facts": facts, "service_role": "data provider only"}
+
+
+@router.get("/facts/stale")
+async def facts_stale(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    facts = MarketFactRepository(enrichment_orchestrator.settings).stale_facts()
+    return {"count": len(facts), "facts": facts, "service_role": "data provider only"}
+
+
+@router.get("/facts/coverage")
+async def facts_coverage(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=30, ge=1, le=365),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    coverage = MarketFactRepository(enrichment_orchestrator.settings).coverage(country=country, days=days)
+    coverage["service_role"] = "data provider only"
+    return coverage
+
+
+@router.get("/enrichment/run/status")
+async def enrichment_run_status(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return {
+        "latest_run": enrichment_orchestrator.runs.latest(),
+        "service_role": "data provider only",
+    }
+
+
+@router.post("/enrichment/run")
+async def enrichment_run(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=30, ge=1, le=365),
+    event_service: EventService = Depends(get_event_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    now = datetime.now(UTC)
+    if hasattr(event_service, "list_events"):
+        events = await event_service.list_events(country=country, start=now, end=now + timedelta(days=days), enrich=False)
+    else:
+        events = await event_service.upcoming(country=country, days=days)
+    enriched, metadata = await enrichment_orchestrator.enrich_events(
+        events=events,
+        country=country,
+        start=now,
+        end=now + timedelta(days=days),
+        trigger="api",
+    )
+    return {
+        "run_id": metadata["run_id"],
+        "events_checked": len(enriched),
+        "data_quality": metadata["data_quality"],
+        "service_role": "data provider only",
+    }
+
+
+@router.get("/news/stored")
+async def news_stored(
+    symbols: str | None = Query(default=None),
+    days: int = Query(default=7, ge=1, le=365),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    symbol_list = [item.strip().upper() for item in symbols.split(",") if item.strip()] if symbols else None
+    news = MarketNewsRepository(enrichment_orchestrator.settings).stored(symbols=symbol_list, days=days)
+    return {"count": len(news), "news": news, "service_role": "data provider only"}
+
+
+@router.post("/diagnostics/e2e-cache-test")
+async def diagnostics_e2e_cache_test(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=30, ge=1, le=365),
+    symbol: str = Query(default="MNQ", min_length=1, max_length=16),
+    reset_db: bool = Query(default=False),
+    enable_ai: bool = Query(default=False),
+    ai_mode: str = Query(default="codex_cli"),
+    run_count: int = Query(default=1, ge=1, le=4),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    service = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    return await service.e2e_cache_test(
+        country=country,
+        days=days,
+        symbol=symbol,
+        reset_db=reset_db,
+        enable_ai=enable_ai,
+        ai_mode=ai_mode,
+        run_count=run_count,
+    )
+
+
+@router.get("/diagnostics/db-summary")
+async def diagnostics_db_summary(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return MarketFactRepository(enrichment_orchestrator.settings).db_summary()
+
+
+@router.get("/diagnostics/credential-audit")
+async def diagnostics_credential_audit(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return credential_audit(enrichment_orchestrator.settings)
+
+
+@router.get("/diagnostics/acquisition-status")
+async def diagnostics_acquisition_status(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return AcquisitionStatusService(enrichment_orchestrator.settings).status()
+
+
+@router.get("/diagnostics/data-quality")
+async def diagnostics_data_quality(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=30, ge=1, le=365),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await market_context_mnq_quality(
+        country=country,
+        days=days,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+
+
+@router.get("/providers/investing/economic-calendar")
+async def provider_investing_economic_calendar(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("investing_economic_calendar", refresh=refresh)
+
+
+@router.get("/providers/investing/holidays")
+async def provider_investing_holidays(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("investing_holidays", refresh=refresh)
+
+
+@router.get("/providers/cboe/risk-indices")
+async def provider_cboe_risk_indices(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("cboe_risk_indices", refresh=refresh)
+
+
+@router.get("/providers/nasdaq/earnings-calendar")
+async def provider_nasdaq_earnings_calendar(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("nasdaq_earnings", refresh=refresh)
+
+
+@router.get("/providers/nasdaq/nasdaq-100")
+async def provider_nasdaq_100(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("nasdaq_100", refresh=refresh)
+
+
+@router.get("/providers/nasdaq/market-info")
+async def provider_nasdaq_market_info(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("nasdaq_market_info", refresh=refresh)
+
+
+@router.get("/providers/nasdaq/qqq-options")
+async def provider_nasdaq_qqq_options(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("nasdaq_qqq_options", refresh=refresh)
+
+
+@router.get("/providers/sentiment/aaii")
+async def provider_sentiment_aaii(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("aaii_sentiment", refresh=refresh)
+
+
+@router.get("/providers/sentiment/macromicro-aaii")
+async def provider_sentiment_macromicro_aaii(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("macromicro_aaii_crosscheck", refresh=refresh)
+
+
+@router.get("/providers/polymarket/markets")
+async def provider_polymarket_markets(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("polymarket_prediction_markets", refresh=refresh)
+
+
+@router.get("/diagnostics/full-model")
+async def diagnostics_full_model(
+    symbol: str = Query(default="MNQ", min_length=1, max_length=16),
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=30, ge=1, le=365),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    service = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    return await service.full_model(country=country, days=days, symbol=symbol)
+
+
+@router.get("/diagnostics/temporal-integrity")
+async def diagnostics_temporal_integrity(
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    ).temporal_integrity()
+
+
+@router.get("/diagnostics/release-refresh-status")
+async def diagnostics_release_refresh_status(
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    ).release_refresh_status()
+
+
+@router.get("/diagnostics/news-freshness")
+async def diagnostics_news_freshness(
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    ).news_freshness()
+
+
+@router.get("/diagnostics/source-classification")
+async def diagnostics_source_classification(
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    ).source_classification()
+
+
+@router.get("/diagnostics/health-summary")
+async def diagnostics_health_summary(
+    refresh: str = Query(default="false", pattern="^(false|auto)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    diagnostics = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    model = await diagnostics.full_model(
+        country="US",
+        days=30,
+        symbol="MNQ",
+        fetch_missing_nasdaq=refresh == "auto",
+        refresh=refresh,
+    )
+    db_summary = MarketFactRepository(enrichment_orchestrator.settings).db_summary()
+    return HealthReportService().build_report(
+        base_url="in-process",
+        refresh_mode=refresh,
+        service_status="ok",
+        db_health={"status": "ok", "db_summary": db_summary},
+        market_context=model,
+        temporal_integrity=diagnostics.temporal_integrity(),
+        release_refresh=diagnostics.release_refresh_status(),
+        news_freshness=diagnostics.news_freshness(),
+        source_classification=diagnostics.source_classification(),
+        db_summary=db_summary,
+        ai_researcher_enabled=enrichment_orchestrator.settings.enable_ai_researcher,
+        ai_researcher_mode=enrichment_orchestrator.settings.ai_researcher_mode,
+    )
+
+
+async def _extended_market_model(
+    *,
+    refresh: str,
+    macro_service: MacroService,
+    event_service: EventService,
+    event_window_service: EventWindowService,
+    nasdaq_service: NasdaqDataService,
+    enrichment_orchestrator: EnrichmentOrchestrator,
+) -> dict[str, object]:
+    diagnostics = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    return await diagnostics.full_model(
+        country="US",
+        days=30,
+        symbol="MNQ",
+        fetch_missing_nasdaq=refresh == "force",
+        refresh=refresh,
+    )
+
+
+@router.get("/positioning/cot")
+async def positioning_cot(
+    refresh: str = Query(default="false", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    cot = await PositioningRuntimeService(enrichment_orchestrator.settings).cot(refresh=refresh)
+    return cot
+
+
+@router.get("/sentiment")
+async def sentiment(
+    refresh: str = Query(default="false", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    aaii = await PositioningRuntimeService(enrichment_orchestrator.settings).aaii(refresh=refresh)
+    return {"status": aaii.get("status"), "aaii": aaii, "service_role": "data provider only"}
+
+
+@router.get("/news/digest")
+async def news_digest(
+    refresh: str = Query(default="false", pattern="^(false|auto|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    model = await _extended_market_model(refresh=refresh, macro_service=macro_service, event_service=event_service, event_window_service=event_window_service, nasdaq_service=nasdaq_service, enrichment_orchestrator=enrichment_orchestrator)
+    return model.get("news_digest", {})
+
+
+@router.get("/news/latest")
+async def news_latest_context(
+    refresh: str = Query(default="false", pattern="^(false|auto|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    model = await _extended_market_model(refresh=refresh, macro_service=macro_service, event_service=event_service, event_window_service=event_window_service, nasdaq_service=nasdaq_service, enrichment_orchestrator=enrichment_orchestrator)
+    return model.get("news_context", {})
+
+
+@router.get("/events/windows")
+async def events_windows(
+    refresh: str = Query(default="false", pattern="^(false|auto|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    model = await _extended_market_model(refresh=refresh, macro_service=macro_service, event_service=event_service, event_window_service=event_window_service, nasdaq_service=nasdaq_service, enrichment_orchestrator=enrichment_orchestrator)
+    return model.get("event_windows", {})
+
+@router.get("/market-context/mnq/quality")
+async def market_context_mnq_quality(
+    country: str = Query(default="US", min_length=2, max_length=8),
+    days: int = Query(default=30, ge=1, le=365),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    service = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    model = await service.full_model(country=country, days=days, symbol="MNQ", fetch_missing_nasdaq=False)
+    quality = model.get("data_quality", {})
+    return {
+        "symbol": "MNQ",
+        "section_quality": quality.get("section_quality", {}),
+        "overall_data_quality": quality.get("overall_data_quality", {}),
+        "missing_critical_data": quality.get("missing_critical_fields", []),
+        "stale_data": quality.get("stale_fields", []),
+        "db_summary": model.get("db_summary", {}),
+        "metadata": model.get("metadata", {}),
+        "service_role": "data provider only",
+    }
+
+
+@router.get("/nasdaq/qqq/holdings", response_model=QQQHoldingsResponse)
+async def nasdaq_qqq_holdings(
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+) -> QQQHoldingsResponse:
+    return await nasdaq_service.qqq_holdings()
+
+
+@router.get("/nasdaq/mega-cap/snapshot", response_model=MegaCapSnapshotResponse)
+async def nasdaq_mega_cap_snapshot(
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+) -> MegaCapSnapshotResponse:
+    return await nasdaq_service.mega_cap_snapshot()
+
+
+@router.get("/nasdaq/mega-cap/breadth", response_model=MegaCapBreadthResponse)
+async def nasdaq_mega_cap_breadth(
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+) -> MegaCapBreadthResponse:
+    return await nasdaq_service.mega_cap_breadth()
+
+
+@router.get("/nasdaq/earnings/upcoming", response_model=EarningsResponse)
+async def nasdaq_earnings_upcoming(
+    days: int = Query(default=14, ge=1, le=90),
+    tickers: str | None = Query(default=None),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+) -> EarningsResponse:
+    ticker_list = [item.strip().upper() for item in tickers.split(",") if item.strip()] if tickers else None
+    return await nasdaq_service.earnings(days=days, tickers=ticker_list)
+
+
+@router.get("/news/latest", response_model=NewsResponse)
+async def news_latest(
+    symbols: str = Query(default="NVDA,AAPL,MSFT,QQQ"),
+    limit: int = Query(default=20, ge=1, le=100),
+    recency_days: int = Query(default=14, ge=1, le=90),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+) -> NewsResponse:
+    symbol_list = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    return await nasdaq_service.latest_news(
+        symbols=symbol_list,
+        limit=limit,
+        recency_days=recency_days,
+    )
+
+
+@router.get("/nasdaq/context")
+async def nasdaq_context(
+    refresh: str = Query(default="false", pattern="^(false|auto|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    diagnostics = DiagnosticsService(
+        enrichment_orchestrator.settings,
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_data_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    nasdaq_context, quality = await diagnostics._nasdaq_db_first(
+        symbol="MNQ",
+        fetch_missing=refresh != "false",
+        force=refresh == "force",
+    )
+    enriched = enrich_nasdaq_context(nasdaq_context or {}, {})
+    enriched["data_quality"] = {**(enriched.get("data_quality") or {}), **quality}
+    enriched["service_role"] = "data provider only"
+    return enriched

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+data/
+auth.json
+*token*
+*tokens*
+*.egg-info/
+*.pyc

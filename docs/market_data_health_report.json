@@ -1,0 +1,90 @@
+﻿{
+    "generated_at_utc":  "2026-07-10T08:41:57.6994547Z",
+    "overall_quality":  {
+                            "completeness_score":  1.0,
+                            "freshness_score":  0.912,
+                            "reliability_score":  0.986,
+                            "temporal_consistency_score":  1.0,
+                            "source_integrity_score":  1.0,
+                            "critical_missing_count":  0,
+                            "invalid_future_actual_count":  0,
+                            "stale_as_recent_count":  0,
+                            "is_ready_for_market_analysis":  true,
+                            "blocking_reasons":  [
+
+                                                 ]
+                        },
+    "temporal_integrity":  {
+                               "future_actual_count":  0,
+                               "stale_as_recent_count":  0,
+                               "released_without_actual_count":  0,
+                               "awaiting_actual_count":  0,
+                               "invalid_period_mapping_count":  0,
+                               "duplicates_count":  0,
+                               "future_actual":  [
+
+                                                 ],
+                               "stale_as_recent":  [
+
+                                                   ],
+                               "awaiting_actual":  [
+
+                                                   ],
+                               "blocking_errors":  [
+
+                                                   ],
+                               "service_role":  "data provider only"
+                           },
+    "release_refresh_status":  {
+                                   "retry_seconds":  [
+                                                         30,
+                                                         120,
+                                                         300,
+                                                         900,
+                                                         1800,
+                                                         3600
+                                                     ],
+                                   "max_attempts":  6,
+                                   "awaiting_actual":  [
+
+                                                       ],
+                                   "service_role":  "data provider only"
+                               },
+    "news_freshness":  {
+                           "total_news":  20,
+                           "latest_eligible_count":  12,
+                           "expired_count":  8,
+                           "invalid_content_count":  1,
+                           "stale_as_recent_count":  0,
+                           "expired_sample":  [
+                                                  "https://news.google.com/rss/articles/CBMiTkFVX3lxTFBpVTJIYnhWcW1kNFFKTHNoajhPeE9zSW9lTElhZkZvcEo3MExtQnpIZjBRek95cWJ0XzRKMzBtMHh0Ty1SYVRESUxfRTJ4Zw?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMirwFBVV95cUxObGR6Q2xZM0I0RlVBUG42OUtQOXRBRlZCcWNxaFJzcUFpX1lDQkI3d3FXbS1maW1wOWJJV0drdlFRRmluSEcySDlmNEotRUpvMFc2TmRuT2RzdmxLUXhUTTRvd0dnV3g1blNCMkEtOUUzTENxUmhROXdnSnI1TkphcUo2aWdYWDhDOUREN05XWGh3ZHJmRWUtbXN5UHlFQndLc09LMUl6QkY0NVI4MG5J?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMiogFBVV95cUxNaFNGbzYydEJKaE15LTNfMkVYSTBTZmR4cHdqTEZQSVhESjc3bkZhaVR6WGJsUDNwTEo3STE2OWZXMDlfV3F6ak44QW9GOHh5bHpYQnZTX09DdzBCTzJpTGoyM1FfVFJQanhmWEludnpSZUVwVFNOakNiWlFkYmhsWE43OVpLVXJLcVp1ZGU5QXBWRjZNS3d3WWlic0J3VUFnU0E?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMimwFBVV95cUxONGo5U3k5QmhsVTBVZ2poM1F5Ni1sOGVQTTh0WUloWkNORzgtSWdCVUhORklPa0FZalF6Tm5TY2tQdndRZXRSTEJBTkZZQnI4SDA1M2xmcDY1blpKSHlkekswXzNFbGhXdkYwVlNmcU9wb3o5T1J3TW5JR3NqVGRSMnUwOGo0VHM3UVBuaGtzb2ZkTldtdmpWTHJ2VQ?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMiywFBVV95cUxOU3pWWXJlM3EzaWI4S3Jva2lvRGtGN1JuX0pSdlkxSmxEalQyS2VKN3planZiak94MDl3MGRsVEtTbkRfN0VIZEFOcUtUWGFTWnlYd1R1UHY3UHhlRW5EY3F0VW5RWWc4bGo3OHVTRlV3Q3k2bm80NnhQbGJ5Z0Uwd19NVGd3aWtRR3JaRklFTW1rVkpqNWZPVW1RQzhGMVVFV1lRMnVwUU0wRndrQncyR1FpdXV6TEhqYWZDNkVOVS1Rd19nSTg4SzAyRQ?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMimAFBVV95cUxPODFmZkNQLTk3bmdZVXdZMkN1bF9POVJtb0VxeElBX1FsazlTRVdjUVY2aFZiYnNzU2JLS2xacmVTNVA0M243bFR4TUEtMUdYX0ZPbE9IekRuVjRQMXJoeFNCN01Qa1dzZTlCZ1lHSHJoWlRXX29JMnV0SlpueFpjeHBxS3ZTbVRjQnZjajZ3OEhhMUt5ZE1NVQ?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMijwFBVV95cUxNRmY0dTdtTS16d2RmZUpXZzh0M3VVd3pmeFd1Z0ptQlNXc1F0VGdzb2ttdWZ6eEx6SXNHSUxiTmJiNTItUjVFRGZ2Uk11S0Z4aVFmZnZqaHFadTZlX3B3aE1rc3E4RUdSY0NSdjNyODdHa1hrVG5BT3dSMkJKTlBjcVZBa25VQmRwWGJjbWwxbw?oc=5",
+                                                  "https://news.google.com/rss/articles/CBMipgFBVV95cUxNdzU2RktkblFtaFdPWDJnZWRIVUUzWVJvclZreXFFMWh3cTFpbC1wZ1VKY0VwdHl0S2JsV0VuZnVkLVFsaHltYXJybHYwZUNZcExiVnRPNTJjcTR6dWQxNkNNNGNNeUItNzVGdERqNzFWLTN2b3hlbjRZUHJrZUtPVFJ6SDlXdWxLZXFlczh3RTE4SlBuSVNKY0dGOWh0UFhUcnNSUzJ3?oc=5"
+                                              ],
+                           "service_role":  "data provider only"
+                       },
+    "source_classification_summary":  {
+                                          "official_count":  0,
+                                          "market_count":  16
+                                      },
+    "model_counts":  {
+                         "critical_macro_events":  5,
+                         "fed_communications":  5,
+                         "latest_news":  9,
+                         "qqq_holdings":  104,
+                         "mega_cap_resolved":  12
+                     },
+    "anomaly_checks":  {
+                           "fred_in_release_queue":  0,
+                           "placeholder_news":  0,
+                           "future_actual":  0,
+                           "stale_as_recent":  0,
+                           "invalid_period_mapping":  0,
+                           "blocking_errors":  0
+                       }
+}

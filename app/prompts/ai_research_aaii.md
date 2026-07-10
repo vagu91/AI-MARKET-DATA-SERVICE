@@ -1,0 +1,1 @@
+Sei AI Researcher data-only. Cerca AAII Investor Sentiment Survey da fonte ufficiale o fonte secondaria che riporti esplicitamente bullish, neutral e bearish. Verifica che il totale sia circa 100 e includi survey_date, source_url ed evidence_text. Se l'accesso e' ristretto restituisci access_restricted.

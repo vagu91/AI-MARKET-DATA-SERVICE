@@ -1,0 +1,292 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AI_MARKET_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    service_name: str = "AI-MARKET-DATA-SERVICE"
+    environment: str = "local"
+    log_level: str = "INFO"
+    database_path: Path = Path("./data/market_data.sqlite3")
+    market_db_path: Path = Field(
+        default=Path("./data/market_data_service.sqlite"),
+        validation_alias=AliasChoices("AI_MARKET_DB_PATH", "DB_PATH"),
+    )
+    timezone: str = "Europe/Rome"
+    http_timeout_seconds: float = 15.0
+    timeout_macro_seconds: float = Field(default=30.0, validation_alias="AI_MARKET_TIMEOUT_MACRO_SECONDS")
+    timeout_events_seconds: float = Field(default=30.0, validation_alias="AI_MARKET_TIMEOUT_EVENTS_SECONDS")
+    timeout_news_seconds: float = Field(default=12.0, validation_alias="AI_MARKET_TIMEOUT_NEWS_SECONDS")
+    timeout_official_news_seconds: float = Field(default=4.0, validation_alias="AI_MARKET_TIMEOUT_OFFICIAL_NEWS_SECONDS")
+    timeout_nasdaq_seconds: float = Field(default=45.0, validation_alias="AI_MARKET_TIMEOUT_NASDAQ_SECONDS")
+    timeout_earnings_seconds: float = Field(default=12.0, validation_alias="AI_MARKET_TIMEOUT_EARNINGS_SECONDS")
+    timeout_cot_seconds: float = Field(default=8.0, validation_alias="AI_MARKET_TIMEOUT_COT_SECONDS")
+    timeout_sentiment_seconds: float = Field(default=8.0, validation_alias="AI_MARKET_TIMEOUT_SENTIMENT_SECONDS")
+    timeout_canonical_seconds: float = Field(default=4.0, validation_alias="AI_MARKET_TIMEOUT_CANONICAL_SECONDS")
+    timeout_article_fetch_seconds: float = Field(default=4.0, validation_alias="AI_MARKET_TIMEOUT_ARTICLE_FETCH_SECONDS")
+    timeout_ai_research_seconds: float = Field(default=60.0, validation_alias="AI_MARKET_TIMEOUT_AI_RESEARCH_SECONDS")
+
+    fred_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_FRED_API_KEY", "FRED_API_KEY"),
+    )
+    bea_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_BEA_API_KEY", "BEA_API_KEY"),
+    )
+    bls_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_BLS_API_KEY", "BLS_API_KEY"),
+    )
+    alpha_vantage_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AI_MARKET_ALPHA_VANTAGE_API_KEY",
+            "ALPHA_VANTAGE_API_KEY",
+        ),
+    )
+    openai_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_OPENAI_API_KEY", "OPENAI_API_KEY"),
+    )
+
+    enable_scraper_fallbacks: bool = False
+    enable_event_enrichment_scrapers: bool = True
+    enable_openai_event_enrichment: bool = False
+    enable_openai_fallback: bool = False
+    enable_scheduler: bool = False
+    enable_browser_scraping: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_ENABLE_BROWSER_SCRAPING", "ENABLE_BROWSER_SCRAPING"),
+    )
+    browser_scraping_headless: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AI_MARKET_BROWSER_SCRAPING_HEADLESS", "BROWSER_SCRAPING_HEADLESS"),
+    )
+    browser_scraping_timeout_seconds: float = Field(
+        default=15.0,
+        validation_alias=AliasChoices(
+            "AI_MARKET_BROWSER_SCRAPING_TIMEOUT_SECONDS",
+            "BROWSER_SCRAPING_TIMEOUT_SECONDS",
+        ),
+    )
+    browser_scraping_max_pages: int = Field(
+        default=3,
+        validation_alias=AliasChoices("AI_MARKET_BROWSER_SCRAPING_MAX_PAGES", "BROWSER_SCRAPING_MAX_PAGES"),
+    )
+    enable_aggressive_scraping: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_ENABLE_AGGRESSIVE_SCRAPING", "ENABLE_AGGRESSIVE_SCRAPING"),
+    )
+    enrich_only_high_impact: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AI_MARKET_ENRICH_ONLY_HIGH_IMPACT", "ENRICH_ONLY_HIGH_IMPACT"),
+    )
+    enrichment_max_events: int = Field(
+        default=10,
+        validation_alias=AliasChoices("AI_MARKET_ENRICHMENT_MAX_EVENTS", "ENRICHMENT_MAX_EVENTS"),
+    )
+    event_enrichment_cache_ttl_hours: int = Field(
+        default=24,
+        validation_alias=AliasChoices(
+            "AI_MARKET_EVENT_ENRICHMENT_CACHE_TTL_HOURS",
+            "EVENT_ENRICHMENT_CACHE_TTL_HOURS",
+        ),
+    )
+    enable_targeted_search_enrichment: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "AI_MARKET_ENABLE_TARGETED_SEARCH_ENRICHMENT",
+            "ENABLE_TARGETED_SEARCH_ENRICHMENT",
+        ),
+    )
+    targeted_search_max_events: int = Field(
+        default=10,
+        validation_alias=AliasChoices("AI_MARKET_TARGETED_SEARCH_MAX_EVENTS", "TARGETED_SEARCH_MAX_EVENTS"),
+    )
+    targeted_search_timeout_seconds: float = Field(
+        default=10.0,
+        validation_alias=AliasChoices(
+            "AI_MARKET_TARGETED_SEARCH_TIMEOUT_SECONDS",
+            "TARGETED_SEARCH_TIMEOUT_SECONDS",
+        ),
+    )
+    targeted_search_recency_days: int = Field(
+        default=30,
+        validation_alias=AliasChoices(
+            "AI_MARKET_TARGETED_SEARCH_RECENCY_DAYS",
+            "TARGETED_SEARCH_RECENCY_DAYS",
+        ),
+    )
+    targeted_search_require_source_url: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "AI_MARKET_TARGETED_SEARCH_REQUIRE_SOURCE_URL",
+            "TARGETED_SEARCH_REQUIRE_SOURCE_URL",
+        ),
+    )
+    openai_event_enrichment_model: str = "gpt-5-mini"
+    openai_event_enrichment_max_events: int = 5
+    manual_event_enrichment_path: Path = Path("./data/manual_event_enrichment.json")
+    allow_stale_facts: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_ALLOW_STALE_FACTS", "ALLOW_STALE_FACTS"),
+    )
+    default_news_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_DEFAULT_NEWS_TTL_HOURS")
+    default_fact_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_DEFAULT_FACT_TTL_HOURS")
+    qqq_holdings_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_QQQ_HOLDINGS_TTL_HOURS")
+    earnings_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_EARNINGS_TTL_HOURS")
+    enable_ai_researcher: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_AI_RESEARCHER")
+    ai_researcher_mode: str = Field(default="codex_cli", validation_alias="AI_MARKET_AI_RESEARCHER_MODE")
+    ai_researcher_max_events: int = Field(default=5, validation_alias="AI_MARKET_AI_RESEARCHER_MAX_EVENTS")
+    ai_researcher_max_macro_events: int = Field(default=5, validation_alias="AI_MARKET_AI_RESEARCH_MAX_MACRO_EVENTS")
+    ai_researcher_max_news: int = Field(default=10, validation_alias="AI_MARKET_AI_RESEARCH_MAX_NEWS")
+    ai_researcher_max_earnings_symbols: int = Field(default=13, validation_alias="AI_MARKET_AI_RESEARCH_MAX_EARNINGS_SYMBOLS")
+    ai_researcher_max_cot_requests: int = Field(default=1, validation_alias="AI_MARKET_AI_RESEARCH_MAX_COT_REQUESTS")
+    ai_researcher_max_sentiment_requests: int = Field(default=1, validation_alias="AI_MARKET_AI_RESEARCH_MAX_SENTIMENT_REQUESTS")
+    ai_researcher_min_confidence: float = Field(default=0.5, validation_alias="AI_MARKET_AI_RESEARCH_MIN_CONFIDENCE")
+    ai_researcher_require_evidence: bool = Field(default=True, validation_alias="AI_MARKET_AI_RESEARCH_REQUIRE_EVIDENCE")
+    ai_researcher_only_high_impact: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_AI_RESEARCHER_ONLY_HIGH_IMPACT",
+    )
+    ai_researcher_require_source_url: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_AI_RESEARCHER_REQUIRE_SOURCE_URL",
+    )
+    save_failed_research: bool = Field(default=True, validation_alias="AI_MARKET_SAVE_FAILED_RESEARCH")
+    codex_cli_command: str = Field(default="codex", validation_alias="AI_MARKET_CODEX_CLI_COMMAND")
+    codex_workspace_dir: Path = Field(
+        default=Path("./data/ai_research_workspace"),
+        validation_alias="AI_MARKET_CODEX_WORKSPACE_DIR",
+    )
+    codex_research_timeout_seconds: int = Field(
+        default=300,
+        validation_alias="AI_MARKET_CODEX_RESEARCH_TIMEOUT_SECONDS",
+    )
+    openai_research_model: str | None = Field(
+        default=None,
+        validation_alias="AI_MARKET_OPENAI_RESEARCH_MODEL",
+    )
+    openai_research_timeout_seconds: int = Field(
+        default=60,
+        validation_alias="AI_MARKET_OPENAI_RESEARCH_TIMEOUT_SECONDS",
+    )
+    openai_research_temperature: float = Field(
+        default=0,
+        validation_alias="AI_MARKET_OPENAI_RESEARCH_TEMPERATURE",
+    )
+    release_refresh_retry_seconds: str = Field(
+        default="30,120,300,900,1800,3600",
+        validation_alias="AI_MARKET_RELEASE_REFRESH_RETRY_SECONDS",
+    )
+    max_release_refresh_attempts: int = Field(
+        default=6,
+        validation_alias="AI_MARKET_MAX_RELEASE_REFRESH_ATTEMPTS",
+    )
+    enable_investing_calendar: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_CALENDAR")
+    enable_investing_holidays: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_HOLIDAYS")
+    enable_cboe_risk_indices: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CBOE_RISK_INDICES")
+    enable_nasdaq_earnings: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_EARNINGS")
+    enable_nasdaq_100: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_100")
+    enable_nasdaq_market_info: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_MARKET_INFO")
+    enable_nasdaq_qqq_options: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_QQQ_OPTIONS")
+    enable_aaii_sentiment: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_AAII_SENTIMENT")
+    enable_macromicro_aaii_crosscheck: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_MACROMICRO_AAII_CROSSCHECK")
+    enable_polymarket: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_POLYMARKET")
+    provider_failure_cache_minutes: int = Field(default=30, validation_alias="AI_MARKET_PROVIDER_FAILURE_CACHE_MINUTES")
+    provider_negative_cache_minutes: int = Field(default=60, validation_alias="AI_MARKET_PROVIDER_NEGATIVE_CACHE_MINUTES")
+    provider_max_retries: int = Field(default=1, validation_alias="AI_MARKET_PROVIDER_MAX_RETRIES")
+    provider_circuit_breaker_failures: int = Field(default=3, validation_alias="AI_MARKET_PROVIDER_CIRCUIT_BREAKER_FAILURES")
+    provider_circuit_breaker_minutes: int = Field(default=15, validation_alias="AI_MARKET_PROVIDER_CIRCUIT_BREAKER_MINUTES")
+    investing_domain_id: int = Field(default=1, validation_alias="AI_MARKET_INVESTING_DOMAIN_ID")
+    investing_country_ids: str = Field(default="5", validation_alias="AI_MARKET_INVESTING_COUNTRY_IDS")
+    investing_calendar_lookahead_days: int = Field(default=14, validation_alias="AI_MARKET_INVESTING_CALENDAR_LOOKAHEAD_DAYS")
+    investing_calendar_page_limit: int = Field(default=100, validation_alias="AI_MARKET_INVESTING_CALENDAR_PAGE_LIMIT")
+    nasdaq_options_symbol: str = Field(default="QQQ", validation_alias="AI_MARKET_NASDAQ_OPTIONS_SYMBOL")
+    nasdaq_options_lookahead_days: int = Field(default=30, validation_alias="AI_MARKET_NASDAQ_OPTIONS_LOOKAHEAD_DAYS")
+    nasdaq_options_default_money: str = Field(default="all", validation_alias="AI_MARKET_NASDAQ_OPTIONS_DEFAULT_MONEY")
+    nasdaq_options_default_type: str = Field(default="all", validation_alias="AI_MARKET_NASDAQ_OPTIONS_DEFAULT_TYPE")
+    nasdaq_options_page_size: int = Field(default=60, validation_alias="AI_MARKET_NASDAQ_OPTIONS_PAGE_SIZE")
+    nasdaq_options_max_pages: int = Field(default=3, validation_alias="AI_MARKET_NASDAQ_OPTIONS_MAX_PAGES")
+    nasdaq_options_cache_minutes: int = Field(default=30, validation_alias="AI_MARKET_NASDAQ_OPTIONS_CACHE_MINUTES")
+    polymarket_gamma_base_url: str = Field(default="https://gamma-api.polymarket.com", validation_alias="AI_MARKET_POLYMARKET_GAMMA_BASE_URL")
+    polymarket_data_base_url: str = Field(default="https://data-api.polymarket.com", validation_alias="AI_MARKET_POLYMARKET_DATA_BASE_URL")
+    polymarket_clob_base_url: str = Field(default="https://clob.polymarket.com", validation_alias="AI_MARKET_POLYMARKET_CLOB_BASE_URL")
+    polymarket_timeout_seconds: float = Field(default=10.0, validation_alias="AI_MARKET_POLYMARKET_TIMEOUT_SECONDS")
+    polymarket_min_liquidity_usd: float = Field(default=10000.0, validation_alias="AI_MARKET_POLYMARKET_MIN_LIQUIDITY_USD")
+    polymarket_min_volume_usd: float = Field(default=25000.0, validation_alias="AI_MARKET_POLYMARKET_MIN_VOLUME_USD")
+    polymarket_max_spread: float = Field(default=0.25, validation_alias="AI_MARKET_POLYMARKET_MAX_SPREAD")
+    polymarket_max_markets: int = Field(default=20, validation_alias="AI_MARKET_POLYMARKET_MAX_MARKETS")
+    polymarket_lookahead_days: int = Field(default=180, validation_alias="AI_MARKET_POLYMARKET_LOOKAHEAD_DAYS")
+    polymarket_history_days: int = Field(default=14, validation_alias="AI_MARKET_POLYMARKET_HISTORY_DAYS")
+    polymarket_cache_minutes: int = Field(default=15, validation_alias="AI_MARKET_POLYMARKET_CACHE_MINUTES")
+
+    fred_base_url: str = "https://api.stlouisfed.org/fred"
+    bls_base_url: str = "https://api.bls.gov/publicAPI/v2/timeseries/data"
+    bea_base_url: str = "https://apps.bea.gov/api/data"
+    federal_reserve_calendar_base_url: str = "https://www.federalreserve.gov/newsevents"
+    bls_schedule_base_url: str = "https://www.bls.gov/schedule"
+    bea_release_schedule_url: str = "https://www.bea.gov/news/schedule"
+    invesco_qqq_holdings_url: str = (
+        "https://www.invesco.com/us/financial-products/etfs/holdings/"
+        "main/holdings/0?audienceType=Investor&action=download&ticker=QQQ"
+    )
+    nasdaq_100_constituents_url: str = (
+        "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+    )
+    yahoo_quote_url: str = "https://query1.finance.yahoo.com/v7/finance/quote"
+    yahoo_chart_url: str = "https://query1.finance.yahoo.com/v8/finance/chart"
+    yahoo_quote_summary_url: str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary"
+    gdelt_doc_api_url: str = "https://api.gdeltproject.org/api/v2/doc/doc"
+    alpha_vantage_base_url: str = "https://www.alphavantage.co/query"
+    google_news_rss_url: str = "https://news.google.com/rss/search"
+    yahoo_finance_rss_url: str = "https://finance.yahoo.com/rss/topstories"
+    marketwatch_rss_url: str = "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+    federal_reserve_rss_url: str = Field(
+        default="https://www.federalreserve.gov/feeds/press_all.xml"
+    )
+    bls_rss_url: str = Field(default="https://www.bls.gov/feed/news_release.rss")
+    bea_rss_url: str = Field(default="https://www.bea.gov/news/rss.xml")
+    dailyfx_calendar_url: str = "https://www.dailyfx.com/economic-calendar"
+    forex_factory_calendar_url: str = "https://www.forexfactory.com/calendar"
+    investing_calendar_url: str = "https://www.investing.com/economic-calendar/"
+    fxstreet_calendar_url: str = "https://www.fxstreet.com/economic-calendar"
+    marketwatch_calendar_url: str = "https://www.marketwatch.com/economy-politics/calendar"
+    yahoo_economic_calendar_url: str = "https://finance.yahoo.com/calendar/economic"
+    generic_search_calendar_url: str | None = None
+    investing_economic_calendar_api_url: str = "https://endpoints.investing.com/pd-instruments/v1/calendars/economic/events/occurrences"
+    investing_holiday_calendar_api_url: str = "https://endpoints.investing.com/pd-instruments/v1/calendars/holidays"
+    cboe_vvix_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VVIX.json"
+    cboe_skew_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_SKEW.json"
+    nasdaq_earnings_calendar_url: str = "https://api.nasdaq.com/api/calendar/earnings"
+    nasdaq_market_info_url: str = "https://api.nasdaq.com/api/market-info"
+    nasdaq_qqq_option_chain_url: str = "https://api.nasdaq.com/api/quote/QQQ/option-chain"
+    macromicro_aaii_chart_url: str = "https://en.macromicro.me/charts/20828/us-aaii-sentimentsurvey"
+    macromicro_aaii_api_url: str = "https://en.macromicro.me/api/view/chart/20828"
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        return init_settings, dotenv_settings, env_settings, file_secret_settings
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

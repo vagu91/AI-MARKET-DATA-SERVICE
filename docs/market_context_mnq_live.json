@@ -1,0 +1,997 @@
+﻿{
+    "symbol":  "MNQ",
+    "macro":  {
+                  "series":  [
+                                 {
+                                     "series_id":  "VIXCLS",
+                                     "name":  "CBOE Volatility Index: VIX",
+                                     "value":  16.9,
+                                     "units":  "index",
+                                     "data_as_of":  "2026-07-08",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "DGS2",
+                                     "name":  "2-Year Treasury Constant Maturity Rate",
+                                     "value":  4.21,
+                                     "units":  "percent",
+                                     "data_as_of":  "2026-07-08",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "DGS10",
+                                     "name":  "10-Year Treasury Constant Maturity Rate",
+                                     "value":  4.56,
+                                     "units":  "percent",
+                                     "data_as_of":  "2026-07-08",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "FEDFUNDS",
+                                     "name":  "Effective Federal Funds Rate",
+                                     "value":  3.63,
+                                     "units":  "percent",
+                                     "data_as_of":  "2026-06-01",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "NFCI",
+                                     "name":  "Chicago Fed National Financial Conditions Index",
+                                     "value":  -0.515,
+                                     "units":  "index",
+                                     "data_as_of":  "2026-07-03",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "SOFR",
+                                     "name":  "Secured Overnight Financing Rate",
+                                     "value":  3.58,
+                                     "units":  "percent",
+                                     "data_as_of":  "2026-07-08",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "T10Y2Y",
+                                     "name":  "10-Year Treasury Minus 2-Year Treasury",
+                                     "value":  0.38,
+                                     "units":  "percent",
+                                     "data_as_of":  "2026-07-09",
+                                     "source":  "FRED",
+                                     "metadata":  {
+                                                      "source":  "FRED",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.95,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "BEA:GDP",
+                                     "name":  "Gross Domestic Product",
+                                     "value":  2.1,
+                                     "units":  "Percent change, annual rate",
+                                     "data_as_of":  "2026Q1",
+                                     "source":  "BEA",
+                                     "metadata":  {
+                                                      "source":  "BEA",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.94,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "BEA:REAL_GDP",
+                                     "name":  "Real GDP",
+                                     "value":  24180419.0,
+                                     "units":  "Level",
+                                     "data_as_of":  "2026Q1",
+                                     "source":  "BEA",
+                                     "metadata":  {
+                                                      "source":  "BEA",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.94,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "BEA:PERSONAL_INCOME",
+                                     "name":  "Personal Income",
+                                     "value":  26916376.0,
+                                     "units":  "Level",
+                                     "data_as_of":  "2026M05",
+                                     "source":  "BEA",
+                                     "metadata":  {
+                                                      "source":  "BEA",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.94,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "BEA:PERSONAL_SPENDING",
+                                     "name":  "Personal Spending",
+                                     "value":  22947517.0,
+                                     "units":  "Level",
+                                     "data_as_of":  "2026M05",
+                                     "source":  "BEA",
+                                     "metadata":  {
+                                                      "source":  "BEA",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.94,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "BEA:CORE_PCE",
+                                     "name":  "Core PCE Price Index",
+                                     "value":  130.082,
+                                     "units":  "Level",
+                                     "data_as_of":  "2026M05",
+                                     "source":  "BEA",
+                                     "metadata":  {
+                                                      "source":  "BEA",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.94,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 },
+                                 {
+                                     "series_id":  "BEA:PCE",
+                                     "name":  "Personal Consumption Expenditures",
+                                     "value":  22059839.0,
+                                     "units":  "Level",
+                                     "data_as_of":  "2026M05",
+                                     "source":  "BEA",
+                                     "metadata":  {
+                                                      "source":  "BEA",
+                                                      "provider_type":  "API",
+                                                      "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                                      "data_as_of":  null,
+                                                      "freshness":  "RECENT",
+                                                      "reliability":  0.94,
+                                                      "is_fallback":  false,
+                                                      "errors":  [
+
+                                                                 ]
+                                                  }
+                                 }
+                             ],
+                  "provider_results":  [
+                                           {
+                                               "source":  "FRED",
+                                               "provider_type":  "API",
+                                               "retrieved_at":  "2026-07-10T07:23:55.749736Z",
+                                               "data_as_of":  null,
+                                               "freshness":  "RECENT",
+                                               "reliability":  0.95,
+                                               "is_fallback":  false,
+                                               "errors":  [
+
+                                                          ]
+                                           },
+                                           {
+                                               "source":  "BEA",
+                                               "provider_type":  "API",
+                                               "retrieved_at":  "2026-07-10T07:24:01.526977Z",
+                                               "data_as_of":  null,
+                                               "freshness":  "RECENT",
+                                               "reliability":  0.94,
+                                               "is_fallback":  false,
+                                               "errors":  [
+
+                                                          ]
+                                           }
+                                       ]
+              },
+    "events_today":  [
+                         {
+                             "event_id":  "bea-cal-1c26a9378d91b5d4",
+                             "name":  "Activities of U.S. Affiliates of Foreign Multinational Enterprises, 2024",
+                             "country":  "US",
+                             "category":  "Economic Release",
+                             "date":  "2026-07-10",
+                             "time_utc":  "2026-07-10T12:30:00Z",
+                             "time_local":  "2026-07-10T14:30:00+02:00",
+                             "impact":  "MEDIUM",
+                             "actual":  null,
+                             "forecast":  null,
+                             "previous":  null,
+                             "source":  "BEA Release Schedule",
+                             "source_url":  "https://www.bea.gov/news/schedule",
+                             "reliability":  0.84,
+                             "incomplete_time":  false,
+                             "event_risk_level":  "MEDIUM",
+                             "default_risk_window_before_minutes":  0,
+                             "default_risk_window_after_minutes":  0,
+                             "enrichment":  {
+                                                "forecast":  null,
+                                                "previous":  null,
+                                                "consensus":  null,
+                                                "actual":  null,
+                                                "source":  null,
+                                                "source_url":  null,
+                                                "provider_type":  null,
+                                                "retrieved_at":  null,
+                                                "valid_until":  null,
+                                                "next_refresh_at":  null,
+                                                "reliability":  0.0,
+                                                "confidence":  0.0,
+                                                "cache_status":  null,
+                                                "matched_by":  null,
+                                                "warnings":  [
+                                                                 "no_data_available: enrichment skipped by high-impact filter"
+                                                             ],
+                                                "errors":  [
+
+                                                           ]
+                                            }
+                         }
+                     ],
+    "upcoming_high_impact_events":  [
+                                        {
+                                            "event_id":  "fed-cal-2112bc0e886b5d00",
+                                            "name":  "Speech - Vice Chair for Supervision Michelle W. Bowman - Modernizing Financial Regulation - At the Bank Policy Institute (BPI) Roundtable (virtual)",
+                                            "country":  "US",
+                                            "category":  "Fed Speech",
+                                            "date":  "2026-07-13",
+                                            "time_utc":  "2026-07-13T09:25:00Z",
+                                            "time_local":  "2026-07-13T11:25:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "Federal Reserve Calendar",
+                                            "source_url":  "https://www.federalreserve.gov/newsevents/2026-july.htm",
+                                            "reliability":  0.86,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  null,
+                                                               "source_url":  null,
+                                                               "provider_type":  null,
+                                                               "retrieved_at":  null,
+                                                               "valid_until":  null,
+                                                               "next_refresh_at":  null,
+                                                               "reliability":  0.0,
+                                                               "confidence":  0.0,
+                                                               "cache_status":  null,
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "no_data_available: enrichment skipped by high-impact filter",
+                                                                                "missing_enrichment_data"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        },
+                                        {
+                                            "event_id":  "bls-db6635b86b5cbd20",
+                                            "name":  "Consumer Price Index (June 2026)",
+                                            "country":  "US",
+                                            "category":  "CPI",
+                                            "date":  "2026-07-14",
+                                            "time_utc":  "2026-07-14T12:30:00Z",
+                                            "time_local":  "2026-07-14T14:30:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "BLS Release Calendar",
+                                            "source_url":  "https://www.bls.gov/schedule/2026/07_sched.htm",
+                                            "reliability":  0.82,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  "U.S. Bureau of Labor Statistics",
+                                                               "source_url":  "https://www.bls.gov/news.release/cpi.nr0.htm",
+                                                               "provider_type":  "AI_RESEARCHER_CODEX_CLI",
+                                                               "retrieved_at":  "2026-07-10T07:30:00Z",
+                                                               "valid_until":  "2026-07-14T12:30:00Z",
+                                                               "next_refresh_at":  "2026-07-14T12:30:00Z",
+                                                               "reliability":  0.96,
+                                                               "confidence":  0.9,
+                                                               "cache_status":  "hit",
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "forecast_not_verified",
+                                                                                "consensus_not_verified",
+                                                                                "actual_not_available_before_release"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        },
+                                        {
+                                            "event_id":  "fed-cal-5d7ab6f501ffc718",
+                                            "name":  "Testimony - Chairman Kevin Warsh - Semiannual Monetary Policy Report to Congress - Before the U.S. House Financial Services Committee",
+                                            "country":  "US",
+                                            "category":  "Fed Speech",
+                                            "date":  "2026-07-14",
+                                            "time_utc":  "2026-07-14T14:00:00Z",
+                                            "time_local":  "2026-07-14T16:00:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "Federal Reserve Calendar",
+                                            "source_url":  "https://www.federalreserve.gov/newsevents/2026-july.htm",
+                                            "reliability":  0.86,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  null,
+                                                               "source_url":  null,
+                                                               "provider_type":  null,
+                                                               "retrieved_at":  null,
+                                                               "valid_until":  null,
+                                                               "next_refresh_at":  null,
+                                                               "reliability":  0.0,
+                                                               "confidence":  0.0,
+                                                               "cache_status":  null,
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "no_data_available: enrichment skipped by high-impact filter",
+                                                                                "missing_enrichment_data"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        },
+                                        {
+                                            "event_id":  "fed-cal-ff39f499f7ba0e28",
+                                            "name":  "Speech - Vice Chair for Supervision Michelle W. Bowman - Responsible Innovation and Financial Inclusion - At the Federal Reserve Board Annual Financial Inclusion Conference, Washington, D.C. (via pre-recorded video)",
+                                            "country":  "US",
+                                            "category":  "Fed Speech",
+                                            "date":  "2026-07-14",
+                                            "time_utc":  "2026-07-14T18:55:00Z",
+                                            "time_local":  "2026-07-14T20:55:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "Federal Reserve Calendar",
+                                            "source_url":  "https://www.federalreserve.gov/newsevents/2026-july.htm",
+                                            "reliability":  0.86,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  null,
+                                                               "source_url":  null,
+                                                               "provider_type":  null,
+                                                               "retrieved_at":  null,
+                                                               "valid_until":  null,
+                                                               "next_refresh_at":  null,
+                                                               "reliability":  0.0,
+                                                               "confidence":  0.0,
+                                                               "cache_status":  null,
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "no_data_available: enrichment skipped by high-impact filter",
+                                                                                "missing_enrichment_data"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        },
+                                        {
+                                            "event_id":  "bls-b7216b76e363888e",
+                                            "name":  "Producer Price Index (June 2026)",
+                                            "country":  "US",
+                                            "category":  "PPI",
+                                            "date":  "2026-07-15",
+                                            "time_utc":  "2026-07-15T12:30:00Z",
+                                            "time_local":  "2026-07-15T14:30:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "BLS Release Calendar",
+                                            "source_url":  "https://www.bls.gov/schedule/2026/07_sched.htm",
+                                            "reliability":  0.82,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  "U.S. Bureau of Labor Statistics",
+                                                               "source_url":  "https://www.bls.gov/news.release/ppi.nr0.htm",
+                                                               "provider_type":  "AI_RESEARCHER_CODEX_CLI",
+                                                               "retrieved_at":  "2026-07-10T07:30:00Z",
+                                                               "valid_until":  "2026-07-15T12:30:00Z",
+                                                               "next_refresh_at":  "2026-07-15T12:30:00Z",
+                                                               "reliability":  0.96,
+                                                               "confidence":  0.9,
+                                                               "cache_status":  "hit",
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "forecast_not_verified",
+                                                                                "consensus_not_verified",
+                                                                                "actual_not_available_before_release"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        },
+                                        {
+                                            "event_id":  "fed-cal-14481f3da421e63e",
+                                            "name":  "Testimony - Chairman Kevin Warsh - Semiannual Monetary Policy Report to Congress - Before the U.S. Senate Committee on Banking, Housing, and Urban Affairs",
+                                            "country":  "US",
+                                            "category":  "Fed Speech",
+                                            "date":  "2026-07-15",
+                                            "time_utc":  "2026-07-15T14:00:00Z",
+                                            "time_local":  "2026-07-15T16:00:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "Federal Reserve Calendar",
+                                            "source_url":  "https://www.federalreserve.gov/newsevents/2026-july.htm",
+                                            "reliability":  0.86,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  null,
+                                                               "source_url":  null,
+                                                               "provider_type":  null,
+                                                               "retrieved_at":  null,
+                                                               "valid_until":  null,
+                                                               "next_refresh_at":  null,
+                                                               "reliability":  0.0,
+                                                               "confidence":  0.0,
+                                                               "cache_status":  null,
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "no_data_available: enrichment skipped by high-impact filter",
+                                                                                "missing_enrichment_data"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        },
+                                        {
+                                            "event_id":  "fed-cal-9512d9d9a32ef25a",
+                                            "name":  "Speech - Vice Chair Philip N. Jefferson - Navigating Economic Shocks - At In Conversation with Philip Jefferson, Stanford, California",
+                                            "country":  "US",
+                                            "category":  "Fed Speech",
+                                            "date":  "2026-07-16",
+                                            "time_utc":  "2026-07-16T23:00:00Z",
+                                            "time_local":  "2026-07-17T01:00:00+02:00",
+                                            "impact":  "HIGH",
+                                            "actual":  null,
+                                            "forecast":  null,
+                                            "previous":  null,
+                                            "source":  "Federal Reserve Calendar",
+                                            "source_url":  "https://www.federalreserve.gov/newsevents/2026-july.htm",
+                                            "reliability":  0.86,
+                                            "incomplete_time":  false,
+                                            "event_risk_level":  "HIGH",
+                                            "default_risk_window_before_minutes":  30,
+                                            "default_risk_window_after_minutes":  30,
+                                            "enrichment":  {
+                                                               "forecast":  null,
+                                                               "previous":  null,
+                                                               "consensus":  null,
+                                                               "actual":  null,
+                                                               "source":  null,
+                                                               "source_url":  null,
+                                                               "provider_type":  null,
+                                                               "retrieved_at":  null,
+                                                               "valid_until":  null,
+                                                               "next_refresh_at":  null,
+                                                               "reliability":  0.0,
+                                                               "confidence":  0.0,
+                                                               "cache_status":  null,
+                                                               "matched_by":  null,
+                                                               "warnings":  [
+                                                                                "no_data_available: enrichment skipped by high-impact filter",
+                                                                                "missing_enrichment_data"
+                                                                            ],
+                                                               "errors":  [
+
+                                                                          ]
+                                                           }
+                                        }
+                                    ],
+    "event_windows":  {
+                          "symbol":  "MNQ",
+                          "checked_at_utc":  "2026-07-10T07:41:21.099214+00:00",
+                          "active_event_windows":  [
+
+                                                   ],
+                          "upcoming_event_windows":  [
+
+                                                     ],
+                          "note":  "Data only. Trading decisions are delegated to AI-TRADER."
+                      },
+    "metadata":  {
+                     "generated_at_utc":  "2026-07-10T07:41:23.159552+00:00",
+                     "service_role":  "data provider only",
+                     "event_enrichment":  {
+                                              "enriched_count":  0,
+                                              "missing_enrichment_count":  1,
+                                              "provider_statuses":  [
+                                                                        {
+                                                                            "source":  "DailyFX Economic Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+                                                                                           "provider_failure_cache: DailyFX Economic Calendar skipped after recent failure: DailyFX Economic Calendar provider_unavailable: HTTP 403"
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "ForexFactory Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+                                                                                           "provider_failure_cache: ForexFactory Calendar skipped after recent failure: ForexFactory Calendar provider_unavailable: HTTP 403"
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Investing Economic Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+                                                                                           "provider_failure_cache: Investing Economic Calendar skipped after recent failure: Investing Economic Calendar provider_unavailable: blocked page or challenge detected"
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "FXStreet Economic Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+                                                                                           "provider_failure_cache: FXStreet Economic Calendar skipped after recent failure: FXStreet Economic Calendar provider_unavailable: blocked page or challenge detected"
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "MarketWatch Economic Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+                                                                                           "provider_failure_cache: MarketWatch Economic Calendar skipped after recent failure: MarketWatch Economic Calendar provider_failed: HTTP 401"
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Yahoo Economic Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+                                                                                           "provider_failure_cache: Yahoo Economic Calendar skipped after recent failure: Yahoo Economic Calendar parser found no enrichment rows; Yahoo Economic Calendar no enrichment rows for requested window"
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Generic Search Snippet Calendar",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Playwright DailyFX",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Playwright ForexFactory",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Playwright Investing",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Targeted Search Event Enrichment",
+                                                                            "status":  "no_data_available",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "Manual Event Enrichment",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        },
+                                                                        {
+                                                                            "source":  "OpenAI Event Enrichment",
+                                                                            "status":  "skipped",
+                                                                            "item_count":  0,
+                                                                            "errors":  [
+
+                                                                                       ]
+                                                                        }
+                                                                    ],
+                                              "providers_attempted":  13,
+                                              "providers_succeeded":  0,
+                                              "providers_failed":  0,
+                                              "provider_errors":  [
+                                                                      "provider_failure_cache: DailyFX Economic Calendar skipped after recent failure: DailyFX Economic Calendar provider_unavailable: HTTP 403",
+                                                                      "provider_failure_cache: ForexFactory Calendar skipped after recent failure: ForexFactory Calendar provider_unavailable: HTTP 403",
+                                                                      "provider_failure_cache: Investing Economic Calendar skipped after recent failure: Investing Economic Calendar provider_unavailable: blocked page or challenge detected",
+                                                                      "provider_failure_cache: FXStreet Economic Calendar skipped after recent failure: FXStreet Economic Calendar provider_unavailable: blocked page or challenge detected",
+                                                                      "provider_failure_cache: MarketWatch Economic Calendar skipped after recent failure: MarketWatch Economic Calendar provider_failed: HTTP 401",
+                                                                      "provider_failure_cache: Yahoo Economic Calendar skipped after recent failure: Yahoo Economic Calendar parser found no enrichment rows; Yahoo Economic Calendar no enrichment rows for requested window"
+                                                                  ],
+                                              "fallback_used":  false,
+                                              "cache_used":  false,
+                                              "browser_scraping_enabled":  false,
+                                              "browser_scraping_used":  false,
+                                              "structured_sources_blocked":  false,
+                                              "targeted_search_enabled":  true,
+                                              "targeted_search_used":  true,
+                                              "targeted_search_queries":  [
+
+                                                                          ],
+                                              "targeted_search_matches":  0,
+                                              "targeted_search_no_match_count":  0
+                                          },
+                     "persistent_enrichment":  {
+                                                   "run_id":  "203590e7-69a8-45d0-ac6f-ffa5323b09e1",
+                                                   "service_role":  "data provider only",
+                                                   "data_quality":  {
+                                                                        "db_hits":  2,
+                                                                        "db_misses":  5,
+                                                                        "provider_hits":  0,
+                                                                        "provider_failures":  5,
+                                                                        "ai_research_used":  false,
+                                                                        "ai_research_called":  false,
+                                                                        "ai_research_succeeded":  false,
+                                                                        "ai_research_requests":  0,
+                                                                        "ai_events_requested":  0,
+                                                                        "ai_results_valid":  0,
+                                                                        "ai_results_rejected":  0,
+                                                                        "ai_failure_reason":  null,
+                                                                        "missing_critical_fields":  [
+                                                                                                        "US:CPI:2026-07-14:consumer_price_index_june_2026:macro_event_enrichment",
+                                                                                                        "US:PPI:2026-07-15:producer_price_index_june_2026:macro_event_enrichment"
+                                                                                                    ],
+                                                                        "stale_fields":  [
+
+                                                                                         ],
+                                                                        "warnings":  [
+
+                                                                                     ],
+                                                                        "errors":  [
+
+                                                                                   ]
+                                                                    },
+                                                   "provider_metadata":  {
+                                                                             "enriched_count":  0,
+                                                                             "missing_enrichment_count":  5,
+                                                                             "provider_statuses":  [
+                                                                                                       {
+                                                                                                           "source":  "DailyFX Economic Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+                                                                                                                          "provider_failure_cache: DailyFX Economic Calendar skipped after recent failure: DailyFX Economic Calendar provider_unavailable: HTTP 403"
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "ForexFactory Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+                                                                                                                          "provider_failure_cache: ForexFactory Calendar skipped after recent failure: ForexFactory Calendar provider_unavailable: HTTP 403"
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Investing Economic Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+                                                                                                                          "provider_failure_cache: Investing Economic Calendar skipped after recent failure: Investing Economic Calendar provider_unavailable: blocked page or challenge detected"
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "FXStreet Economic Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+                                                                                                                          "provider_failure_cache: FXStreet Economic Calendar skipped after recent failure: FXStreet Economic Calendar provider_unavailable: blocked page or challenge detected"
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "MarketWatch Economic Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+                                                                                                                          "provider_failure_cache: MarketWatch Economic Calendar skipped after recent failure: MarketWatch Economic Calendar provider_failed: HTTP 401"
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Yahoo Economic Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+                                                                                                                          "provider_failure_cache: Yahoo Economic Calendar skipped after recent failure: Yahoo Economic Calendar parser found no enrichment rows; Yahoo Economic Calendar no enrichment rows for requested window"
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Generic Search Snippet Calendar",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Playwright DailyFX",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Playwright ForexFactory",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Playwright Investing",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Targeted Search Event Enrichment",
+                                                                                                           "status":  "no_data_available",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "Manual Event Enrichment",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       },
+                                                                                                       {
+                                                                                                           "source":  "OpenAI Event Enrichment",
+                                                                                                           "status":  "skipped",
+                                                                                                           "item_count":  0,
+                                                                                                           "errors":  [
+
+                                                                                                                      ]
+                                                                                                       }
+                                                                                                   ],
+                                                                             "providers_attempted":  13,
+                                                                             "providers_succeeded":  0,
+                                                                             "providers_failed":  0,
+                                                                             "provider_errors":  [
+                                                                                                     "provider_failure_cache: DailyFX Economic Calendar skipped after recent failure: DailyFX Economic Calendar provider_unavailable: HTTP 403",
+                                                                                                     "provider_failure_cache: ForexFactory Calendar skipped after recent failure: ForexFactory Calendar provider_unavailable: HTTP 403",
+                                                                                                     "provider_failure_cache: Investing Economic Calendar skipped after recent failure: Investing Economic Calendar provider_unavailable: blocked page or challenge detected",
+                                                                                                     "provider_failure_cache: FXStreet Economic Calendar skipped after recent failure: FXStreet Economic Calendar provider_unavailable: blocked page or challenge detected",
+                                                                                                     "provider_failure_cache: MarketWatch Economic Calendar skipped after recent failure: MarketWatch Economic Calendar provider_failed: HTTP 401",
+                                                                                                     "provider_failure_cache: Yahoo Economic Calendar skipped after recent failure: Yahoo Economic Calendar parser found no enrichment rows; Yahoo Economic Calendar no enrichment rows for requested window"
+                                                                                                 ],
+                                                                             "fallback_used":  false,
+                                                                             "cache_used":  false,
+                                                                             "browser_scraping_enabled":  false,
+                                                                             "browser_scraping_used":  false,
+                                                                             "structured_sources_blocked":  false,
+                                                                             "targeted_search_enabled":  true,
+                                                                             "targeted_search_used":  true,
+                                                                             "targeted_search_queries":  [
+
+                                                                                                         ],
+                                                                             "targeted_search_matches":  0,
+                                                                             "targeted_search_no_match_count":  0
+                                                                         },
+                                                   "decisions_delegated_to":  "AI-TRADER",
+                                                   "trading_logic":  "not implemented; data service only"
+                                               },
+                     "data_quality":  {
+                                          "db_hits":  2,
+                                          "db_misses":  5,
+                                          "provider_hits":  0,
+                                          "provider_failures":  5,
+                                          "ai_research_used":  false,
+                                          "ai_research_called":  false,
+                                          "ai_research_succeeded":  false,
+                                          "ai_research_requests":  0,
+                                          "ai_events_requested":  0,
+                                          "ai_results_valid":  0,
+                                          "ai_results_rejected":  0,
+                                          "ai_failure_reason":  null,
+                                          "missing_critical_fields":  [
+                                                                          "US:CPI:2026-07-14:consumer_price_index_june_2026:macro_event_enrichment",
+                                                                          "US:PPI:2026-07-15:producer_price_index_june_2026:macro_event_enrichment"
+                                                                      ],
+                                          "stale_fields":  [
+
+                                                           ],
+                                          "warnings":  [
+
+                                                       ],
+                                          "errors":  [
+
+                                                     ],
+                                          "macro":  {
+                                                        "db_hits":  13,
+                                                        "db_misses":  0,
+                                                        "provider_hits":  0,
+                                                        "provider_failures":  0,
+                                                        "warnings":  [
+                                                                         "macro_loaded_from_db_preview_only"
+                                                                     ],
+                                                        "errors":  [
+
+                                                                   ]
+                                                    }
+                                      },
+                     "decisions_delegated_to":  "AI-TRADER",
+                     "trading_logic":  "not implemented; data service only"
+                 }
+}
