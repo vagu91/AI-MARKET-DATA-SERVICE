@@ -62,6 +62,7 @@ class MarketBeatHolidaysProvider:
             events = parse_marketbeat_holidays_json_ld(text)
             if not events:
                 warnings.append("marketbeat_holidays_no_rows")
+        parser_strategy = "json_ld_fallback" if fallback_used and events else "html_table"
 
         now = datetime.now(UTC)
         deduped, duplicate_count, conflict_count = deduplicate_marketbeat_events(events)
@@ -73,6 +74,8 @@ class MarketBeatHolidaysProvider:
             "source_url": self.settings.marketbeat_holidays_url,
             "source_type": "secondary_calendar",
             "official_exchange_source": False,
+            "is_official": False,
+            "parser_strategy": parser_strategy,
             "retrieved_at": _iso(now),
             "valid_until": _iso(now + timedelta(hours=self.settings.marketbeat_holidays_ttl_hours)),
             "holidays": deduped,
@@ -82,6 +85,7 @@ class MarketBeatHolidaysProvider:
                 "closed_rows": parsed["closed_rows"],
                 "early_close_rows": parsed["early_close_rows"],
                 "json_ld_fallback_used": fallback_used,
+                "parser_strategy": parser_strategy,
                 "years_covered": years,
                 "duplicate_count": duplicate_count,
                 "conflict_count": conflict_count,
@@ -164,7 +168,7 @@ def deduplicate_marketbeat_events(events: list[dict[str, Any]]) -> tuple[list[di
     duplicates = 0
     conflicts = 0
     for item in events:
-        key = (str(item.get("date")), str(item.get("name") or item.get("holiday_name")))
+        key = (str(item.get("date")), str(item.get("market") or "NASDAQ_NYSE"))
         existing = by_key.get(key)
         if not existing:
             by_key[key] = item
@@ -244,6 +248,7 @@ def _event(*, name: str, date: str, session_status: str) -> dict[str, Any]:
         "source_url": "https://www.marketbeat.com/stock-market-holidays/",
         "source_type": "secondary_calendar",
         "official_exchange_source": False,
+        "is_official": False,
     }
 
 
@@ -264,11 +269,13 @@ def _status(status: str, reason: str, started: datetime, source_url: str) -> dic
         "source_url": source_url,
         "source_type": "secondary_calendar",
         "official_exchange_source": False,
+        "is_official": False,
+        "parser_strategy": None,
         "retrieved_at": _iso(now),
         "valid_until": _iso(now + timedelta(hours=6)),
         "holidays": [],
         "relevant_holidays": [],
-        "diagnostics": {"tables_seen": 0, "closed_rows": 0, "early_close_rows": 0},
+        "diagnostics": {"tables_seen": 0, "closed_rows": 0, "early_close_rows": 0, "parser_strategy": None},
         "warnings": [reason] if status != "provider_failed" else [],
         "errors": [reason] if status == "provider_failed" else [],
         "duration_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),

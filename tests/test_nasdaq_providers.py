@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -215,6 +216,22 @@ def test_parse_nasdaq_constituents_html_fixture() -> None:
     assert [item.symbol for item in holdings] == ["MSFT", "AMZN"]
     assert holdings[0].weight is None
     assert holdings[1].sector == "Consumer Discretionary"
+
+
+def test_parse_nasdaq_constituents_accepts_data_data_list() -> None:
+    payload = {
+        "data": {
+            "data": [
+                {"symbol": "MSFT", "companyName": "Microsoft Corp", "sector": "Technology"},
+                {"symbol": "AAPL", "companyName": "Apple Inc", "sector": "Technology"},
+            ]
+        }
+    }
+
+    holdings = parse_nasdaq_constituents(json.dumps(payload))
+
+    assert [item.symbol for item in holdings] == ["MSFT", "AAPL"]
+    assert holdings[0].weight is None
 
 
 def test_parse_yahoo_earnings_fixture() -> None:

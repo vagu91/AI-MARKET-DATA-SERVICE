@@ -12,6 +12,7 @@ from app.providers.investing_fed_rate_monitor_provider import (
 )
 from app.providers.marketbeat_holidays_provider import (
     MarketBeatHolidaysProvider,
+    deduplicate_marketbeat_events,
     parse_marketbeat_holidays_html,
     parse_marketbeat_holidays_json_ld,
 )
@@ -46,6 +47,12 @@ def test_marketbeat_table_parser_reads_closed_and_early_close_rows() -> None:
     assert any(item["date"] == "2026-07-03" and item["session_status"] == "early_close" for item in events)
     assert all(item["source_type"] == "secondary_calendar" for item in events)
     assert all(item["official_exchange_source"] is False for item in events)
+    deduped, duplicates, conflicts = deduplicate_marketbeat_events(events)
+    july_3 = [item for item in deduped if item["date"] == "2026-07-03"]
+    assert len(july_3) == 1
+    assert july_3[0]["session_status"] == "closed"
+    assert duplicates == 1
+    assert conflicts == 1
 
 
 def test_marketbeat_json_ld_fallback_extracts_dates() -> None:
@@ -88,7 +95,9 @@ def test_investing_fed_rate_monitor_parser_reads_meeting_probabilities() -> None
 
     assert parsed["cards_seen"] == 1
     assert meeting["meeting_date"] == "2026-07-29"
+    assert meeting["meeting_at"] == "2026-07-29"
     assert meeting["future_price"] == 96.373
+    assert meeting["updated_at"] == "Jul 10, 2026 01:05PM EDT"
     assert meeting["event_id"] == "516971"
     assert meeting["probability_sum_pct"] == 100.0
     assert meeting["target_rate_probabilities"][1]["previous_day_probability_pct"] is None
@@ -132,6 +141,8 @@ async def test_marketbeat_provider_fetches_and_marks_secondary(tmp_path) -> None
     assert result["holidays"][0]["date"] == "2026-01-01"
     assert result["source_type"] == "secondary_calendar"
     assert result["official_exchange_source"] is False
+    assert result["is_official"] is False
+    assert result["parser_strategy"] == "html_table"
 
 
 @pytest.mark.asyncio
@@ -149,8 +160,14 @@ async def test_investing_fed_monitor_provider_fetches_secondary_probabilities(tm
         result = await InvestingFedRateMonitorProvider(cfg).fetch()
 
     assert result["status"] == "found"
+    assert result["source"] == "Investing Fed Rate Monitor"
+    assert result["dataset_type"] == "market_implied_target_rate_distribution"
+    assert result["official_fed_data"] is False
+    assert result["official_cme_data"] is False
     assert result["current_meeting"]["event_id"] == "516971"
+    assert result["current_meeting"]["meeting_at"] == "2026-07-29"
     assert result["history_endpoint"]["status"] == "not_integrated"
+    assert result["history_endpoint_status"] == "not_integrated"
     assert result["official_fed_source"] is False
 
 

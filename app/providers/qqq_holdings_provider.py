@@ -206,7 +206,7 @@ class QQQHoldingsProvider(BaseProvider):
                 diagnostics["actual_network_calls"] += 1
                 response = await client.get(
                     self.settings.nasdaq_100_constituents_url,
-                    headers=REQUEST_HEADERS,
+                    headers=_nasdaq_headers(),
                     timeout=min(float(self.settings.http_timeout_seconds), 8.0),
                 )
                 response.raise_for_status()
@@ -391,7 +391,12 @@ def parse_nasdaq_constituents(text: str) -> list[QQQHolding]:
     rows: list[dict[str, Any]] = []
     data = payload.get("data") if isinstance(payload, dict) else None
     if isinstance(data, dict):
-        rows = data.get("data", {}).get("rows") or data.get("rows") or []
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            rows = nested.get("rows") or []
+        elif isinstance(nested, list):
+            rows = nested
+        rows = rows or data.get("rows") or []
     holdings = []
     for row in rows:
         symbol = row.get("symbol") or row.get("ticker")
@@ -524,6 +529,16 @@ def _next_utc_midnight() -> str:
     now = datetime.now(UTC)
     tomorrow = (now + timedelta(days=1)).date()
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _nasdaq_headers() -> dict[str, str]:
+    return {
+        **REQUEST_HEADERS,
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/",
+    }
 
 
 def _diagnostics() -> dict[str, Any]:
