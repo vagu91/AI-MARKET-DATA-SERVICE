@@ -437,11 +437,17 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
     earnings = data.get("upcoming_earnings") or data.get("earnings") or {}
     return {
         "qqq_holdings": {
+            "status": holdings.get("status") or ("found" if holdings.get("holdings") or top_holdings else "not_found"),
             "as_of": holdings.get("as_of") or summary.get("as_of"),
-            "holdings_count": len(holdings.get("holdings") or top_holdings or []),
+            "holdings_count": holdings.get("holdings_count") or len(holdings.get("holdings") or top_holdings or []),
             "top_holdings": (top_holdings or [])[:15],
             "source": holdings.get("source") or summary.get("source"),
             "reliability": holdings.get("reliability") or summary.get("reliability"),
+            "is_proxy": bool(holdings.get("is_proxy")),
+            "proxy_for": holdings.get("proxy_for"),
+            "weight_data_available": holdings.get("weight_data_available"),
+            "official_etf_holdings": holdings.get("official_etf_holdings", True),
+            "data_quality": holdings.get("data_quality") or {},
         },
         "mega_cap_snapshot": {
             "tracked_count": (snapshot.get("data_quality") or {}).get("tracked_count") or len(snapshot.get("stocks") or []),

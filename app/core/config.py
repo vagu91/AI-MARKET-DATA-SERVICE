@@ -145,6 +145,7 @@ class Settings(BaseSettings):
     default_news_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_DEFAULT_NEWS_TTL_HOURS")
     default_fact_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_DEFAULT_FACT_TTL_HOURS")
     qqq_holdings_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_QQQ_HOLDINGS_TTL_HOURS")
+    qqq_holdings_stale_tolerance_hours: int = Field(default=72, validation_alias="AI_MARKET_QQQ_HOLDINGS_STALE_TOLERANCE_HOURS")
     earnings_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_EARNINGS_TTL_HOURS")
     enable_ai_researcher: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_AI_RESEARCHER")
     ai_researcher_mode: str = Field(default="codex_cli", validation_alias="AI_MARKET_AI_RESEARCHER_MODE")
