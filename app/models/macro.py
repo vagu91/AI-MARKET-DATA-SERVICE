@@ -60,6 +60,8 @@ class MarketContextResponse(BaseModel):
     nasdaq_context: dict[str, Any] | None = None
     economic_calendar_enrichment: dict[str, Any] = Field(default_factory=dict)
     market_schedule: dict[str, Any] = Field(default_factory=dict)
+    market_calendar: dict[str, Any] = Field(default_factory=dict)
+    rates_expectations: dict[str, Any] = Field(default_factory=dict)
     corporate_events: dict[str, Any] = Field(default_factory=dict)
     source_reviews: dict[str, Any] = Field(default_factory=dict)
     news_context: dict[str, Any] = Field(default_factory=dict)

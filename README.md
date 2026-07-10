@@ -41,6 +41,8 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /nasdaq/context`
 - `GET /providers/investing/economic-calendar?refresh=false|auto|force`
 - `GET /providers/investing/holidays?refresh=false|auto|force`
+- `GET /providers/marketbeat/holidays?refresh=false|auto|force`
+- `GET /providers/investing/fed-rate-monitor?refresh=false|auto|force`
 - `GET /providers/cboe/risk-indices?refresh=false|auto|force`
 - `GET /providers/nasdaq/earnings-calendar?refresh=false|auto|force`
 - `GET /providers/nasdaq/nasdaq-100?refresh=false|auto|force`

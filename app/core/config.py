@@ -197,6 +197,8 @@ class Settings(BaseSettings):
     )
     enable_investing_calendar: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_CALENDAR")
     enable_investing_holidays: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_HOLIDAYS")
+    enable_marketbeat_holidays: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_MARKETBEAT_HOLIDAYS")
+    enable_investing_fed_rate_monitor: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_FED_RATE_MONITOR")
     enable_cboe_risk_indices: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CBOE_RISK_INDICES")
     enable_nasdaq_earnings: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_EARNINGS")
     enable_nasdaq_100: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_100")
@@ -214,6 +216,11 @@ class Settings(BaseSettings):
     investing_country_ids: str = Field(default="5", validation_alias="AI_MARKET_INVESTING_COUNTRY_IDS")
     investing_calendar_lookahead_days: int = Field(default=14, validation_alias="AI_MARKET_INVESTING_CALENDAR_LOOKAHEAD_DAYS")
     investing_calendar_page_limit: int = Field(default=100, validation_alias="AI_MARKET_INVESTING_CALENDAR_PAGE_LIMIT")
+    marketbeat_timeout_seconds: float = Field(default=10.0, validation_alias="AI_MARKET_MARKETBEAT_TIMEOUT_SECONDS")
+    marketbeat_holidays_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_MARKETBEAT_HOLIDAYS_TTL_HOURS")
+    investing_fed_rate_monitor_timeout_seconds: float = Field(default=10.0, validation_alias="AI_MARKET_INVESTING_FED_RATE_MONITOR_TIMEOUT_SECONDS")
+    investing_fed_rate_monitor_ttl_minutes: int = Field(default=30, validation_alias="AI_MARKET_INVESTING_FED_RATE_MONITOR_TTL_MINUTES")
+    investing_fed_rate_monitor_max_meetings: int = Field(default=8, validation_alias="AI_MARKET_INVESTING_FED_RATE_MONITOR_MAX_MEETINGS")
     nasdaq_options_symbol: str = Field(default="QQQ", validation_alias="AI_MARKET_NASDAQ_OPTIONS_SYMBOL")
     nasdaq_options_lookahead_days: int = Field(default=30, validation_alias="AI_MARKET_NASDAQ_OPTIONS_LOOKAHEAD_DAYS")
     nasdaq_options_default_money: str = Field(default="all", validation_alias="AI_MARKET_NASDAQ_OPTIONS_DEFAULT_MONEY")
@@ -268,6 +275,8 @@ class Settings(BaseSettings):
     generic_search_calendar_url: str | None = None
     investing_economic_calendar_api_url: str = "https://endpoints.investing.com/pd-instruments/v1/calendars/economic/events/occurrences"
     investing_holiday_calendar_api_url: str = "https://endpoints.investing.com/pd-instruments/v1/calendars/holidays"
+    marketbeat_holidays_url: str = "https://www.marketbeat.com/stock-market-holidays/"
+    investing_fed_rate_monitor_url: str = "https://www.investing.com/central-banks/fed-rate-monitor"
     cboe_vvix_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VVIX.json"
     cboe_skew_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_SKEW.json"
     nasdaq_earnings_calendar_url: str = "https://api.nasdaq.com/api/calendar/earnings"

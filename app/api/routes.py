@@ -383,6 +383,22 @@ async def provider_investing_holidays(
     return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("investing_holidays", refresh=refresh)
 
 
+@router.get("/providers/marketbeat/holidays")
+async def provider_marketbeat_holidays(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("marketbeat_holidays", refresh=refresh)
+
+
+@router.get("/providers/investing/fed-rate-monitor")
+async def provider_investing_fed_rate_monitor(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("investing_fed_rate_monitor", refresh=refresh)
+
+
 @router.get("/providers/cboe/risk-indices")
 async def provider_cboe_risk_indices(
     refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
