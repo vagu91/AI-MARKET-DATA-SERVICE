@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from app.models.common import ProviderType
 from app.models.nasdaq import (
@@ -38,7 +39,13 @@ class NasdaqDataService:
         self.earnings_provider = earnings_provider
         self.news_provider = news_provider
 
-    async def qqq_holdings(self) -> QQQHoldingsResponse:
+    async def qqq_holdings(self, *, run_cache: dict[str, Any] | None = None) -> QQQHoldingsResponse:
+        cache_key = "qqq_holdings:QQQ"
+        if run_cache is not None and cache_key in run_cache:
+            cached = run_cache[cache_key]
+            cached.data_quality.run_cache_used = True
+            cached.data_quality.run_deduplicated_calls += 1
+            return cached
         result = await self.qqq_holdings_provider.fetch_safe()
         data = result.data if isinstance(result.data, dict) else {}
         holdings = [QQQHolding.model_validate(item) for item in data.get("holdings", [])]
@@ -47,21 +54,34 @@ class NasdaqDataService:
         quality_data["errors"] = _merge_errors(quality_data.get("errors", []), result.metadata.errors)
         quality_data.setdefault("warnings", [])
         quality_data["count"] = len(holdings)
+        quality_data["holdings_count"] = len(holdings)
         quality_data["missing_weights"] = any(item.weight is None for item in holdings)
         quality_data.setdefault("final_data_available", bool(holdings))
-        return QQQHoldingsResponse(
+        quality_data.setdefault("weights_available", all(item.weight is not None for item in holdings) if holdings else False)
+        quality_data.setdefault("weight_data_available", all(item.weight is not None for item in holdings) if holdings else False)
+        quality = QQQHoldingsQuality.model_validate(quality_data)
+        response = QQQHoldingsResponse(
+            status=data.get("status") or quality.final_status or ("found" if holdings else "not_found"),
             as_of=data.get("as_of"),
-            source=result.metadata.source,
+            source=data.get("source") or result.metadata.source,
             provider_type=result.metadata.provider_type,
             retrieved_at=result.metadata.retrieved_at,
             reliability=result.metadata.reliability,
             is_fallback=result.metadata.is_fallback,
+            is_proxy=bool(data.get("is_proxy") or quality.is_proxy),
+            proxy_for=data.get("proxy_for") or quality.proxy_for,
+            holdings_count=len(holdings),
+            weight_data_available=bool(data.get("weight_data_available", quality.weight_data_available)),
+            official_etf_holdings=bool(data.get("official_etf_holdings", quality.official_etf_holdings)),
             holdings=holdings,
-            data_quality=QQQHoldingsQuality.model_validate(quality_data),
+            data_quality=quality,
         )
+        if run_cache is not None:
+            run_cache[cache_key] = response
+        return response
 
-    async def mega_cap_snapshot(self) -> MegaCapSnapshotResponse:
-        holdings = await self.qqq_holdings()
+    async def mega_cap_snapshot(self, *, run_cache: dict[str, Any] | None = None) -> MegaCapSnapshotResponse:
+        holdings = await self.qqq_holdings(run_cache=run_cache)
         weights = {item.symbol: item.weight for item in holdings.holdings}
         result = await self.mega_cap_snapshot_provider.fetch_safe()
         data = result.data if isinstance(result.data, dict) else {}
@@ -90,8 +110,8 @@ class NasdaqDataService:
             data_quality=MegaCapSnapshotQuality.model_validate(quality_data),
         )
 
-    async def mega_cap_breadth(self) -> MegaCapBreadthResponse:
-        snapshot = await self.mega_cap_snapshot()
+    async def mega_cap_breadth(self, *, run_cache: dict[str, Any] | None = None) -> MegaCapBreadthResponse:
+        snapshot = await self.mega_cap_snapshot(run_cache=run_cache)
         stocks = snapshot.stocks
         missing_weights = [stock.symbol for stock in stocks if stock.weight is None]
         missing_prices = [stock.symbol for stock in stocks if stock.change_pct is None]
@@ -212,23 +232,24 @@ class NasdaqDataService:
         warnings: list[str] = []
         fallback_notes: list[str] = []
         fallback_used = False
+        run_cache: dict[str, Any] = {}
         holdings = await _timed_section(
             "qqq_holdings",
-            self.qqq_holdings(),
+            self.qqq_holdings(run_cache=run_cache),
             timeout=_provider_timeout(self.qqq_holdings_provider, "timeout_nasdaq_seconds", 45.0),
             fallback=lambda error: _empty_holdings(error),
             warnings=warnings,
         )
         snapshot = await _timed_section(
             "mega_cap_snapshot",
-            self.mega_cap_snapshot(),
+            self.mega_cap_snapshot(run_cache=run_cache),
             timeout=_provider_timeout(self.mega_cap_snapshot_provider, "timeout_nasdaq_seconds", 45.0),
             fallback=lambda error: _empty_snapshot(error),
             warnings=warnings,
         )
         breadth = await _timed_section(
             "mega_cap_breadth",
-            self.mega_cap_breadth(),
+            self.mega_cap_breadth(run_cache=run_cache),
             timeout=_provider_timeout(self.mega_cap_snapshot_provider, "timeout_nasdaq_seconds", 45.0),
             fallback=lambda error: _empty_breadth(error),
             warnings=warnings,
@@ -353,15 +374,20 @@ async def _timed_section(label: str, awaitable, *, timeout: float, fallback, war
 
 def _empty_holdings(error: str) -> QQQHoldingsResponse:
     return QQQHoldingsResponse(
+        status="not_found",
         as_of=None,
         source="provider_timeout",
         provider_type=ProviderType.API,
         retrieved_at=datetime.now(UTC),
         reliability=0.0,
         is_fallback=True,
+        holdings_count=0,
+        weight_data_available=False,
+        official_etf_holdings=False,
         holdings=[],
         data_quality=QQQHoldingsQuality(
             count=0,
+            holdings_count=0,
             errors=[],
             warnings=[error],
             fallback_used=True,

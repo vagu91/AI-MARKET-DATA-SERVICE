@@ -191,6 +191,46 @@ async def test_aaii_incapsula_http_uses_browser_fallback_and_closes(monkeypatch,
     assert result["diagnostics"]["browser_closed"] is True
 
 
+async def test_aaii_browser_fallback_failure_is_motivated(monkeypatch, tmp_path):
+    blocked_html = "<html>Request unsuccessful. Incapsula incident id 123</html>"
+
+    class FakeResponse:
+        status_code = 200
+        text = blocked_html
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    async def fake_browser(url, *, timeout_seconds):
+        return "<html><body>challenge still active</body></html>", {
+            "browser_attempted": True,
+            "browser_success": True,
+            "browser_error": None,
+            "browser_closed": True,
+            "selector_found": False,
+        }
+
+    monkeypatch.setattr(aaii_module.httpx, "AsyncClient", lambda timeout: FakeClient())
+    monkeypatch.setattr(aaii_module, "fetch_aaii_with_browser", fake_browser)
+
+    result = await AaiiSentimentProvider(settings(tmp_path)).fetch()
+
+    assert result["status"] == "access_restricted"
+    assert result["diagnostics"]["browser_attempted"] is True
+    assert result["diagnostics"]["browser_closed"] is True
+    assert result["diagnostics"]["browser_error"] == "browser_page_loaded_but_sentiment_selectors_not_found"
+
+
 async def test_aaii_refresh_false_does_not_attempt_network_or_browser(tmp_path):
     service = PositioningRuntimeService(settings(tmp_path))
 

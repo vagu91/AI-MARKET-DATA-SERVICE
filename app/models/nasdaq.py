@@ -46,15 +46,40 @@ class QQQHoldingsQuality(DataQuality):
     count: int = 0
     missing_weights: bool = False
     stale: bool = False
+    provider_attempts: list[str] = Field(default_factory=list)
+    actual_network_calls: int = 0
+    run_deduplicated_calls: int = 0
+    run_cache_used: bool = False
+    alpha_vantage_status: str | None = None
+    alpha_vantage_rate_limited: bool = False
+    alpha_vantage_next_retry_at: str | None = None
+    invesco_status: str | None = None
+    invesco_http_status: int | None = None
+    nasdaq_proxy_used: bool = False
+    last_known_good_used: bool = False
+    final_source: str | None = None
+    final_status: str | None = None
+    holdings_count: int = 0
+    weights_available: bool = False
+    is_proxy: bool = False
+    proxy_for: str | None = None
+    official_etf_holdings: bool = True
+    weight_data_available: bool = True
 
 
 class QQQHoldingsResponse(BaseModel):
+    status: str = "found"
     as_of: str | None = None
     source: str
     provider_type: ProviderType
     retrieved_at: datetime
     reliability: float
     is_fallback: bool = False
+    is_proxy: bool = False
+    proxy_for: str | None = None
+    holdings_count: int = 0
+    weight_data_available: bool = True
+    official_etf_holdings: bool = True
     holdings: list[QQQHolding] = Field(default_factory=list)
     data_quality: QQQHoldingsQuality
 

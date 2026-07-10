@@ -59,6 +59,14 @@ class AaiiSentimentProvider:
                 parsed, parse_diagnostics = _parse_aaii_sentiment_with_diagnostics(browser_html)
                 diagnostics.update(parse_diagnostics)
                 diagnostics["browser_success"] = bool(parsed)
+                if not parsed and not diagnostics.get("browser_error"):
+                    diagnostics["browser_error"] = (
+                        "browser_page_loaded_but_sentiment_selectors_not_found"
+                        if not diagnostics.get("selector_found")
+                        else "browser_page_loaded_but_sentiment_values_not_parsed"
+                    )
+            elif not diagnostics.get("browser_error"):
+                diagnostics["browser_error"] = "browser_returned_no_html"
             if not parsed:
                 status = "access_restricted" if diagnostics.get("http_blocked") else "not_found"
                 reason = diagnostics.get("browser_error") or "AAII sentiment percentages were not visible in the public page."

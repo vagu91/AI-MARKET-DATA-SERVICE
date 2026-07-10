@@ -28,6 +28,16 @@ class FakeProvider:
         )
 
 
+class CountingProvider(FakeProvider):
+    def __init__(self, data, source="fixture", provider_type=ProviderType.API, reliability=0.8):
+        super().__init__(data, source=source, provider_type=provider_type, reliability=reliability)
+        self.calls = 0
+
+    async def fetch_safe(self):
+        self.calls += 1
+        return await super().fetch_safe()
+
+
 @pytest.mark.asyncio
 async def test_mega_cap_breadth_uses_weights_and_equal_weight_fallback() -> None:
     service = NasdaqDataService(
@@ -282,3 +292,51 @@ async def test_context_metadata_separates_warnings_and_fallback_notes() -> None:
     assert any("missing sector" in warning for warning in context.metadata["warnings"])
     assert any("Stooq quote provider_failed" in note for note in context.metadata["fallback_notes"])
     assert any("latest_news" in error for error in context.metadata["critical_errors"])
+
+
+@pytest.mark.asyncio
+async def test_context_run_deduplicates_qqq_holdings_provider_call() -> None:
+    qqq_provider = CountingProvider(
+        {
+            "as_of": "2026-07-08",
+            "holdings": [{"symbol": "NVDA", "name": "NVIDIA", "weight": 10.0, "sector": "Technology"}],
+            "data_quality": {
+                "count": 1,
+                "holdings_count": 1,
+                "missing_weights": False,
+                "final_data_available": True,
+                "actual_network_calls": 1,
+            },
+        },
+        provider_type=ProviderType.CSV,
+    )
+    service = NasdaqDataService(
+        qqq_holdings_provider=qqq_provider,
+        mega_cap_snapshot_provider=FakeProvider(
+            {
+                "stocks": [
+                    {
+                        "symbol": "NVDA",
+                        "name": "NVIDIA",
+                        "last_price": 100.0,
+                        "change": 1.0,
+                        "change_pct": 1.0,
+                        "volume": 10,
+                        "market_session": "REGULAR",
+                        "currency": "USD",
+                        "source": "fixture",
+                        "retrieved_at": datetime.now(UTC).isoformat(),
+                    }
+                ],
+                "data_quality": {"tracked_count": 1, "resolved_count": 1, "missing_prices": [], "final_data_available": True},
+            }
+        ),
+        earnings_provider=FakeProvider({"events": [], "data_quality": {"errors": [], "fallback_used": False, "final_data_available": True}}),
+        news_provider=FakeProvider({"articles": [], "data_quality": {"errors": [], "fallback_used": False, "final_data_available": True}}),
+    )
+
+    context = await service.context()
+
+    assert qqq_provider.calls == 1
+    assert context.qqq_holdings.data_quality.run_cache_used is True
+    assert context.qqq_holdings.data_quality.run_deduplicated_calls >= 2

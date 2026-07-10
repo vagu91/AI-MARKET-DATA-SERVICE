@@ -6,6 +6,7 @@ import respx
 
 from app.core.cache import SQLiteCache
 from app.core.config import Settings
+from app.models.common import Freshness, ProviderMetadata, ProviderResult, ProviderType
 from app.providers.earnings_provider import EarningsProvider
 from app.providers.earnings_provider import parse_yahoo_earnings
 from app.providers.earnings_provider import parse_alpha_vantage_earnings_calendar
@@ -25,6 +26,8 @@ from app.providers.news_provider import (
     tag_topics,
 )
 from app.providers.qqq_holdings_provider import (
+    QQQHoldingsProvider,
+    is_alpha_vantage_daily_rate_limited,
     parse_alpha_vantage_etf_profile,
     parse_invesco_holdings_csv,
     parse_nasdaq_constituents,
@@ -62,6 +65,140 @@ def test_parse_alpha_vantage_etf_profile_fixture() -> None:
     assert holdings[0].weight == 8.7
     assert holdings[1].weight == 4.1
     assert errors == ["Alpha Vantage ETF_PROFILE missing sector for 1 holdings"]
+
+
+def test_alpha_vantage_daily_rate_limit_payload_detected() -> None:
+    payload = {
+        "Information": (
+            "Thank you for using Alpha Vantage! Our standard API rate limit is "
+            "25 requests per day. Please visit https://www.alphavantage.co/premium/"
+        )
+    }
+
+    assert is_alpha_vantage_daily_rate_limited(payload) is True
+
+
+@pytest.mark.asyncio
+async def test_qqq_holdings_invesco_403_alpha_rate_limit_then_nasdaq_proxy(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPHA_VANTAGE_API_KEY=test-key\n", encoding="utf-8")
+    settings = Settings(
+        _env_file=env_file,
+        alpha_vantage_base_url="https://alpha.test/query",
+        invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
+        nasdaq_100_constituents_url="https://nasdaq.test/constituents",
+    )
+    provider = QQQHoldingsProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    nasdaq_payload = {"data": {"rows": [{"symbol": "MSFT", "companyName": "Microsoft", "sector": "Technology"}]}}
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        invesco = router.get("https://invesco.test/qqq.csv").mock(return_value=httpx.Response(403, text="Forbidden"))
+        alpha = router.get("https://alpha.test/query").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "Information": (
+                        "Thank you for using Alpha Vantage. Our standard API rate limit is "
+                        "25 requests per day."
+                    )
+                },
+            )
+        )
+        nasdaq = router.get("https://nasdaq.test/constituents").mock(return_value=httpx.Response(200, json=nasdaq_payload))
+        result = await provider.fetch_safe()
+        second = await provider.fetch_safe()
+
+    quality = result.data["data_quality"]
+    assert invesco.call_count == 1
+    assert alpha.call_count == 1
+    assert nasdaq.call_count == 1
+    assert second.metadata.provider_type == "CACHE"
+    assert second.data["data_quality"]["actual_network_calls"] == 0
+    assert result.data["status"] == "proxy"
+    assert result.data["is_proxy"] is True
+    assert result.data["official_etf_holdings"] is False
+    assert result.data["weight_data_available"] is False
+    assert result.data["holdings"][0]["weight"] is None
+    assert quality["invesco_status"] == "access_restricted"
+    assert quality["invesco_http_status"] == 403
+    assert quality["alpha_vantage_status"] == "rate_limited"
+    assert quality["alpha_vantage_rate_limited"] is True
+    assert quality["nasdaq_proxy_used"] is True
+    assert len(quality["warnings"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_qqq_holdings_no_retry_when_alpha_negative_cache_is_open(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPHA_VANTAGE_API_KEY=test-key\n", encoding="utf-8")
+    settings = Settings(
+        _env_file=env_file,
+        alpha_vantage_base_url="https://alpha.test/query",
+        invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
+        nasdaq_100_constituents_url="https://nasdaq.test/constituents",
+    )
+    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    provider = QQQHoldingsProvider(cache, settings)
+    cache.set(
+        provider.alpha_negative_cache_key,
+        {
+            "status": "rate_limited",
+            "negative_cache_reason": "provider_daily_rate_limit",
+            "next_retry_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        },
+    )
+
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.get("https://invesco.test/qqq.csv").mock(return_value=httpx.Response(403, text="Forbidden"))
+        alpha = router.get("https://alpha.test/query").mock(return_value=httpx.Response(500, text="should not call"))
+        router.get("https://nasdaq.test/constituents").mock(
+            return_value=httpx.Response(200, json={"data": {"rows": [{"symbol": "AAPL", "companyName": "Apple"}]}})
+        )
+        result = await provider.fetch()
+
+    assert alpha.call_count == 0
+    assert result.data["data_quality"]["alpha_vantage_status"] == "rate_limited"
+    assert "alpha_vantage_negative_cache" in result.data["data_quality"]["provider_attempts"]
+
+
+@pytest.mark.asyncio
+async def test_qqq_holdings_last_known_good_preserved_when_upstreams_fail(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        alpha_vantage_api_key=None,
+        invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
+        nasdaq_100_constituents_url="https://nasdaq.test/constituents",
+        qqq_holdings_ttl_hours=0,
+        qqq_holdings_stale_tolerance_hours=24,
+    )
+    provider = QQQHoldingsProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    cached = ProviderResult(
+        metadata=ProviderMetadata(
+            source="Invesco QQQ Holdings",
+            provider_type=ProviderType.CSV,
+            retrieved_at=datetime.now(UTC),
+            freshness=Freshness.RECENT,
+            reliability=0.88,
+        ),
+        data={
+            "as_of": "2026-07-08",
+            "holdings": [{"symbol": "NVDA", "name": "NVIDIA", "weight": 8.7, "sector": "Technology"}],
+            "data_quality": {"count": 1, "holdings_count": 1, "missing_weights": False, "final_data_available": True},
+        },
+    )
+    provider.cache.set(provider.cache_key, cached.model_dump(mode="json"))
+
+    with respx.mock(assert_all_mocked=True) as router:
+        router.get("https://invesco.test/qqq.csv").mock(return_value=httpx.Response(403, text="Forbidden"))
+        router.get("https://nasdaq.test/constituents").mock(return_value=httpx.Response(500, text="down"))
+        result = await provider.fetch_safe()
+
+    assert result.data["holdings"][0]["symbol"] == "NVDA"
+    assert result.data["data_quality"]["final_status"] == "stale_acceptable"
+    assert result.data["data_quality"]["last_known_good_used"] is True
+
+    stored = provider.cache.get(provider.cache_key)
+    assert stored["data"]["holdings"][0]["symbol"] == "NVDA"
 
 
 def test_parse_nasdaq_constituents_html_fixture() -> None:

@@ -8,8 +8,10 @@ from typing import Any
 from app.core.config import Settings
 from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
 from app.providers.investing_economic_calendar_provider import InvestingEconomicCalendarProvider
+from app.providers.investing_fed_rate_monitor_provider import InvestingFedRateMonitorProvider
 from app.providers.investing_holiday_calendar_provider import InvestingHolidayCalendarProvider
 from app.providers.macromicro_aaii_crosscheck_provider import MacroMicroAaiiCrosscheckProvider
+from app.providers.marketbeat_holidays_provider import MarketBeatHolidaysProvider
 from app.providers.nasdaq_100_constituents_provider import Nasdaq100ConstituentsProvider
 from app.providers.nasdaq_earnings_provider import NasdaqEarningsProvider
 from app.providers.nasdaq_market_info_provider import NasdaqMarketInfoProvider
@@ -26,6 +28,8 @@ FetchCallable = Callable[[], Awaitable[dict[str, Any]]]
 FACT_TYPES = {
     "investing_economic_calendar": "investing_economic_calendar",
     "investing_holidays": "investing_holidays",
+    "marketbeat_holidays": "marketbeat_holidays",
+    "investing_fed_rate_monitor": "investing_fed_rate_monitor",
     "cboe_risk_indices": "cboe_risk_indices",
     "nasdaq_earnings": "nasdaq_earnings_calendar",
     "nasdaq_100": "nasdaq_100_constituents",
@@ -45,6 +49,8 @@ class MultiSourceRuntimeService:
         self.observations = ProviderObservationRepository(settings)
         self.investing_calendar = InvestingEconomicCalendarProvider(settings)
         self.investing_holidays = InvestingHolidayCalendarProvider(settings)
+        self.marketbeat_holidays = MarketBeatHolidaysProvider(settings)
+        self.investing_fed_rate_monitor = InvestingFedRateMonitorProvider(settings)
         self.cboe = CboeRiskIndicesProvider(settings)
         self.nasdaq_earnings = NasdaqEarningsProvider(settings)
         self.nasdaq_100 = Nasdaq100ConstituentsProvider(settings)
@@ -73,6 +79,26 @@ class MultiSourceRuntimeService:
                 enabled=self.settings.enable_investing_holidays,
                 source="Investing Holiday Calendar",
                 refresh=refresh,
+            ),
+            "marketbeat_holidays": await self._run_provider(
+                "marketbeat_holidays",
+                FACT_TYPES["marketbeat_holidays"],
+                self.marketbeat_holidays.fetch,
+                item_count=lambda payload: len(payload.get("holidays") or []),
+                enabled=self.settings.enable_marketbeat_holidays,
+                source="MarketBeat Stock Market Holidays",
+                refresh=refresh,
+                persist_unmaterialized=False,
+            ),
+            "investing_fed_rate_monitor": await self._run_provider(
+                "investing_fed_rate_monitor",
+                FACT_TYPES["investing_fed_rate_monitor"],
+                self.investing_fed_rate_monitor.fetch,
+                item_count=lambda payload: len(payload.get("meetings") or []),
+                enabled=self.settings.enable_investing_fed_rate_monitor,
+                source="Investing.com Fed Rate Monitor",
+                refresh=refresh,
+                persist_unmaterialized=False,
             ),
             "cboe_risk_indices": await self._run_provider(
                 "cboe_risk_indices",
@@ -171,6 +197,28 @@ class MultiSourceRuntimeService:
                 source="Investing Holiday Calendar",
                 refresh=refresh,
             )
+        if name == "marketbeat_holidays":
+            return await self._run_provider(
+                name,
+                FACT_TYPES[name],
+                self.marketbeat_holidays.fetch,
+                item_count=lambda payload: len(payload.get("holidays") or []),
+                enabled=self.settings.enable_marketbeat_holidays,
+                source="MarketBeat Stock Market Holidays",
+                refresh=refresh,
+                persist_unmaterialized=False,
+            )
+        if name == "investing_fed_rate_monitor":
+            return await self._run_provider(
+                name,
+                FACT_TYPES[name],
+                self.investing_fed_rate_monitor.fetch,
+                item_count=lambda payload: len(payload.get("meetings") or []),
+                enabled=self.settings.enable_investing_fed_rate_monitor,
+                source="Investing.com Fed Rate Monitor",
+                refresh=refresh,
+                persist_unmaterialized=False,
+            )
         if name == "cboe_risk_indices":
             return await self._run_provider(
                 name,
@@ -257,6 +305,7 @@ class MultiSourceRuntimeService:
         enabled: bool,
         source: str,
         refresh: str | None = None,
+        persist_unmaterialized: bool = True,
     ) -> dict[str, Any]:
         refresh_mode = refresh or "auto"
         cached = [] if refresh_mode == "force" else self.facts.get_valid_facts_by_type(fact_type)
@@ -271,9 +320,10 @@ class MultiSourceRuntimeService:
             result = _provider_exception(name, source, exc)
         count = item_count(result)
         self._record(name, fact_type, result, count)
-        persisted_count = self._save_fact(name, fact_type, result, source=source)
-        read_back_count = 1 if self.facts.get_fact(_fact_key(name, fact_type)) else 0
-        materialized_count = 1 if read_back_count and _materialized(result, count) else 0
+        materialized = _materialized(result, count)
+        persisted_count = self._save_fact(name, fact_type, result, source=source) if _should_persist(result, count, persist_unmaterialized) else 0
+        read_back_count = 1 if persisted_count and self.facts.get_fact(_fact_key(name, fact_type)) else 0
+        materialized_count = 1 if read_back_count and materialized else 0
         return _with_runtime_fields(
             result,
             enabled=enabled,
@@ -373,6 +423,8 @@ class MultiSourceRuntimeService:
 def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict[str, Any]:
     investing = blocks.get("investing_economic_calendar") or {}
     holidays = blocks.get("investing_holidays") or {}
+    marketbeat_holidays = blocks.get("marketbeat_holidays") or {}
+    fed_rate_monitor = blocks.get("investing_fed_rate_monitor") or {}
     cboe = blocks.get("cboe_risk_indices") or {}
     earnings = blocks.get("nasdaq_earnings") or {}
     nasdaq_100 = blocks.get("nasdaq_100") or {}
@@ -382,6 +434,9 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
     macromicro = blocks.get("macromicro_aaii_crosscheck") or {}
     polymarket = blocks.get("polymarket_prediction_markets") or {}
     quikstrike = blocks.get("quikstrike_review") or {}
+    primary_holidays = holidays.get("relevant_holidays") or holidays.get("holidays") or []
+    secondary_holidays = marketbeat_holidays.get("relevant_holidays") or marketbeat_holidays.get("holidays") or []
+    merged_holidays = _merge_calendar_events(primary_holidays, secondary_holidays)
     return {
         "economic_calendar_enrichment": {
             "investing": {**investing, "events": investing.get("items") or []},
@@ -400,8 +455,29 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
         },
         "market_schedule": {
             "nasdaq_cash_session": market_info,
-            "holidays": holidays.get("relevant_holidays") or holidays.get("holidays") or [],
-            "holiday_source": holidays,
+            "holidays": primary_holidays or secondary_holidays,
+            "holiday_source": holidays if primary_holidays else marketbeat_holidays,
+            "holiday_fallback_source": marketbeat_holidays if secondary_holidays else {},
+        },
+        "market_calendar": {
+            "market_holidays": {
+                "official_sources": {},
+                "primary_sources": {
+                    "investing": holidays,
+                },
+                "secondary_sources": {
+                    "marketbeat": marketbeat_holidays,
+                },
+                "merged_relevant_holidays": merged_holidays,
+            }
+        },
+        "rates_expectations": {
+            "fed_funds_futures": {
+                "investing_fed_rate_monitor": fed_rate_monitor,
+                "primary_source": None,
+                "secondary_source": "Investing.com Fed Rate Monitor" if fed_rate_monitor else None,
+                "official_fed_source": False,
+            }
         },
         "risk_context": {
             "vvix": _risk_index_block((cboe.get("indices") or {}).get("vvix")),
@@ -446,6 +522,8 @@ def apply_multi_source_context(contract: dict[str, Any], snapshot: dict[str, Any
     context_blocks = snapshot.get("context_blocks") or {}
     contract["economic_calendar_enrichment"] = context_blocks.get("economic_calendar_enrichment") or {}
     contract["market_schedule"] = context_blocks.get("market_schedule") or {}
+    contract["market_calendar"] = context_blocks.get("market_calendar") or {}
+    contract["rates_expectations"] = context_blocks.get("rates_expectations") or {}
     contract["risk_context"] = context_blocks.get("risk_context") or {}
     contract["corporate_events"] = context_blocks.get("corporate_events") or {}
     additions = context_blocks.get("nasdaq_context_additions") or {}
@@ -670,6 +748,27 @@ def _risk_index_block(index: dict[str, Any] | None) -> dict[str, Any]:
         "status": "found" if index.get("current_price") is not None else "not_found",
         "value": index.get("current_price"),
     }
+
+
+def _merge_calendar_events(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in secondary:
+        date = str(item.get("date") or "")
+        name = str(item.get("holiday_name") or item.get("name") or "")
+        if date and name:
+            merged[(date, name.lower())] = item
+    for item in primary:
+        date = str(item.get("date") or "")
+        name = str(item.get("holiday_name") or item.get("name") or "")
+        if date and name:
+            merged[(date, name.lower())] = item
+    return sorted(merged.values(), key=lambda item: (item.get("date") or "", item.get("holiday_name") or item.get("name") or ""))
+
+
+def _should_persist(payload: dict[str, Any], item_count: int, persist_unmaterialized: bool) -> bool:
+    if persist_unmaterialized:
+        return True
+    return item_count > 0 or payload.get("status") in {"found", "valid", "anomalous", "partial", "reviewed_excluded"}
 
 
 def assert_fetcher_shape(fetcher: FetchCallable) -> None:
