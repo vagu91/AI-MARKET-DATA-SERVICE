@@ -33,6 +33,7 @@ from app.services.macro_service import MacroService
 from app.services.market_fact_repository import MarketFactRepository, init_market_db
 from app.services.market_context_builder import build_market_context_contract
 from app.services.ai_trader_contract_service import build_ai_trader_market_context
+from app.services.ai_research_diagnostics import record_final_consumer_events
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.health_report_service import HealthReportService
@@ -124,7 +125,15 @@ async def market_context_mnq(
             fetch_missing_nasdaq=refresh == "force",
             refresh=refresh,
         )
-        return contract if view == "debug" else build_ai_trader_market_context(contract)
+        if view == "debug":
+            return contract
+        consumer = build_ai_trader_market_context(contract)
+        record_final_consumer_events(
+            enrichment_orchestrator.settings,
+            (contract.get("data_quality") or {}).get("ai_diagnostic_artifact_dir"),
+            consumer,
+        )
+        return consumer
     macro, macro_quality = await diagnostics._macro_db_first()
     events_today_data = await event_service.today(country="US")
     now = datetime.now(UTC)

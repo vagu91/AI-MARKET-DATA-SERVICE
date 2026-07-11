@@ -111,6 +111,7 @@ def test_build_codex_research_prompt_contains_full_template_input_and_schema():
     assert "previous" in prompt
     assert "consensus" in prompt
     assert "source_url" in prompt
+    assert "evidence_text" in prompt
     assert "valid_until" in prompt
     assert '"results"' in prompt
     assert "Restituisci esclusivamente JSON" in prompt
@@ -275,8 +276,69 @@ def test_metric_only_ai_result_counts_as_valid_fact(tmp_path):
     facts, status = provider.load_payload(data)
     assert status["results_used"] == 1
     assert facts[0]["status"] == "active"
+    assert facts[0]["previous"] == 0.5
     assert facts[0]["source"] == "BLS"
     assert facts[0]["source_url"] == "https://www.bls.gov/news.release/cpi.nr0.htm"
+
+
+def test_metric_only_numeric_values_require_metric_evidence(tmp_path):
+    provider = AIResearcherProvider(settings(tmp_path))
+    data = payload()
+    item = data["results"][0]
+    item.update(
+        {
+            "forecast": None,
+            "previous": None,
+            "consensus": None,
+            "actual": None,
+            "evidence_text": None,
+            "extracted_text": None,
+            "metrics": [
+                {
+                    "metric_id": "headline_cpi_mom",
+                    "frequency": "MoM",
+                    "unit": "percent",
+                    "previous": 0.5,
+                    "source": "BLS",
+                    "source_url": "https://www.bls.gov/news.release/cpi.nr0.htm",
+                    "valid_until": item["valid_until"],
+                    "reliability": 0.9,
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+
+    facts, status = provider.load_payload(data)
+
+    assert facts == []
+    assert status["results_rejected"] == 1
+    assert status["warnings"] == [f"rejected_missing_evidence:{item['fact_key']}"]
+
+
+def test_metric_zero_value_is_preserved_in_top_level_fact(tmp_path):
+    provider = AIResearcherProvider(settings(tmp_path))
+    data = payload()
+    item = data["results"][0]
+    item.update({"forecast": None, "previous": None, "metrics": []})
+    item["metrics"].append(
+        {
+            "metric_id": "headline_cpi_mom",
+            "frequency": "MoM",
+            "unit": "percent",
+            "previous": 0.0,
+            "source": "BLS",
+            "source_url": "https://www.bls.gov/news.release/cpi.nr0.htm",
+            "evidence_text": "BLS reported a zero percent prior-period change.",
+            "valid_until": item["valid_until"],
+            "reliability": 0.9,
+            "confidence": 0.9,
+        }
+    )
+
+    facts, _ = provider.load_payload(data)
+
+    assert facts[0]["previous"] == 0.0
 
 
 async def test_provider_failure_cache_skips_immediate_retry(tmp_path):

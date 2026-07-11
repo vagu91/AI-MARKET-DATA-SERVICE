@@ -72,6 +72,7 @@ research_output.json valido con:
           "unit": "percent",
           "source": null,
           "source_url": null,
+          "evidence_text": null,
           "retrieved_at": null,
           "valid_until": "...",
           "reliability": 0.0,

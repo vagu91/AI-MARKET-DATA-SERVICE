@@ -9,6 +9,7 @@ from app.core.config import Settings
 from app.models.common import Impact, ProviderType
 from app.models.events import EconomicEvent, EventEnrichment
 from app.services.ai_researcher_service import AIResearcherService
+from app.services.ai_research_diagnostics import AIResearchDiagnostics
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.enrichment_run_repository import EnrichmentRunRepository
 from app.services.event_enrichment_service import EventEnrichmentService
@@ -158,6 +159,7 @@ class EnrichmentOrchestrator:
             ai_called = False
             ai_succeeded = False
             ai_failure_reason = None
+            ai_diagnostic_artifact_dir: str | None = None
             if provider_missing and self.settings.enable_ai_researcher:
                 all_ai_candidates = self._ai_candidates(provider_missing, limit=False)
                 ai_candidates = all_ai_candidates[: self.settings.ai_researcher_max_events]
@@ -175,6 +177,7 @@ class EnrichmentOrchestrator:
                     )
                     metrics["ai_duration_ms"] = int((perf_counter() - started) * 1000)
                     metrics["ai_research_status"] = ai_status.get("status") or "failed"
+                    ai_diagnostic_artifact_dir = ai_status.get("diagnostic_artifact_dir")
                     ai_succeeded = ai_status.get("status") == "success"
                     ai_failure_reason = ai_status.get("failure_reason") or ai_status.get("error")
                     metrics["ai_results_valid"] = int(ai_status.get("results_valid") or len(facts))
@@ -204,11 +207,14 @@ class EnrichmentOrchestrator:
                 else:
                     metrics["ai_research_status"] = "not_required"
                 facts_by_key = {fact["fact_key"]: fact for fact in facts}
+                diagnostics = AIResearchDiagnostics(self.settings, artifact_dir=ai_diagnostic_artifact_dir)
                 for event in provider_missing:
                     fact = facts_by_key.get(self.fact_key(event))
                     updated = event.model_copy(deep=True)
                     if fact:
-                        self.facts.upsert_fact(fact)
+                        persisted = self.facts.upsert_fact(fact)
+                        diagnostics.event_json(event.event_id, "persistence_payload.json", persisted)
+                        diagnostics.event_json(event.event_id, "read_back.json", self.facts.get_fact(self.fact_key(event)))
                         updated.enrichment = self._enrichment_from_fact(fact, "refreshed", [])
                         if _has_values(updated.enrichment):
                             ai_used = True
@@ -248,6 +254,7 @@ class EnrichmentOrchestrator:
                 "ai_research_status": metrics["ai_research_status"],
                 "ai_duration_ms": metrics["ai_duration_ms"],
                 "ai_not_available": metrics["ai_not_available"],
+                "ai_diagnostic_artifact_dir": ai_diagnostic_artifact_dir,
                 "ai_results_valid": metrics["ai_results_valid"],
                 "ai_results_rejected": metrics["ai_results_rejected"],
                 "ai_failure_reason": ai_failure_reason,

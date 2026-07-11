@@ -16,6 +16,7 @@ from app.providers.base import redact_sensitive
 from app.services.market_fact_repository import now_iso
 from app.services.data_integrity_service import reject_future_actual
 from app.services.ai_research_validation_service import ValidationRequest, validate_ai_research_result
+from app.services.ai_research_diagnostics import AIResearchDiagnostics
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
 FORBIDDEN_TRADING_TERMS = {
@@ -61,6 +62,7 @@ class AIResearcherProvider:
         return [], {"status": "provider_unavailable", "error": f"unsupported_mode:{self.settings.ai_researcher_mode}"}
 
     def _codex_cli(self, events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        diagnostics = AIResearchDiagnostics(self.settings)
         workspace = Path(self.settings.codex_workspace_dir)
         workspace.mkdir(parents=True, exist_ok=True)
         input_path = workspace / "research_input.json"
@@ -90,6 +92,17 @@ class AIResearcherProvider:
             "web_search_enabled": False,
             "web_search_note": "Codex CLI web access is controlled by the local Codex installation; no separate web-search flag is configured by this service.",
         }
+        if diagnostics.enabled:
+            for event in events:
+                event_id = event.get("event_id")
+                diagnostics.event_json(event_id, "input.json", research_input)
+                diagnostics.event_text(event_id, "prompt.txt", final_prompt)
+                diagnostics.event_json(
+                    event_id,
+                    "command.json",
+                    {"command": _safe_command(command), "cwd": str(cwd), "timeout_seconds": self.settings.codex_research_timeout_seconds},
+                )
+            diagnostics.write_json("run_summary.json", {**run_info, "started_at": now_iso(), "events": events})
         if (
             run_info["prompt_length_chars"] <= 2000
             or run_info["prompt_line_count"] <= 20
@@ -103,6 +116,7 @@ class AIResearcherProvider:
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
+            _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
         try:
             completed = subprocess.run(
@@ -127,6 +141,7 @@ class AIResearcherProvider:
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
+            _record_diagnostic_failure(diagnostics, events, run_info)
             return [], {**run_info, "status": "provider_failed", "failure_reason": "codex_cli_timeout"}
         except (FileNotFoundError, PermissionError, OSError) as exc:
             run_info.update(
@@ -138,6 +153,7 @@ class AIResearcherProvider:
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
+            _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
         duration_ms = int((perf_counter() - started) * 1000)
         run_info.update(
@@ -149,6 +165,10 @@ class AIResearcherProvider:
                 "stdout_length": len(completed.stdout or ""),
             }
         )
+        if diagnostics.enabled:
+            for event in events:
+                diagnostics.event_text(event.get("event_id"), "stdout.txt", completed.stdout)
+                diagnostics.event_text(event.get("event_id"), "stderr.txt", completed.stderr)
         if completed.returncode != 0:
             run_info.update(
                 {
@@ -158,6 +178,7 @@ class AIResearcherProvider:
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
+            _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
         payload, parse_error = parse_json_from_stdout(completed.stdout)
         if payload is None:
@@ -173,15 +194,21 @@ class AIResearcherProvider:
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
+            _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
         output_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         facts, status = self.load_payload(payload)
+        _record_diagnostic_success(diagnostics, self.settings, events, payload, facts, status)
         run_info.update(status)
+        if diagnostics.artifact_dir:
+            run_info["diagnostic_artifact_dir"] = diagnostics.artifact_dir
         run_info["status"] = status.get("status", "success")
         run_info["results_valid"] = len(facts)
         run_info["json_found"] = True
         run_info["parsed_result_count"] = len(payload.get("results", [])) if isinstance(payload.get("results"), list) else 0
         run_info["validation_errors"] = status.get("warnings", [])
+        if diagnostics.enabled:
+            diagnostics.write_json("run_summary.json", {**run_info, "completed_at": now_iso()})
         diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
         return facts, run_info
 
@@ -270,11 +297,11 @@ class AIResearcherProvider:
                     "category": item.get("category"),
                     "event_name": item.get("event_name"),
                     "period": item.get("period"),
-                    "unit": item.get("unit"),
-                    "forecast": item.get("forecast"),
-                    "previous": item.get("previous"),
-                    "consensus": item.get("consensus"),
-                    "actual": item.get("actual"),
+                    "unit": _top_or_metric(item, "unit"),
+                    "forecast": _top_or_metric(item, "forecast"),
+                    "previous": _top_or_metric(item, "previous"),
+                    "consensus": _top_or_metric(item, "consensus"),
+                    "actual": _top_or_metric(item, "actual"),
                     "source": item.get("source") or _first_metric_field(item, "source"),
                     "source_url": item.get("source_url") or _first_metric_field(item, "source_url"),
                     "provider_type": "AI_RESEARCHER_CODEX_CLI",
@@ -301,6 +328,123 @@ class AIResearcherProvider:
         }
 
 
+def _record_diagnostic_failure(
+    diagnostics: AIResearchDiagnostics,
+    events: list[dict[str, Any]],
+    run_info: dict[str, Any],
+) -> None:
+    if not diagnostics.enabled:
+        return
+    for event in events:
+        event_id = event.get("event_id")
+        diagnostics.event_text(event_id, "stdout.txt", str(run_info.get("stdout") or ""))
+        diagnostics.event_text(event_id, "stderr.txt", str(run_info.get("stderr") or ""))
+        diagnostics.event_json(
+            event_id,
+            "validation_report.json",
+            {
+                "status": run_info.get("status"),
+                "failure_reason": run_info.get("failure_reason") or run_info.get("error"),
+                "fields": [],
+            },
+        )
+    diagnostics.write_json("run_summary.json", {**run_info, "completed_at": now_iso()})
+
+
+def _record_diagnostic_success(
+    diagnostics: AIResearchDiagnostics,
+    settings: Settings,
+    events: list[dict[str, Any]],
+    payload: dict[str, Any],
+    facts: list[dict[str, Any]],
+    status: dict[str, Any],
+) -> None:
+    if not diagnostics.enabled:
+        return
+    raw_results = payload.get("results") if isinstance(payload.get("results"), list) else []
+    facts_by_key = {str(fact.get("fact_key")): fact for fact in facts}
+    for event in events:
+        event_id = event.get("event_id")
+        fact_key = str(event.get("fact_key") or "")
+        raw_item = next((item for item in raw_results if isinstance(item, dict) and str(item.get("fact_key") or "") == fact_key), None)
+        normalized = None
+        report: dict[str, Any]
+        if raw_item is None:
+            report = {
+                "status": "schema_field_missing",
+                "reasons": ["result_for_fact_key_not_found"],
+                "fields": [],
+            }
+        else:
+            normalized, rejected_future_actual = reject_future_actual(dict(raw_item))
+            validation = validate_ai_research_result(
+                {
+                    **normalized,
+                    "status": normalized.get("status") or ("found" if _item_has_values(normalized) else "not_found"),
+                    "data_type": normalized.get("data_type") or "macro_forecast",
+                    "evidence_text": normalized.get("evidence_text") or normalized.get("extracted_text"),
+                },
+                _validation_request(settings, normalized),
+            )
+            report = {
+                "status": validation.status,
+                "reasons": validation.reasons,
+                "rejected_future_actual": rejected_future_actual,
+                "fields": _field_validation_rows(normalized, validation),
+            }
+        diagnostics.event_json(event_id, "extracted_candidate.json", raw_item)
+        diagnostics.event_json(event_id, "parsed_result.json", raw_item)
+        diagnostics.event_json(event_id, "normalized_result.json", normalized)
+        diagnostics.event_json(event_id, "validation_report.json", report)
+        fact = facts_by_key.get(fact_key)
+        diagnostics.event_json(
+            event_id,
+            "persistence_payload.json",
+            fact if fact else {"status": "not_persisted", "reason": report["status"], "warnings": status.get("warnings") or []},
+        )
+
+
+def _validation_request(settings: Settings, item: dict[str, Any]) -> ValidationRequest:
+    return ValidationRequest(
+        data_type=str(item.get("data_type") or "macro_forecast"),
+        expected_period=item.get("expected_period") or item.get("period"),
+        release_at=_parse_event_time(item.get("time_utc") or item.get("date")),
+        min_confidence=float(settings.ai_researcher_min_confidence),
+        require_evidence=bool(settings.ai_researcher_require_evidence),
+    )
+
+
+def _field_validation_rows(item: dict[str, Any], validation: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    expected_period = str(item.get("expected_period") or item.get("period") or "")
+    metric_rows = item.get("metrics") if isinstance(item.get("metrics"), list) else []
+    candidates = [("top_level", item), *[(str(metric.get("metric_id") or "metric"), metric) for metric in metric_rows if isinstance(metric, dict)]]
+    for scope, candidate in candidates:
+        source_url = candidate.get("source_url") or item.get("source_url")
+        period = str(candidate.get("period") or item.get("period") or "")
+        for field in VALUE_FIELDS:
+            raw_value = candidate.get(field)
+            if raw_value in (None, ""):
+                continue
+            rows.append(
+                {
+                    "field": f"{scope}.{field}",
+                    "raw_value": raw_value,
+                    "normalized_value": raw_value,
+                    "accepted": validation.accepted,
+                    "rejection_code": None if validation.accepted else validation.status,
+                    "rejection_reason": [] if validation.accepted else validation.reasons,
+                    "source_url": source_url,
+                    "confidence": candidate.get("confidence") or item.get("confidence"),
+                    "reliability": candidate.get("reliability") or item.get("reliability"),
+                    "temporal_match": not (field == "actual" and raw_value not in (None, "") and _parse_event_time(item.get("time_utc") or item.get("date")) and datetime.now(UTC) < _parse_event_time(item.get("time_utc") or item.get("date"))),
+                    "period_match": bool(period) and (not expected_period or expected_period.lower() in period.lower()),
+                    "schema_match": bool(source_url and candidate.get("unit") and (candidate.get("frequency") or item.get("frequency"))),
+                }
+            )
+    return rows
+
+
 def _item_has_values(item: dict[str, Any]) -> bool:
     if any(item.get(field) not in (None, "") for field in VALUE_FIELDS):
         return True
@@ -312,9 +456,14 @@ def _item_has_values(item: dict[str, Any]) -> bool:
 
 def _first_metric_field(item: dict[str, Any], field: str) -> Any:
     for metric in item.get("metrics") or []:
-        if isinstance(metric, dict) and metric.get(field):
+        if isinstance(metric, dict) and metric.get(field) not in (None, ""):
             return metric.get(field)
     return None
+
+
+def _top_or_metric(item: dict[str, Any], field: str) -> Any:
+    value = item.get(field)
+    return value if value not in (None, "") else _first_metric_field(item, field)
 
 
 def _contains_forbidden_terms(payload: Any) -> bool:
@@ -412,6 +561,7 @@ def build_codex_research_prompt(prompt_template: str, research_input: dict[str, 
                         "unit": "percent",
                         "source": None,
                         "source_url": None,
+                        "evidence_text": None,
                         "retrieved_at": None,
                         "valid_until": "ISO-UTC",
                         "reliability": 0.0,
@@ -437,7 +587,7 @@ Ricerca forecast, previous, consensus e actual per gli eventi macro contenuti ne
 REGOLE OPERATIVE
 - Non inventare dati.
 - Non stimare valori.
-- Ogni valore numerico deve avere source e source_url.
+- Ogni valore numerico deve avere source, source_url e evidence_text.
 - Il periodo della fonte deve coincidere con il periodo dell'evento.
 - Se un dato non e' verificabile, lascialo null.
 - Nessuna trading logic.
@@ -448,7 +598,7 @@ REGOLE OPERATIVE
 - Non aggiungere spiegazioni prima o dopo il JSON.
 - Se non hai accesso web reale per verificare fonti, restituisci valori null e warning codex_web_research_unavailable.
 - Restituisci metrics[] per ogni dato numerico verificabile.
-- Ogni metrica deve avere metric_id, unit, frequency, source_url e field_semantics.
+- Ogni metrica deve avere metric_id, unit, frequency, source_url, evidence_text e field_semantics.
 - Non usare forecast come consensus se la fonte non dice esplicitamente consensus.
 - Dai priorita' a PCE se presente nel batch.
 - Per FOMC usa fomc_context e non metriche CPI-like.

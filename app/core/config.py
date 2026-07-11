@@ -183,6 +183,8 @@ class Settings(BaseSettings):
         default=True,
         validation_alias="AI_MARKET_AI_RESEARCHER_REQUIRE_SOURCE_URL",
     )
+    ai_diagnostics: bool = Field(default=False, validation_alias="AI_MARKET_AI_DIAGNOSTICS")
+    ai_diagnostics_dir: Path | None = Field(default=None, validation_alias="AI_MARKET_AI_DIAGNOSTICS_DIR")
     save_failed_research: bool = Field(default=True, validation_alias="AI_MARKET_SAVE_FAILED_RESEARCH")
     codex_cli_command: str = Field(default="codex", validation_alias="AI_MARKET_CODEX_CLI_COMMAND")
     codex_workspace_dir: Path = Field(
