@@ -168,6 +168,12 @@ class Settings(BaseSettings):
     qqq_weight_total_tolerance_pct: float = Field(default=1.0, validation_alias="AI_MARKET_QQQ_WEIGHT_TOTAL_TOLERANCE_PCT")
     qqq_weight_min_coverage_pct: float = Field(default=95.0, validation_alias="AI_MARKET_QQQ_WEIGHT_MIN_COVERAGE_PCT")
     qqq_weight_max_constituent_pct: float = Field(default=25.0, validation_alias="AI_MARKET_QQQ_WEIGHT_MAX_CONSTITUENT_PCT")
+    sec_class_shares_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_SEC_CLASS_SHARES_TTL_HOURS")
+    sec_request_timeout_seconds: float = Field(default=15.0, validation_alias="AI_MARKET_SEC_REQUEST_TIMEOUT_SECONDS")
+    sec_user_agent: str = Field(
+        default="AI-MARKET-DATA-SERVICE contact@example.com",
+        validation_alias="AI_MARKET_SEC_USER_AGENT",
+    )
     earnings_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_EARNINGS_TTL_HOURS")
     enable_ai_researcher: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_AI_RESEARCHER")
     ai_researcher_mode: str = Field(default="codex_cli", validation_alias="AI_MARKET_AI_RESEARCHER_MODE")
@@ -281,6 +287,8 @@ class Settings(BaseSettings):
     nasdaq_100_constituents_url: str = (
         "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
     )
+    sec_submissions_base_url: str = "https://data.sec.gov/submissions"
+    sec_archives_base_url: str = "https://www.sec.gov/Archives/edgar/data"
     yahoo_quote_url: str = "https://query1.finance.yahoo.com/v7/finance/quote"
     yahoo_chart_url: str = "https://query1.finance.yahoo.com/v8/finance/chart"
     yahoo_quote_summary_url: str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary"

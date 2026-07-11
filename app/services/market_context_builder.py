@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 MACRO_BUCKETS = {
-    "rates_and_yields": {"FEDFUNDS", "SOFR", "DGS2", "DGS10", "T10Y2Y"},
+    "rates_and_yields": {"FEDFUNDS", "DFF", "DFEDTARL", "DFEDTARU", "SOFR", "DGS2", "DGS10", "T10Y2Y"},
     "financial_conditions": {"VIXCLS", "NFCI"},
     "growth": {"BEA:GDP", "BEA:REAL_GDP"},
     "inflation": {"CUSR0000SA0", "WPUFD4", "BEA:PCE", "BEA:CORE_PCE"},
@@ -87,6 +87,9 @@ SOURCE_URLS = {
 
 SERIES_META = {
     "FEDFUNDS": ("effective_fed_funds_rate", "percent", "monthly"),
+    "DFF": ("effective_fed_funds_rate_daily", "percent", "daily"),
+    "DFEDTARL": ("fed_funds_target_lower_bound", "percent", "daily"),
+    "DFEDTARU": ("fed_funds_target_upper_bound", "percent", "daily"),
     "SOFR": ("secured_overnight_financing_rate", "percent", "daily"),
     "DGS2": ("treasury_2y_yield", "percent", "daily"),
     "DGS10": ("treasury_10y_yield", "percent", "daily"),
@@ -382,6 +385,7 @@ def build_section_quality(
         price_coverage_pct=price_coverage,
         sector_coverage_pct=sector_coverage,
         stale=bool(qqq_quality.get("stale")),
+        issuer_semantics_quality_score=float(qqq_quality.get("issuer_semantics_quality_score", 1.0)),
     )
     if qqq.get("weight_method") == "equal_weight_proxy":
         nasdaq_missing.append("qqq_weights_equal_weight_proxy")

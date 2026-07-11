@@ -222,11 +222,22 @@ async def market_context_mnq(
         news_context_override=news_context,
     )
     contract["data_quality"]["macro_pipeline"] = _macro_pipeline_status(macro, contract.get("macro_snapshot") or {})
+    fed_expectations_payload = await multi_runtime.provider("investing_fed_rate_monitor", refresh="auto")
     multi_source = await multi_runtime.snapshot(
         refresh="false",
-        preloaded_blocks={"investing_economic_calendar": investing_payload},
+        preloaded_blocks={
+            "investing_economic_calendar": investing_payload,
+            "investing_fed_rate_monitor": fed_expectations_payload,
+        },
     )
     apply_multi_source_context(contract, multi_source)
+    contract["rates_expectations"] = diagnostics.fed_expectations.snapshot(
+        refresh="auto",
+        provider_payload=fed_expectations_payload,
+        macro_snapshot=contract.get("macro_snapshot") or {},
+        event_calendar=contract.get("event_calendar") or {},
+        legacy_block=contract.get("rates_expectations") or {},
+    )
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
     return contract if view == "debug" else build_ai_trader_market_context(contract)
 

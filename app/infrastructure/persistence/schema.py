@@ -169,7 +169,28 @@ CREATE TABLE IF NOT EXISTS provider_state (
 """
 
 
+FED_EXPECTATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fed_expectation_snapshots (
+  id INTEGER PRIMARY KEY,
+  snapshot_key TEXT UNIQUE NOT NULL,
+  data_as_of TEXT NULL,
+  retrieved_at TEXT NOT NULL,
+  valid_until TEXT NULL,
+  source TEXT NULL,
+  source_type TEXT NULL,
+  quality_score REAL DEFAULT 0,
+  payload_json TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fed_expectations_retrieved_at
+  ON fed_expectation_snapshots(retrieved_at DESC);
+"""
+
+
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
     ("002_provider_cache_and_state", PROVIDER_CACHE_SCHEMA),
+    ("003_fed_expectation_history", FED_EXPECTATIONS_SCHEMA),
 )

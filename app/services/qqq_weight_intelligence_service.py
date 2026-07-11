@@ -164,10 +164,13 @@ def reconstruct_market_cap_weights(
             duplicate_symbols.append(symbol)
             continue
         seen.add(symbol)
-        market_cap = parse_market_value(raw.get("market_cap") or raw.get("marketCap"))
+        market_cap = parse_market_value(
+            raw.get("security_market_cap")
+            or raw.get("market_cap")
+            or raw.get("marketCap")
+        )
         company_name = raw.get("company_name") or raw.get("companyName") or raw.get("name")
-        normalized.append(
-            {
+        item = {
                 "symbol": symbol,
                 "name": company_name,
                 "company_name": company_name,
@@ -178,8 +181,42 @@ def reconstruct_market_cap_weights(
                 "change_pct": parse_weight_value(raw.get("change_pct") or raw.get("percentage_change") or raw.get("percentageChange")),
                 "price_source": source,
                 "warnings": [] if market_cap and market_cap > 0 else ["market_cap_missing_or_invalid"],
-            }
-        )
+        }
+        for field in (
+            "market_cap_raw",
+            "market_cap_parsed",
+            "security_market_cap",
+            "implied_shares",
+            "issuer_id",
+            "issuer_name",
+            "issuer_group",
+            "issuer_identifier",
+            "cik",
+            "isin",
+            "cusip",
+            "security_type",
+            "market_cap_semantics",
+            "market_cap_raw_semantics",
+            "market_cap_source",
+            "market_cap_source_url",
+            "market_cap_verified",
+            "market_cap_is_issuer_level",
+            "market_cap_is_security_level",
+            "multi_class_group",
+            "multi_class_adjustment_applied",
+            "multi_class_adjustment_method",
+            "multi_class_confidence",
+            "class_shares",
+            "class_shares_source",
+            "class_shares_source_url",
+            "class_shares_as_of",
+            "class_shares_retrieved_at",
+            "class_shares_valid_until",
+            "class_shares_verified",
+        ):
+            if field in raw:
+                item[field] = raw.get(field)
+        normalized.append(item)
     usable_total = sum(float(item["market_cap"]) for item in normalized if item.get("market_cap") and item["market_cap"] > 0)
     for item in normalized:
         market_cap = item.get("market_cap")
@@ -198,6 +235,16 @@ def reconstruct_market_cap_weights(
                 reconstructed=True,
                 confidence=0.76 if weight is not None else 0.0,
             )
+        )
+    issuer_totals: dict[str, float] = {}
+    for item in normalized:
+        issuer_group = str(item.get("issuer_group") or "")
+        if issuer_group and item.get("weight") is not None:
+            issuer_totals[issuer_group] = issuer_totals.get(issuer_group, 0.0) + float(item["weight"])
+    for item in normalized:
+        issuer_group = str(item.get("issuer_group") or "")
+        item["issuer_aggregate_weight_pct"] = (
+            round(issuer_totals[issuer_group], 8) if issuer_group in issuer_totals else None
         )
     validation = validate_weight_set(
         normalized,
@@ -474,6 +521,7 @@ def weight_quality_score(
     price_coverage_pct: float,
     sector_coverage_pct: float,
     stale: bool,
+    issuer_semantics_quality_score: float = 1.0,
 ) -> dict[str, Any]:
     method_score = {
         OFFICIAL_QQQ_WEIGHT: 1.0,
@@ -484,6 +532,7 @@ def weight_quality_score(
     }.get(str(method), 0.0)
     proxy_penalty = 0.25 if method == EQUAL_WEIGHT_PROXY else 0.08 if method == RECONSTRUCTED_MARKET_CAP_WEIGHT else 0.0
     stale_penalty = 0.15 if stale else 0.0
+    semantics_penalty = (1.0 - min(max(issuer_semantics_quality_score, 0.0), 1.0)) * 0.25
     score = (
         method_score * 0.45
         + min(max(weight_coverage_pct, 0.0), 100.0) / 100.0 * 0.30
@@ -491,11 +540,13 @@ def weight_quality_score(
         + min(max(sector_coverage_pct, 0.0), 100.0) / 100.0 * 0.10
         - proxy_penalty
         - stale_penalty
+        - semantics_penalty
     )
     return {
         "weight_quality_score": round(min(max(score, 0.0), 1.0), 3),
         "proxy_penalty": proxy_penalty,
         "stale_penalty": stale_penalty,
+        "issuer_semantics_penalty": round(semantics_penalty, 3),
     }
 
 

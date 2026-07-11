@@ -13,6 +13,12 @@ from app.models.nasdaq import QQQHolding
 from app.providers.alpha_vantage import ensure_alpha_payload_ok, parse_percent
 from app.providers.base import BaseProvider, ProviderError, metadata
 from app.providers.calendar_utils import REQUEST_HEADERS
+from app.providers.sec_class_shares_provider import SecClassSharesProvider
+from app.services.nasdaq_multiclass_service import (
+    apply_multi_class_adjustments,
+    detect_multi_class_groups,
+    log_multi_class_event,
+)
 from app.services.qqq_weight_intelligence_service import (
     EQUAL_WEIGHT_PROXY,
     OFFICIAL_QQQ_WEIGHT,
@@ -36,6 +42,7 @@ class QQQHoldingsProvider(BaseProvider):
     def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
         self.settings = settings
+        self.sec_class_shares = SecClassSharesProvider(settings)
 
     async def fetch_safe(self, *, force: bool = False) -> ProviderResult:
         valid_cached = self._cached_result(max_age_hours=self.settings.qqq_holdings_ttl_hours)
@@ -284,8 +291,54 @@ class QQQHoldingsProvider(BaseProvider):
                 rows, as_of = _nasdaq_rows(payload)
                 if not rows:
                     raise ProviderError("Nasdaq-100 fallback returned no holdings")
-                candidate = reconstruct_market_cap_weights(
+                shares_by_issuer: dict[str, dict[str, Any]] = {}
+                for group in detect_multi_class_groups(rows):
+                    issuer_group = str(group.get("issuer_group") or "")
+                    if not group.get("cik"):
+                        continue
+                    diagnostics["provider_attempts"].append(f"sec_class_shares:{issuer_group}")
+                    diagnostics["source_attempt_count"] += 1
+                    log_multi_class_event(
+                        "class_shares_lookup_started",
+                        issuer=group.get("issuer_name"),
+                        symbols=group.get("symbols"),
+                        source="SEC submissions and inline XBRL",
+                    )
+                    shares = await self.sec_class_shares.fetch(
+                        cik=str(group["cik"]),
+                        listed_class_symbols={
+                            class_code: symbol
+                            for symbol, class_code in (group.get("class_by_symbol") or {}).items()
+                        },
+                    )
+                    diagnostics["actual_network_calls"] += int(shares.get("network_calls") or 0)
+                    shares_by_issuer[issuer_group] = shares
+                    if shares.get("verified"):
+                        diagnostics["source_success_count"] += 1
+                        log_multi_class_event(
+                            "class_shares_lookup_succeeded",
+                            issuer=group.get("issuer_name"),
+                            symbols=group.get("symbols"),
+                            class_shares=list((shares.get("listed_shares") or {}).values()),
+                            source=shares.get("source"),
+                            confidence=0.99,
+                        )
+                    else:
+                        diagnostics["source_failure_count"] += 1
+                        diagnostics["failure_breakdown"]["partial_response"] += 1
+                        log_multi_class_event(
+                            "class_shares_lookup_failed",
+                            issuer=group.get("issuer_name"),
+                            symbols=group.get("symbols"),
+                            source=shares.get("source"),
+                            reason=";".join(shares.get("errors") or []) or "verified_class_shares_not_found",
+                        )
+                adjusted_rows, multi_class_quality = apply_multi_class_adjustments(
                     rows,
+                    shares_by_issuer,
+                )
+                candidate = reconstruct_market_cap_weights(
+                    adjusted_rows,
                     source="Nasdaq official constituent market-cap snapshot",
                     source_url=self.settings.nasdaq_100_constituents_url,
                     as_of=as_of,
@@ -295,6 +348,24 @@ class QQQHoldingsProvider(BaseProvider):
                     maximum_constituent_pct=self.settings.qqq_weight_max_constituent_pct,
                 )
                 candidate["proxy_for"] = "QQQ holdings / Nasdaq-100 modified weights"
+                candidate["multi_class_quality"] = multi_class_quality
+                if multi_class_quality.get("multi_class_unresolved_count"):
+                    candidate["validation"]["valid"] = False
+                    candidate["validation"]["partial"] = True
+                    candidate["validation"].setdefault("rejection_reasons", []).append(
+                        "multi_class_ambiguous"
+                    )
+                    log_multi_class_event(
+                        "multi_class_weight_validation_failed",
+                        symbols=[
+                            symbol
+                            for item in multi_class_quality.get("multi_class_diagnostics") or []
+                            for symbol in item.get("symbols") or []
+                        ],
+                        classification="ambiguous",
+                        confidence=multi_class_quality.get("issuer_semantics_quality_score"),
+                        reason="verified_class_shares_unavailable",
+                    )
                 if candidate["validation"]["valid"]:
                     diagnostics["source_success_count"] += 1
                     diagnostics["reconstruction_used"] = True
@@ -731,6 +802,21 @@ def _candidate_result(
         reliability * (1.0 if candidate.get("weight_verified") else 0.75), 3
     )
     quality["alternative_sources"] = quality.get("fallback_chain") or []
+    multi_class_quality = candidate.get("multi_class_quality") or {}
+    for field in (
+        "multi_class_issuer_count",
+        "multi_class_security_count",
+        "verified_security_cap_count",
+        "issuer_level_duplicate_count",
+        "issuer_level_probable_count",
+        "unknown_market_cap_semantics_count",
+        "multi_class_adjustment_count",
+        "multi_class_weight_coverage_pct",
+        "issuer_semantics_quality_score",
+        "multi_class_diagnostics",
+    ):
+        if field in multi_class_quality:
+            quality[field] = multi_class_quality[field]
     log_weight_event(
         "qqq_weight_set_validated",
         source=candidate.get("source"),
@@ -768,7 +854,11 @@ def _validation_failure(candidate: dict[str, Any]) -> str:
 
 def _result_rank(result: ProviderResult) -> int:
     data = result.data if isinstance(result.data, dict) else {}
-    return WEIGHT_METHOD_RANK.get(str(data.get("weight_method") or ""), 0)
+    quality = data.get("data_quality") or {}
+    base = WEIGHT_METHOD_RANK.get(str(data.get("weight_method") or ""), 0) * 100
+    semantics = float(quality.get("issuer_semantics_quality_score") or 0.0)
+    verified = 10 if quality.get("multi_class_adjustment_count") else 0
+    return base + int(semantics * 10) + verified
 
 
 def _preserve_better_cached_result(cached: ProviderResult, attempted: ProviderResult) -> ProviderResult:

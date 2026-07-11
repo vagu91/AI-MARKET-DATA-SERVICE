@@ -55,6 +55,37 @@ class QQQHolding(BaseModel):
     weight_is_reconstructed: bool = False
     weight_confidence: float = 0.0
     market_cap: float | None = None
+    market_cap_raw: str | float | None = None
+    market_cap_parsed: float | None = None
+    security_market_cap: float | None = None
+    implied_shares: float | None = None
+    issuer_id: str | None = None
+    issuer_name: str | None = None
+    issuer_group: str | None = None
+    issuer_identifier: str | None = None
+    cik: str | None = None
+    isin: str | None = None
+    cusip: str | None = None
+    security_type: str | None = None
+    market_cap_semantics: str = "unknown"
+    market_cap_raw_semantics: str | None = None
+    market_cap_source: str | None = None
+    market_cap_source_url: str | None = None
+    market_cap_verified: bool = False
+    market_cap_is_issuer_level: bool = False
+    market_cap_is_security_level: bool = False
+    multi_class_group: str | None = None
+    multi_class_adjustment_applied: bool = False
+    multi_class_adjustment_method: str | None = None
+    multi_class_confidence: float = 0.0
+    class_shares: float | None = None
+    class_shares_source: str | None = None
+    class_shares_source_url: str | None = None
+    class_shares_as_of: str | None = None
+    class_shares_retrieved_at: datetime | None = None
+    class_shares_valid_until: datetime | None = None
+    class_shares_verified: bool = False
+    issuer_aggregate_weight_pct: float | None = None
     price: float | None = None
     change_pct: float | None = None
     price_source: str | None = None
@@ -126,6 +157,16 @@ class QQQHoldingsQuality(DataQuality):
     fallback_chain: list[dict[str, Any]] = Field(default_factory=list)
     alternative_sources: list[dict[str, Any]] = Field(default_factory=list)
     failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    multi_class_issuer_count: int = 0
+    multi_class_security_count: int = 0
+    verified_security_cap_count: int = 0
+    issuer_level_duplicate_count: int = 0
+    issuer_level_probable_count: int = 0
+    unknown_market_cap_semantics_count: int = 0
+    multi_class_adjustment_count: int = 0
+    multi_class_weight_coverage_pct: float = 0.0
+    issuer_semantics_quality_score: float = 0.0
+    multi_class_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class QQQHoldingsResponse(BaseModel):

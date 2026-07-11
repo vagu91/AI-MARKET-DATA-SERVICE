@@ -279,6 +279,7 @@ def enrich_nasdaq_context(nasdaq_context: dict[str, Any], news_context: dict[str
         price_coverage_pct=price_coverage,
         sector_coverage_pct=sector_coverage,
         stale=bool((qqq.get("data_quality") or {}).get("stale")),
+        issuer_semantics_quality_score=float((qqq.get("data_quality") or {}).get("issuer_semantics_quality_score", 1.0)),
     )
     output["weight_quality"] = {
         **quality,

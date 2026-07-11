@@ -44,6 +44,7 @@ from app.services.news_intelligence_runtime_service import NewsIntelligenceRunti
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
+from app.services.fed_expectations_service import FedExpectationsService
 from app.services.social_sentiment_service import SocialSentimentService
 
 
@@ -71,6 +72,7 @@ class DiagnosticsService:
         self.news_intelligence = NewsIntelligenceRuntimeService(settings, facts=self.facts)
         self.freshness = DataFreshnessService(settings)
         self.positioning_runtime = PositioningRuntimeService(settings)
+        self.fed_expectations = FedExpectationsService(settings)
 
     async def e2e_cache_test(
         self,
@@ -357,6 +359,13 @@ class DiagnosticsService:
             preloaded_blocks={"investing_economic_calendar": investing_payload},
         )
         apply_multi_source_context(contract, multi_source)
+        contract["rates_expectations"] = self.fed_expectations.snapshot(
+            refresh=refresh,
+            provider_payload=(multi_source.get("blocks") or {}).get("investing_fed_rate_monitor") or {},
+            macro_snapshot=contract.get("macro_snapshot") or {},
+            event_calendar=contract.get("event_calendar") or {},
+            legacy_block=contract.get("rates_expectations") or {},
+        )
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
         return contract
 
