@@ -9,3 +9,12 @@ auth.json
 *tokens*
 *.egg-info/
 *.pyc
+
+# Temporary scraping/debug artifacts
+ibmetrics_aaii.html
+investing_fed_monitor.html
+justetf_responses.json
+marketbeat_holidays.html
+marketwatch_calendar.html
+slickcharts_nasdaq100.html
+logs/
