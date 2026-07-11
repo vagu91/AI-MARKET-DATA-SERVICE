@@ -26,6 +26,8 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /events/active-windows?symbol=MNQ`
 - `GET /market-context/mnq`
 - `GET /db/health`
+- `GET /storage/health`
+- `GET /storage/retention-policy`
 - `GET /facts/lookup?fact_key=...`
 - `GET /facts/search?country=US&category=CPI`
 - `GET /facts/stale`
@@ -79,6 +81,8 @@ Invoke-RestMethod "http://127.0.0.1:8000/db/health"
 Invoke-RestMethod "http://127.0.0.1:8000/db/health/details"
 Invoke-RestMethod "http://127.0.0.1:8000/db/schema-version"
 Invoke-RestMethod "http://127.0.0.1:8000/db/cache/stats"
+Invoke-RestMethod "http://127.0.0.1:8000/storage/health"
+Invoke-RestMethod "http://127.0.0.1:8000/storage/retention-policy"
 Invoke-RestMethod "http://127.0.0.1:8000/facts/coverage?country=US&days=30"
 Invoke-RestMethod -Method Post "http://127.0.0.1:8000/enrichment/run?country=US&days=30"
 ```
@@ -90,7 +94,11 @@ Operational scripts:
 .\.venv\Scripts\python.exe .\scripts\backup_database.py
 .\.venv\Scripts\python.exe .\scripts\validate_database.py
 .\.venv\Scripts\python.exe .\scripts\reset_database.py --cache-only --dry-run
+.\.venv\Scripts\python.exe .\scripts\cleanup_storage.py --dry-run
+.\.venv\Scripts\python.exe .\scripts\cleanup_storage.py --category diagnostics --apply
 ```
+
+Storage retention covers diagnostics, backups, logs, service temp files, and DB maintenance tables. Manual cleanup defaults to dry-run; startup performs only lightweight non-blocking temp cleanup, and scheduled full cleanup runs at most once per configured interval when the scheduler is enabled.
 
 ## Data Sources
 

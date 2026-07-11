@@ -125,6 +125,79 @@ def test_consumer_contract_is_compact_and_excludes_debug_blocks() -> None:
     assert len(encoded.encode("utf-8")) < 400_000
 
 
+def test_consumer_aggregates_optional_enrichment_warnings_and_keeps_debug_details() -> None:
+    full = {
+        "symbol": "MNQ",
+        "generated_at_utc": "2099-01-01T00:00:00Z",
+        "data_quality": {
+            "overall_data_quality": {"freshness_score": 0.9, "reliability_score": 0.8},
+            "warnings": ["optional_event_enrichment_timeout_after_1s"],
+        },
+        "event_calendar": {
+            "critical_macro_events": [
+                {
+                    "event_id": "cpi",
+                    "impact": "HIGH",
+                    "time_utc": "2099-01-02T12:30:00Z",
+                    "enrichment": {"warnings": ["optional_enrichment_timeout"], "provider": "slow"},
+                },
+                {
+                    "event_id": "nfp",
+                    "impact": "HIGH",
+                    "time_utc": "2099-01-03T12:30:00Z",
+                    "enrichment": {"warnings": ["optional_enrichment_timeout"]},
+                },
+            ],
+            "fed_communications": [],
+            "other_economic_events": [],
+        },
+        "news_context": {"latest": [{"title": "Clean"}]},
+    }
+
+    consumer = build_ai_trader_market_context(full)
+
+    assert consumer["warnings"] == [{"code": "optional_event_enrichment_partial", "count": 3, "blocking": False}]
+    assert all(
+        "optional_enrichment_timeout" not in ((event.get("enrichment") or {}).get("warnings") or [])
+        for event in consumer["event_calendar"]["critical_macro_events"]
+    )
+    assert full["event_calendar"]["critical_macro_events"][0]["enrichment"]["warnings"] == ["optional_enrichment_timeout"]
+
+
+def test_snapshot_summary_is_present_and_data_only() -> None:
+    full = {
+        "symbol": "MNQ",
+        "generated_at_utc": "2099-01-01T00:00:00Z",
+        "data_quality": {
+            "overall_data_quality": {"freshness_score": 0.91, "reliability_score": 0.88},
+            "critical_errors": [],
+        },
+        "event_calendar": {
+            "critical_macro_events": [{"category": "CPI", "impact": "HIGH", "time_utc": "2099-01-02T12:30:00Z"}],
+            "fed_communications": [{"category": "FOMC", "impact": "HIGH", "time_utc": "2099-01-29T19:00:00Z"}],
+            "other_economic_events": [],
+        },
+        "nasdaq_context": {"earnings": {"events": [{"symbol": "NVDA"}]}},
+        "news_context": {"latest": [{"title": "A"}, {"title": "B"}]},
+        "social_sentiment": {"status": "found"},
+        "risk_context": {"vvix": {"status": "found"}},
+        "market_schedule": {"nasdaq_cash_session": {"status": "closed"}},
+    }
+
+    summary = build_ai_trader_market_context(full)["snapshot_summary"]
+
+    assert summary["symbol"] == "MNQ"
+    assert summary["ready"] is True
+    assert summary["critical_errors"] == 0
+    assert summary["critical_event_count"] == 1
+    assert summary["high_impact_event_count_next_7d"] == 2
+    assert summary["next_critical_event_at"] == "2099-01-02T12:30:00Z"
+    assert summary["next_fomc_meeting_at"] == "2099-01-29T19:00:00Z"
+    assert summary["next_earnings_count_14d"] == 1
+    assert summary["news_article_count"] == 2
+    assert "buy" not in json.dumps(summary).lower()
+
+
 @pytest.mark.asyncio
 async def test_event_enrichment_timeout_keeps_base_events_and_closes_run(tmp_path: Path) -> None:
     cfg = Settings(

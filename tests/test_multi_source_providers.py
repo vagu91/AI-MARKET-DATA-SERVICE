@@ -3,14 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
+
 from app.api.routes import router
 from app.core.config import Settings
+from app.providers import polymarket_prediction_provider as poly_module
 from app.providers import aaii_sentiment_provider as aaii_module
 from app.providers.aaii_sentiment_provider import AaiiSentimentProvider, is_aaii_blocked_html, parse_aaii_sentiment
 from app.providers.investing_economic_calendar_provider import _normalize as normalize_investing
 from app.providers.macromicro_aaii_crosscheck_provider import parse_macromicro_aaii
 from app.providers.nasdaq_qqq_option_chain_provider import normalize_option_rows, option_chain_aggregates
-from app.providers.polymarket_prediction_provider import group_polymarket_events, normalize_polymarket_market
+from app.providers.polymarket_prediction_provider import PolymarketPredictionProvider, group_polymarket_events, normalize_polymarket_market
 from app.services.acquisition_status_service import _diagnostic_rejection_reasons
 from app.services.economic_value_parser import parse_economic_value
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, _exclusion_reasons, build_multi_source_context_blocks
@@ -349,6 +352,131 @@ def test_polymarket_groups_by_event_before_limiting_and_does_not_sum_event_liqui
     assert fed["total_event_volume"] == 190.0
     assert fed["event_liquidity"] == 2000.0
     assert fed["value_scope"]["liquidity"] == "event_level_or_max_market_level_not_summed"
+
+
+async def test_polymarket_tls_failure_is_not_not_found(monkeypatch, tmp_path):
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectError("SSL CERTIFICATE_VERIFY_FAILED hostname mismatch")
+
+    monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
+
+    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+
+    assert result["status"] == "ssl_error"
+    assert result["failure_type"] == "ssl_error"
+    assert result["ssl_error"] is True
+    assert result["status"] != "not_found"
+
+
+async def test_polymarket_http_404_is_not_found(monkeypatch, tmp_path):
+    class FakeResponse:
+        status_code = 404
+
+        def raise_for_status(self):
+            request = httpx.Request("GET", "https://gamma-api.polymarket.com/events")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("404 Not Found", request=request, response=response)
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
+
+    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+
+    assert result["status"] == "not_found"
+    assert result["http_status"] == 404
+    assert result["failure_type"] == "http_404"
+
+
+async def test_polymarket_rate_limit_classification(monkeypatch, tmp_path):
+    class FakeResponse:
+        status_code = 429
+
+        def raise_for_status(self):
+            request = httpx.Request("GET", "https://gamma-api.polymarket.com/events")
+            response = httpx.Response(429, request=request)
+            raise httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
+
+    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+
+    assert result["status"] == "rate_limited"
+    assert result["http_status"] == 429
+    assert result["retryable"] is False
+    assert result["next_retry_at"]
+
+
+async def test_polymarket_zero_relevant_markets_is_not_found(monkeypatch, tmp_path):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "id": "evt-entertainment",
+                    "title": "Entertainment market",
+                    "endDate": "2099-12-31T00:00:00Z",
+                    "markets": [
+                        {
+                            "id": "m-entertainment",
+                            "question": "Will a pop album release before a video game?",
+                            "outcomes": '["Yes","No"]',
+                            "outcomePrices": '["0.45","0.55"]',
+                            "volumeNum": 50000,
+                            "liquidityNum": 20000,
+                            "endDate": "2099-12-31T00:00:00Z",
+                            "active": True,
+                            "closed": False,
+                            "description": "Entertainment resolution rules.",
+                        }
+                    ],
+                }
+            ]
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
+
+    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+
+    assert result["status"] == "not_found"
+    assert result["failure_type"] is None
+    assert "polymarket_no_relevant_markets_after_filters" in result["warnings"]
 
 
 async def test_multi_source_refresh_false_does_not_call_provider(tmp_path):

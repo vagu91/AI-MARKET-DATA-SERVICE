@@ -16,6 +16,7 @@ def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "symbol": full.get("symbol"),
         "generated_at": full.get("generated_at_utc") or full.get("generated_at"),
+        "snapshot_summary": _snapshot_summary(full),
         "service_role": "data provider only",
         "readiness": _readiness(data_quality),
         "data_quality": _compact_quality(data_quality),
@@ -74,9 +75,9 @@ def _compact_quality(data_quality: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_events(calendar: dict[str, Any]) -> dict[str, Any]:
     return {
-        "critical_macro_events": (calendar.get("critical_macro_events") or [])[:12],
-        "fed_communications": (calendar.get("fed_communications") or [])[:8],
-        "other_economic_events": (calendar.get("other_economic_events") or [])[:12],
+        "critical_macro_events": [_compact_event_item(item) for item in (calendar.get("critical_macro_events") or [])[:12]],
+        "fed_communications": [_compact_event_item(item) for item in (calendar.get("fed_communications") or [])[:8]],
+        "other_economic_events": [_compact_event_item(item) for item in (calendar.get("other_economic_events") or [])[:12]],
     }
 
 
@@ -159,18 +160,145 @@ def _compact_market_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _consumer_warnings(full: dict[str, Any]) -> list[str]:
+def _consumer_warnings(full: dict[str, Any]) -> list[dict[str, Any]]:
     warnings: list[str] = []
     for source in (full.get("data_quality") or {}, full.get("social_sentiment") or {}):
         warnings.extend(source.get("warnings") or [])
-    ignored_prefixes = ("optional_event_enrichment_timeout_after_",)
-    return sorted(
-        set(
-            str(item)
-            for item in warnings
-            if item and not any(str(item).startswith(prefix) for prefix in ignored_prefixes)
-        )
-    )
+    warnings.extend(_event_optional_warnings(full))
+    output: dict[str, dict[str, Any]] = {}
+    for item in warnings:
+        code = _warning_code(str(item))
+        if not code:
+            continue
+        if code.startswith("optional_event_enrichment"):
+            code = "optional_event_enrichment_partial"
+        entry = output.setdefault(code, {"code": code, "count": 0, "blocking": False})
+        entry["count"] += 1
+    return sorted(output.values(), key=lambda item: item["code"])
+
+
+def _compact_event_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    output = dict(item)
+    enrichment = output.get("enrichment")
+    if isinstance(enrichment, dict):
+        warnings = [
+            warning
+            for warning in (enrichment.get("warnings") or [])
+            if _warning_code(str(warning)) != "optional_event_enrichment_partial"
+        ]
+        output["enrichment"] = {**enrichment, "warnings": warnings}
+    warnings = [
+        warning
+        for warning in (output.get("warnings") or [])
+        if _warning_code(str(warning)) != "optional_event_enrichment_partial"
+    ]
+    if "warnings" in output:
+        output["warnings"] = warnings
+    return output
+
+
+def _event_optional_warnings(full: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    calendar = full.get("event_calendar") or {}
+    for section in ("critical_macro_events", "fed_communications", "other_economic_events"):
+        for item in calendar.get(section) or []:
+            if not isinstance(item, dict):
+                continue
+            warnings.extend(str(warning) for warning in item.get("warnings") or [])
+            enrichment = item.get("enrichment") or {}
+            if isinstance(enrichment, dict):
+                warnings.extend(str(warning) for warning in enrichment.get("warnings") or [])
+    return [warning for warning in warnings if _warning_code(warning) == "optional_event_enrichment_partial"]
+
+
+def _warning_code(value: str) -> str:
+    if not value:
+        return ""
+    if value == "optional_enrichment_timeout" or value.startswith("optional_event_enrichment_timeout_after_"):
+        return "optional_event_enrichment_partial"
+    return value.split(":", 1)[0]
+
+
+def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
+    data_quality = full.get("data_quality") or {}
+    readiness = _readiness(data_quality)
+    overall = data_quality.get("overall_data_quality") or {}
+    event_calendar = full.get("event_calendar") or {}
+    critical_events = event_calendar.get("critical_macro_events") or []
+    all_events = critical_events + (event_calendar.get("fed_communications") or []) + (event_calendar.get("other_economic_events") or [])
+    nasdaq = full.get("nasdaq_context") or {}
+    earnings = nasdaq.get("earnings") or {}
+    news_latest = (full.get("news_context") or {}).get("latest") or []
+    statuses = _collect_statuses(full)
+    return {
+        "generated_at": full.get("generated_at_utc") or full.get("generated_at"),
+        "symbol": full.get("symbol"),
+        "ready": readiness["ready"],
+        "critical_errors": readiness["critical_errors"],
+        "provider_success_count": sum(1 for status in statuses if status == "found"),
+        "provider_partial_count": sum(1 for status in statuses if status in {"partial", "stale_acceptable"}),
+        "provider_failure_count": sum(1 for status in statuses if status in {"provider_failed", "ssl_error", "rate_limited", "access_restricted"}),
+        "cache_used": _cache_used(full),
+        "critical_event_count": len(critical_events),
+        "high_impact_event_count_next_7d": sum(1 for event in all_events if str((event or {}).get("impact") or (event or {}).get("event_risk_level") or "").upper() == "HIGH"),
+        "next_critical_event_at": _next_event_at(critical_events),
+        "next_fomc_meeting_at": _next_fomc_at(all_events),
+        "next_earnings_count_14d": len(earnings.get("events") or earnings.get("upcoming") or []),
+        "news_article_count": len(news_latest),
+        "social_sentiment_status": (full.get("social_sentiment") or {}).get("status"),
+        "risk_context_status": _block_status(full.get("risk_context") or full.get("risk_sentiment") or {}),
+        "market_status": (((full.get("market_schedule") or {}).get("nasdaq_cash_session") or {}).get("status")),
+        "data_freshness_score": overall.get("freshness_score"),
+        "data_reliability_score": overall.get("reliability_score"),
+    }
+
+
+def _collect_statuses(value: Any) -> list[str]:
+    statuses: list[str] = []
+    if isinstance(value, dict):
+        status = value.get("status")
+        if isinstance(status, str):
+            statuses.append(status)
+        for item in value.values():
+            statuses.extend(_collect_statuses(item))
+    elif isinstance(value, list):
+        for item in value:
+            statuses.extend(_collect_statuses(item))
+    return statuses
+
+
+def _cache_used(full: dict[str, Any]) -> bool:
+    runtime = ((full.get("metadata") or {}).get("multi_source_runtime") or {})
+    return bool(runtime.get("cache_used") or runtime.get("db_hits") or "false" == runtime.get("refresh_mode"))
+
+
+def _next_event_at(events: list[Any]) -> str | None:
+    candidates = []
+    for event in events:
+        if isinstance(event, dict):
+            candidates.append(event.get("time_utc") or event.get("release_at") or event.get("date"))
+    return sorted(str(item) for item in candidates if item)[:1][0] if any(candidates) else None
+
+
+def _next_fomc_at(events: list[Any]) -> str | None:
+    fomc = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and "FOMC" in " ".join(str(event.get(key) or "") for key in ("category", "name", "event_name")).upper()
+    ]
+    return _next_event_at(fomc)
+
+
+def _block_status(block: dict[str, Any]) -> str | None:
+    if block.get("status"):
+        return block.get("status")
+    statuses = [value.get("status") for value in block.values() if isinstance(value, dict) and value.get("status")]
+    if any(status == "found" for status in statuses):
+        return "found"
+    return statuses[0] if statuses else None
 
 
 def _empty_social() -> dict[str, Any]:

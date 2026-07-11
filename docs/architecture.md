@@ -13,6 +13,7 @@ All application SQLite access is centralized under `app.infrastructure.persisten
 - `database.py`: connection creation and health checks.
 - `schema.py`: canonical schema and provider-cache schema.
 - `migrations.py`: idempotent schema migrations and legacy `cache_entries` import.
+- `database_maintenance.py`: retention for cache, observations, enrichment runs, market news, provider state, ANALYZE, and guarded VACUUM.
 - `provider_cache_repository.py`: provider cache repository.
 
 Canonical repositories keep their public APIs but obtain connections through the same `Settings.database_path`.
@@ -62,5 +63,10 @@ flowchart LR
 - `scripts/backup_database.py`
 - `scripts/reset_database.py`
 - `scripts/validate_database.py`
+- `scripts/cleanup_storage.py`
 
 Use `--dry-run` on legacy migration/reset checks before applying destructive operations.
+
+## Storage Guardrails
+
+`app.infrastructure.storage_retention` centralizes deterministic cleanup for `data/diagnostics`, `data/backups`, `logs`, and service temp files. Cleanup validates absolute paths under the project root, refuses root/data-root deletion, skips symlinks, and defaults to dry-run in the manual script. `/storage/health` and `/storage/retention-policy` expose disk, policy, log rotation, and DB maintenance status without mutating data.

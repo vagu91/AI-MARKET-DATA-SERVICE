@@ -18,6 +18,28 @@ class Settings(BaseSettings):
     environment: str = "local"
     log_level: str = "INFO"
     database_path: Path = Path("./data/market_data_service.sqlite")
+    diagnostics_dir: Path = Field(default=Path("./data/diagnostics"), validation_alias="AI_MARKET_DIAGNOSTICS_DIR")
+    backups_dir: Path = Field(default=Path("./data/backups"), validation_alias="AI_MARKET_BACKUPS_DIR")
+    logs_dir: Path = Field(default=Path("./logs"), validation_alias="AI_MARKET_LOGS_DIR")
+    temp_dir: Path = Field(default=Path("./data/temp"), validation_alias="AI_MARKET_TEMP_DIR")
+    diagnostics_retention_days: int = Field(default=7, validation_alias="AI_MARKET_DIAGNOSTICS_RETENTION_DAYS")
+    diagnostics_max_total_mb: int = Field(default=250, validation_alias="AI_MARKET_DIAGNOSTICS_MAX_TOTAL_MB")
+    diagnostics_max_runs: int = Field(default=10, validation_alias="AI_MARKET_DIAGNOSTICS_MAX_RUNS")
+    backups_retention_days: int = Field(default=14, validation_alias="AI_MARKET_BACKUPS_RETENTION_DAYS")
+    backups_max_total_mb: int = Field(default=500, validation_alias="AI_MARKET_BACKUPS_MAX_TOTAL_MB")
+    backups_max_files: int = Field(default=5, validation_alias="AI_MARKET_BACKUPS_MAX_FILES")
+    log_max_file_mb: int = Field(default=10, validation_alias="AI_MARKET_LOG_MAX_FILE_MB")
+    log_backup_count: int = Field(default=5, validation_alias="AI_MARKET_LOG_BACKUP_COUNT")
+    temp_retention_hours: int = Field(default=24, validation_alias="AI_MARKET_TEMP_RETENTION_HOURS")
+    disk_warning_free_mb: int = Field(default=1024, validation_alias="AI_MARKET_DISK_WARNING_FREE_MB")
+    disk_critical_free_mb: int = Field(default=512, validation_alias="AI_MARKET_DISK_CRITICAL_FREE_MB")
+    provider_observations_retention_days: int = Field(default=30, validation_alias="AI_MARKET_PROVIDER_OBSERVATIONS_RETENTION_DAYS")
+    enrichment_runs_retention_days: int = Field(default=30, validation_alias="AI_MARKET_ENRICHMENT_RUNS_RETENTION_DAYS")
+    expired_cache_retention_days: int = Field(default=7, validation_alias="AI_MARKET_EXPIRED_CACHE_RETENTION_DAYS")
+    market_news_retention_days: int = Field(default=30, validation_alias="AI_MARKET_MARKET_NEWS_RETENTION_DAYS")
+    db_vacuum_min_size_mb: int = Field(default=250, validation_alias="AI_MARKET_DB_VACUUM_MIN_SIZE_MB")
+    db_vacuum_min_reclaimable_mb: int = Field(default=50, validation_alias="AI_MARKET_DB_VACUUM_MIN_RECLAIMABLE_MB")
+    storage_cleanup_interval_hours: int = Field(default=24, validation_alias="AI_MARKET_STORAGE_CLEANUP_INTERVAL_HOURS")
     timezone: str = "Europe/Rome"
     http_timeout_seconds: float = 15.0
     timeout_macro_seconds: float = Field(default=30.0, validation_alias="AI_MARKET_TIMEOUT_MACRO_SECONDS")

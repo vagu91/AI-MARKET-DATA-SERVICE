@@ -42,9 +42,12 @@ from app.services.context_extensions_service import enrich_nasdaq_context
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
 from app.services.social_sentiment_service import SocialSentimentService
+from app.core.logging import logging_rotation_config
 from app.infrastructure.persistence.database import database_health
+from app.infrastructure.persistence.database_maintenance import analyze_database
 from app.infrastructure.persistence.migrations import migrate_database
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
+from app.infrastructure.storage_retention import retention_policy_report, storage_health
 
 router = APIRouter()
 
@@ -286,6 +289,43 @@ async def db_cache_stats(
         "database_path": str(settings.database_path),
         "single_physical_database": True,
         "stats": repository.stats(),
+        "service_role": "data provider only",
+    }
+
+
+@router.get("/storage/health")
+async def storage_health_endpoint(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    health = storage_health(settings)
+    return {
+        **health,
+        "database_maintenance": {
+            "enabled": True,
+            "analysis": analyze_database(settings),
+        },
+        "service_role": "data provider only",
+    }
+
+
+@router.get("/storage/retention-policy")
+async def storage_retention_policy(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    return {
+        "status": "ok",
+        "storage_retention_enabled": True,
+        "policies": retention_policy_report(settings),
+        "log_rotation": logging_rotation_config(settings),
+        "database_maintenance": {
+            "provider_observations_retention_days": settings.provider_observations_retention_days,
+            "enrichment_runs_retention_days": settings.enrichment_runs_retention_days,
+            "expired_cache_retention_days": settings.expired_cache_retention_days,
+            "market_news_retention_days": settings.market_news_retention_days,
+            "vacuum_manual_or_scheduled": True,
+        },
         "service_role": "data provider only",
     }
 

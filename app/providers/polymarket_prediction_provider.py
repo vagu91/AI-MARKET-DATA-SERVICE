@@ -126,9 +126,24 @@ class PolymarketPredictionProvider:
                         if isinstance(payload, list):
                             raw_events.extend(item for item in payload if isinstance(item, dict))
                     except Exception as exc:
-                        errors.append(f"{tag_slug}:{exc or type(exc).__name__}")
+                        failure = _classify_failure(exc)
+                        errors.append(f"{tag_slug}:{failure['failure_type']}:{failure['reason']}")
         except TimeoutError:
-            return _status("provider_timeout", "Polymarket discovery timed out", started)
+            return _status("provider_timeout", "Polymarket discovery timed out", started, failure_type="timeout", retryable=True)
+
+        if errors and not raw_events:
+            failure = _classify_error_messages(errors)
+            return _status(
+                str(failure["status"]),
+                str(failure["reason"]),
+                started,
+                failure_type=str(failure.get("failure_type") or failure["status"]),
+                http_status=failure.get("http_status"),
+                network_error=bool(failure.get("network_error")),
+                ssl_error=bool(failure.get("ssl_error")),
+                retryable=bool(failure.get("retryable")),
+                next_retry_at=failure.get("next_retry_at"),
+            )
 
         candidates, rejected, rejected_samples = _markets_from_events(raw_events, self.settings)
         candidates = _dedupe_markets(candidates)
@@ -140,6 +155,12 @@ class PolymarketPredictionProvider:
             "provider": self.source,
             "source": "Polymarket Gamma API",
             "source_url": self.settings.polymarket_gamma_base_url,
+            "failure_type": None,
+            "http_status": None,
+            "network_error": False,
+            "ssl_error": False,
+            "retryable": False,
+            "next_retry_at": None,
             "retrieved_at": _iso(now),
             "valid_until": _iso(now + timedelta(minutes=self.settings.polymarket_cache_minutes)),
             "markets": accepted,
@@ -534,7 +555,76 @@ def _is_past(value: Any) -> bool:
     return parsed.astimezone(UTC) < datetime.now(UTC)
 
 
-def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:
+def _classify_failure(exc: Exception) -> dict[str, Any]:
+    reason = str(exc) or type(exc).__name__
+    lowered = reason.lower()
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        if status_code == 404:
+            return _failure("not_found", reason, failure_type="http_404", http_status=status_code, retryable=False)
+        if status_code in {401, 403}:
+            return _failure("access_restricted", reason, failure_type="access_restricted", http_status=status_code, retryable=False)
+        if status_code == 429:
+            return _failure("rate_limited", reason, failure_type="rate_limited", http_status=status_code, retryable=False, next_retry_at=_iso(datetime.now(UTC) + timedelta(minutes=15)))
+        return _failure("provider_failed", reason, failure_type="http_error", http_status=status_code, retryable=status_code >= 500)
+    if "certificate" in lowered or "ssl" in lowered or "hostname" in lowered:
+        return _failure("ssl_error", reason, failure_type="ssl_error", ssl_error=True, retryable=False)
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, httpx.TransportError)):
+        return _failure("provider_failed", reason, failure_type="network_error", network_error=True, retryable=True)
+    return _failure("provider_failed", reason, failure_type="provider_failed", retryable=True)
+
+
+def _classify_error_messages(errors: list[str]) -> dict[str, Any]:
+    joined = " | ".join(errors)
+    lowered = joined.lower()
+    if "ssl_error" in lowered or "certificate" in lowered or "hostname" in lowered:
+        return _failure("ssl_error", joined, failure_type="ssl_error", ssl_error=True, retryable=False)
+    if "rate_limited" in lowered or "429" in lowered:
+        return _failure("rate_limited", joined, failure_type="rate_limited", http_status=429, retryable=False, next_retry_at=_iso(datetime.now(UTC) + timedelta(minutes=15)))
+    if "access_restricted" in lowered or "403" in lowered or "401" in lowered:
+        return _failure("access_restricted", joined, failure_type="access_restricted", http_status=403, retryable=False)
+    if "http_404" in lowered or "404" in lowered:
+        return _failure("not_found", joined, failure_type="http_404", http_status=404, retryable=False)
+    if "network_error" in lowered:
+        return _failure("provider_failed", joined, failure_type="network_error", network_error=True, retryable=True)
+    return _failure("provider_failed", joined, failure_type="provider_failed", retryable=True)
+
+
+def _failure(
+    status: str,
+    reason: str,
+    *,
+    failure_type: str,
+    http_status: int | None = None,
+    network_error: bool = False,
+    ssl_error: bool = False,
+    retryable: bool = False,
+    next_retry_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reason": reason,
+        "failure_type": failure_type,
+        "http_status": http_status,
+        "network_error": network_error,
+        "ssl_error": ssl_error,
+        "retryable": retryable,
+        "next_retry_at": next_retry_at,
+    }
+
+
+def _status(
+    status: str,
+    reason: str,
+    started: datetime,
+    *,
+    failure_type: str | None = None,
+    http_status: Any = None,
+    network_error: bool = False,
+    ssl_error: bool = False,
+    retryable: bool = False,
+    next_retry_at: Any = None,
+) -> dict[str, Any]:
     now = datetime.now(UTC)
     return {
         "status": status,
@@ -546,9 +636,26 @@ def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:
         "markets": [],
         "events": [],
         "labeling": {"probability_type": "market_implied", "objective_probability": False, "signal": False},
-        "diagnostics": {"accepted": 0, "accepted_events": 0, "rejected_samples": [], "auth_used": False},
-        "warnings": [reason] if status != "provider_failed" else [],
-        "errors": [reason] if status == "provider_failed" else [],
+        "failure_type": failure_type,
+        "http_status": http_status,
+        "network_error": network_error,
+        "ssl_error": ssl_error,
+        "retryable": retryable,
+        "next_retry_at": next_retry_at,
+        "diagnostics": {
+            "accepted": 0,
+            "accepted_events": 0,
+            "rejected_samples": [],
+            "auth_used": False,
+            "failure_type": failure_type,
+            "http_status": http_status,
+            "network_error": network_error,
+            "ssl_error": ssl_error,
+            "retryable": retryable,
+            "next_retry_at": next_retry_at,
+        },
+        "warnings": [reason] if status in {"not_found", "access_restricted", "rate_limited", "ssl_error"} else [],
+        "errors": [reason] if status in {"provider_failed", "ssl_error", "provider_timeout"} else [],
         "duration_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),
     }
 
