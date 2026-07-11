@@ -268,7 +268,6 @@ def test_each_critical_readiness_section_blocks(missing: str) -> None:
 @pytest.mark.parametrize(
     ("field", "section"),
     [
-        ("readiness_require_news", "news_context"),
         ("readiness_require_rates", "rates_expectations"),
         ("readiness_require_positioning", "positioning"),
         ("readiness_require_sentiment", "sentiment"),
@@ -282,6 +281,16 @@ def test_optional_readiness_configuration_can_make_section_required(field: str, 
     cfg = Settings(_env_file=None, **{field: True})
     hardened = harden_market_context(full, settings=cfg, now=SATURDAY)
     assert f"{section}_required" in hardened["readiness"]["blocking_reasons"]
+
+
+def test_expected_weekend_news_does_not_block_when_news_is_required() -> None:
+    hardened = harden_market_context(
+        minimal_full(),
+        settings=Settings(_env_file=None, readiness_require_news=True),
+        now=SATURDAY,
+    )
+    assert "news_context_required" not in hardened["readiness"]["blocking_reasons"]
+    assert hardened["readiness"]["ready_for_trading_context"] is True
 
 
 @pytest.mark.parametrize(
@@ -581,7 +590,7 @@ def test_hardening_is_idempotent_for_same_context_date() -> None:
     assert second == first
     assert second["metadata"]["hardening"] == {
         "completed": True,
-        "version": "market_context_hardening_v3",
+        "version": "market_context_hardening_v4",
         "context_date": "2026-07-11",
         "pass_count": 1,
     }

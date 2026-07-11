@@ -5,7 +5,9 @@ import logging
 from typing import Any
 
 from app.core.config import Settings
+from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_hardening_service import harden_market_context
+from app.services.market_session_service import NEW_YORK
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,11 @@ def build_ai_trader_consumer_v2(
         "positioning": _positioning(hardened.get("positioning") or {}),
         "nasdaq": _nasdaq(hardened.get("nasdaq_context") or {}),
         "earnings": _earnings(hardened),
-        "news": _news(hardened.get("news_context") or {}, hardened.get("news_digest") or {}),
+        "news": _news(
+            hardened.get("news_context") or {},
+            hardened.get("news_digest") or {},
+            hardened.get("market_schedule") or {},
+        ),
         "sentiment": _sentiment(hardened.get("sentiment_context") or {}),
         "market_schedule": _schedule(hardened.get("market_schedule") or {}),
         "quality": hardened.get("quality") or {},
@@ -125,8 +131,21 @@ def _macro(snapshot: dict[str, Any]) -> dict[str, Any]:
         "NFP": labor.get("CES0000000001"),
         "unemployment": labor.get("LNS14000000"),
     }
+    projected = {key: _metric(value or {}) for key, value in rows.items()}
+    series_lifecycle = {
+        key: _series_lifecycle(key, value or {})
+        for key, value in rows.items()
+        if value
+    }
+    policy_refs = {item["policy_ref"] for item in series_lifecycle.values()}
     return {
-        **{key: _metric(value or {}) for key, value in rows.items()},
+        **projected,
+        "series_lifecycle": series_lifecycle,
+        "series_lifecycle_policies": {
+            key: value
+            for key, value in _macro_lifecycle_policies().items()
+            if key in policy_refs
+        },
         "lifecycle": snapshot.get("lifecycle") or {},
     }
 
@@ -137,7 +156,9 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
     critical = list(calendar.get("critical_macro_events") or [])
     fed = list(calendar.get("fed_communications") or [])
     active = list(windows.get("active") or windows.get("active_event_windows") or [])
-    upcoming = [item for item in (windows.get("upcoming") or windows.get("upcoming_event_windows") or []) if str(item.get("impact") or "").upper() == "HIGH"]
+    upcoming = [item for item in (windows.get("upcoming") or windows.get("upcoming_event_windows") or []) if str(item.get("impact") or "").upper() == "HIGH" and _event_release_at(item)]
+    unscheduled = [item for item in (windows.get("upcoming_unscheduled") or []) if str(item.get("impact") or "").upper() == "HIGH"]
+    scheduled_critical = [item for item in critical if _event_release_at(item)]
     return {
         "consensus_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_consensus") or {},
         "actual_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_actual") or {},
@@ -145,19 +166,22 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
         "event_risk_window_status": windows.get("event_risk_window_status"),
         "active_windows": [_event(item) for item in active[:6]],
         "upcoming_high_impact_windows": [_event(item) for item in upcoming[:8]],
-        "next_critical_event": _event(critical[0]) if critical else None,
+        "upcoming_high_impact_events_unscheduled": [_unscheduled_event(item) for item in unscheduled[:8]],
+        "next_critical_event": _event(scheduled_critical[0]) if scheduled_critical else None,
         "next_fomc": _event(next((item for item in [*critical, *fed] if "FOMC" in _event_text(item)), {})) or None,
         "critical_events": [_event(item) for item in critical[:8]],
+        "warnings": windows.get("warnings") or [],
     }
 
 
 def _rates(rates: dict[str, Any]) -> dict[str, Any]:
+    meetings = [_meeting(item) for item in (rates.get("meetings") or [])[:4]]
     return {
         "lifecycle": rates.get("lifecycle") or {},
         "status": rates.get("status"),
         "current_fed_state": rates.get("current_fed_state") or {},
-        "next_meeting": _meeting(rates.get("next_meeting") or {}),
-        "meetings": [_meeting(item) for item in (rates.get("meetings") or [])[:4]],
+        "next_meeting": dict(meetings[0]) if meetings else None,
+        "meetings": meetings,
         "sanity_check": rates.get("sanity_check") or {},
         "repricing_summary": _select(
             rates.get("repricing") or {},
@@ -281,7 +305,21 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _news(news: dict[str, Any], digest: dict[str, Any]) -> dict[str, Any]:
+def _news(news: dict[str, Any], digest: dict[str, Any], schedule: dict[str, Any]) -> dict[str, Any]:
+    current_drivers: list[dict[str, Any]] = []
+    previous_session_drivers: list[dict[str, Any]] = []
+    for raw in (digest.get("drivers") or [])[:12]:
+        driver = _news_driver(
+            raw,
+            context_date=str(news.get("context_date") or schedule.get("context_date") or ""),
+            previous_session_date=str(schedule.get("last_market_session_date") or ""),
+        )
+        if not driver:
+            continue
+        if driver["context_classification"] == "CURRENT_DAY":
+            current_drivers.append(driver)
+        elif driver["context_classification"] == "PREVIOUS_SESSION":
+            previous_session_drivers.append(driver)
     return {
         "lifecycle": news.get("lifecycle") or {},
         "status": news.get("status"),
@@ -298,7 +336,8 @@ def _news(news: dict[str, Any], digest: dict[str, Any]) -> dict[str, Any]:
         "rejected_article_count": news.get("rejected_article_count"),
         "articles": [_article(item) for item in (news.get("articles") or news.get("latest") or [])[:8]],
         "clusters": [_cluster(item) for item in (news.get("clusters") or [])[:8]],
-        "drivers": (digest.get("drivers") or [])[:8],
+        "current_drivers": current_drivers[:8],
+        "previous_session_drivers": previous_session_drivers[:8],
         "quality": news.get("quality") or {},
         "reason": news.get("reason"),
         "warnings": news.get("warnings") or digest.get("warnings") or [],
@@ -385,14 +424,14 @@ def _contract(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ratio(item: dict[str, Any]) -> dict[str, Any]:
-    return _select(item, "ratio_id", "scope", "basis", "put_value", "call_value", "ratio", "change_1d", "change_5d", "moving_average_5d", "moving_average_20d", "percentile_1y", "relative_regime", "data_as_of", "source", "freshness")
+    return _select(item, "ratio_id", "scope", "basis", "put_value", "call_value", "ratio", "change_1d", "change_5d", "moving_average_5d", "moving_average_20d", "percentile_1y", "z_score_1y", "history_depth", "history_status", "relative_regime", "data_as_of", "source", "freshness")
 
 
 def _event(item: dict[str, Any]) -> dict[str, Any]:
     if not item:
         return {}
     enrichment = item.get("enrichment") or {}
-    lineage = _select(
+    lineage = _drop_empty(_select(
         enrichment,
         "source",
         "source_url",
@@ -406,37 +445,28 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
         "cache_status",
         "valid_until",
         "next_refresh_at",
-    )
-    return {
-        **_select(item, "event_id", "name", "event_name", "category", "impact", "date", "time_utc", "release_at", "event_type", "release_period", "period_date_consistent", "event_risk_window_status"),
+    ))
+    if lineage.get("field_lineage"):
+        lineage["field_lineage"] = _compact_field_lineage(
+            lineage["field_lineage"],
+            shared_evidence=lineage.get("evidence"),
+        )
+    if lineage.get("evidence_text") == lineage.get("evidence"):
+        lineage.pop("evidence_text", None)
+    projected = {
+        **_select(item, "event_id", "name", "event_name", "category", "impact", "date", "time_utc", "event_type", "release_period", "period_date_consistent", "event_risk_window_status"),
+        "release_at": _event_release_at(item),
         "consensus": enrichment.get("consensus"),
         "previous": enrichment.get("previous"),
         "actual": enrichment.get("actual"),
-        "lineage": lineage,
         "metrics": [
-            _select(
-                metric,
-                "metric_id",
-                "name",
-                "consensus",
-                "forecast",
-                "previous",
-                "actual",
-                "unit",
-                "frequency",
-                "source",
-                "source_url",
-                "provider_type",
-                "confidence",
-                "reliability",
-                "evidence",
-                "evidence_text",
-                "validation",
-                "field_lineage",
-            )
+            _event_metric(metric)
             for metric in (enrichment.get("metrics") or [])[:6]
         ],
     }
+    if lineage and (lineage.get("provider_type") in {"AI_RESEARCHER_CODEX_CLI", "MIXED"} or lineage.get("field_lineage")):
+        projected["lineage"] = lineage
+    return projected
 
 
 def _meeting(item: dict[str, Any]) -> dict[str, Any]:
@@ -507,6 +537,189 @@ def _compact_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
         output["warnings"] = [item[:180] for item in warnings[:5]]
     output["blocking"] = False
     return output
+
+
+def _series_lifecycle(series_name: str, item: dict[str, Any]) -> dict[str, Any]:
+    frequency = str(item.get("frequency") or "unknown").lower()
+    if series_name in {"Fed target lower", "Fed target upper"}:
+        policy_ref = "fed_target"
+    elif frequency == "daily":
+        policy_ref = "daily_market"
+    elif frequency == "weekly":
+        policy_ref = "weekly_release"
+    elif frequency == "monthly":
+        policy_ref = "monthly_release"
+    elif frequency == "quarterly":
+        policy_ref = "quarterly_release"
+    else:
+        policy_ref = "unknown_frequency"
+    lifecycle = {
+        "frequency": frequency,
+        "lifecycle_status": "KNOWN" if item.get("valid_until") and item.get("next_refresh_at") else "POLICY_DEFINED_DATE_UNKNOWN",
+        "policy_ref": policy_ref,
+    }
+    if item.get("valid_until"):
+        lifecycle["valid_until"] = item["valid_until"]
+    if item.get("next_refresh_at"):
+        lifecycle["next_refresh_at"] = item["next_refresh_at"]
+    return lifecycle
+
+
+def _macro_lifecycle_policies() -> dict[str, dict[str, Any]]:
+    return {
+        "daily_market": {
+            "refresh_policy": "refresh_next_market_session",
+            "carry_forward_allowed": True,
+            "stale_policy": "carry_only_with_explicit_last_session_or_stale_label",
+        },
+        "fed_target": {
+            "refresh_policy": "verify_daily_and_refresh_on_fomc_decision",
+            "carry_forward_allowed": True,
+            "stale_policy": "valid_until_superseded_by_official_target_decision",
+        },
+        "weekly_release": {
+            "refresh_policy": "refresh_on_next_official_weekly_release",
+            "carry_forward_allowed": True,
+            "stale_policy": "carry_only_with_current_release_or_stale_label",
+        },
+        "monthly_release": {
+            "refresh_policy": "refresh_on_next_official_monthly_release",
+            "carry_forward_allowed": True,
+            "stale_policy": "carry_published_value_until_superseded_with_release_freshness",
+        },
+        "quarterly_release": {
+            "refresh_policy": "refresh_on_next_official_quarterly_release",
+            "carry_forward_allowed": True,
+            "stale_policy": "carry_published_value_until_superseded_with_release_freshness",
+        },
+        "unknown_frequency": {
+            "refresh_policy": "refresh_from_official_provider_when_due",
+            "carry_forward_allowed": True,
+            "stale_policy": "unknown_frequency_requires_explicit_freshness",
+        },
+    }
+
+
+def _event_release_at(item: dict[str, Any]) -> str | None:
+    direct = item.get("release_at") or item.get("release_at_utc")
+    parsed = parse_datetime(direct)
+    if parsed:
+        return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    event_date = str(item.get("date") or "").strip()
+    event_time = str(item.get("time_utc") or "").strip()
+    parsed = parse_datetime(event_time)
+    if parsed:
+        return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if event_date and event_time:
+        parsed = parse_datetime(f"{event_date}T{event_time.replace('Z', '')}Z")
+        if parsed:
+            return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return None
+
+
+def _unscheduled_event(item: dict[str, Any]) -> dict[str, Any]:
+    return _select(
+        item,
+        "event_id",
+        "event_name",
+        "event_type",
+        "impact",
+        "schedule_status",
+        "reason",
+        "source",
+        "source_url",
+    )
+
+
+def _news_driver(
+    raw: Any,
+    *,
+    context_date: str,
+    previous_session_date: str,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    published = parse_datetime(raw.get("published_at_latest") or raw.get("published_at"))
+    if published is None:
+        return None
+    source_context_date = published.astimezone(NEW_YORK).date().isoformat()
+    if source_context_date == context_date:
+        classification = "CURRENT_DAY"
+    elif source_context_date == previous_session_date:
+        classification = "PREVIOUS_SESSION"
+    else:
+        return None
+    return {
+        **raw,
+        "context_classification": classification,
+        "source_context_date": source_context_date,
+        "is_current_context_date": classification == "CURRENT_DAY",
+        "is_previous_session_context": classification == "PREVIOUS_SESSION",
+        "usable_for_current_news_analysis": classification == "CURRENT_DAY",
+    }
+
+
+def _event_metric(metric: dict[str, Any]) -> dict[str, Any]:
+    output = _select(
+        metric,
+        "metric_id",
+        "name",
+        "consensus",
+        "forecast",
+        "previous",
+        "actual",
+        "unit",
+        "frequency",
+        "source",
+        "source_url",
+        "provider_type",
+        "confidence",
+        "reliability",
+        "evidence",
+        "validation",
+        "field_lineage",
+    )
+    for key in ("source", "source_url", "provider_type", "confidence", "reliability", "evidence", "validation", "field_lineage"):
+        if output.get(key) in (None, "", {}, []):
+            output.pop(key, None)
+    if output.get("provider_type") not in {"AI_RESEARCHER_CODEX_CLI", "MIXED"}:
+        output.pop("field_lineage", None)
+    elif output.get("field_lineage"):
+        output["field_lineage"] = _compact_field_lineage(
+            output["field_lineage"],
+            shared_evidence=output.get("evidence"),
+        )
+    return output
+
+
+def _compact_field_lineage(raw: Any, *, shared_evidence: Any = None) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    output: dict[str, Any] = {}
+    for field, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        compact = _drop_empty(
+            _select(
+                value,
+                "source",
+                "source_url",
+                "provider_type",
+                "confidence",
+                "reliability",
+                "evidence",
+                "validation",
+            )
+        )
+        if compact.get("evidence") == shared_evidence:
+            compact.pop("evidence", None)
+        if compact:
+            output[str(field)] = compact
+    return output
+
+
+def _drop_empty(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if value not in (None, "", {}, [])}
 
 
 def _select(item: dict[str, Any], *keys: str) -> dict[str, Any]:

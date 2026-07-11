@@ -20,9 +20,9 @@ from app.services.market_session_service import (
 
 
 logger = logging.getLogger(__name__)
-READINESS_VERSION = "session_aware_readiness_v2"
-QUALITY_VERSION = "available_data_quality_v2"
-HARDENING_VERSION = "market_context_hardening_v3"
+READINESS_VERSION = "session_aware_readiness_v3"
+QUALITY_VERSION = "available_data_quality_v3"
+HARDENING_VERSION = "market_context_hardening_v4"
 NEWS_STATUSES = {
     "AVAILABLE",
     "PARTIAL",
@@ -82,6 +82,10 @@ def harden_market_context(
     output["rates_expectations"] = _harden_fed_expectations(
         output.get("rates_expectations") or {},
         macro_snapshot=output.get("macro_snapshot") or {},
+    )
+    output["risk_context"] = _harden_put_call_history(
+        output.get("risk_context") or {},
+        history_min=settings.risk_context_history_min_points,
     )
     output["sentiment_context"] = _harden_sentiment(
         output.get("sentiment_context") or {},
@@ -297,13 +301,14 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
     rates = full.get("rates_expectations") or {}
     sentiment = full.get("sentiment_context") or {}
     prediction = sentiment.get("prediction_markets") or (full.get("sentiment") or {}).get("prediction_markets") or {}
+    news_status = str(news.get("status") or "NOT_CONFIGURED")
     section_status = {
         "macro_snapshot": _section_status(_macro_available(full.get("macro_snapshot") or {})),
         "event_risk": _event_section_status(events_today),
         "market_schedule": _section_status(bool(full.get("market_schedule"))),
         "risk_context": _section_status(_risk_available(full.get("risk_context") or {})),
         "nasdaq_context": _section_status(_nasdaq_available(full.get("nasdaq_context") or {})),
-        "news_context": str(news.get("status") or "NOT_CONFIGURED"),
+        "news_context": "NO_DATA_EXPECTED" if news_status == "MARKET_CLOSED_NO_FRESH_NEWS" else news_status,
         "rates_expectations": _optional_status(rates),
         "positioning": _optional_status(full.get("positioning") or {}),
         "earnings": _optional_status((full.get("nasdaq_context") or {}).get("earnings") or {}),
@@ -340,7 +345,7 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
 
     for section, field in OPTIONAL_SECTION_CONFIG.items():
         status = section_status[section]
-        if status not in {"AVAILABLE", "LAST_KNOWN_GOOD"}:
+        if status not in {"AVAILABLE", "LAST_KNOWN_GOOD", "NO_DATA_EXPECTED", "NO_RELEVANT_DATA", "NO_RELEVANT_MARKETS"}:
             missing_optional.append(section)
             if bool(getattr(settings, field)):
                 blocking.append(f"{section}_required")
@@ -353,6 +358,14 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
         status = "DEGRADED"
     else:
         status = "READY"
+    full_acceptable = {
+        "AVAILABLE",
+        "NO_DATA_EXPECTED",
+        "NO_RELEVANT_DATA",
+        "NO_RELEVANT_MARKETS",
+    }
+    full_ready = trading_ready and all(value in full_acceptable for value in section_status.values())
+    confidence = _readiness_confidences(section_status, full.get("quality") or {}, trading_ready=trading_ready)
     readiness = {
         "status": status,
         "ready": trading_ready,
@@ -364,7 +377,7 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
         "ready_for_news_analysis": news.get("status") in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"},
         "ready_for_sentiment_analysis": section_status["sentiment"] in {"AVAILABLE", "LAST_KNOWN_GOOD"},
         "ready_for_trading_context": trading_ready,
-        "ready_for_full_analysis": trading_ready and not critical_errors,
+        "ready_for_full_analysis": full_ready,
         "critical_errors": sorted(set(critical_errors)),
         "critical_error_count": len(set(critical_errors)),
         "blocking_reasons": sorted(set(blocking)),
@@ -372,7 +385,10 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
         "informational_reasons": sorted(set(informational)),
         "missing_optional_sections": sorted(set(missing_optional)),
         "section_status": section_status,
-        "confidence": _readiness_confidence(section_status, trading_ready),
+        "available_data_confidence": confidence["available_data_confidence"],
+        "full_analysis_confidence": confidence["full_analysis_confidence"],
+        "confidence": confidence["available_data_confidence"],
+        "confidence_method": confidence["method"],
         "market_session_status": session_status,
         "version": READINESS_VERSION,
     }
@@ -556,10 +572,46 @@ def _harden_fed_expectations(rates: dict[str, Any], *, macro_snapshot: dict[str,
             "status": "FAIL",
             "warnings": [f"sanity_check_pipeline_error:{type(exc).__name__}"],
         }
-    for meeting in output.get("meetings") or []:
+    meetings = [dict(item) for item in (output.get("meetings") or []) if isinstance(item, dict)]
+    for meeting in meetings:
         if isinstance(meeting, dict):
             meeting["probability_semantics"] = "probability_target_range_after_meeting_relative_to_current_range"
             meeting["is_single_meeting_action_probability"] = False
+    output["meetings"] = meetings
+    output["next_meeting"] = dict(meetings[0]) if meetings else None
+    return output
+
+
+def _harden_put_call_history(risk: dict[str, Any], *, history_min: int) -> dict[str, Any]:
+    output = dict(risk)
+    put_call = dict(output.get("put_call") or {})
+    ratios = [dict(item) for item in (put_call.get("ratios") or []) if isinstance(item, dict)]
+    by_id = {
+        str(key): dict(item)
+        for key, item in (put_call.get("by_id") or {}).items()
+        if isinstance(item, dict)
+    }
+    if not ratios and by_id:
+        ratios = list(by_id.values())
+    normalized: list[dict[str, Any]] = []
+    for item in ratios:
+        depth = max(int(item.get("history_depth") or 1), 1) if item.get("ratio") is not None else 0
+        item["history_depth"] = depth
+        item["history_status"] = "NOT_AVAILABLE" if depth == 0 else "SUFFICIENT" if depth - 1 >= history_min else "INSUFFICIENT"
+        if depth < 2:
+            item["change_1d"] = None
+        if depth < 5:
+            item["change_5d"] = None
+            item["moving_average_5d"] = None
+        if depth < 20:
+            item["moving_average_20d"] = None
+        if depth - 1 < history_min:
+            item["percentile_1y"] = None
+            item["z_score_1y"] = None
+        normalized.append(item)
+    put_call["ratios"] = normalized
+    put_call["by_id"] = {str(item.get("ratio_id")): item for item in normalized if item.get("ratio_id")}
+    output["put_call"] = put_call
     return output
 
 
@@ -596,6 +648,7 @@ def _harden_sentiment(sentiment: dict[str, Any], *, social: dict[str, Any], mark
         output["fear_greed"].get("status") == "AVAILABLE",
         prediction.get("status") == "AVAILABLE",
     ]
+    quality_score = round(sum(available) / len(available), 3)
     output["sentiment_quality"] = {
         "aaii_available": available[0],
         "retail_symbol_available": available[1],
@@ -603,10 +656,10 @@ def _harden_sentiment(sentiment: dict[str, Any], *, social: dict[str, Any], mark
         "fear_greed_available": available[3],
         "prediction_markets_available": available[4],
         "source_diversity": sum(available),
-        "quality_score": round(sum(available) / len(available), 3),
+        "quality_score": quality_score,
         "market_closed_adjustment": market_closed,
     }
-    output["status"] = "AVAILABLE" if any(available) else "NOT_CONFIGURED"
+    output["status"] = "AVAILABLE" if quality_score >= 0.5 else "PARTIAL" if any(available) else "NOT_CONFIGURED"
     output["blocking"] = False
     return output
 
@@ -628,8 +681,20 @@ def _news_digest_view(news: dict[str, Any], legacy: dict[str, Any]) -> dict[str,
 
 def _event_window_status(windows: dict[str, Any], *, events_today: dict[str, Any]) -> dict[str, Any]:
     output = dict(windows)
-    active = list(output.get("active") or output.get("active_event_windows") or [])
-    upcoming = list(output.get("upcoming") or output.get("upcoming_event_windows") or [])
+    raw_active = list(output.get("active") or output.get("active_event_windows") or [])
+    raw_upcoming = list(output.get("upcoming") or output.get("upcoming_event_windows") or [])
+    active = [normalized for item in raw_active if (normalized := _scheduled_event(item)) is not None]
+    upcoming = [normalized for item in raw_upcoming if (normalized := _scheduled_event(item)) is not None]
+    unscheduled = [_unscheduled_event(item) for item in raw_upcoming if _scheduled_event(item) is None]
+    output["active"] = active
+    output["upcoming"] = upcoming
+    output["upcoming_unscheduled"] = unscheduled
+    if "active_event_windows" in output:
+        output["active_event_windows"] = active
+    if "upcoming_event_windows" in output:
+        output["upcoming_event_windows"] = upcoming
+    if unscheduled:
+        output["warnings"] = list(dict.fromkeys([*(output.get("warnings") or []), "high_impact_events_present_but_unscheduled"]))
     high_active = any(str(item.get("impact") or "").upper() == "HIGH" for item in active if isinstance(item, dict))
     medium_active = any(str(item.get("impact") or "").upper() == "MEDIUM" for item in active if isinstance(item, dict))
     high_upcoming = any(str(item.get("impact") or "").upper() == "HIGH" for item in upcoming if isinstance(item, dict))
@@ -640,12 +705,48 @@ def _event_window_status(windows: dict[str, Any], *, events_today: dict[str, Any
         if medium_active
         else "UPCOMING_HIGH_IMPACT_WINDOW"
         if high_upcoming
+        else "NO_ACTIVE_WINDOW"
+        if unscheduled
         else "NO_EVENTS_SCHEDULED"
         if events_today.get("status") == "NO_EVENTS_SCHEDULED"
         else "NO_ACTIVE_WINDOW"
     )
     output["event_risk_window_status"] = status
     return output
+
+
+def _scheduled_event(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    item = dict(raw)
+    release = parse_datetime(item.get("release_at") or item.get("release_at_utc"))
+    if release is None:
+        event_date = str(item.get("date") or "").strip()
+        event_time = str(item.get("time_utc") or "").strip()
+        release = parse_datetime(event_time)
+        if release is None and event_date and event_time:
+            release = parse_datetime(f"{event_date}T{event_time.replace('Z', '')}Z")
+    if release is None:
+        return None
+    release = _aware(release)
+    item["release_at"] = release.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    item.setdefault("date", release.date().isoformat())
+    item.setdefault("time_utc", item["release_at"])
+    return item
+
+
+def _unscheduled_event(raw: Any) -> dict[str, Any]:
+    item = raw if isinstance(raw, dict) else {}
+    return {
+        "event_id": item.get("event_id"),
+        "event_name": item.get("event_name") or item.get("name"),
+        "event_type": item.get("event_type") or item.get("category"),
+        "impact": item.get("impact"),
+        "schedule_status": "UNSCHEDULED",
+        "reason": "missing_valid_release_timestamp",
+        "source": item.get("source"),
+        "source_url": item.get("source_url"),
+    }
 
 
 def _annotate_event_calendar(calendar: dict[str, Any]) -> dict[str, Any]:
@@ -895,31 +996,88 @@ def _section_status(available: bool) -> str:
 
 def _optional_status(block: dict[str, Any]) -> str:
     status = str(block.get("status") or "").upper()
-    if status in {"FOUND", "AVAILABLE", "COMPLETE", "PARTIAL"}:
+    if status in {"FOUND", "AVAILABLE", "COMPLETE"}:
         return "AVAILABLE"
+    if status == "PARTIAL":
+        return "PARTIAL"
     if status in {"STALE_ACCEPTABLE", "LAST_KNOWN_GOOD"}:
         return "LAST_KNOWN_GOOD"
     if status in {"DISABLED", "NOT_CONFIGURED"}:
         return "NOT_CONFIGURED"
-    if status in {"PROVIDER_FAILED", "PROVIDER_UNAVAILABLE", "SSL_ERROR", "ACCESS_RESTRICTED"}:
+    if status == "SSL_ERROR":
+        return "SSL_ERROR"
+    if status in {"PROVIDER_FAILED", "PROVIDER_UNAVAILABLE", "ACCESS_RESTRICTED"}:
         return "PROVIDER_UNAVAILABLE"
     if status == "PIPELINE_ERROR":
         return status
+    if status == "NO_RELEVANT_MARKETS":
+        return "NO_RELEVANT_MARKETS"
+    if status in {"NO_RELEVANT_DATA", "NO_RELEVANT_DATA_FOUND", "NO_RELEVANT_NEWS"}:
+        return "NO_RELEVANT_DATA"
+    if status in {"NO_DATA_EXPECTED", "NO_EVENTS_SCHEDULED", "MARKET_CLOSED_NO_FRESH_NEWS"}:
+        return "NO_DATA_EXPECTED"
     if (block.get("data_quality") or {}).get("no_data_found"):
         return "NO_DATA_EXPECTED"
     return "AVAILABLE" if block and any(value not in (None, {}, [], "") for value in block.values()) else "NOT_AVAILABLE"
 
 
-def _readiness_confidence(section_status: dict[str, str], ready: bool) -> float:
+def _readiness_confidences(
+    section_status: dict[str, str],
+    quality: dict[str, Any],
+    *,
+    trading_ready: bool,
+) -> dict[str, Any]:
     weights = {
-        "macro_snapshot": 0.22,
-        "event_risk": 0.18,
-        "market_schedule": 0.15,
-        "risk_context": 0.22,
-        "nasdaq_context": 0.23,
+        "macro_snapshot": 0.16,
+        "event_risk": 0.12,
+        "market_schedule": 0.10,
+        "risk_context": 0.16,
+        "nasdaq_context": 0.16,
+        "rates_expectations": 0.12,
+        "positioning": 0.06,
+        "earnings": 0.04,
+        "news_context": 0.04,
+        "sentiment": 0.02,
+        "prediction_markets": 0.02,
     }
-    score = sum(weight for key, weight in weights.items() if section_status.get(key) == "AVAILABLE")
-    return round(score if ready else score * 0.6, 3)
+    section_scores = {
+        "macro_snapshot": _score(quality.get("macro_quality")),
+        "event_risk": _score(quality.get("event_quality")),
+        "market_schedule": _score(quality.get("schedule_quality")),
+        "risk_context": _score(quality.get("risk_quality")),
+        "nasdaq_context": _score(quality.get("nasdaq_quality")),
+        "rates_expectations": _score(quality.get("rates_quality")),
+        "positioning": 1.0,
+        "earnings": 1.0,
+        "news_context": _score(quality.get("news_quality")),
+        "sentiment": _score(quality.get("sentiment_quality")),
+        "prediction_markets": _score(quality.get("sentiment_quality")),
+    }
+    usable = {"AVAILABLE", "LAST_KNOWN_GOOD"}
+    expected_absence = {"NO_DATA_EXPECTED", "NO_RELEVANT_DATA", "NO_RELEVANT_MARKETS"}
+    available_keys = [key for key in weights if section_status.get(key) in usable]
+    available_weight = sum(weights[key] for key in available_keys)
+    available_score = sum(
+        weights[key] * section_scores[key] * (0.85 if section_status.get(key) == "LAST_KNOWN_GOOD" else 1.0)
+        for key in available_keys
+    )
+    full_keys = [key for key in weights if section_status.get(key) not in expected_absence]
+    full_weight = sum(weights[key] for key in full_keys)
+    full_score = sum(
+        weights[key] * section_scores[key] * (0.85 if section_status.get(key) == "LAST_KNOWN_GOOD" else 1.0)
+        for key in full_keys
+        if section_status.get(key) in usable
+    )
+    available_confidence = available_score / available_weight if available_weight else 0.0
+    full_confidence = full_score / full_weight if full_weight else available_confidence
+    if not trading_ready:
+        available_confidence *= 0.6
+        full_confidence *= 0.6
+    return {
+        "available_data_confidence": round(available_confidence, 3),
+        "full_analysis_confidence": round(full_confidence, 3),
+        "method": "quality_weighted_by_section_status_v1; expected_absence_excluded",
+    }
 
 
 def _sentiment_status(value: Any, *, enabled: bool) -> str:
@@ -945,6 +1103,8 @@ def _prediction_status(value: Any, payload: dict[str, Any]) -> str:
         return "NO_RELEVANT_MARKETS"
     if status == "ssl_error" or payload.get("ssl_error") or payload.get("failure_type") == "ssl_error":
         return "SSL_ERROR"
+    if status == "pipeline_error":
+        return "PIPELINE_ERROR"
     return "PROVIDER_UNAVAILABLE"
 
 

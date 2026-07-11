@@ -418,13 +418,14 @@ def test_qqq_volume_and_open_interest_ratios_are_separate_and_scoped(complete, r
 
 def test_ratio_history_never_mixes_equity_and_index() -> None:
     snapshots = [{"put_call": {"by_id": {"equity_volume_put_call": {"ratio": .6}, "index_volume_put_call": {"ratio": 1.2}}}}]
-    assert ratio_history(snapshots, "equity_volume_put_call") == [{"ratio": .6, "data_as_of": None}]
+    assert ratio_history(snapshots, "equity_volume_put_call") == []
 
 
 def test_put_call_statistics_5d_20d_percentile_same_series() -> None:
     snapshots = []
     for index in range(70):
-        snapshots.append({"put_call": {"by_id": {"equity_volume_put_call": {"ratio": .5 + index / 100, "data_as_of": str(index)}}}})
+        observed = (NOW.date() - timedelta(days=index + 1)).isoformat()
+        snapshots.append({"put_call": {"by_id": {"equity_volume_put_call": {"ratio": .5 + index / 100, "data_as_of": observed}}}})
     result = normalize_put_call(cboe_ratios_payload()["ratios"], qqq_options={}, snapshot_history=snapshots, history_min=60, now=NOW)
     equity = result["by_id"]["equity_volume_put_call"]
     assert equity["moving_average_5d"] is not None

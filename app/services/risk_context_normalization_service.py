@@ -431,16 +431,26 @@ def normalize_put_call(
     qqq_rows = qqq_put_call_ratios(qqq_options, now=now)
     ratios.extend(qqq_rows)
     for item in ratios:
-        prior = ratio_history(snapshot_history, item["ratio_id"])
+        prior = ratio_history(
+            snapshot_history,
+            item["ratio_id"],
+            exclude_data_as_of=item.get("data_as_of"),
+        )
         values = [row["ratio"] for row in prior]
+        current_value = float(item["ratio"])
+        observations = [current_value, *values]
+        five_day_prior = _prior_at_least_days(prior, item.get("data_as_of"), days=5)
+        history_depth = len(observations)
         item.update(
             {
-                "moving_average_5d": round(fmean(values[:5]), 6) if len(values) >= 5 else None,
-                "moving_average_20d": round(fmean(values[:20]), 6) if len(values) >= 20 else None,
-                "change_1d": round(item["ratio"] - values[0], 6) if values else None,
-                "change_5d": round(item["ratio"] - values[4], 6) if len(values) >= 5 else None,
-                "percentile_1y": _percentile(item["ratio"], values[:252]) if len(values) >= history_min else None,
-                "z_score_1y": _zscore(item["ratio"], values[:252]) if len(values) >= history_min else None,
+                "moving_average_5d": round(fmean(observations[:5]), 6) if history_depth >= 5 else None,
+                "moving_average_20d": round(fmean(observations[:20]), 6) if history_depth >= 20 else None,
+                "change_1d": round(current_value - values[0], 6) if values else None,
+                "change_5d": round(current_value - five_day_prior["ratio"], 6) if five_day_prior else None,
+                "percentile_1y": _percentile(current_value, values[:252]) if len(values) >= history_min else None,
+                "z_score_1y": _zscore(current_value, values[:252]) if len(values) >= history_min else None,
+                "history_depth": history_depth,
+                "history_status": "SUFFICIENT" if len(values) >= history_min else "INSUFFICIENT",
             }
         )
         item["relative_regime"] = relative_regime(item["percentile_1y"])
@@ -512,13 +522,69 @@ def qqq_put_call_ratios(payload: dict[str, Any], *, now: datetime) -> list[dict[
     return rows
 
 
-def ratio_history(snapshots: list[dict[str, Any]], ratio_id: str) -> list[dict[str, Any]]:
-    output = []
+def ratio_history(
+    snapshots: list[dict[str, Any]],
+    ratio_id: str,
+    *,
+    exclude_data_as_of: Any = None,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen_dates: set[str] = set()
+    excluded = _observation_date(exclude_data_as_of)
     for snapshot in snapshots:
         item = (((snapshot.get("put_call") or {}).get("by_id") or {}).get(ratio_id))
-        if item and _positive_float(item.get("ratio")) is not None:
-            output.append({"ratio": float(item["ratio"]), "data_as_of": item.get("data_as_of")})
+        if not item or _positive_float(item.get("ratio")) is None:
+            continue
+        observed = _observation_date(item.get("data_as_of") or snapshot.get("data_as_of"))
+        if observed is None or observed == excluded or observed in seen_dates:
+            continue
+        seen_dates.add(observed)
+        output.append({"ratio": float(item["ratio"]), "data_as_of": observed})
     return output
+
+
+def _prior_at_least_days(
+    observations: list[dict[str, Any]],
+    current_data_as_of: Any,
+    *,
+    days: int,
+) -> dict[str, Any] | None:
+    current = _observation_date_value(current_data_as_of)
+    if current is None:
+        return None
+    cutoff = current - timedelta(days=days)
+    return next(
+        (
+            item
+            for item in observations
+            if (observed := _observation_date_value(item.get("data_as_of"))) is not None
+            and observed <= cutoff
+        ),
+        None,
+    )
+
+
+def _observation_date(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    parsed = parse_datetime(value)
+    if parsed:
+        return parsed.date().isoformat()
+    raw = str(value).strip()
+    try:
+        return date.fromisoformat(raw[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _observation_date_value(value: Any) -> date | None:
+    observed = _observation_date(value)
+    if observed is None:
+        return None
+    try:
+        return date.fromisoformat(observed)
+    except ValueError:
+        return None
 
 
 def calculate_temporal_alignment(

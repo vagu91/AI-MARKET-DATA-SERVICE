@@ -757,14 +757,7 @@ def _legacy_fed_funds_block(payload: dict[str, Any], legacy_block: dict[str, Any
 def _next_meeting_summary(meeting: dict[str, Any] | None) -> dict[str, Any] | None:
     if not meeting:
         return None
-    keys = (
-        "meeting_id", "meeting_date", "meeting_time_utc", "expected_target_midpoint", "expected_change_bps",
-        "most_likely_target_range", "most_likely_probability", "most_likely_probability_pct",
-        "cut_probability", "hold_probability", "hike_probability", "cut_25_probability",
-        "cut_50_or_more_probability", "hike_25_probability", "hike_50_or_more_probability",
-        "source", "source_url", "provider_type", "freshness", "confidence",
-    )
-    return {key: meeting.get(key) for key in keys}
+    return copy.deepcopy(meeting)
 
 
 def _series_value(rates: dict[str, Any], *keys: str) -> float | None:

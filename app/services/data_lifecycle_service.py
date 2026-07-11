@@ -227,11 +227,14 @@ def _record(
     explicit_valid_until: datetime | None,
 ) -> dict[str, Any]:
     policy = LIFECYCLE_POLICIES[category]
+    context_anchor = _context_date_anchor(context_date)
     born_at = _latest_timestamp(source, {"retrieved_at", "created_at", "generated_at", "generated_at_utc"})
+    if category == "market_schedule":
+        born_at = context_anchor
     valid_until = explicit_valid_until or _earliest_timestamp(source, {"valid_until", "consensus_valid_until"})
     data_present = _has_content(source)
     if valid_until is None:
-        valid_until = (born_at or now) + _default_ttl(category, settings) if data_present else now
+        valid_until = (born_at or context_anchor) + _default_ttl(category, settings)
     next_refresh = _earliest_timestamp(source, {"next_refresh", "next_refresh_at"}) or valid_until
     retention_days = _retention_days(category, settings)
     delete_after = valid_until + timedelta(days=retention_days) if valid_until and retention_days is not None else None
@@ -366,3 +369,11 @@ def _iso(value: datetime | None) -> str | None:
 
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _context_date_anchor(context_date: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(context_date).date()
+    except ValueError:
+        parsed = datetime.now(NEW_YORK).date()
+    return datetime.combine(parsed, datetime.min.time(), NEW_YORK).astimezone(UTC)
