@@ -35,6 +35,24 @@ def build_session_aware_schedule(
     }
     cash = _cash_session(local, closed_dates, early_closes)
     futures = _futures_session(local)
+    cme_calendar = existing.get("cme_calendar") or {}
+    official_cme = str(cme_calendar.get("status") or "").lower() == "found" and bool(cme_calendar.get("calendar_verified"))
+    if official_cme:
+        futures.update(
+            {
+                "source": cme_calendar.get("source") or "CME Group Trading Hours",
+                "source_url": cme_calendar.get("source_url"),
+                "source_classification": "official_cme_calendar",
+                "calendar_crosscheck_status": "verified",
+                "data_origin_is_official": True,
+                "distribution_source_is_official": True,
+                "source_is_primary_originator": True,
+                "source_is_official_redistributor": False,
+                "is_official_source": True,
+            }
+        )
+    else:
+        futures["calendar_crosscheck_status"] = str(cme_calendar.get("status") or "not_available")
     last_session = _previous_cash_session(local.date(), closed_dates)
     next_holiday = next(
         (item for item in sorted(holidays, key=lambda row: str(row.get("date") or "")) if str(item.get("date") or "") >= local.date().isoformat()),
@@ -83,7 +101,7 @@ def build_session_aware_schedule(
         "source_is_primary_originator": False,
         "source_is_official_redistributor": False,
         "source": _schedule_source(existing),
-        "warnings": _schedule_warnings(existing),
+        "warnings": _schedule_warnings(existing, official_cme=official_cme),
     }
 
 
@@ -220,7 +238,9 @@ def _schedule_source(schedule: dict[str, Any]) -> str:
     return str(source or "versioned session rules")
 
 
-def _schedule_warnings(schedule: dict[str, Any]) -> list[str]:
+def _schedule_warnings(schedule: dict[str, Any], *, official_cme: bool = False) -> list[str]:
+    if official_cme:
+        return []
     source = str((schedule.get("holiday_source") or {}).get("source") or "").lower()
     return [] if any(token in source for token in ("cme", "nasdaq", "nyse")) else ["official_cme_calendar_crosscheck_unavailable"]
 

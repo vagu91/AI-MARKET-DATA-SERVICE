@@ -277,6 +277,9 @@ class Settings(BaseSettings):
     enable_nasdaq_earnings: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_EARNINGS")
     enable_nasdaq_100: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_100")
     enable_nasdaq_market_info: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_MARKET_INFO")
+    enable_cme_market_schedule: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CME_MARKET_SCHEDULE")
+    cme_market_schedule_timeout_seconds: float = Field(default=10.0, validation_alias="AI_MARKET_CME_MARKET_SCHEDULE_TIMEOUT_SECONDS")
+    cme_market_schedule_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_CME_MARKET_SCHEDULE_TTL_HOURS")
     enable_nasdaq_qqq_options: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_QQQ_OPTIONS")
     enable_aaii_sentiment: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_AAII_SENTIMENT")
     enable_social_sentiment: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_SOCIAL_SENTIMENT")
@@ -367,6 +370,7 @@ class Settings(BaseSettings):
     cboe_put_call_url: str = "https://www.cboe.com/markets/us/options/market-statistics/daily"
     nasdaq_earnings_calendar_url: str = "https://api.nasdaq.com/api/calendar/earnings"
     nasdaq_market_info_url: str = "https://api.nasdaq.com/api/market-info"
+    cme_market_schedule_url: str = "https://www.cmegroup.com/trading-hours.html"
     nasdaq_qqq_option_chain_url: str = "https://api.nasdaq.com/api/quote/QQQ/option-chain"
     macromicro_aaii_chart_url: str = "https://en.macromicro.me/charts/20828/us-aaii-sentimentsurvey"
     macromicro_aaii_api_url: str = "https://en.macromicro.me/api/view/chart/20828"

@@ -7,6 +7,7 @@ from typing import Any
 
 from app.core.config import Settings
 from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
+from app.providers.cme_market_schedule_provider import CmeMarketScheduleProvider
 from app.providers.investing_economic_calendar_provider import InvestingEconomicCalendarProvider
 from app.providers.investing_fed_rate_monitor_provider import InvestingFedRateMonitorProvider
 from app.providers.investing_holiday_calendar_provider import InvestingHolidayCalendarProvider
@@ -29,6 +30,7 @@ FACT_TYPES = {
     "investing_economic_calendar": "investing_economic_calendar",
     "investing_holidays": "investing_holidays",
     "marketbeat_holidays": "marketbeat_holidays",
+    "cme_market_schedule": "cme_market_schedule",
     "investing_fed_rate_monitor": "investing_fed_rate_monitor",
     "cboe_risk_indices": "cboe_risk_indices",
     "nasdaq_earnings": "nasdaq_earnings_calendar",
@@ -50,6 +52,7 @@ class MultiSourceRuntimeService:
         self.investing_calendar = InvestingEconomicCalendarProvider(settings)
         self.investing_holidays = InvestingHolidayCalendarProvider(settings)
         self.marketbeat_holidays = MarketBeatHolidaysProvider(settings)
+        self.cme_market_schedule = CmeMarketScheduleProvider(settings)
         self.investing_fed_rate_monitor = InvestingFedRateMonitorProvider(settings)
         self.cboe = CboeRiskIndicesProvider(settings)
         self.nasdaq_earnings = NasdaqEarningsProvider(settings)
@@ -93,6 +96,16 @@ class MultiSourceRuntimeService:
                 item_count=lambda payload: len(payload.get("holidays") or []),
                 enabled=self.settings.enable_marketbeat_holidays,
                 source="MarketBeat Stock Market Holidays",
+                refresh=refresh,
+                persist_unmaterialized=False,
+            ),
+            "cme_market_schedule": await self._run_provider(
+                "cme_market_schedule",
+                FACT_TYPES["cme_market_schedule"],
+                self.cme_market_schedule.fetch,
+                item_count=lambda payload: 1 if payload.get("calendar_verified") else 0,
+                enabled=self.settings.enable_cme_market_schedule,
+                source="CME Group Trading Hours",
                 refresh=refresh,
                 persist_unmaterialized=False,
             ),
@@ -214,6 +227,17 @@ class MultiSourceRuntimeService:
                 item_count=lambda payload: len(payload.get("holidays") or []),
                 enabled=self.settings.enable_marketbeat_holidays,
                 source="MarketBeat Stock Market Holidays",
+                refresh=refresh,
+                persist_unmaterialized=False,
+            )
+        if name == "cme_market_schedule":
+            return await self._run_provider(
+                name,
+                FACT_TYPES[name],
+                self.cme_market_schedule.fetch,
+                item_count=lambda payload: 1 if payload.get("calendar_verified") else 0,
+                enabled=self.settings.enable_cme_market_schedule,
+                source="CME Group Trading Hours",
                 refresh=refresh,
                 persist_unmaterialized=False,
             )
@@ -433,6 +457,7 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
     investing = blocks.get("investing_economic_calendar") or {}
     holidays = blocks.get("investing_holidays") or {}
     marketbeat_holidays = blocks.get("marketbeat_holidays") or {}
+    cme_market_schedule = blocks.get("cme_market_schedule") or {}
     fed_rate_monitor = blocks.get("investing_fed_rate_monitor") or {}
     cboe = blocks.get("cboe_risk_indices") or {}
     earnings = blocks.get("nasdaq_earnings") or {}
@@ -464,11 +489,13 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
         },
         "market_schedule": {
             "nasdaq_cash_session": market_info,
+            "cme_calendar": cme_market_schedule,
             "holidays": primary_holidays or secondary_holidays,
             "holiday_source": holidays if primary_holidays else marketbeat_holidays,
             "holiday_fallback_source": marketbeat_holidays if secondary_holidays else {},
         },
         "market_calendar": {
+            "cme_equity_futures": cme_market_schedule,
             "market_holidays": {
                 "official_sources": {},
                 "primary_sources": {

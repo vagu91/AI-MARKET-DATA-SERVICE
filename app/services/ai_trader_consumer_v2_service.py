@@ -439,6 +439,7 @@ def _session(session: dict[str, Any]) -> dict[str, Any]:
         "next_close",
         "source",
         "source_classification",
+        "calendar_crosscheck_status",
         "freshness",
     )
 
