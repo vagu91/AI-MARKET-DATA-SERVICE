@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import asyncio
@@ -22,6 +23,7 @@ VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
 FORBIDDEN_TRADING_TERMS = {
     "buy", "sell", "long", "short", "no_trade", "entry", "target", "stop", "recommendation",
 }
+TRADING_TEXT_FIELDS = {"notes", "fomc_context"}
 
 
 class AIResearcherProvider:
@@ -467,8 +469,22 @@ def _top_or_metric(item: dict[str, Any], field: str) -> Any:
 
 
 def _contains_forbidden_terms(payload: Any) -> bool:
-    text = json.dumps(payload, default=str).lower()
-    return any(term in text for term in FORBIDDEN_TRADING_TERMS)
+    text = "\n".join(_iter_trading_text(payload)).lower()
+    return any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in FORBIDDEN_TRADING_TERMS)
+
+
+def _iter_trading_text(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    text: list[str] = []
+    for field in TRADING_TEXT_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str):
+            text.append(value)
+    for item in payload.get("results") or []:
+        if isinstance(item, dict):
+            text.extend(_iter_trading_text(item))
+    return text
 
 
 def _negative_cache_valid_until(item: dict[str, Any]) -> str:

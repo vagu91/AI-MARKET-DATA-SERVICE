@@ -162,6 +162,7 @@ class DiagnosticsService:
                         start=now,
                         end=now + timedelta(days=days),
                         trigger="diagnostics_full_model" if not force else "diagnostics_full_model_force",
+                        force=force,
                     ),
                     timeout=enrichment_timeout,
                 )
@@ -785,6 +786,7 @@ def _event_enrichment_metadata(
         values = [field for field in ("forecast", "previous", "consensus", "actual") if getattr(enrichment, field, None) not in (None, "")]
         accepted_fields = values if attempted and status == "completed" and source_url else []
         rejected_fields = values if attempted and status == "rejected" else []
+        persistence = getattr(enrichment, "summary", {}).get("persistence", {}) if enrichment else {}
         event_rows.append(
             {
                 "event_id": getattr(event, "event_id", None),
@@ -795,8 +797,8 @@ def _event_enrichment_metadata(
                 "failure_type": status if status in {"failed", "timeout", "cancelled", "rejected"} else None,
                 "timeout": status == "timeout",
                 "duration_ms": duration_ms if attempted else None,
-                "persisted": getattr(enrichment, "cache_status", None) == "refreshed",
-                "read_back": getattr(enrichment, "cache_status", None) == "hit",
+                "persisted": bool(persistence.get("persisted")) or getattr(enrichment, "cache_status", None) == "refreshed",
+                "read_back": bool(persistence.get("read_back")) or getattr(enrichment, "cache_status", None) == "hit",
                 "accepted_fields": accepted_fields,
                 "rejected_fields": rejected_fields,
                 "source_urls": [source_url] if source_url else [],

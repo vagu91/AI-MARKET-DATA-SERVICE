@@ -74,6 +74,52 @@ class FakeAIService:
         return self.facts, {"status": "success" if self.facts else "no_data_available"}
 
 
+def _ai_fact(orchestrator: EnrichmentOrchestrator, event: EconomicEvent, *, previous: float = 0.5) -> dict:
+    return {
+        "fact_key": orchestrator.fact_key(event),
+        "fact_type": "ai_research_result",
+        "country": event.country,
+        "category": event.category,
+        "event_name": event.name,
+        "previous": previous,
+        "source": "Research",
+        "source_url": "https://research.test/macro",
+        "provider_type": "AI_RESEARCHER_CODEX_CLI",
+        "reliability": 0.9,
+        "confidence": 0.9,
+        "valid_until": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+        "raw_payload_json": {
+            "metrics": [
+                {
+                    "metric_id": f"{event.category.lower()}_previous",
+                    "previous": previous,
+                    "source": "Research",
+                    "source_url": "https://research.test/macro",
+                }
+            ]
+        },
+    }
+
+
+def _negative_fact(orchestrator: EnrichmentOrchestrator, event: EconomicEvent) -> dict:
+    return {
+        "fact_key": orchestrator.fact_key(event),
+        "fact_type": "macro_event_enrichment",
+        "country": event.country,
+        "category": event.category,
+        "event_name": event.name,
+        "source": "AI Researcher",
+        "source_url": event.source_url,
+        "provider_type": "AI_RESEARCHER_CODEX_CLI",
+        "reliability": 0,
+        "confidence": 0,
+        "status": "no_data_available",
+        "valid_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        "warnings_json": ["ai_negative_cache:no_data_available"],
+        "raw_payload_json": {},
+    }
+
+
 def test_db_init_and_fact_freshness(tmp_path):
     cfg = settings(tmp_path)
     init_market_db(cfg)
@@ -132,6 +178,95 @@ def test_orchestrator_db_hit_does_not_call_provider(tmp_path):
     assert orchestrator.event_enrichment_service.calls == 0
     assert enriched[0].enrichment.forecast == "0.3%"
     assert metadata["data_quality"]["db_hits"] == 1
+
+
+def test_orchestrator_force_bypasses_valid_negative_cache_and_calls_ai(tmp_path):
+    cfg = settings(tmp_path, enable_ai_researcher=True)
+    event = make_event()
+    provider = CountingEnrichmentService()
+    orchestrator = EnrichmentOrchestrator(cfg, event_enrichment_service=provider)
+    ai = FakeAIService([_ai_fact(orchestrator, event)])
+    orchestrator.ai_researcher_service = ai
+    repo = MarketFactRepository(cfg)
+    repo.upsert_fact(_negative_fact(orchestrator, event))
+
+    _, cached = run_async(
+        orchestrator.enrich_events(
+            events=[event], country="US", start=datetime.now(UTC), end=datetime.now(UTC) + timedelta(days=7), trigger="test"
+        )
+    )
+    assert cached["data_quality"]["db_hits"] == 1
+    assert cached["data_quality"]["ai_research_requests"] == 0
+    assert ai.calls == 0
+
+    enriched, forced = run_async(
+        orchestrator.enrich_events(
+            events=[event], country="US", start=datetime.now(UTC), end=datetime.now(UTC) + timedelta(days=7), trigger="test", force=True
+        )
+    )
+    assert forced["data_quality"]["db_hits"] == 0
+    assert forced["data_quality"]["db_bypassed_force"] == 1
+    assert forced["data_quality"]["ai_research_requests"] == 1
+    assert ai.calls == 1
+    assert float(enriched[0].enrichment.previous) == 0.5
+    assert float(enriched[0].enrichment.metrics[0]["previous"]) == 0.5
+    assert enriched[0].enrichment.summary["persistence"] == {"persisted": True, "read_back": True}
+
+
+def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
+    cfg = settings(tmp_path, enable_ai_researcher=True)
+    event = make_event()
+    provider = CountingEnrichmentService()
+    orchestrator = EnrichmentOrchestrator(cfg, event_enrichment_service=provider)
+    ai = FakeAIService([_ai_fact(orchestrator, event, previous=0.7)])
+    orchestrator.ai_researcher_service = ai
+    MarketFactRepository(cfg).upsert_fact({**_ai_fact(orchestrator, event, previous=0.3), "fact_type": "macro_event_enrichment"})
+
+    enriched, metadata = run_async(
+        orchestrator.enrich_events(
+            events=[event], country="US", start=datetime.now(UTC), end=datetime.now(UTC) + timedelta(days=7), trigger="test", force=True
+        )
+    )
+
+    assert metadata["data_quality"]["db_hits"] == 0
+    assert metadata["data_quality"]["db_bypassed_force"] == 1
+    assert metadata["data_quality"]["ai_research_requests"] == 1
+    assert ai.calls == 1
+    assert float(enriched[0].enrichment.previous) == 0.7
+
+
+def test_orchestrator_force_batches_five_valid_negative_caches(tmp_path):
+    cfg = settings(tmp_path, enable_ai_researcher=True, ai_researcher_max_events=5)
+    events = [
+        make_event(event_id="evt-cpi", category="CPI", name="Consumer Price Index"),
+        make_event(event_id="evt-ppi", category="PPI", name="Producer Price Index"),
+        make_event(event_id="evt-gdp", category="GDP", name="GDP Advance Estimate"),
+        make_event(event_id="evt-pce", category="PCE", name="Personal Consumption Expenditures"),
+        make_event(event_id="evt-nfp", category="NFP", name="Employment Situation"),
+    ]
+    orchestrator = EnrichmentOrchestrator(cfg, event_enrichment_service=CountingEnrichmentService())
+    ai = FakeAIService([_ai_fact(orchestrator, event, previous=float(index + 1)) for index, event in enumerate(events)])
+    orchestrator.ai_researcher_service = ai
+    repo = MarketFactRepository(cfg)
+    for event in events:
+        repo.upsert_fact(_negative_fact(orchestrator, event))
+
+    enriched, metadata = run_async(
+        orchestrator.enrich_events(
+            events=events, country="US", start=datetime.now(UTC), end=datetime.now(UTC) + timedelta(days=7), trigger="test", force=True
+        )
+    )
+
+    quality = metadata["data_quality"]
+    assert quality["db_hits"] == 0
+    assert quality["db_bypassed_force"] == 5
+    assert quality["ai_research_requests"] == 1
+    assert quality["ai_events_requested"] == 5
+    assert ai.calls == 1
+    assert all(item.enrichment.previous is not None for item in enriched)
+    for event in events:
+        stored = repo.get_fact(orchestrator.fact_key(event))
+        assert stored["previous"] is not None
 
 
 def test_orchestrator_provider_success_saves_db(tmp_path):

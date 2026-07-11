@@ -12,7 +12,7 @@ import respx
 from app.core.config import Settings
 from app.core.text_normalization import normalize_text
 from app.models.common import Impact
-from app.models.events import EconomicEvent
+from app.models.events import EconomicEvent, EventEnrichment
 from app.providers.hacker_news_social_sentiment_provider import HackerNewsSocialSentimentProvider
 from app.providers.investing_fed_rate_monitor_provider import parse_investing_fed_rate_monitor_html
 from app.providers.nasdaq_100_constituents_provider import _normalize
@@ -345,6 +345,33 @@ def test_ai_enrichment_state_machine_has_only_coherent_states(quality, expected_
     assert not (row["attempted"] is False and row["timeout"] is True)
     assert not (metadata["attempted_event_count"] == 0 and metadata["timeout_event_count"] > 0)
     assert not (metadata["AI_called"] is False and metadata["completed_event_count"] > 0)
+
+
+def test_ai_enrichment_reports_same_run_persistence_read_back() -> None:
+    event = _event()
+    event.enrichment = EventEnrichment(
+        previous=0.5,
+        source="BLS",
+        source_url="https://www.bls.gov/news.release/cpi.nr0.htm",
+        cache_status="refreshed",
+        summary={"persistence": {"persisted": True, "read_back": True}},
+    )
+
+    metadata = _event_enrichment_metadata(
+        {
+            "data_quality": {
+                "ai_research_enabled": True,
+                "ai_research_configured": True,
+                "ai_research_called": True,
+                "ai_candidate_event_ids": [event.event_id],
+                "ai_research_status": "success",
+            }
+        },
+        [event],
+    )
+
+    assert metadata["persisted_event_count"] == 1
+    assert metadata["read_back_event_count"] == 1
 
 
 def _event() -> EconomicEvent:

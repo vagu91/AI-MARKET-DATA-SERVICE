@@ -303,3 +303,22 @@ async def test_full_model_materializes_symbolless_macro_news_from_db(tmp_path):
     assert model["news_context"]["latest"][0]["source_url"] == "https://www.reuters.com/markets/fed-minutes-test"
     assert model["data_quality"]["news_pipeline"]["eligible_count"] == 1
     assert model["data_quality"]["news_pipeline"]["materialized_count"] == 1
+
+
+async def test_full_model_propagates_force_and_refresh_false_skips_orchestrator(tmp_path):
+    service = diagnostics(tmp_path)
+    original = service.enrichment_orchestrator.enrich_events
+    force_values: list[bool] = []
+
+    async def capture_force(**kwargs):
+        force_values.append(kwargs["force"])
+        return await original(**kwargs)
+
+    service.enrichment_orchestrator.enrich_events = capture_force
+
+    await service.full_model(country="US", days=30, symbol="MNQ", fetch_missing_nasdaq=False, refresh="force")
+    assert force_values == [True]
+
+    force_values.clear()
+    await service.full_model(country="US", days=30, symbol="MNQ", fetch_missing_nasdaq=False, refresh="false")
+    assert force_values == []

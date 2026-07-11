@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import logging
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
@@ -20,6 +21,7 @@ from app.services.provider_observation_repository import ProviderObservationRepo
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
 AI_PRIORITY = {"CPI": 1, "PPI": 2, "NFP": 3, "GDP": 4, "PCE": 5, "FOMC": 6}
+logger = logging.getLogger(__name__)
 
 
 class EnrichmentOrchestrator:
@@ -47,12 +49,14 @@ class EnrichmentOrchestrator:
         start: datetime,
         end: datetime,
         trigger: str,
+        force: bool = False,
     ) -> tuple[list[EconomicEvent], dict[str, Any]]:
         run_id = str(uuid.uuid4())
         metrics: dict[str, Any] = {
             "events_checked": 0,
             "db_hits": 0,
             "db_misses": 0,
+            "db_bypassed_force": 0,
             "provider_hits": 0,
             "provider_misses": 0,
             "ai_research_requests": 0,
@@ -90,7 +94,23 @@ class EnrichmentOrchestrator:
                 fact = self.facts.get_fact(fact_key)
                 if fact:
                     freshness = self.freshness.evaluate(fact)
-                    if freshness.usable:
+                    if freshness.usable and force:
+                        metrics["db_bypassed_force"] += 1
+                        logger.info(
+                            "event_enrichment_cache_bypassed_force",
+                            extra={"event_id": event.event_id, "fact_key": fact_key, "fact_status": fact.get("status")},
+                        )
+                        self.observations.record(
+                            run_id=run_id,
+                            provider_name="market_facts",
+                            provider_type="DB",
+                            status="cache_bypassed_force",
+                            country=event.country,
+                            category=event.category,
+                            query=fact_key,
+                            item_count=1,
+                        )
+                    elif freshness.usable:
                         updated = event.model_copy(deep=True)
                         updated.enrichment = self._enrichment_from_fact(fact, freshness.cache_status, freshness.warnings)
                         enriched_by_id[event.event_id] = updated
@@ -213,9 +233,17 @@ class EnrichmentOrchestrator:
                     updated = event.model_copy(deep=True)
                     if fact:
                         persisted = self.facts.upsert_fact(fact)
+                        read_back = self.facts.get_fact(self.fact_key(event))
                         diagnostics.event_json(event.event_id, "persistence_payload.json", persisted)
-                        diagnostics.event_json(event.event_id, "read_back.json", self.facts.get_fact(self.fact_key(event)))
-                        updated.enrichment = self._enrichment_from_fact(fact, "refreshed", [])
+                        diagnostics.event_json(event.event_id, "read_back.json", read_back)
+                        if read_back:
+                            updated.enrichment = self._enrichment_from_fact(read_back, "refreshed", [])
+                        else:
+                            updated.enrichment = self._enrichment_from_fact(fact, "refreshed", ["ai_fact_read_back_failed"])
+                        updated.enrichment.summary["persistence"] = {
+                            "persisted": True,
+                            "read_back": read_back is not None,
+                        }
                         if _has_values(updated.enrichment):
                             ai_used = True
                     else:
@@ -240,6 +268,8 @@ class EnrichmentOrchestrator:
                 "enrichment_status": "enrichment_complete" if metrics["provider_misses"] == 0 else ("enrichment_partial" if metrics["provider_hits"] else "enrichment_missing"),
                 "db_hits": metrics["db_hits"],
                 "db_misses": metrics["db_misses"],
+                "db_bypassed_force": metrics["db_bypassed_force"],
+                "refresh_mode": "force" if force else "auto",
                 "provider_hits": metrics["provider_hits"],
                 "provider_failures": metrics["provider_misses"],
                 "ai_research_used": ai_used,

@@ -341,6 +341,44 @@ def test_metric_zero_value_is_preserved_in_top_level_fact(tmp_path):
     assert facts[0]["previous"] == 0.0
 
 
+def test_source_name_containing_trading_substring_is_not_rejected(tmp_path):
+    provider = AIResearcherProvider(settings(tmp_path))
+    data = payload()
+    item = data["results"][0]
+    item.update(
+        {
+            "source": "Investopedia",
+            "source_url": "https://www.investopedia.com/cpi-release",
+            "evidence_text": "Investopedia reported the cited official CPI prior value.",
+            "previous": 0.5,
+        }
+    )
+
+    facts, status = provider.load_payload(data)
+
+    assert status["status"] == "success"
+    assert facts[0]["source"] == "Investopedia"
+
+
+def test_source_url_containing_target_is_not_rejected(tmp_path):
+    provider = AIResearcherProvider(settings(tmp_path))
+    data = payload()
+    item = data["results"][0]
+    item.update(
+        {
+            "source": "Wall Street Journal",
+            "source_url": "https://www.wsj.com/economy/central-banking/feds-preferred-inflation-gauge-climbs-above-target-range-b2220751",
+            "evidence_text": "The cited article documents the reported macro result.",
+            "previous": 0.5,
+        }
+    )
+
+    facts, status = provider.load_payload(data)
+
+    assert status["status"] == "success"
+    assert facts[0]["source_url"] == item["source_url"]
+
+
 async def test_provider_failure_cache_skips_immediate_retry(tmp_path):
     cfg = settings(tmp_path)
     cache = ProviderCacheRepository(cfg.database_path)
