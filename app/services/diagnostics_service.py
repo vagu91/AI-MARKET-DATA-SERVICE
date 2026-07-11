@@ -45,6 +45,7 @@ from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
 from app.services.fed_expectations_service import FedExpectationsService
+from app.services.risk_context_runtime_service import RiskContextRuntimeService
 from app.services.social_sentiment_service import SocialSentimentService
 
 
@@ -73,6 +74,7 @@ class DiagnosticsService:
         self.freshness = DataFreshnessService(settings)
         self.positioning_runtime = PositioningRuntimeService(settings)
         self.fed_expectations = FedExpectationsService(settings)
+        self.risk_context = RiskContextRuntimeService(settings)
 
     async def e2e_cache_test(
         self,
@@ -366,6 +368,15 @@ class DiagnosticsService:
             event_calendar=contract.get("event_calendar") or {},
             legacy_block=contract.get("rates_expectations") or {},
         )
+        risk_context, risk_sentiment = await self.risk_context.snapshot(
+            refresh=refresh,
+            macro_snapshot=contract.get("macro_snapshot") or {},
+            preloaded_risk_indices=(multi_source.get("blocks") or {}).get("cboe_risk_indices") or {},
+            preloaded_qqq_options=(multi_source.get("blocks") or {}).get("nasdaq_qqq_options") or {},
+            existing_legacy=contract.get("risk_sentiment") or {},
+        )
+        contract["risk_context"] = risk_context
+        contract["risk_sentiment"] = risk_sentiment
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
         return contract
 

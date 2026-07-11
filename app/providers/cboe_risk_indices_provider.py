@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,10 +24,13 @@ class CboeRiskIndicesProvider:
         if not self.settings.enable_cboe_risk_indices:
             return _status("disabled", "cboe_risk_indices_disabled", started)
         results: dict[str, Any] = {}
+        histories: dict[str, list[dict[str, Any]]] = {}
         errors: list[str] = []
+        actual_network_calls = 0
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
             for key, url in {"vvix": self.settings.cboe_vvix_url, "skew": self.settings.cboe_skew_url}.items():
                 try:
+                    actual_network_calls += 1
                     response = await asyncio.wait_for(
                         client.get(url, headers={**REQUEST_HEADERS, "Accept": "application/json"}),
                         timeout=min(float(self.settings.http_timeout_seconds), 10.0),
@@ -35,6 +41,23 @@ class CboeRiskIndicesProvider:
                     errors.append(f"{key}_timeout")
                 except Exception as exc:
                     errors.append(f"{key}_failed:{exc or type(exc).__name__}")
+            for key, url in {
+                "vvix": self.settings.cboe_vvix_history_url,
+                "skew": self.settings.cboe_skew_history_url,
+                "vix": self.settings.cboe_vix_history_url,
+            }.items():
+                try:
+                    actual_network_calls += 1
+                    response = await asyncio.wait_for(
+                        client.get(url, headers={**REQUEST_HEADERS, "Accept": "text/csv"}),
+                        timeout=min(float(self.settings.http_timeout_seconds), 10.0),
+                    )
+                    response.raise_for_status()
+                    histories[key] = parse_index_history_csv(response.text, key=key, limit=260)
+                except TimeoutError:
+                    errors.append(f"{key}_history_timeout")
+                except Exception as exc:
+                    errors.append(f"{key}_history_failed:{exc or type(exc).__name__}")
         return {
             "status": "found" if results else "provider_failed",
             "provider": self.source,
@@ -43,7 +66,13 @@ class CboeRiskIndicesProvider:
             "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "valid_until": (datetime.now(UTC) + timedelta(minutes=15)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "indices": results,
-            "diagnostics": {"found": list(results), "missing": [key for key in ("vvix", "skew") if key not in results]},
+            "history": histories,
+            "diagnostics": {
+                "found": list(results),
+                "missing": [key for key in ("vvix", "skew") if key not in results],
+                "history_depth": {key: len(value) for key, value in histories.items()},
+                "actual_network_calls": actual_network_calls,
+            },
             "warnings": [error for error in errors if results],
             "errors": [] if results else errors,
             "duration_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),
@@ -75,8 +104,29 @@ def _normalize(key: str, payload: dict[str, Any], url: str) -> dict[str, Any]:
         "delayed": True,
         "stale": stale,
         "reliability": 0.86 if not stale else 0.55,
+        "is_official_source": True,
         "warnings": ["skew_open_high_low_zero_not_reliable"] if unreliable_ohl else [],
     }
+
+
+def parse_index_history_csv(text: str, *, key: str, limit: int = 260) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    value_key = key.upper()
+    for row in csv.DictReader(io.StringIO(text.lstrip("\ufeff"))):
+        raw_date = str(row.get("DATE") or "").strip()
+        raw_value = row.get(value_key)
+        if key == "vix":
+            raw_value = row.get("CLOSE")
+        value = _float(raw_value)
+        if not raw_date or value is None or value <= 0:
+            continue
+        try:
+            data_as_of = datetime.strptime(raw_date, "%m/%d/%Y").date().isoformat()
+        except ValueError:
+            continue
+        rows.append({"data_as_of": data_as_of, "value": value})
+    rows.sort(key=lambda item: item["data_as_of"])
+    return rows[-max(int(limit), 1):]
 
 
 def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:
@@ -88,6 +138,7 @@ def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:
         "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "valid_until": (datetime.now(UTC) + timedelta(minutes=15)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "indices": {},
+        "history": {},
         "diagnostics": {"found": [], "missing": ["vvix", "skew"]},
         "warnings": [reason],
         "errors": [],
@@ -99,7 +150,8 @@ def _float(value: Any) -> float | None:
     if value in (None, "", "--"):
         return None
     try:
-        return float(str(value).replace(",", ""))
+        parsed = float(str(value).replace(",", ""))
+        return parsed if math.isfinite(parsed) else None
     except ValueError:
         return None
 

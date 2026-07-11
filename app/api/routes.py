@@ -238,6 +238,15 @@ async def market_context_mnq(
         event_calendar=contract.get("event_calendar") or {},
         legacy_block=contract.get("rates_expectations") or {},
     )
+    risk_context, risk_sentiment = await diagnostics.risk_context.snapshot(
+        refresh="auto",
+        macro_snapshot=contract.get("macro_snapshot") or {},
+        preloaded_risk_indices=(multi_source.get("blocks") or {}).get("cboe_risk_indices") or {},
+        preloaded_qqq_options=(multi_source.get("blocks") or {}).get("nasdaq_qqq_options") or {},
+        existing_legacy=contract.get("risk_sentiment") or {},
+    )
+    contract["risk_context"] = risk_context
+    contract["risk_sentiment"] = risk_sentiment
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
     return contract if view == "debug" else build_ai_trader_market_context(contract)
 

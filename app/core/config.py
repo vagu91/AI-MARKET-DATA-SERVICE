@@ -230,6 +230,12 @@ class Settings(BaseSettings):
     enable_marketbeat_holidays: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_MARKETBEAT_HOLIDAYS")
     enable_investing_fed_rate_monitor: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_FED_RATE_MONITOR")
     enable_cboe_risk_indices: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CBOE_RISK_INDICES")
+    enable_cboe_vix_futures: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CBOE_VIX_FUTURES")
+    enable_cboe_put_call: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CBOE_PUT_CALL")
+    risk_context_ttl_minutes: int = Field(default=30, validation_alias="AI_MARKET_RISK_CONTEXT_TTL_MINUTES")
+    risk_context_history_min_points: int = Field(default=60, validation_alias="AI_MARKET_RISK_CONTEXT_HISTORY_MIN_POINTS")
+    risk_curve_flat_tolerance_pct: float = Field(default=0.25, validation_alias="AI_MARKET_RISK_CURVE_FLAT_TOLERANCE_PCT")
+    risk_alignment_max_gap_minutes: int = Field(default=1440, validation_alias="AI_MARKET_RISK_ALIGNMENT_MAX_GAP_MINUTES")
     enable_nasdaq_earnings: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_EARNINGS")
     enable_nasdaq_100: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_100")
     enable_nasdaq_market_info: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_MARKET_INFO")
@@ -315,6 +321,12 @@ class Settings(BaseSettings):
     investing_fed_rate_monitor_url: str = "https://www.investing.com/central-banks/fed-rate-monitor"
     cboe_vvix_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VVIX.json"
     cboe_skew_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_SKEW.json"
+    cboe_vvix_history_url: str = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv"
+    cboe_skew_history_url: str = "https://cdn.cboe.com/api/global/us_indices/daily_prices/SKEW_History.csv"
+    cboe_vix_history_url: str = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+    cboe_vix_futures_settlement_url: str = "https://www-api.cboe.com/us/futures/market_statistics/settlement/csv/"
+    cboe_vix_futures_delayed_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/futures/_VIX.json"
+    cboe_put_call_url: str = "https://www.cboe.com/markets/us/options/market-statistics/daily"
     nasdaq_earnings_calendar_url: str = "https://api.nasdaq.com/api/calendar/earnings"
     nasdaq_market_info_url: str = "https://api.nasdaq.com/api/market-info"
     nasdaq_qqq_option_chain_url: str = "https://api.nasdaq.com/api/quote/QQQ/option-chain"
