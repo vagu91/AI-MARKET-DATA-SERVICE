@@ -221,13 +221,13 @@ class DiagnosticsService:
         news_pipeline = _news_pipeline_status(news_items)
         macro_pipeline = _macro_pipeline_status(macro)
         pipeline_integrity = {
-            "critical_fetch_completed": True,
-            "critical_persistence_completed": True,
-            "critical_commits_completed": True,
+            "critical_fetch_completed": (not fetch_missing) or macro_quality.get("provider_hits", 0) > 0 or macro_quality.get("db_hits", 0) > 0,
+            "critical_persistence_completed": macro_quality.get("provider_hits", 0) == 0 or macro_quality.get("read_back_count", macro_quality.get("db_hits", 0)) > 0,
+            "critical_commits_completed": macro_quality.get("provider_hits", 0) == 0 or macro_quality.get("read_back_count", 0) > 0,
             "critical_read_back_completed": bool(macro.series) and bool(nasdaq_context) and news_pipeline["read_back_count"] > 0,
             "snapshot_materialization_completed": news_pipeline["materialized_count"] > 0 and bool(macro.series) and bool(nasdaq_context),
             "snapshot_built_from_db": True,
-            "partial_response": False,
+            "partial_response": not (bool(macro.series) and bool(nasdaq_context)),
         }
         cot_payload = await self.positioning_runtime.cot(refresh=refresh)
         aaii_payload = await self.positioning_runtime.aaii(refresh=refresh)
@@ -256,10 +256,13 @@ class DiagnosticsService:
             data_quality=quality,
             db_summary=self.facts.db_summary(),
             event_facts=event_facts,
+            metadata={"event_enrichment": _event_enrichment_metadata(enrichment_metadata, enriched)},
             positioning_context=positioning_context,
             sentiment_context=sentiment_context,
         )
         contract["data_quality"]["macro_pipeline"] = _macro_pipeline_status(macro, contract.get("macro_snapshot") or {})
+        overall_quality = contract["data_quality"].get("overall_data_quality") or {}
+        contract["data_quality"]["missing_critical_fields"] = overall_quality.get("missing_critical_fields") or contract["data_quality"].get("missing_critical_fields") or []
         multi_refresh = "force" if refresh == "force" else "false"
         multi_source = await MultiSourceRuntimeService(self.settings).snapshot(refresh=multi_refresh)
         apply_multi_source_context(contract, multi_source)
@@ -447,44 +450,8 @@ class DiagnosticsService:
     async def _macro_db_first(self, *, fetch_missing: bool = True, force: bool = False) -> tuple[MacroLatestResponse, dict[str, Any]]:
         cached = [] if force else self.facts.get_valid_facts_by_type("official_macro_latest")
         if cached:
-            metadata_by_source: dict[str, ProviderMetadata] = {}
-            series = []
-            for fact in cached:
-                raw = fact.get("raw_payload") if isinstance(fact.get("raw_payload"), dict) else {}
-                series_id = raw.get("series_id") or fact.get("category") or fact.get("fact_key")
-                source = fact.get("source") or "DB"
-                provider_type = fact.get("provider_type") or "DB"
-                try:
-                    parsed_provider_type = ProviderType(provider_type)
-                except ValueError:
-                    parsed_provider_type = ProviderType.DB
-                metadata_by_source.setdefault(
-                    source,
-                    ProviderMetadata(
-                        source=source,
-                        provider_type=parsed_provider_type,
-                        retrieved_at=datetime.fromisoformat(str(fact["retrieved_at"]).replace("Z", "+00:00")),
-                        freshness=Freshness.RECENT,
-                        reliability=fact.get("reliability") or 0,
-                        is_fallback=False,
-                    ),
-                )
-                try:
-                    value = float(fact["value"]) if fact.get("value") is not None else None
-                except (TypeError, ValueError):
-                    value = None
-                series.append(
-                    MacroSeries(
-                        series_id=str(series_id),
-                        name=str(fact.get("event_name") or fact.get("category") or "macro fact"),
-                        value=value,
-                        units=fact.get("unit"),
-                        data_as_of=fact.get("release_at"),
-                        source=source,
-                        metadata=metadata_by_source[source],
-                    )
-                )
-            return MacroLatestResponse(series=series, provider_results=list(metadata_by_source.values())), {
+            macro = self._macro_from_facts(cached)
+            return macro, {
                 "db_hits": len(cached),
                 "db_misses": 0,
                 "provider_hits": 0,
@@ -503,15 +470,60 @@ class DiagnosticsService:
             }
         macro = await self.macro_service.latest()
         written = self._save_macro(macro)
+        read_back = self.facts.get_valid_facts_by_type("official_macro_latest")
+        read_back_macro = self._macro_from_facts(read_back) if read_back else MacroLatestResponse(provider_results=macro.provider_results)
         provider_failures = sum(1 for item in macro.provider_results if item.errors)
-        return macro, {
-            "db_hits": 0,
+        return read_back_macro, {
+            "db_hits": len(read_back),
             "db_misses": 1,
             "provider_hits": written,
             "provider_failures": provider_failures,
+            "read_back_count": len(read_back),
+            "materialized_count": len(read_back_macro.series),
             "warnings": [],
             "errors": [error for item in macro.provider_results for error in item.errors],
         }
+
+    def _macro_from_facts(self, facts: list[dict[str, Any]]) -> MacroLatestResponse:
+        metadata_by_source: dict[str, ProviderMetadata] = {}
+        series = []
+        for fact in facts:
+            raw = fact.get("raw_payload") if isinstance(fact.get("raw_payload"), dict) else {}
+            series_id = raw.get("series_id") or fact.get("category") or fact.get("fact_key")
+            source = fact.get("source") or "DB"
+            provider_type = fact.get("provider_type") or "DB"
+            try:
+                parsed_provider_type = ProviderType(provider_type)
+            except ValueError:
+                parsed_provider_type = ProviderType.DB
+            retrieved_at_raw = str(fact.get("retrieved_at") or datetime.now(UTC).isoformat()).replace("Z", "+00:00")
+            metadata_by_source.setdefault(
+                source,
+                ProviderMetadata(
+                    source=source,
+                    provider_type=parsed_provider_type,
+                    retrieved_at=datetime.fromisoformat(retrieved_at_raw),
+                    freshness=Freshness.RECENT,
+                    reliability=fact.get("reliability") or 0,
+                    is_fallback=False,
+                ),
+            )
+            try:
+                value = float(fact["value"]) if fact.get("value") is not None else None
+            except (TypeError, ValueError):
+                value = None
+            series.append(
+                MacroSeries(
+                    series_id=str(series_id),
+                    name=str(fact.get("event_name") or fact.get("category") or "macro fact"),
+                    value=value,
+                    units=fact.get("unit"),
+                    data_as_of=fact.get("release_at"),
+                    source=source,
+                    metadata=metadata_by_source[source],
+                )
+            )
+        return MacroLatestResponse(series=series, provider_results=list(metadata_by_source.values()))
 
     def _save_macro(self, macro: MacroLatestResponse) -> int:
         count = 0
@@ -703,6 +715,65 @@ class DiagnosticsService:
                 "SELECT provider_name, status, COUNT(*) c FROM provider_observations GROUP BY provider_name, status"
             ).fetchall()
         return {"by_provider_status": [dict(row) for row in rows]}
+
+
+def _event_enrichment_metadata(metadata: dict[str, Any], events: list[Any]) -> dict[str, Any]:
+    quality = metadata.get("data_quality") or {}
+    warnings = quality.get("warnings") or metadata.get("warnings") or []
+    timeout = bool(quality.get("enrichment_timeout")) or any("timeout" in str(warning) for warning in warnings)
+    ai_called = bool(quality.get("ai_research_called") or quality.get("ai_research_requests"))
+    accepted_events = [
+        event for event in events
+        if getattr(getattr(event, "enrichment", None), "source_url", None)
+        and any(getattr(getattr(event, "enrichment", None), field, None) not in (None, "") for field in ("forecast", "previous", "consensus", "actual"))
+    ]
+    event_rows = []
+    for event in events:
+        enrichment = getattr(event, "enrichment", None)
+        summary = getattr(enrichment, "summary", {}) or {}
+        event_rows.append(
+            {
+                "event_id": getattr(event, "event_id", None),
+                "event_name": getattr(event, "name", None),
+                "AI_called": ai_called,
+                "attempted": ai_called and summary.get("research_priority", 99) <= 6,
+                "status": summary.get("temporal_status") or quality.get("enrichment_status"),
+                "failure_type": "timeout" if timeout else None,
+                "timeout": timeout,
+                "source_url": getattr(enrichment, "source_url", None),
+                "accepted_fields": [
+                    field for field in ("forecast", "previous", "consensus", "actual")
+                    if getattr(enrichment, field, None) not in (None, "") and getattr(enrichment, "source_url", None)
+                ],
+                "rejected_fields": [
+                    field for field in ("forecast", "previous", "consensus", "actual")
+                    if getattr(enrichment, field, None) not in (None, "") and not getattr(enrichment, "source_url", None)
+                ],
+                "confidence": getattr(enrichment, "confidence", None),
+                "reliability": getattr(enrichment, "reliability", None),
+                "persisted": getattr(enrichment, "cache_status", None) == "refreshed",
+                "read_back": getattr(enrichment, "cache_status", None) == "hit",
+                "rejection_reason": ";".join(getattr(enrichment, "warnings", []) or []) or None,
+            }
+        )
+    return {
+        "enabled": bool(getattr(metadata, "enabled", False)) if not isinstance(metadata, dict) else quality.get("ai_research_enabled", ai_called or "ai_researcher_disabled" not in warnings),
+        "configured": "ai_researcher_disabled" not in warnings,
+        "mode": quality.get("ai_research_mode") or metadata.get("ai_mode") or "codex_cli",
+        "AI_called": ai_called,
+        "attempted_event_count": int(quality.get("ai_candidate_count") or sum(1 for row in event_rows if row["attempted"])),
+        "completed_event_count": int(quality.get("provider_hits") or 0),
+        "timeout_event_count": len(event_rows) if timeout else 0,
+        "failed_event_count": int(quality.get("provider_misses") or 0) if not timeout else 0,
+        "rejected_event_count": int(quality.get("ai_rejected_count") or 0),
+        "accepted_event_count": len(accepted_events),
+        "persisted_event_count": int(quality.get("facts_written") or len([row for row in event_rows if row["persisted"]])),
+        "read_back_event_count": int(quality.get("db_hits") or len([row for row in event_rows if row["read_back"]])),
+        "duration_ms": quality.get("duration_ms"),
+        "status": quality.get("enrichment_status") or ("ai_timeout" if timeout else "not_available"),
+        "warnings": warnings,
+        "events": event_rows[:25],
+    }
 
 
 def _news_pipeline_status(news_items: list[dict[str, Any]]) -> dict[str, Any]:

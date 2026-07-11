@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
+from app.core.text_normalization import normalize_payload_text
 from app.models.common import Impact
 from app.models.events import EconomicEvent
 from app.models.macro import MacroLatestResponse
@@ -28,6 +30,48 @@ MACRO_BUCKETS = {
     "inflation": {"CUSR0000SA0", "WPUFD4", "BEA:PCE", "BEA:CORE_PCE"},
     "labor": {"CES0000000001", "LNS14000000"},
     "consumer": {"BEA:PERSONAL_INCOME", "BEA:PERSONAL_SPENDING"},
+}
+
+NEWS_RELEVANCE_TERMS = {
+    "nasdaq",
+    "qqq",
+    "ndx",
+    "mnq",
+    "nvidia",
+    "nvda",
+    "apple",
+    "microsoft",
+    "meta",
+    "amazon",
+    "google",
+    "alphabet",
+    "semiconductor",
+    "chip",
+    "fed",
+    "fomc",
+    "inflation",
+    "rates",
+    "yield",
+    "payroll",
+    "bls",
+    "bea",
+    "bureau of labor statistics",
+    "bureau of economic analysis",
+    "cpi",
+    "ppi",
+    "pce",
+    "earnings",
+}
+NEWS_EXCLUSION_TERMS = {
+    "mortgage",
+    "retirement",
+    "pension",
+    "personal finance",
+    "crypto",
+    "bitcoin",
+    "oil",
+    "gold",
+    "commodity",
 }
 
 SOURCE_URLS = {
@@ -158,7 +202,7 @@ def build_market_context_contract(
         "upcoming_high_impact_events": legacy_high,
         "latest_news": {"articles": news_context["latest"], "deprecated": "Use news_context.latest."},
     }
-    return apply_context_extensions(contract)
+    return normalize_payload_text(apply_context_extensions(contract))
 
 
 def build_macro_snapshot(macro: MacroLatestResponse) -> dict[str, Any]:
@@ -295,8 +339,9 @@ def build_event_calendar(events: list[EconomicEvent]) -> dict[str, list[Economic
     }
 
 
-def build_news_context(news_items: list[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+def build_news_context(news_items: list[dict[str, Any]], limit: int = 12) -> dict[str, Any]:
     deduped: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in news_items:
         key = str(item.get("source_url") or item.get("url") or item.get("title") or "").lower()
@@ -305,8 +350,13 @@ def build_news_context(news_items: list[dict[str, Any]], limit: int = 20) -> dic
         seen.add(key)
         normalized = _news_item(item)
         if normalized["content_status"] == "invalid_content":
+            excluded.append({"title": normalized.get("title"), "reason": "invalid_content"})
             continue
         if normalized["freshness"] in {"EXPIRED", "STALE"}:
+            excluded.append({"title": normalized.get("title"), "reason": "stale_or_expired"})
+            continue
+        if not _news_relevant_to_mnq(normalized):
+            excluded.append({"title": normalized.get("title"), "reason": "not_relevant_to_mnq"})
             continue
         deduped.append(normalized)
     deduped.sort(key=lambda item: (item.get("published_at") or item.get("retrieved_at") or ""), reverse=True)
@@ -326,6 +376,7 @@ def build_news_context(news_items: list[dict[str, Any]], limit: int = 20) -> dic
         "by_symbol": by_symbol,
         "official_sources": official_sources,
         "market_sources": market_sources,
+        "excluded": excluded[:50],
     }
 
 
@@ -344,7 +395,8 @@ def build_section_quality(
     missing_events = list(existing_quality.get("missing_critical_fields", []))
     event_count = len(event_calendar.get("critical_macro_events", []))
     nasdaq_missing = [] if nasdaq_context else ["nasdaq_context"]
-    if nasdaq_context and (nasdaq_context.get("sector_exposure") or {}).get("unknown_weight_pct", 100) >= 10:
+    unknown_weight = (nasdaq_context.get("sector_exposure") or {}).get("unknown_weight_pct") if nasdaq_context else None
+    if unknown_weight is not None and unknown_weight >= 10:
         nasdaq_missing.append("sector_exposure_unknown_weight_above_threshold")
     news_missing = [] if news_context.get("latest") else ["latest"]
     return {
@@ -399,6 +451,7 @@ def build_overall_quality(section_quality: dict[str, Any]) -> dict[str, Any]:
         "temporal_consistency_score": 0.0 if invalid_future_actual_count else 1.0,
         "source_integrity_score": 1.0,
         "critical_missing_count": len(missing),
+        "missing_critical_fields": missing,
         "invalid_future_actual_count": invalid_future_actual_count,
         "stale_as_recent_count": stale_as_recent_count,
         "is_ready_for_market_analysis": not blocking,
@@ -469,16 +522,17 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
     }
 
 
-def _annotate_event(event: EconomicEvent, seen: dict[str, str]) -> EconomicEvent:
+def _annotate_event(event: EconomicEvent, seen: dict[str, dict[str, Any]]) -> EconomicEvent:
     payload = event.model_copy(deep=True)
     _reject_event_future_actual(payload)
     category = _category_key(payload)
     event_type = _event_type(payload)
     invalid = _invalid_period_mapping(payload)
-    duplicate_key = f"{category}:{payload.date}:{event_type}"
-    duplicate_of = seen.get(duplicate_key)
-    if duplicate_of is None:
-        seen[duplicate_key] = payload.event_id
+    duplicate_key, duplicate_confidence, duplicate_reason = _dedup_signature(payload, event_type)
+    duplicate_record = seen.get(duplicate_key)
+    duplicate_of = duplicate_record.get("event_id") if duplicate_record else None
+    if duplicate_record is None:
+        seen[duplicate_key] = {"event_id": payload.event_id, "confidence": duplicate_confidence, "reason": duplicate_reason}
     if payload.enrichment.metrics:
         payload.enrichment.metrics = [_normalize_metric(metric, payload) for metric in payload.enrichment.metrics]
     payload.enrichment.summary = _enrichment_summary(payload.enrichment.model_dump(mode="json"))
@@ -499,14 +553,48 @@ def _annotate_event(event: EconomicEvent, seen: dict[str, str]) -> EconomicEvent
                 invalid=invalid,
                 duplicate=duplicate_of is not None,
             ),
-            "deduplication_confidence": 1.0 if duplicate_of is not None else 0.0,
-            "duplicate_reason": "same_category_date_event_type" if duplicate_of is not None else None,
+            "deduplication_confidence": duplicate_confidence if duplicate_of is not None else 0.0,
+            "duplicate_confidence_label": "exact" if duplicate_confidence >= 1.0 else "high" if duplicate_confidence >= 0.85 else "medium" if duplicate_confidence >= 0.65 else "low",
+            "duplicate_reason": duplicate_reason if duplicate_of is not None else None,
             "possible_duplicate": False,
         }
     )
     if category == "FOMC":
         payload.enrichment.fomc_context = _fomc_context(payload)
     return payload
+
+
+def _dedup_signature(event: EconomicEvent, event_type: str) -> tuple[str, float, str]:
+    source_url = str(event.source_url or "").strip().lower()
+    source_event_id = str(event.event_id or "").strip().lower()
+    title = _dedup_text(event.name)
+    speaker = _speaker_key(event.name)
+    period = _period_key(event.name)
+    release_time = event.time_utc or event.date
+    if source_event_id and not source_url and not source_event_id.startswith(("fed-", "event-")):
+        return f"id:{source_event_id}", 1.0, "same_source_event_id"
+    return (
+        f"event:{_category_key(event)}:{event_type}:{event.date}:{release_time}:{title}:{speaker}:{period}:{source_url}",
+        0.9 if source_url else 0.75,
+        "same_specific_title_time_speaker_period_source" if source_url else "same_specific_title_time_speaker_period",
+    )
+
+
+def _dedup_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def _speaker_key(value: Any) -> str:
+    text = str(value or "")
+    match = re.search(r"\b(?:Governor|Chair|President|Fed's|Fed)\s+([A-Z][A-Za-z.-]+)", text)
+    return match.group(1).lower() if match else ""
+
+
+def _period_key(value: Any) -> str:
+    text = str(value or "").upper()
+    month = next((name for name in MONTHS if name in text), "")
+    year_match = re.search(r"\b(20\d{2})\b", text)
+    return f"{month}:{year_match.group(1) if year_match else ''}"
 
 
 def _reject_event_future_actual(event: EconomicEvent) -> None:
@@ -680,12 +768,16 @@ def _news_item(item: dict[str, Any]) -> dict[str, Any]:
     source_url = item.get("source_url") or item.get("url")
     aggregator_url = source_url if "news.google.com" in str(source_url or "") else None
     canonical_url = item.get("canonical_url") or (None if aggregator_url else source_url)
-    warnings = ["summary_missing", "summary_source_unavailable"] if not (item.get("summary") or item.get("content_snippet")) else []
+    source_text_available = bool(item.get("source_text_available") or item.get("summary") or item.get("content_snippet"))
+    summary = clean_text(item.get("summary") or item.get("content_snippet")) if source_text_available else None
+    warnings = ["summary_missing", "summary_source_unavailable"] if not summary else []
     if aggregator_url and not canonical_url:
         warnings.append("canonical_unresolved")
+    if not item.get("published_at"):
+        warnings.append("published_at_missing")
     return {
         "title": clean_text(item.get("title")),
-        "summary": clean_text(item.get("summary") or item.get("content_snippet")),
+        "summary": summary,
         "source": clean_text(item.get("source")),
         "source_url": source_url,
         "canonical_url": canonical_url,
@@ -694,7 +786,7 @@ def _news_item(item: dict[str, Any]) -> dict[str, Any]:
         "redirect_chain": item.get("redirect_chain") or [],
         "summary_source_type": item.get("summary_source_type"),
         "summary_source_url": item.get("summary_source_url") or source_url,
-        "source_text_available": bool(item.get("source_text_available") or item.get("summary") or item.get("content_snippet")),
+        "source_text_available": source_text_available,
         "published_at": item.get("published_at"),
         "retrieved_at": item.get("retrieved_at"),
         "symbols": item.get("symbols") or [],
@@ -708,9 +800,31 @@ def _news_item(item: dict[str, Any]) -> dict[str, Any]:
         "valid_until": valid_until,
         "freshness": freshness_label(valid_until=valid_until),
         "content_status": news_content_status(item),
-        **{**source_info, "is_official_source": bool(item.get("is_official")) or source_info["is_official_source"]},
+        **source_info,
         "warnings": warnings,
     }
+
+
+def _news_relevant_to_mnq(item: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in [
+            item.get("title"),
+            item.get("summary"),
+            item.get("source"),
+            " ".join(item.get("topics") or []),
+            " ".join(item.get("symbols") or []),
+        ]
+    ).lower()
+    if any(term in text for term in NEWS_EXCLUSION_TERMS) and not any(term in text for term in NEWS_RELEVANCE_TERMS):
+        return False
+    if str(item.get("relevance") or "").upper() == "LOW" and not any(term in text for term in NEWS_RELEVANCE_TERMS):
+        return False
+    if " ai " in f" {text} " and not any(term in text for term in NEWS_RELEVANCE_TERMS - {"fed"}):
+        return False
+    if item.get("symbols"):
+        return True
+    return any(term in text for term in NEWS_RELEVANCE_TERMS)
 
 
 def _topic_key(topic: str) -> str:

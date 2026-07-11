@@ -12,6 +12,8 @@ from app.core.config import Settings
 from app.core.text_normalization import normalize_text
 
 KEYWORDS = ("AI", "semiconductors", "Nvidia", "OpenAI", "Fed", "inflation", "rates", "recession")
+MARKET_TERMS = ("QQQ", "NDX", "MNQ", "Nasdaq", "Fed", "FOMC", "inflation", "rates", "yield", "earnings", "stock", "market", "Nvidia", "NVDA", "semiconductor")
+DIRECT_SYMBOLS = ("QQQ", "NDX", "MNQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AMD", "AVGO", "MU")
 POSITIVE = {"beat", "growth", "strong", "record", "surge", "optimistic", "accelerate", "breakthrough"}
 NEGATIVE = {"risk", "slowdown", "weak", "lawsuit", "ban", "cut", "recession", "inflation", "bubble"}
 
@@ -83,37 +85,68 @@ def build_social_sentiment(items: list[dict[str, Any]], *, started: datetime, so
             continue
         deduped.setdefault(key, item)
     usable = list(deduped.values())
-    scored = [_score_item(item) for item in usable]
+    scored_all = [_score_item(item) for item in usable]
+    scored = [item for item in scored_all if item["market_relevant"]]
+    irrelevant_count = len(scored_all) - len(scored)
     mention_count = sum(len(item["matched_keywords"]) for item in scored)
+    direct_symbol_mentions = sum(1 for item in scored if item.get("direct_symbols"))
+    direct_market_mentions = sum(1 for item in scored if item.get("direct_market_mentions"))
     bullish = sum(1 for item in scored if item["sentiment_label"] == "bullish")
     bearish = sum(1 for item in scored if item["sentiment_label"] == "bearish")
     neutral = max(0, len(scored) - bullish - bearish)
-    total = len(scored) or 1
-    score = round(sum(float(item["sentiment_score"]) for item in scored) / total, 4) if scored else None
+    total = len(scored)
+    score = round(sum(float(item["sentiment_score"]) for item in scored) / total, 4) if total else None
+    market_relevance_score = round(total / max(len(scored_all), 1), 4) if scored_all else 0.0
+    if not total:
+        status = "insufficient_data"
+        coverage_quality = "none"
+    elif len(scored) < 2:
+        status = "partial"
+        coverage_quality = "low"
+    else:
+        status = "found"
+        coverage_quality = "medium"
     now = datetime.now(UTC)
     return {
-        "status": "found" if scored else "not_found",
+        "status": status,
         "provider": "hacker_news_social_sentiment",
         "source": "Hacker News Algolia public API",
         "source_url": source_url,
         "retrieved_at": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "valid_until": (now + timedelta(minutes=ttl_minutes)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "coverage": {"window_hours": 24, "source_scope": "public_hacker_news_stories", "keywords": list(KEYWORDS)},
+        "coverage": {
+            "window_hours": 24,
+            "source_scope": "public_hacker_news_stories",
+            "keywords": list(KEYWORDS),
+            "source_diversity": "single_public_forum",
+            "coverage_quality": coverage_quality,
+        },
         "social_market_sentiment": {
             "sentiment_score": score,
-            "bullish_ratio": round(bullish / total, 4),
-            "bearish_ratio": round(bearish / total, 4),
-            "neutral_ratio": round(neutral / total, 4),
-            "discussion_volume": len(scored),
+            "bullish_ratio": round(bullish / total, 4) if total else None,
+            "bearish_ratio": round(bearish / total, 4) if total else None,
+            "neutral_ratio": round(neutral / total, 4) if total else None,
+            "discussion_volume": total,
+            "sentiment_method": "keyword_lexicon_filtered_market_relevance",
         },
         "social_symbol_sentiment": _symbol_sentiment(scored),
-        "source_count": 1 if scored else 0,
+        "source_count": 1 if scored_all else 0,
+        "source_diversity": "single_source",
+        "source_scope": "tech_discussion_not_retail_trading_sentiment",
+        "direct_market_mention_count": direct_market_mentions,
+        "direct_symbol_mention_count": direct_symbol_mentions,
+        "relevant_item_count": total,
+        "irrelevant_item_count": irrelevant_count,
+        "market_relevance_score": market_relevance_score,
+        "coverage_quality": coverage_quality,
+        "confidence": 0.35 if status == "partial" else 0.15 if status == "insufficient_data" else 0.5,
+        "limitations": ["Hacker News is technology discussion, not MNQ/QQQ retail trading sentiment"],
         "mention_count": mention_count,
         "unique_authors": len({item.get("author") for item in scored if item.get("author")}) or None,
         "spam_filtered_count": spam_filtered,
         "bot_suspected_count": None,
-        "reliability": 0.45 if scored else 0.0,
-        "warnings": [] if scored else ["social_sentiment_not_available"],
+        "reliability": 0.35 if status == "partial" else 0.0 if status == "insufficient_data" else 0.45,
+        "warnings": [] if status == "found" else ["social_sentiment_low_coverage" if status == "partial" else "social_sentiment_insufficient_market_relevance"],
         "items": scored[:20],
         "diagnostics": {"duration_ms": int((datetime.now(UTC) - started).total_seconds() * 1000), "items_seen": len(items)},
         "service_role": "data provider only",
@@ -156,8 +189,19 @@ def _score_item(item: dict[str, Any]) -> dict[str, Any]:
     neg = len(words & NEGATIVE)
     score = 0.0 if pos == neg else min(1.0, (pos - neg) / max(pos + neg, 1))
     matched = [keyword for keyword in KEYWORDS if keyword.lower() in text.lower()]
+    market_matches = [term for term in MARKET_TERMS if re.search(rf"\b{re.escape(term)}\b", text, flags=re.I)]
+    direct_symbols = [symbol for symbol in DIRECT_SYMBOLS if re.search(rf"\b{re.escape(symbol)}\b", text, flags=re.I)]
+    generic_ai_only = matched and set(keyword.lower() for keyword in matched) <= {"ai", "openai"} and not market_matches
     label = "bullish" if score > 0.15 else "bearish" if score < -0.15 else "neutral"
-    return {**item, "matched_keywords": matched, "sentiment_score": round(score, 4), "sentiment_label": label}
+    return {
+        **item,
+        "matched_keywords": matched,
+        "direct_market_mentions": market_matches,
+        "direct_symbols": direct_symbols,
+        "market_relevant": bool(market_matches) and not generic_ai_only,
+        "sentiment_score": round(score, 4),
+        "sentiment_label": label,
+    }
 
 
 def _symbol_sentiment(items: list[dict[str, Any]]) -> dict[str, Any]:

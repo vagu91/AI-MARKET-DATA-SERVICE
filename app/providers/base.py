@@ -14,6 +14,10 @@ class ProviderError(RuntimeError):
     pass
 
 
+class ProviderDisabled(ProviderError):
+    pass
+
+
 class BaseProvider(ABC):
     source: str
     provider_type: ProviderType
@@ -32,6 +36,20 @@ class BaseProvider(ABC):
             result = await self.fetch()
             self.cache.set(self.cache_key, result.model_dump(mode="json"))
             return result
+        except ProviderDisabled as exc:
+            detail = redact_sensitive(str(exc) or f"{self.source} disabled")
+            return ProviderResult(
+                metadata=ProviderMetadata(
+                    source=self.source,
+                    provider_type=self.provider_type,
+                    retrieved_at=datetime.now(UTC),
+                    freshness=Freshness.UNKNOWN,
+                    reliability=0.0,
+                    is_fallback=True,
+                    errors=[],
+                ),
+                data={"status": "disabled", "warning": detail},
+            )
         except Exception as exc:
             detail = str(exc) or f"{type(exc).__name__}"
             error = redact_sensitive(f"{self.source} failed: {detail}")

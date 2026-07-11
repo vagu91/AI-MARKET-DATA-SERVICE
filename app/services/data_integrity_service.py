@@ -12,7 +12,7 @@ OFFICIAL_SOURCE_KEYWORDS = {
     "BEA": ("BEA", "BUREAU OF ECONOMIC ANALYSIS", "bea.gov"),
     "FEDERAL_RESERVE": ("FEDERAL RESERVE", "FOMC", "federalreserve.gov"),
     "SEC": ("SEC", "sec.gov"),
-    "NASDAQ_OFFICIAL": ("NASDAQ OFFICIAL", "nasdaq.com"),
+    "NASDAQ_OFFICIAL": ("NASDAQ OFFICIAL",),
 }
 
 MARKET_SOURCE_KEYWORDS = (
@@ -301,6 +301,28 @@ def sector_exposure(holdings: list[dict[str, Any]], *, total_holdings_count: int
         exposure[sector] = exposure.get(sector, 0.0) + weight
     covered_count = len(holdings)
     total_count = total_holdings_count or covered_count
+    if covered_count and holdings_with_weight == 0:
+        return {
+            "by_sector_weight_pct": {},
+            "sector_weight_pct": {},
+            "classified_weight_pct": None,
+            "unknown_weight_pct": None,
+            "total_weight_pct": None,
+            "covered_holdings_count": covered_count,
+            "total_holdings_count": total_count,
+            "covered_holdings_weight_pct": None,
+            "uncovered_holdings_weight_pct": None,
+            "portfolio_weight_pct": None,
+            "coverage_scope": coverage_scope or f"top_{covered_count}_holdings_weight_unavailable",
+            "sector_classification_source": SECTOR_MAP_VERSION,
+            "complete_portfolio_coverage": False,
+            "weight_data_available": False,
+            "sector_map_version": SECTOR_MAP_VERSION,
+            "data_quality": {
+                "unknown_below_threshold": None,
+                "warnings": ["sector_weight_data_unavailable"],
+            },
+        }
     complete_by_weight = 99.0 <= total <= 101.0
     complete_by_count = total_count == covered_count and holdings_with_weight == covered_count and complete_by_weight
     inferred_scope = coverage_scope or ("complete_portfolio" if complete_by_count else f"top_{covered_count}_holdings" if covered_count else "empty")

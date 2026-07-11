@@ -384,23 +384,43 @@ def _window_from_event(event: dict[str, Any], status: str, *, now: datetime) -> 
 
 
 def _breadth_summary(breadth: dict[str, Any]) -> dict[str, Any]:
-    avg = float(breadth.get("weighted_average_change_pct") or 0.0)
-    classification = "POSITIVE" if avg > 0.05 else "NEGATIVE" if avg < -0.05 else "MIXED"
+    weighted_avg = breadth.get("weighted_average_change_pct")
+    avg_change = breadth.get("average_change_pct")
+    value = weighted_avg if weighted_avg is not None else avg_change
+    avg = float(value) if value is not None else None
+    classification = "UNKNOWN" if avg is None else "POSITIVE" if avg > 0.05 else "NEGATIVE" if avg < -0.05 else "MIXED"
+    weight_available = weighted_avg is not None
     return {
         "positive_count": int(breadth.get("positive_count") or 0),
         "negative_count": int(breadth.get("negative_count") or 0),
         "neutral_count": int(breadth.get("neutral_count") or 0),
         "weighted_positive_pct": breadth.get("weighted_positive_pct"),
         "weighted_negative_pct": breadth.get("weighted_negative_pct"),
-        "weighted_average_change_pct": breadth.get("weighted_average_change_pct"),
+        "weighted_average_change_pct": weighted_avg,
+        "average_change_pct": avg_change,
+        "calculation_method": "provider_weighted" if weight_available else ("equal_weight_proxy" if avg_change is not None else "unavailable"),
+        "is_proxy": not weight_available and avg_change is not None,
+        "proxy_reason": None if weight_available else "QQQ constituent weights unavailable",
+        "reliability": 0.75 if weight_available else (0.45 if avg_change is not None else 0.0),
         "classification": classification,
     }
 
 
 def _concentration(holdings: list[dict[str, Any]]) -> dict[str, Any]:
-    weights = [float(item.get("weight") or 0.0) for item in holdings]
-    top5 = round(sum(weights[:5]), 4)
-    top10 = round(sum(weights[:10]), 4)
+    weights = [_float_or_none(item.get("weight")) for item in holdings]
+    if holdings and not any(weight is not None for weight in weights):
+        largest = holdings[0]
+        return {
+            "top_5_weight_pct": None,
+            "top_10_weight_pct": None,
+            "largest_constituent_symbol": largest.get("symbol"),
+            "largest_constituent_weight_pct": None,
+            "classification": "UNKNOWN",
+            "weight_data_available": False,
+        }
+    numeric_weights = [weight or 0.0 for weight in weights]
+    top5 = round(sum(numeric_weights[:5]), 4)
+    top10 = round(sum(numeric_weights[:10]), 4)
     largest = holdings[0] if holdings else {}
     classification = "HIGH" if top10 >= 45 else "MEDIUM" if top10 >= 30 else "LOW"
     return {
@@ -409,12 +429,13 @@ def _concentration(holdings: list[dict[str, Any]]) -> dict[str, Any]:
         "largest_constituent_symbol": largest.get("symbol"),
         "largest_constituent_weight_pct": largest.get("weight"),
         "classification": classification,
+        "weight_data_available": True,
     }
 
 
 def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str, Any]]) -> dict[str, Any]:
     by_symbol = {str(item.get("symbol")).upper(): item for item in stocks}
-    weight_by_symbol = {str(item.get("symbol")).upper(): float(item.get("weight") or 0.0) for item in holdings}
+    weight_by_symbol = {str(item.get("symbol")).upper(): _float_or_none(item.get("weight")) for item in holdings}
     holding_symbols = {str(item.get("symbol")).upper() for item in holdings}
     relevant = [symbol for symbol in SEMICONDUCTOR_SYMBOLS if symbol in holding_symbols or symbol in by_symbol]
     resolved = [symbol for symbol in relevant if symbol in by_symbol]
@@ -422,10 +443,10 @@ def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str
     excluded = [symbol for symbol in SEMICONDUCTOR_SYMBOLS if symbol not in relevant]
     positive = sum(1 for symbol in resolved if float(by_symbol[symbol].get("change_pct") or 0.0) > 0)
     negative = sum(1 for symbol in resolved if float(by_symbol[symbol].get("change_pct") or 0.0) < 0)
-    total_weight = sum(weight_by_symbol.get(symbol, 0.0) for symbol in resolved)
+    total_weight = sum(weight for symbol in resolved if (weight := weight_by_symbol.get(symbol)) is not None)
     weighted = None
     if total_weight:
-        weighted = round(sum(weight_by_symbol.get(symbol, 0.0) * float(by_symbol[symbol].get("change_pct") or 0.0) for symbol in resolved) / total_weight, 4)
+        weighted = round(sum((weight_by_symbol.get(symbol) or 0.0) * float(by_symbol[symbol].get("change_pct") or 0.0) for symbol in resolved) / total_weight, 4)
     classification = "INSUFFICIENT_DATA" if not resolved else "POSITIVE" if positive > negative else "NEGATIVE" if negative > positive else "MIXED"
     return {
         "symbols": sorted(SEMICONDUCTOR_SYMBOLS),
@@ -445,6 +466,7 @@ def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str
         "data_quality": {
             "resolution_pct": _pct(len(resolved), len(SEMICONDUCTOR_SYMBOLS)),
             "unresolved_reason": {symbol: "missing_from_mega_cap_snapshot_provider_output" for symbol in unresolved},
+            "weight_data_available": any(weight is not None for weight in weight_by_symbol.values()),
         },
     }
 
@@ -459,14 +481,14 @@ def _driver_context(holdings: list[dict[str, Any]], stocks: list[dict[str, Any]]
         stock = stock_by_symbol.get(symbol, {})
         related_news = [item for item in latest_news if symbol in [str(value).upper() for value in item.get("symbols", [])]]
         earnings_item = earnings_by_symbol.get(symbol)
-        weight = float(holding.get("weight") or 0.0)
+        weight = _float_or_none(holding.get("weight"))
         change = stock.get("change_pct")
         output.append(
             {
                 "symbol": symbol,
                 "qqq_weight": weight,
                 "change_pct": change,
-                "weighted_contribution": round(weight * float(change) / 100, 6) if change is not None else None,
+                "weighted_contribution": round(weight * float(change) / 100, 6) if weight is not None and change is not None else None,
                 "has_recent_news": bool(related_news),
                 "recent_news_count": len(related_news),
                 "upcoming_earnings": earnings_item is not None,
@@ -552,3 +574,12 @@ def _stable_id(topic: str, urls: list[str]) -> str:
 
 def _pct(count: int, total: int) -> float:
     return round((count / total) * 100, 2) if total else 0.0
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

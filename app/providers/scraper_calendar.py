@@ -1,7 +1,7 @@
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import ProviderResult, ProviderType
-from app.providers.base import BaseProvider, ProviderError
+from app.providers.base import BaseProvider, ProviderDisabled, ProviderError
 
 
 class EconomicCalendarScraperProvider(BaseProvider):
@@ -16,7 +16,7 @@ class EconomicCalendarScraperProvider(BaseProvider):
 
     async def fetch(self) -> ProviderResult:
         if not self.settings.enable_scraper_fallbacks:
-            raise ProviderError(
+            raise ProviderDisabled(
                 "Scraper fallbacks are disabled by config "
                 "(DailyFX, ForexFactory, Investing)"
             )

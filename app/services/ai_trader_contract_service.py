@@ -24,7 +24,7 @@ def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
         "event_calendar": _compact_events(full.get("event_calendar") or {}),
         "event_windows": full.get("event_windows") or {},
         "positioning": full.get("positioning") or {},
-        "sentiment_context": full.get("sentiment_context") or {},
+        "sentiment_context": _compact_sentiment_context(full.get("sentiment_context") or {}),
         "social_sentiment": full.get("social_sentiment") or _empty_social(),
         "risk_sentiment": full.get("risk_sentiment") or {},
         "risk_context": full.get("risk_context") or {},
@@ -52,10 +52,11 @@ def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
 def _readiness(data_quality: dict[str, Any]) -> dict[str, Any]:
     overall = data_quality.get("overall_data_quality") or {}
     explicit_errors = data_quality.get("critical_errors") or data_quality.get("errors") or []
+    blocking = list(overall.get("blocking_reasons") or [])
     return {
-        "ready": len(explicit_errors) == 0,
-        "critical_errors": len(explicit_errors),
-        "blocking_reasons": overall.get("blocking_reasons") or [],
+        "ready": len(explicit_errors) == 0 and not blocking,
+        "critical_errors": len(explicit_errors) + len(blocking),
+        "blocking_reasons": blocking,
     }
 
 
@@ -66,10 +67,10 @@ def _compact_quality(data_quality: dict[str, Any]) -> dict[str, Any]:
         "freshness_score": overall.get("freshness_score"),
         "reliability_score": overall.get("reliability_score"),
         "critical_missing_count": overall.get("critical_missing_count"),
-        "missing_critical_fields": data_quality.get("missing_critical_fields") or [],
+        "missing_critical_fields": data_quality.get("missing_critical_fields") or overall.get("missing_critical_fields") or [],
         "section_quality": data_quality.get("section_quality") or {},
         "pipeline_integrity": data_quality.get("pipeline_integrity") or {},
-        "multi_source_pipeline": data_quality.get("multi_source_pipeline") or {},
+        "multi_source_pipeline": _compact_multi_source_pipeline(data_quality.get("multi_source_pipeline") or {}),
     }
 
 
@@ -86,7 +87,7 @@ def _compact_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
         "qqq_holdings": nasdaq.get("qqq_holdings") or {},
         "sector_exposure": nasdaq.get("sector_exposure") or {},
         "mega_cap_snapshot": _compact_snapshot(nasdaq.get("mega_cap_snapshot") or {}),
-        "mega_cap_breadth": nasdaq.get("mega_cap_breadth") or {},
+        "mega_cap_breadth": _compact_breadth(nasdaq.get("mega_cap_breadth") or {}),
         "concentration": nasdaq.get("concentration") or {},
         "semiconductor_context": nasdaq.get("semiconductor_context") or {},
         "earnings": nasdaq.get("earnings") or {},
@@ -100,6 +101,53 @@ def _compact_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {**snapshot, "stocks": (snapshot.get("stocks") or [])[:20]}
+
+
+def _compact_breadth(breadth: dict[str, Any]) -> dict[str, Any]:
+    if not breadth:
+        return {}
+    missing_weights = ((breadth.get("data_quality") or {}).get("missing_weights") or [])
+    output = dict(breadth)
+    if missing_weights:
+        output["calculation_method"] = "equal_weight_proxy"
+        output["is_proxy"] = True
+        output["proxy_reason"] = "QQQ constituent weights unavailable; equal-weight mega-cap proxy only"
+        output["weighted_average_change_pct"] = None
+        output["weighted_positive_pct"] = None
+        output["weighted_negative_pct"] = None
+        output["top_positive_contributors"] = [_strip_proxy_weight(item) for item in output.get("top_positive_contributors") or []]
+        output["top_negative_contributors"] = [_strip_proxy_weight(item) for item in output.get("top_negative_contributors") or []]
+    return output
+
+
+def _strip_proxy_weight(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": item.get("symbol"),
+        "change_pct": item.get("change_pct"),
+        "weight": None,
+        "weighted_contribution": None,
+        "calculation_method": "equal_weight_proxy",
+    }
+
+
+def _compact_multi_source_pipeline(pipeline: dict[str, Any]) -> dict[str, Any]:
+    output = dict(pipeline)
+    output["warnings"] = _compact_messages(output.get("warnings") or [])
+    output["errors"] = _compact_messages(output.get("errors") or [])
+    return output
+
+
+def _compact_messages(messages: list[Any]) -> list[str]:
+    compacted: list[str] = []
+    for message in messages:
+        text = str(message)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "SSL" in text.upper():
+            text = "polymarket:ssl_error:ssl_certificate_verification_failed"
+        elif len(text) > 180:
+            text = text[:177] + "..."
+        if text not in compacted:
+            compacted.append(text)
+    return compacted
 
 
 def _compact_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -150,6 +198,47 @@ def _compact_nasdaq_100(snapshot: dict[str, Any]) -> dict[str, Any]:
         "diagnostics": snapshot.get("diagnostics") or {},
         "warnings": snapshot.get("warnings") or [],
     }
+
+
+def _compact_sentiment_context(sentiment: dict[str, Any]) -> dict[str, Any]:
+    output = dict(sentiment)
+    prediction = output.get("prediction_markets")
+    if isinstance(prediction, dict):
+        errors = prediction.get("errors") or []
+        warnings = prediction.get("warnings") or []
+        combined = [str(item) for item in [*errors, *warnings] if item]
+        failure_type = prediction.get("failure_type")
+        if not failure_type and any("CERTIFICATE_VERIFY_FAILED" in item or "SSL" in item.upper() for item in combined):
+            failure_type = "ssl_error"
+        short_reason = _short_reason(combined, fallback=prediction.get("warning") or prediction.get("error"))
+        output["prediction_markets"] = {
+            "status": prediction.get("status"),
+            "failure_type": failure_type,
+            "attempt_count": int(prediction.get("attempt_count") or (prediction.get("diagnostics") or {}).get("attempt_count") or len((prediction.get("diagnostics") or {}).get("attempts") or []) or 0),
+            "blocking": False,
+            "retryable": prediction.get("retryable"),
+            "next_retry_at": prediction.get("next_retry_at"),
+            "short_reason": short_reason,
+            "source": prediction.get("source"),
+            "source_url": prediction.get("source_url"),
+        }
+    return output
+
+
+def _short_reason(messages: list[str], *, fallback: Any = None) -> str | None:
+    candidates = messages or ([str(fallback)] if fallback else [])
+    if not candidates:
+        return None
+    unique = []
+    for message in candidates:
+        text = str(message)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "SSL" in text.upper():
+            text = "ssl_certificate_verification_failed"
+        elif len(text) > 160:
+            text = text[:157] + "..."
+        if text not in unique:
+            unique.append(text)
+    return "; ".join(unique[:3])
 
 
 def _compact_market_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
