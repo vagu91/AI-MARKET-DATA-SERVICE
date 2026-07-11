@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import html
@@ -15,6 +16,7 @@ from app.providers.alpha_vantage import ensure_alpha_payload_ok
 from app.providers.base import BaseProvider, metadata
 from app.providers.calendar_utils import REQUEST_HEADERS
 from app.services.market_news_repository import MarketNewsRepository
+from app.services.news_intelligence_service import extract_page_metadata, normalize_news_article
 
 TOPIC_KEYWORDS = {
     "Fed": ["federal reserve", "fed ", "fomc", "powell"],
@@ -81,6 +83,10 @@ class NewsProvider(BaseProvider):
                         parse_alpha_vantage_news(payload, symbols, limit),
                         recency_days=recency_days,
                     )
+                    articles = filter_recent_articles(
+                        await self._enrich_missing_metadata(client, articles),
+                        recency_days=recency_days,
+                    )
                     if articles:
                         return self._store_and_return(_news_result(
                             source="Alpha Vantage NEWS_SENTIMENT",
@@ -115,6 +121,10 @@ class NewsProvider(BaseProvider):
                     parse_gdelt_articles(payload, symbols, limit),
                     recency_days=recency_days,
                 )
+                articles = filter_recent_articles(
+                    await self._enrich_missing_metadata(client, articles),
+                    recency_days=recency_days,
+                )
                 if articles:
                     return self._store_and_return(_news_result(
                         source="GDELT Doc API",
@@ -137,6 +147,7 @@ class NewsProvider(BaseProvider):
             )
             warnings.extend(rss_warnings)
             if rss_articles:
+                rss_articles = await self._enrich_missing_metadata(client, rss_articles)
                 return self._store_and_return(_news_result(
                     source="RSS fallback",
                     provider_type=ProviderType.RSS,
@@ -159,6 +170,19 @@ class NewsProvider(BaseProvider):
         ))
 
     def _store_and_return(self, result: ProviderResult) -> ProviderResult:
+        if isinstance(result.data, dict):
+            normalized = [normalize_news_article(article) for article in result.data.get("articles", [])]
+            result.data["articles"] = normalized
+            quality = dict(result.data.get("data_quality") or {})
+            quality.update(
+                {
+                    "raw_article_count": len(normalized),
+                    "accepted_count": sum(bool(article.get("accepted")) for article in normalized),
+                    "excluded_count": sum(not bool(article.get("accepted")) for article in normalized),
+                    "exclusion_breakdown": dict(Counter(str(article.get("exclusion_reason")) for article in normalized if article.get("exclusion_reason"))),
+                }
+            )
+            result.data["data_quality"] = quality
         if not self.market_news_repository:
             return result
         for article in result.data.get("articles", []) if isinstance(result.data, dict) else []:
@@ -220,6 +244,42 @@ class NewsProvider(BaseProvider):
                     return articles, _dedupe_errors(warnings)
         return articles, _dedupe_errors(warnings)
 
+    async def _enrich_missing_metadata(
+        self,
+        client: httpx.AsyncClient,
+        articles: list[dict[str, object]],
+        *,
+        max_pages: int = 8,
+    ) -> list[dict[str, object]]:
+        candidates = [
+            article
+            for article in articles
+            if (not article.get("published_at") or not article.get("summary"))
+            and article.get("source_url")
+            and not any(host in str(article.get("source_url") or "") for host in ("news.google.com",))
+        ][:max_pages]
+
+        async def enrich(article: dict[str, object]) -> None:
+            try:
+                response = await client.get(
+                    str(article.get("source_url")),
+                    headers=REQUEST_HEADERS,
+                    follow_redirects=True,
+                    timeout=min(float(self.settings.http_timeout_seconds), 2.5),
+                )
+                response.raise_for_status()
+                metadata = extract_page_metadata(response.text, page_url=str(response.url))
+            except Exception:
+                return
+            for key in ("published_at", "published_at_source", "summary", "summary_source_type", "summary_source_url", "author", "canonical_url"):
+                if not article.get(key) and metadata.get(key):
+                    article[key] = metadata[key]
+            if article.get("summary"):
+                article["source_text_available"] = True
+
+        await asyncio.gather(*(enrich(article) for article in candidates))
+        return articles
+
 
 async def _fetch_one_rss_feed(
     *,
@@ -268,7 +328,8 @@ def parse_gdelt_articles(payload: dict, symbols: list[str], limit: int) -> list[
             {
                 "title": title,
                 "source": item.get("sourceCountry") or item.get("domain") or "GDELT",
-                "published_at": parse_gdelt_date(item.get("seendate")),
+                "published_at": None,
+                "provider_seen_at": parse_gdelt_date(item.get("seendate")),
                 "url": url,
                 "source_url": url,
                 "canonical_url": url,
@@ -341,20 +402,26 @@ def parse_rss_articles(
     root = ET.fromstring(text)
     articles = []
     warnings = []
-    for item in root.findall(".//item")[:limit]:
-        title = (item.findtext("title") or "").strip()
-        url = (item.findtext("link") or "").strip()
+    rss_items = list(root.findall(".//item"))
+    atom_items = [node for node in root.iter() if node.tag.split("}")[-1] == "entry"]
+    for item in [*rss_items, *atom_items][:limit]:
+        is_atom = item.tag.split("}")[-1] == "entry"
+        title = (_node_text(item, "title") or "").strip()
+        url = (_node_link(item) or "").strip()
         if not title or not url:
             continue
-        description = _rss_text(item, "description")
+        description = _rss_text(item, "description") or _rss_text(item, "summary")
         content_encoded = _rss_text(item, "{http://purl.org/rss/1.0/modules/content/}encoded")
-        summary = _clean_markup(content_encoded or description)
-        published_at = parse_rss_date(item.findtext("pubDate"))
+        atom_content = _rss_text(item, "content") if is_atom else None
+        summary = _clean_markup(description or content_encoded or atom_content)
+        pub_date = _node_text(item, "pubDate")
+        atom_published = _node_text(item, "published") or _node_text(item, "updated")
+        published_at = parse_rss_date(pub_date) or parse_atom_date(atom_published)
         article_reliability = reliability
         if not published_at:
             article_reliability = max(reliability - 0.12, 0.0)
             warnings.append(f"{source_name} article missing published_at: {title[:80]}")
-        source = item.findtext("source") or source_name
+        source = _node_text(item, "source") or _node_text(item, "author") or source_name
         is_official = source_name in {"Federal Reserve RSS", "BLS RSS", "BEA RSS"}
         canonical_url = None if "Google News RSS" in source_name else url
         aggregator_url = url if "Google News RSS" in source_name else None
@@ -368,6 +435,7 @@ def parse_rss_articles(
                 "title": title,
                 "source": source,
                 "published_at": published_at,
+                "published_at_source": "rss_pub_date" if pub_date and published_at else "atom_published" if atom_published and published_at else None,
                 "url": url,
                 "source_url": url,
                 "canonical_url": canonical_url,
@@ -375,7 +443,7 @@ def parse_rss_articles(
                 "canonical_status": "unresolved" if aggregator_url else "resolved",
                 "summary": summary,
                 "content_snippet": summary,
-                "summary_source_type": "content_encoded" if content_encoded else ("rss_description" if description else None),
+                "summary_source_type": "rss_description" if description else ("content_encoded" if content_encoded else "atom_content" if atom_content else None),
                 "summary_source_url": url,
                 "source_text_available": bool(summary),
                 "is_official": is_official,
@@ -399,6 +467,33 @@ def _rss_text(item: ET.Element, tag: str) -> str | None:
     return None
 
 
+def _node_text(item: ET.Element, local_name: str) -> str | None:
+    for child in item:
+        if child.tag.split("}")[-1] != local_name:
+            continue
+        if local_name == "author":
+            nested = next((node.text for node in child if node.tag.split("}")[-1] == "name" and node.text), None)
+            return nested or child.text
+        if local_name == "source":
+            nested = next((node.text for node in child if node.tag.split("}")[-1] == "title" and node.text), None)
+            return nested or child.text
+        return child.text
+    return None
+
+
+def _node_link(item: ET.Element) -> str | None:
+    for child in item:
+        if child.tag.split("}")[-1] != "link":
+            continue
+        href = child.attrib.get("href")
+        rel = child.attrib.get("rel", "alternate")
+        if href and rel in {"alternate", ""}:
+            return href
+        if child.text:
+            return child.text
+    return None
+
+
 def _clean_markup(value: str | None) -> str | None:
     if not value:
         return None
@@ -414,6 +509,18 @@ def parse_rss_date(value: str | None) -> str | None:
     try:
         parsed = parsedate_to_datetime(value)
     except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
+def parse_atom_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)

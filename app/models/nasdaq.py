@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -189,6 +190,30 @@ class NewsArticle(BaseModel):
     relevance: Relevance = Relevance.LOW
     provider_type: ProviderType
     reliability: float
+    original_publisher: str | None = None
+    source_classification: str | None = None
+    author: str | None = None
+    summary_source_url: str | None = None
+    summary_quality: float | None = None
+    summary_is_generated: bool = False
+    summary_reliability: float | None = None
+    is_official_source: bool = False
+    is_primary_source: bool = False
+    entities: list[str] = Field(default_factory=list)
+    matched_entities: list[str] = Field(default_factory=list)
+    topic_classifications: list[dict[str, Any]] = Field(default_factory=list)
+    relevance_score: float | None = None
+    relevance_reasons: list[str] = Field(default_factory=list)
+    relevance_tier: str | None = None
+    exclusion_reason: str | None = None
+    accepted: bool = True
+    article_id: str | None = None
+    duplicate_group_id: str | None = None
+    duplicate_of: str | None = None
+    syndication_group: str | None = None
+    independent_source_count: int = 1
+    pipeline_version: str | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class NewsQuality(DataQuality):

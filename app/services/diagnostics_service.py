@@ -39,6 +39,7 @@ from app.services.data_integrity_service import (
 )
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.macro_consensus_service import MacroConsensusService
+from app.services.news_intelligence_runtime_service import NewsIntelligenceRuntimeService
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
@@ -66,6 +67,7 @@ class DiagnosticsService:
         self.event_materializer = EconomicEventMaterializationService(settings, facts=self.facts)
         self.macro_consensus = MacroConsensusService(settings, facts=self.facts)
         self.news = MarketNewsRepository(settings)
+        self.news_intelligence = NewsIntelligenceRuntimeService(settings, facts=self.facts)
         self.freshness = DataFreshnessService(settings)
         self.positioning_runtime = PositioningRuntimeService(settings)
 
@@ -296,7 +298,11 @@ class DiagnosticsService:
 
                 event_windows = EventWindowsResponse(symbol=symbol, checked_at_utc=datetime.now(UTC).isoformat())
         news_items = self.news.stored(days=days, limit=100)
-        news_pipeline = _news_pipeline_status(news_items)
+        news_context, news_runtime = self.news_intelligence.materialize(
+            news_items,
+            refresh_mode=refresh,
+        )
+        news_pipeline = _news_pipeline_status(news_items, materialized=news_context)
         macro_pipeline = _macro_pipeline_status(macro)
         pipeline_integrity = {
             "critical_fetch_completed": (not fetch_missing) or macro_quality.get("provider_hits", 0) > 0 or macro_quality.get("db_hits", 0) > 0,
@@ -322,6 +328,7 @@ class DiagnosticsService:
             "provider_observations_summary": self._provider_observation_summary(),
             "pipeline_integrity": pipeline_integrity,
             "news_pipeline": news_pipeline,
+            "news_intelligence": news_runtime,
             "macro_pipeline": macro_pipeline,
         }
         contract = build_market_context_contract(
@@ -338,6 +345,7 @@ class DiagnosticsService:
             metadata={"event_enrichment": _event_enrichment_metadata(enrichment_metadata, enriched, settings=self.settings)},
             positioning_context=positioning_context,
             sentiment_context=sentiment_context,
+            news_context_override=news_context,
         )
         contract["data_quality"]["macro_pipeline"] = _macro_pipeline_status(macro, contract.get("macro_snapshot") or {})
         overall_quality = contract["data_quality"].get("overall_data_quality") or {}
@@ -875,8 +883,13 @@ def _event_enrichment_metadata(
     }
 
 
-def _news_pipeline_status(news_items: list[dict[str, Any]]) -> dict[str, Any]:
-    materialized = build_news_context(news_items)
+def _news_pipeline_status(
+    news_items: list[dict[str, Any]],
+    *,
+    materialized: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    materialized = materialized or build_news_context(news_items)
+    diagnostics = dict(materialized.get("diagnostics") or {})
     exclusions: list[dict[str, Any]] = []
     eligible_count = 0
     for item in news_items:
@@ -890,6 +903,9 @@ def _news_pipeline_status(news_items: list[dict[str, Any]]) -> dict[str, Any]:
                     "reason": reason,
                 }
             )
+    if diagnostics:
+        eligible_count = int(diagnostics.get("accepted_count") or 0)
+        exclusions = list(materialized.get("excluded") or [])
     materialized_count = len(materialized.get("latest") or [])
     return {
         "fetched_count": len(news_items),
@@ -902,6 +918,8 @@ def _news_pipeline_status(news_items: list[dict[str, Any]]) -> dict[str, Any]:
         "excluded_count": len(exclusions),
         "exclusion_reasons": _reason_counts(exclusions),
         "exclusions": exclusions[:50],
+        "diagnostics": diagnostics,
+        "quality": materialized.get("quality") or {},
         "eligible_news_not_materialized": max(eligible_count - materialized_count, 0) if materialized_count == 0 else 0,
     }
 

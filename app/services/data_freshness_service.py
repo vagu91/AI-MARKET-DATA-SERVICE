@@ -69,8 +69,10 @@ class DataFreshnessService:
         retrieved_at: str,
         topics: list[str] | None = None,
     ) -> str:
-        fast_topics = {"fed", "fomc", "cpi", "ppi", "nfp", "pce", "gdp", "risk_event", "inflation"}
-        ttl_hours = 6 if fast_topics.intersection({topic.lower() for topic in topics or []}) else self.settings.default_news_ttl_hours
+        fast_topics = {"fed", "fomc", "cpi", "ppi", "nfp", "pce", "gdp", "risk_event", "inflation", "macro", "yields"}
+        medium_topics = {"mega-cap", "semiconductors", "earnings"}
+        normalized_topics = {topic.lower() for topic in topics or []}
+        ttl_hours = 12 if fast_topics.intersection(normalized_topics) else 18 if medium_topics.intersection(normalized_topics) else self.settings.default_news_ttl_hours
         base = parse_datetime(published_at) or parse_datetime(retrieved_at) or datetime.now(UTC)
         return (base + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat()
 

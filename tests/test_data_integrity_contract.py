@@ -152,6 +152,8 @@ def test_expired_news_excluded_and_marketbeat_not_official():
                 "title": "Fresh BLS release",
                 "source": "BLS",
                 "source_url": "https://www.bls.gov/news.release/cpi.nr0.htm",
+                "published_at": datetime.now(UTC).isoformat(),
+                "summary": "The official BLS release reports current Consumer Price Index data.",
                 "valid_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             },
             {
@@ -181,6 +183,8 @@ def test_placeholder_news_title_excluded_from_latest():
                 "title": "Real QQQ market story",
                 "source": "Reuters",
                 "source_url": "https://news.test/real-story",
+                "published_at": datetime.now(UTC).isoformat(),
+                "summary": "Reuters reports a material development affecting QQQ and Nasdaq markets.",
                 "valid_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             },
         ]

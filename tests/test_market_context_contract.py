@@ -139,10 +139,11 @@ def test_news_context_dedupes_and_groups_articles():
     news = build_news_context(
         [
             {
-                "title": "Fed and Nasdaq story",
+                "title": "Fed policy and Nasdaq story",
                 "source": "MarketWatch",
                 "source_url": "https://news.test/1",
-                "published_at": "2099-07-10T00:00:00+00:00",
+                "published_at": datetime.now(UTC).isoformat(),
+                "summary": "MarketWatch reports a Federal Reserve development affecting Nasdaq and QQQ.",
                 "symbols": ["QQQ"],
                 "topics": ["Fed", "mega-cap"],
                 "relevance": "HIGH",
@@ -155,7 +156,7 @@ def test_news_context_dedupes_and_groups_articles():
 
     assert len(news["latest"]) == 1
     assert news["by_topic"]["fed"][0]["source_url"] == "https://news.test/1"
-    assert news["by_symbol"]["QQQ"][0]["title"] == "Fed and Nasdaq story"
+    assert news["by_symbol"]["QQQ"][0]["title"] == "Fed policy and Nasdaq story"
 
 
 def test_full_contract_has_quality_legacy_views_and_metric_based_enrichment():
@@ -178,7 +179,7 @@ def test_full_contract_has_quality_legacy_views_and_metric_based_enrichment():
         upcoming_events=[event("CPI", "Consumer Price Index", "cpi")],
         event_windows=EventWindowsResponse(symbol="MNQ", checked_at_utc=datetime.now(UTC).isoformat()),
         nasdaq_context={"qqq_holdings": {"holdings_count": 1}, "mega_cap_breadth": {}, "earnings": {}},
-        news_items=[{"title": "QQQ news", "source_url": "https://news.test", "symbols": ["QQQ"], "topics": ["macro"]}],
+        news_items=[{"title": "QQQ news", "summary": "Reuters reports a material development affecting QQQ and Nasdaq markets.", "source": "Reuters", "source_url": "https://news.test", "published_at": datetime.now(UTC).isoformat(), "symbols": ["QQQ"], "topics": ["macro"]}],
         data_quality={"missing_critical_fields": []},
         db_summary={"market_facts": {"total": 1}},
     )
@@ -228,7 +229,7 @@ def test_extended_contract_adds_data_only_context_blocks_and_event_windows():
             "earnings": {"upcoming": [{"symbol": "NVDA", "date": "2099-08-01"}], "data_quality": {"final_data_available": True}},
             "sector_exposure": {"unknown_weight_pct": 0.0, "classified_weight_pct": 15.0},
         },
-        news_items=[{"title": "Nvidia chip story", "summary": "Text from feed", "source": "Reuters", "source_url": "https://reuters.test/1", "symbols": ["NVDA"], "topics": ["semiconductors"], "relevance": "HIGH", "reliability": 0.8}],
+        news_items=[{"title": "Nvidia chip story", "summary": "Reuters reports a material semiconductor development affecting Nvidia.", "source": "Reuters", "source_url": "https://reuters.test/1", "published_at": datetime.now(UTC).isoformat(), "symbols": ["NVDA"], "topics": ["semiconductors"], "relevance": "HIGH", "reliability": 0.8}],
         data_quality={"missing_critical_fields": []},
         db_summary={"market_facts": {"total": 1}},
     )

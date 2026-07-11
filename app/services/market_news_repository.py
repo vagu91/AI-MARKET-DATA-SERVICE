@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.text_normalization import normalize_payload_text
@@ -9,6 +10,7 @@ from app.services.data_freshness_service import DataFreshnessService
 from app.services.data_integrity_service import news_content_status
 from app.services.fact_key_service import FactKeyService
 from app.services.market_fact_repository import connect_market_db, encode, init_market_db, now_iso, decode
+from app.services.news_intelligence_service import normalize_news_article
 
 
 class MarketNewsRepository:
@@ -19,7 +21,7 @@ class MarketNewsRepository:
         init_market_db(settings)
 
     def upsert_news(self, article: dict[str, Any]) -> dict[str, Any]:
-        article = normalize_payload_text(redact_payload(dict(article)))
+        article = normalize_news_article(normalize_payload_text(redact_payload(dict(article))))
         content_status = news_content_status(article)
         if content_status == "invalid_content":
             article["content_status"] = "invalid_content"
@@ -50,8 +52,8 @@ class MarketNewsRepository:
             "reliability": article.get("reliability") or 0,
             "confidence": article.get("confidence") or article.get("reliability") or 0,
             "provider_type": article.get("provider_type"),
-            "is_official": 1 if article.get("is_official") else 0,
-            "is_duplicate": 0,
+            "is_official": 1 if article.get("is_official_source") or article.get("is_official") else 0,
+            "is_duplicate": 1 if article.get("is_duplicate") else 0,
             "raw_payload_json": encode(article),
             "created_at": article.get("created_at") or timestamp,
             "updated_at": timestamp,
@@ -76,10 +78,11 @@ class MarketNewsRepository:
         return payload
 
     def stored(self, *, symbols: list[str] | None = None, days: int = 7, limit: int = 200) -> list[dict[str, Any]]:
+        cutoff = (datetime.now(UTC) - timedelta(days=max(days, 1))).replace(microsecond=0).isoformat()
         with connect_market_db(self.settings) as conn:
             rows = conn.execute(
-                "SELECT * FROM market_news ORDER BY COALESCE(published_at, retrieved_at) DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM market_news WHERE COALESCE(published_at, retrieved_at) >= ? ORDER BY COALESCE(published_at, retrieved_at) DESC LIMIT ?",
+                (cutoff, limit),
             ).fetchall()
         items = [self._row(row) for row in rows]
         if symbols:
@@ -96,14 +99,13 @@ class MarketNewsRepository:
             data["content_status"] = data["raw_payload"]["content_status"]
         if isinstance(data["raw_payload"], dict):
             for key in (
-                "canonical_url",
-                "aggregator_url",
-                "canonical_status",
-                "redirect_chain",
-                "summary_source_type",
-                "summary_source_url",
-                "source_text_available",
-                "is_official",
+                "accepted", "article_id", "author", "canonical_url", "aggregator_url", "canonical_status",
+                "redirect_chain", "summary_source_type", "summary_source_url", "summary_quality",
+                "summary_is_generated", "summary_reliability", "source_text_available", "original_publisher",
+                "source_classification", "is_official", "is_official_source", "is_primary_source", "entities",
+                "matched_entities", "topic_classifications", "relevance_score", "relevance_reasons",
+                "relevance_tier", "exclusion_reason", "duplicate_group_id", "duplicate_of", "syndication_group",
+                "independent_source_count", "pipeline_version", "warnings", "content_status",
             ):
                 if data.get(key) in (None, "") and key in data["raw_payload"]:
                     data[key] = data["raw_payload"][key]

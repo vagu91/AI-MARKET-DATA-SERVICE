@@ -174,7 +174,11 @@ async def market_context_mnq(
     event_windows = await event_window_service.event_windows(symbol="MNQ")
     nasdaq_context, nasdaq_quality = await diagnostics._nasdaq_db_first(symbol="MNQ", fetch_missing=False)
     news_items = MarketNewsRepository(enrichment_orchestrator.settings).stored(days=30, limit=100)
-    news_pipeline = _news_pipeline_status(news_items)
+    news_context, news_runtime = diagnostics.news_intelligence.materialize(
+        news_items,
+        refresh_mode="auto",
+    )
+    news_pipeline = _news_pipeline_status(news_items, materialized=news_context)
     macro_pipeline = _macro_pipeline_status(macro)
     pipeline_integrity = {
         "critical_fetch_completed": True,
@@ -195,6 +199,7 @@ async def market_context_mnq(
         "nasdaq": nasdaq_quality,
         "pipeline_integrity": pipeline_integrity,
         "news_pipeline": news_pipeline,
+        "news_intelligence": news_runtime,
         "macro_pipeline": macro_pipeline,
     }
     contract = build_market_context_contract(
@@ -214,6 +219,7 @@ async def market_context_mnq(
             "event_enrichment": event_service.last_enrichment_metadata,
             "persistent_enrichment": orchestrator_metadata,
         },
+        news_context_override=news_context,
     )
     contract["data_quality"]["macro_pipeline"] = _macro_pipeline_status(macro, contract.get("macro_snapshot") or {})
     multi_source = await multi_runtime.snapshot(

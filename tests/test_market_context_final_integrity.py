@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.core.text_normalization import normalize_payload_text, normalize_text
@@ -180,7 +180,7 @@ def test_news_context_filters_irrelevant_articles_and_classifies_sources() -> No
                 "source": "Yahoo Finance",
                 "source_url": "https://finance.yahoo.com/personal",
                 "retrieved_at": "2099-07-10T00:00:00Z",
-                "valid_until": "2099-07-11T00:00:00Z",
+                "valid_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "relevance": "LOW",
             },
             {
@@ -188,9 +188,9 @@ def test_news_context_filters_irrelevant_articles_and_classifies_sources() -> No
                 "summary": "QQQ and mega-cap semiconductors moved higher.",
                 "source": "Reuters",
                 "source_url": "https://reuters.test/nasdaq",
-                "published_at": "2099-07-10T00:00:00Z",
-                "retrieved_at": "2099-07-10T00:00:00Z",
-                "valid_until": "2099-07-11T00:00:00Z",
+                "published_at": datetime.now(UTC).isoformat(),
+                "retrieved_at": datetime.now(UTC).isoformat(),
+                "valid_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "relevance": "HIGH",
                 "symbols": ["QQQ", "NVDA"],
                 "topics": ["mega-cap"],

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.services.data_freshness_service import parse_datetime
+from app.services.news_intelligence_service import build_news_digest as build_intelligence_news_digest
 
 
 SEMICONDUCTOR_SYMBOLS = {"NVDA", "AVGO", "AMD", "MU", "INTC", "AMAT", "QCOM", "ARM", "ASML", "LRCX", "KLAC", "MRVL"}
@@ -196,6 +197,8 @@ def build_fomc_context(event_calendar: dict[str, Any]) -> dict[str, Any]:
 
 
 def enrich_news_context(news_context: dict[str, Any]) -> dict[str, Any]:
+    if news_context.get("pipeline_version"):
+        return dict(news_context)
     output = dict(news_context)
     latest = []
     for item in output.get("latest") or []:
@@ -226,58 +229,15 @@ def enrich_news_context(news_context: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_news_digest(news_context: dict[str, Any], *, coverage_window_hours: int = 24) -> dict[str, Any]:
-    latest = list(news_context.get("latest") or [])
-    source_urls = [item.get("canonical_url") or item.get("source_url") for item in latest if item.get("canonical_url") or item.get("source_url")]
-    topics: dict[str, list[dict[str, Any]]] = {}
-    for item in latest:
-        for topic in item.get("topics") or ["uncategorized"]:
-            topics.setdefault(str(topic), []).append(item)
-    topic_rows = [
-        {
-            "topic": topic,
-            "article_count": len(items),
-            "weighted_relevance": round(sum(_relevance_score(item.get("relevance")) for item in items) / len(items), 3),
-            "representative_articles": [item.get("canonical_url") or item.get("source_url") for item in items[:3] if item.get("canonical_url") or item.get("source_url")],
-        }
-        for topic, items in sorted(topics.items())
-    ]
-    drivers = []
-    for topic, items in sorted(topics.items()):
-        urls = [item.get("canonical_url") or item.get("source_url") for item in items if item.get("canonical_url") or item.get("source_url")]
-        if not urls:
-            continue
-        drivers.append(
-            {
-                "driver_id": _stable_id(topic, urls),
-                "category": _driver_category(topic),
-                "headline": _driver_headline(topic),
-                "summary": _driver_summary(topic, items),
-                "affected_symbols": sorted({symbol for item in items for symbol in item.get("symbols", [])}),
-                "source_count": len(set(urls)),
-                "source_urls": sorted(set(urls)),
-                "confidence": 0.75 if len(set(urls)) > 1 else 0.45,
-                "reliability": round(sum(float(item.get("reliability") or 0.0) for item in items) / len(items), 3),
-                "is_confirmed_by_multiple_sources": len(set(urls)) > 1,
-            }
-        )
-    return {
-        **block_metadata(status="available" if latest else "no_data_available", source="news_context.latest", freshness="FRESH" if latest else "UNKNOWN", reliability=0.64 if latest else None, confidence=0.6 if latest else None),
-        "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "coverage_window_hours": coverage_window_hours,
-        "source_count": len({item.get("source") for item in latest if item.get("source")}),
-        "high_reliability_source_count": sum(1 for item in latest if float(item.get("reliability") or 0) >= 0.8),
-        "official_source_count": sum(1 for item in latest if item.get("is_official_source")),
-        "article_count": len(latest),
-        "topics": topic_rows,
-        "drivers": drivers,
-        "narrative_balance": {
-            "positive_driver_count": 0,
-            "negative_driver_count": 0,
-            "mixed_driver_count": len(drivers),
-            "classification": "MIXED" if drivers else "INSUFFICIENT_DATA",
-        },
-        "warnings": [] if drivers else ["news_digest_insufficient_sources"],
+    digest = build_intelligence_news_digest(news_context, coverage_window_hours=coverage_window_hours)
+    digest["article_count"] = digest["accepted_article_count"]
+    digest["narrative_balance"] = {
+        "positive_driver_count": 0,
+        "negative_driver_count": 0,
+        "mixed_driver_count": len(digest.get("drivers") or []),
+        "classification": "MIXED" if digest.get("drivers") else "INSUFFICIENT_DATA",
     }
+    return digest
 
 
 def enrich_nasdaq_context(nasdaq_context: dict[str, Any], news_context: dict[str, Any]) -> dict[str, Any]:

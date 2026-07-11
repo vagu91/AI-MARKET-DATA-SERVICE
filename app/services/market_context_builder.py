@@ -22,6 +22,7 @@ from app.services.data_integrity_service import (
 )
 from app.services.bls_required_series import normalize_bls_series_id
 from app.services.context_extensions_service import apply_context_extensions
+from app.services.news_intelligence_service import build_news_context as build_intelligence_news_context
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +160,13 @@ def build_market_context_contract(
     event_facts: list[dict[str, Any]] | None = None,
     positioning_context: dict[str, Any] | None = None,
     sentiment_context: dict[str, Any] | None = None,
+    news_context_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     macro_snapshot = build_macro_snapshot(macro)
     if event_facts:
         augment_macro_snapshot_from_event_facts(macro_snapshot, event_facts)
     event_calendar = build_event_calendar(upcoming_events)
-    news_context = build_news_context(news_items)
+    news_context = news_context_override or build_news_context(news_items)
     section_quality = build_section_quality(
         macro_snapshot=macro_snapshot,
         event_calendar=event_calendar,
@@ -343,44 +345,7 @@ def build_event_calendar(events: list[EconomicEvent]) -> dict[str, list[Economic
 
 
 def build_news_context(news_items: list[dict[str, Any]], limit: int = 12) -> dict[str, Any]:
-    deduped: list[dict[str, Any]] = []
-    excluded: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in news_items:
-        key = str(item.get("source_url") or item.get("url") or item.get("title") or "").lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        normalized = _news_item(item)
-        if normalized["content_status"] == "invalid_content":
-            excluded.append({"title": normalized.get("title"), "reason": "invalid_content"})
-            continue
-        if normalized["freshness"] in {"EXPIRED", "STALE"}:
-            excluded.append({"title": normalized.get("title"), "reason": "stale_or_expired"})
-            continue
-        if not _news_relevant_to_mnq(normalized):
-            excluded.append({"title": normalized.get("title"), "reason": "not_relevant_to_mnq"})
-            continue
-        deduped.append(normalized)
-    deduped.sort(key=lambda item: (item.get("published_at") or item.get("retrieved_at") or ""), reverse=True)
-    latest = deduped[:limit]
-    by_topic: dict[str, list[dict[str, Any]]] = {}
-    by_symbol: dict[str, list[dict[str, Any]]] = {}
-    for item in latest:
-        for topic in item.get("topics", []) or ["uncategorized"]:
-            by_topic.setdefault(_topic_key(topic), []).append(item)
-        for symbol in item.get("symbols", []) or []:
-            by_symbol.setdefault(str(symbol).upper(), []).append(item)
-    official_sources = [item for item in latest if item.get("is_official_source")]
-    market_sources = [item for item in latest if item not in official_sources]
-    return {
-        "latest": latest,
-        "by_topic": by_topic,
-        "by_symbol": by_symbol,
-        "official_sources": official_sources,
-        "market_sources": market_sources,
-        "excluded": excluded[:50],
-    }
+    return build_intelligence_news_context(news_items, limit=limit)
 
 
 def build_section_quality(
@@ -403,7 +368,10 @@ def build_section_quality(
     unknown_weight = (nasdaq_context.get("sector_exposure") or {}).get("unknown_weight_pct") if nasdaq_context else None
     if unknown_weight is not None and unknown_weight >= 10:
         nasdaq_missing.append("sector_exposure_unknown_weight_above_threshold")
+    news_quality = dict(news_context.get("quality") or {})
     news_missing = [] if news_context.get("latest") else ["latest"]
+    if news_context.get("latest") and float(news_quality.get("news_quality_score") or 0) < 0.4:
+        news_missing.append("news_quality_below_threshold")
     return {
         "macro_snapshot": {
             "completeness_score": _ratio(macro_present, macro_required),
@@ -417,7 +385,14 @@ def build_section_quality(
             "missing_fields": nasdaq_missing,
         },
         "news_context": {
-            "completeness_score": 1.0 if news_context.get("latest") else 0.0,
+            "completeness_score": float(news_quality.get("completeness_score") or 0.0),
+            "freshness_score": float(news_quality.get("published_at_coverage_pct") or 0.0) / 100,
+            "reliability_score": round(
+                sum(float(item.get("reliability") or 0) for item in news_context.get("latest") or [])
+                / max(len(news_context.get("latest") or []), 1),
+                3,
+            ),
+            **news_quality,
             "missing_fields": news_missing,
         },
     }
