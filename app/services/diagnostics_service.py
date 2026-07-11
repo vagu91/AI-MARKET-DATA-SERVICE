@@ -189,6 +189,9 @@ class DiagnosticsService:
                     }
                 }
             enrichment_timeout = max(float(self.settings.timeout_events_seconds), 1.0)
+            if self.settings.enable_ai_researcher:
+                enrichment_timeout += max(float(self.settings.timeout_ai_research_seconds), 1.0)
+            enrichment_timeout += 5.0
             try:
                 return await asyncio.wait_for(
                     self.enrichment_orchestrator.enrich_events(
@@ -348,7 +351,11 @@ class DiagnosticsService:
             data_quality=quality,
             db_summary=self.facts.db_summary(),
             event_facts=event_facts,
-            metadata={"event_enrichment": _event_enrichment_metadata(enrichment_metadata, enriched, settings=self.settings)},
+            metadata={
+                "event_enrichment": _event_enrichment_metadata(enrichment_metadata, enriched, settings=self.settings),
+                "persistent_enrichment": enrichment_metadata,
+                "request_refresh_mode": refresh,
+            },
             positioning_context=positioning_context,
             sentiment_context=sentiment_context,
             news_context_override=news_context,
@@ -568,6 +575,8 @@ class DiagnosticsService:
                 "db_misses": 0,
                 "provider_hits": 0,
                 "provider_failures": 0,
+                "provider_calls": 0,
+                "actual_network_calls": 0,
                 "warnings": ["macro_loaded_from_db_preview_only"],
                 "errors": [],
             }
@@ -577,6 +586,8 @@ class DiagnosticsService:
                 "db_misses": 1,
                 "provider_hits": 0,
                 "provider_failures": 0,
+                "provider_calls": 0,
+                "actual_network_calls": 0,
                 "warnings": ["macro_not_in_db_refresh_false"],
                 "errors": [],
             }
@@ -590,6 +601,8 @@ class DiagnosticsService:
             "db_misses": 1,
             "provider_hits": written,
             "provider_failures": provider_failures,
+            "provider_calls": len(macro.provider_results),
+            "actual_network_calls": len(macro.provider_results),
             "read_back_count": len(read_back),
             "materialized_count": len(read_back_macro.series),
             "warnings": [],
@@ -640,10 +653,10 @@ class DiagnosticsService:
     def _save_macro(self, macro: MacroLatestResponse) -> int:
         count = 0
         valid_until = (datetime.now(UTC) + timedelta(hours=self.settings.default_fact_ttl_hours)).isoformat()
-        for series in macro.series:
+        for series in _canonical_macro_series(macro.series):
             self.facts.upsert_fact(
                 {
-                    "fact_key": f"{series.source}:{series.series_id}:latest:official_macro_latest",
+                    "fact_key": f"US:{str(series.series_id).upper()}:latest:official_macro_latest",
                     "fact_type": "official_macro_latest",
                     "country": "US",
                     "category": str(series.series_id).upper(),
@@ -723,6 +736,8 @@ class DiagnosticsService:
                 "db_misses": 0,
                 "provider_hits": 0,
                 "provider_failures": 0,
+                "provider_calls": 0,
+                "actual_network_calls": 0,
                 "warnings": ["nasdaq_last_known_good_stale"] if stale_used else [],
                 "errors": [],
             }
@@ -732,6 +747,8 @@ class DiagnosticsService:
                 "db_misses": 1,
                 "provider_hits": 0,
                 "provider_failures": 0,
+                "provider_calls": 0,
+                "actual_network_calls": 0,
                 "warnings": ["nasdaq_context_not_in_db"],
                 "errors": [],
             }
@@ -743,6 +760,8 @@ class DiagnosticsService:
                 "db_misses": 1,
                 "provider_hits": 0,
                 "provider_failures": 1,
+                "provider_calls": 0,
+                "actual_network_calls": 0,
                 "warnings": [],
                 "errors": [str(exc) or type(exc).__name__],
             }
@@ -752,6 +771,9 @@ class DiagnosticsService:
             "db_misses": 1,
             "provider_hits": written,
             "provider_failures": 0,
+            "provider_calls": int(context.metadata.get("provider_calls") or 0),
+            "actual_network_calls": int(context.metadata.get("actual_network_calls") or 0),
+            "run_deduplicated_calls": int(context.metadata.get("run_deduplicated_calls") or 0),
             "warnings": list(context.metadata.get("warnings", [])),
             "errors": list(context.metadata.get("critical_errors", [])),
         }
@@ -927,15 +949,22 @@ def _event_enrichment_metadata(
         "completed_event_count": sum(1 for row in event_rows if row["status"] == "completed"),
         "timeout_event_count": sum(1 for row in event_rows if row["timeout"]),
         "failed_event_count": sum(1 for row in event_rows if row["status"] == "failed"),
-        "rejected_event_count": sum(len(row["rejected_fields"]) for row in event_rows),
-        "accepted_event_count": sum(len(row["accepted_fields"]) for row in event_rows),
+        "rejected_event_count": sum(1 for row in event_rows if row["attempted"] and row["status"] == "rejected"),
+        "rejected_field_count": sum(len(row["rejected_fields"]) for row in event_rows),
+        "accepted_event_count": sum(1 for row in event_rows if row["accepted_fields"]),
+        "accepted_field_count": sum(len(row["accepted_fields"]) for row in event_rows),
+        "no_data_event_count": sum(
+            1
+            for row in event_rows
+            if row["attempted"] and row["status"] == "completed" and not row["accepted_fields"]
+        ),
         "persisted_event_count": sum(1 for row in event_rows if row["persisted"]),
         "read_back_event_count": sum(1 for row in event_rows if row["read_back"]),
         "duration_ms": duration_ms if ai_called else None,
         "status": overall_status,
         "reason": reason,
         "warnings": warnings,
-        "events": event_rows[:25],
+        "events": sorted(event_rows, key=lambda row: (not row["attempted"], str(row["event_name"] or "")))[:25],
     }
 
 
@@ -960,8 +989,19 @@ def _news_pipeline_status(
                 }
             )
     if diagnostics:
-        eligible_count = int(diagnostics.get("accepted_count") or 0)
+        eligible_count = int(
+            materialized.get("accepted_article_count")
+            if materialized.get("accepted_article_count") is not None
+            else diagnostics.get("accepted_count") or 0
+        )
         exclusions = list(materialized.get("excluded") or [])
+        exclusions.extend(
+            {
+                "article_id": item.get("article_id") or item.get("news_key") or item.get("source_url") or item.get("title"),
+                "reason": "outside_context_date",
+            }
+            for item in materialized.get("historical_articles") or []
+        )
     materialized_count = len(materialized.get("latest") or [])
     return {
         "fetched_count": len(news_items),
@@ -1025,6 +1065,27 @@ def _macro_pipeline_status(macro: MacroLatestResponse, macro_snapshot: dict[str,
     }
 
 
+def _canonical_macro_series(series: list[Any]) -> list[Any]:
+    selected: dict[str, Any] = {}
+    for item in series:
+        series_id = str(getattr(item, "series_id", "") or "").upper()
+        if not series_id:
+            continue
+        current = selected.get(series_id)
+        if current is None or _macro_series_rank(item) > _macro_series_rank(current):
+            selected[series_id] = item
+    return list(selected.values())
+
+
+def _macro_series_rank(series: Any) -> tuple[int, str, str, float]:
+    source = str(getattr(series, "source", "") or "").lower()
+    source_rank = 1 if " via fred" in source else 3 if any(token in source for token in ("bls", "bea")) else 2
+    metadata = getattr(series, "metadata", None)
+    retrieved_at = str(getattr(metadata, "retrieved_at", "") or "")
+    reliability = float(getattr(metadata, "reliability", 0) or 0)
+    return source_rank, str(getattr(series, "data_as_of", "") or ""), retrieved_at, reliability
+
+
 def _reason_counts(exclusions: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in exclusions:
@@ -1059,6 +1120,9 @@ def _positioning_context_from_runtime(cot: dict[str, Any]) -> dict[str, Any]:
         "freshness": "WEEKLY",
         "reliability": cot.get("reliability"),
         "confidence": cot.get("reliability"),
+        "provider_calls": int(cot.get("provider_calls") or 0),
+        "actual_network_calls": int(cot.get("actual_network_calls") or cot.get("provider_calls") or 0),
+        "cache_used": bool(cot.get("cache_used") or cot.get("cache_status") == "hit"),
         "warnings": cot.get("warnings") or [],
         "errors": cot.get("errors") or [],
         "cot": {"nasdaq_100": cot},
@@ -1079,6 +1143,9 @@ def _sentiment_context_from_runtime(aaii: dict[str, Any]) -> dict[str, Any]:
         "freshness": "WEEKLY",
         "reliability": aaii.get("reliability"),
         "confidence": aaii.get("reliability"),
+        "provider_calls": int(aaii.get("provider_calls") or 0),
+        "actual_network_calls": int(aaii.get("actual_network_calls") or aaii.get("provider_calls") or 0),
+        "cache_used": bool(aaii.get("cache_used") or aaii.get("cache_status") == "hit"),
         "warnings": aaii.get("warnings") or [],
         "errors": aaii.get("errors") or [],
         "aaii": aaii,

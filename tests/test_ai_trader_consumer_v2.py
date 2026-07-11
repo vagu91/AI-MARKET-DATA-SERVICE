@@ -394,10 +394,17 @@ def test_consumer_v2_does_not_materialize_debug_section(section: str) -> None:
 def test_consumer_v2_contract_name_schema_and_payload_size() -> None:
     consumer = build_ai_trader_consumer_v2(minimal_full(), settings=Settings(_env_file=None))
     assert consumer["contract"] == "ai_trader_market_context_consumer"
-    assert consumer["schema_version"] == "2.0"
-    assert consumer["payload_view"] == "consumer"
+    assert consumer["schema_version"] == "2.1"
     assert len(json.dumps(consumer, default=str).encode()) < 100_000
-    assert consumer["snapshot_summary"]["consumer_payload_under_100kb"] is True
+    assert not {
+        "payload_view",
+        "payload_size_bytes",
+        "included_sections",
+        "excluded_debug_sections",
+        "debug_available",
+        "trading_logic",
+        "decisions_delegated_to",
+    }.intersection(consumer)
 
 
 def test_consumer_v2_limits_holdings_to_twenty() -> None:
@@ -471,23 +478,168 @@ def test_nasdaq_weight_validation_is_not_official_verification() -> None:
 
 
 def test_materialization_flags_reflect_valid_empty_sections() -> None:
-    consumer = build_ai_trader_consumer_v2(minimal_full(), settings=Settings(_env_file=None))
-    flags = consumer["snapshot_summary"]["materialization"]
+    hardened = harden_market_context(minimal_full(), settings=Settings(_env_file=None), now=SATURDAY)
+    flags = hardened["metadata"]["materialization"]
     assert flags["snapshot_built_from_db"] is True
     assert flags["snapshot_materialization_completed"] is True
     assert flags["snapshot_serialization_completed"] is True
     assert flags["snapshot_contract_validation_completed"] is True
-    assert flags["consumer_materialization_completed"] is True
+    assert flags["consumer_materialization_completed"] is False
+    assert "materialization" not in build_ai_trader_consumer_v2(hardened)["snapshot_summary"]
 
 
 def test_cache_only_runtime_io_is_explicitly_zero() -> None:
-    consumer = build_ai_trader_consumer_v2(minimal_full(), settings=Settings(_env_file=None))
-    runtime = consumer["snapshot_summary"]["runtime_io"]
+    hardened = harden_market_context(minimal_full(), settings=Settings(_env_file=None), now=SATURDAY)
+    runtime = hardened["metadata"]["runtime_io"]
     assert runtime["provider_calls"] == 0
     assert runtime["actual_network_calls"] == 0
     assert runtime["browser_calls"] == 0
     assert runtime["AI_called"] is False
     assert runtime["cache_used"] is True
+    assert runtime["network_used"] is False
+    assert "runtime_io" not in build_ai_trader_consumer_v2(hardened)["snapshot_summary"]
+
+
+def test_runtime_io_uses_outer_refresh_mode_and_aggregates_instrumented_calls() -> None:
+    full = minimal_full()
+    full["metadata"].update(
+        {
+            "request_refresh_mode": "auto",
+            "persistent_enrichment": {
+                "provider_metadata": {"provider_calls": 1, "actual_network_calls": 1},
+                "data_quality": {"ai_research_called": False},
+            },
+        }
+    )
+    full["data_quality"].update(
+        {
+            "macro": {"provider_calls": 1, "actual_network_calls": 1},
+            "nasdaq": {"provider_calls": 4, "actual_network_calls": 4},
+            "multi_source_pipeline": {"provider_calls": 2, "actual_network_calls": 2, "blocks": {}},
+        }
+    )
+    runtime = harden_market_context(full, settings=Settings(_env_file=None), now=SATURDAY)["metadata"]["runtime_io"]
+    assert runtime["refresh_mode"] == "auto"
+    assert runtime["provider_calls"] == 8
+    assert runtime["actual_network_calls"] == 8
+    assert runtime["cache_used"] is True
+    assert runtime["network_used"] is True
+
+
+def test_news_from_previous_context_date_is_history_not_current() -> None:
+    result = apply_news_semantics(
+        {
+            "latest": [
+                {"article_id": "today", "published_at": "2026-07-11T11:00:00Z"},
+                {"article_id": "yesterday", "published_at": "2026-07-10T11:00:00Z"},
+            ]
+        },
+        pipeline={},
+        market_schedule={"market_session_status": "weekend", "context_date": "2026-07-11"},
+        settings=Settings(_env_file=None),
+        now=SATURDAY,
+    )
+    assert [item["article_id"] for item in result["latest"]] == ["today"]
+    assert [item["article_id"] for item in result["historical_articles"]] == ["yesterday"]
+    assert result["context_date"] == "2026-07-11"
+
+
+def test_previous_context_date_only_is_market_closed_without_fresh_news() -> None:
+    result = apply_news_semantics(
+        {"latest": [{"article_id": "old", "published_at": "2026-07-10T18:00:00Z"}]},
+        pipeline={},
+        market_schedule={"market_session_status": "weekend", "context_date": "2026-07-11"},
+        settings=Settings(_env_file=None),
+        now=SATURDAY,
+    )
+    assert result["status"] == "MARKET_CLOSED_NO_FRESH_NEWS"
+    assert result["latest"] == []
+    assert result["historical_article_count"] == 1
+
+
+def test_news_semantics_reapplication_does_not_double_count_rejections() -> None:
+    payload = {
+        "latest": [{"article_id": "old", "published_at": "2026-07-10T18:00:00Z"}],
+        "diagnostics": {"raw_article_count": 3, "excluded_count": 2},
+    }
+    kwargs = {
+        "pipeline": {},
+        "market_schedule": {"market_session_status": "weekend", "context_date": "2026-07-11"},
+        "settings": Settings(_env_file=None),
+        "now": SATURDAY,
+    }
+    first = apply_news_semantics(payload, **kwargs)
+    second = apply_news_semantics(first, **kwargs)
+    assert first["rejected_article_count"] == 3
+    assert second["rejected_article_count"] == 3
+    assert second["candidate_article_count"] == 3
+
+
+def test_hardening_is_idempotent_for_same_context_date() -> None:
+    first = harden_market_context(minimal_full(), settings=Settings(_env_file=None), now=SATURDAY)
+    second = harden_market_context(first, settings=Settings(_env_file=None), now=SATURDAY + timedelta(hours=1))
+    assert second == first
+    assert second["metadata"]["hardening"] == {
+        "completed": True,
+        "version": "market_context_hardening_v3",
+        "context_date": "2026-07-11",
+        "pass_count": 1,
+    }
+
+
+def test_all_required_data_categories_have_explicit_lifecycle() -> None:
+    hardened = harden_market_context(minimal_full(), settings=Settings(_env_file=None), now=SATURDAY)
+    catalog = hardened["metadata"]["data_lifecycle"]
+    expected = {
+        "news", "macro_snapshot", "macro_consensus", "macro_actual", "fed_expectations",
+        "risk_context", "vvix", "skew", "vix_futures", "put_call", "nasdaq_weights",
+        "earnings", "cot", "aaii", "sentiment", "prediction_markets",
+        "holiday_calendar", "market_schedule",
+    }
+    assert set(catalog) == expected
+    for lifecycle in catalog.values():
+        assert lifecycle["valid_until"] is not None
+        assert lifecycle["next_refresh"] is not None
+        assert lifecycle["refresh_policy"]
+        assert isinstance(lifecycle["carry_forward_allowed"], bool)
+        assert lifecycle["stale_policy"]
+        assert lifecycle["retention_policy"]
+
+
+def test_consumer_keeps_lifecycle_but_not_lifecycle_debug_catalog() -> None:
+    consumer = build_ai_trader_consumer_v2(minimal_full(), settings=Settings(_env_file=None))
+    assert consumer["macro"]["lifecycle"]["category"] == "macro_snapshot"
+    assert consumer["news"]["lifecycle"]["category"] == "news"
+    assert consumer["risk"]["VVIX"]["lifecycle"]["category"] == "vvix"
+    assert "data_lifecycle" not in json.dumps(consumer)
+
+
+def test_ai_enrichment_lineage_survives_consumer_materialization() -> None:
+    full = minimal_full()
+    full["event_calendar"]["critical_macro_events"] = [
+        {
+            "event_id": "cpi",
+            "name": "Consumer Price Index",
+            "category": "CPI",
+            "impact": "HIGH",
+            "date": "2026-07-14",
+            "enrichment": {
+                "previous": 0.1,
+                "source": "BLS",
+                "source_url": "https://www.bls.gov/news.release/cpi.htm",
+                "provider_type": "AI_RESEARCHER_CODEX_CLI",
+                "confidence": 0.9,
+                "reliability": 0.95,
+                "evidence": "BLS table records the previous monthly change.",
+                "validation": {"status": "accepted", "reasons": []},
+            },
+        }
+    ]
+    event = build_ai_trader_consumer_v2(full)["event_risk"]["critical_events"][0]
+    assert event["previous"] == 0.1
+    assert event["lineage"]["provider_type"] == "AI_RESEARCHER_CODEX_CLI"
+    assert event["lineage"]["evidence"]
+    assert event["lineage"]["validation"]["status"] == "accepted"
 
 
 def test_consumer_route_is_registered_separately_from_debug() -> None:

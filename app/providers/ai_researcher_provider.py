@@ -260,7 +260,7 @@ class AIResearcherProvider:
                     require_evidence=bool(self.settings.ai_researcher_require_evidence),
                 ),
             )
-            if _item_has_values(item) and not validation.accepted:
+            if validation.status.startswith("rejected"):
                 status_code = validation.status
                 if status_code == "rejected_invalid_source" and not (item.get("source_url") or _first_metric_field(item, "source_url")):
                     status_code = "rejected_missing_source_url"
@@ -298,6 +298,34 @@ class AIResearcherProvider:
                 rejected += 1
                 continue
             valid_until = item.get("valid_until") if has_value else _negative_cache_valid_until(item)
+            validated_payload = {
+                **item,
+                "provider_type": "AI_RESEARCHER_CODEX_CLI",
+                "evidence": (
+                    item.get("evidence")
+                    or item.get("evidence_text")
+                    or item.get("extracted_text")
+                    or _first_metric_field(item, "evidence_text")
+                ),
+                "validation": {
+                    "status": validation.status,
+                    "reasons": validation.reasons,
+                    "validated_at": now_iso(),
+                },
+                "metrics": [
+                    {
+                        **metric,
+                        "provider_type": "AI_RESEARCHER_CODEX_CLI",
+                        "evidence": metric.get("evidence") or metric.get("evidence_text"),
+                        "validation": {
+                            "status": validation.status,
+                            "reasons": validation.reasons,
+                        },
+                    }
+                    for metric in item.get("metrics") or []
+                    if isinstance(metric, dict)
+                ],
+            }
             facts.append(
                 {
                     "fact_key": item.get("fact_key"),
@@ -323,7 +351,7 @@ class AIResearcherProvider:
                     "status": "active" if has_value else "no_data_available",
                     "notes": item.get("notes"),
                     "warnings_json": item.get("warnings") or [],
-                    "raw_payload_json": item,
+                    "raw_payload_json": validated_payload,
                 }
             )
         valid_with_values = sum(1 for fact in facts if _item_has_values(fact) or _item_has_values(fact.get("raw_payload_json") or {}))

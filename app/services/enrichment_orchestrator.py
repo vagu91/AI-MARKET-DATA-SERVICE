@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 import logging
 from datetime import UTC, datetime, timedelta
@@ -150,17 +151,41 @@ class EnrichmentOrchestrator:
 
             provider_missing: list[EconomicEvent] = []
             if missing and self.event_enrichment_service:
-                provider_events, provider_metadata = await self.event_enrichment_service.enrich_events(
-                    events=missing,
-                    country=country,
-                    start=start,
-                    end=end,
-                )
+                try:
+                    provider_events, provider_metadata = await asyncio.wait_for(
+                        self.event_enrichment_service.enrich_events(
+                            events=missing,
+                            country=country,
+                            start=start,
+                            end=end,
+                        ),
+                        timeout=max(float(self.settings.timeout_events_seconds), 1.0),
+                    )
+                except TimeoutError:
+                    provider_events = [event.model_copy(deep=True) for event in missing]
+                    provider_metadata = {
+                        "status": "timeout",
+                        "provider_calls": 0,
+                        "actual_network_calls": 0,
+                        "providers_attempted": 0,
+                        "providers_considered": 0,
+                        "providers_skipped": 0,
+                        "provider_errors": [f"event_enrichment_timeout_after_{self.settings.timeout_events_seconds}s"],
+                    }
+                    metrics["warnings_json"].append(
+                        f"event_enrichment_timeout_after_{self.settings.timeout_events_seconds}s"
+                    )
                 self.observations.record(
                     run_id=run_id,
                     provider_name="event_enrichment_service",
                     provider_type="SCRAPER",
-                    status="success" if any(_has_values(event.enrichment) for event in provider_events) else "no_data_available",
+                    status=(
+                        "timeout"
+                        if provider_metadata.get("status") == "timeout"
+                        else "success"
+                        if any(_has_values(event.enrichment) for event in provider_events)
+                        else "no_data_available"
+                    ),
                     country=country,
                     item_count=sum(1 for event in provider_events if _has_values(event.enrichment)),
                     raw_payload_json=provider_metadata,
@@ -206,9 +231,20 @@ class EnrichmentOrchestrator:
                     metrics["ai_research_requests"] = 1
                     ai_called = True
                     started = perf_counter()
-                    facts, ai_status = await self.ai_researcher_service.research_and_save(
-                        [self._event_payload(event) for event in ai_candidates]
-                    )
+                    try:
+                        facts, ai_status = await asyncio.wait_for(
+                            self.ai_researcher_service.research_and_save(
+                                [self._event_payload(event) for event in ai_candidates]
+                            ),
+                            timeout=max(float(self.settings.timeout_ai_research_seconds), 1.0),
+                        )
+                    except TimeoutError:
+                        facts = []
+                        ai_status = {
+                            "status": "provider_failed",
+                            "failure_reason": "ai_research_timeout",
+                            "timeout_seconds": self.settings.timeout_ai_research_seconds,
+                        }
                     metrics["ai_duration_ms"] = int((perf_counter() - started) * 1000)
                     metrics["ai_research_status"] = ai_status.get("status") or "failed"
                     ai_diagnostic_artifact_dir = ai_status.get("diagnostic_artifact_dir")

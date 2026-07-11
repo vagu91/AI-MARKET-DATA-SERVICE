@@ -8,6 +8,7 @@ from app.bootstrap.application import build_application_state
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.infrastructure.storage_retention import cleanup_storage, maybe_run_startup_cleanup
+from app.infrastructure.persistence.database_maintenance import run_database_maintenance
 
 
 @asynccontextmanager
@@ -18,6 +19,7 @@ async def lifespan(app: FastAPI):
     for name, value in state.items():
         setattr(app.state, name, value)
     app.state.startup_storage_cleanup = maybe_run_startup_cleanup(settings)
+    app.state.startup_database_maintenance = run_database_maintenance(settings, dry_run=False)
 
     scheduler = None
     if settings.enable_scheduler:
@@ -29,6 +31,14 @@ async def lifespan(app: FastAPI):
             "interval",
             hours=max(settings.storage_cleanup_interval_hours, 1),
             id="storage_retention_cleanup",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            lambda: run_database_maintenance(settings, dry_run=False),
+            "interval",
+            hours=max(settings.storage_cleanup_interval_hours, 1),
+            id="database_retention_cleanup",
             max_instances=1,
             coalesce=True,
         )

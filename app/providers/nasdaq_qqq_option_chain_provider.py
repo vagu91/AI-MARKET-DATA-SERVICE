@@ -356,7 +356,7 @@ def _parse_abbrev_expiry(value: Any) -> str | None:
     year = datetime.now(UTC).year
     for fmt in ("%b %d", "%B %d"):
         try:
-            parsed = datetime.strptime(str(value).strip(), fmt).replace(year=year)
+            parsed = datetime.strptime(f"{year} {str(value).strip()}", f"%Y {fmt}")
             return parsed.date().isoformat()
         except ValueError:
             continue

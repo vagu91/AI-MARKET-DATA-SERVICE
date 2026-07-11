@@ -280,6 +280,12 @@ def test_metric_only_ai_result_counts_as_valid_fact(tmp_path):
     assert facts[0]["previous"] == 0.5
     assert facts[0]["source"] == "BLS"
     assert facts[0]["source_url"] == "https://www.bls.gov/news.release/cpi.nr0.htm"
+    raw = facts[0]["raw_payload_json"]
+    assert raw["provider_type"] == "AI_RESEARCHER_CODEX_CLI"
+    assert raw["evidence"]
+    assert raw["validation"]["status"] == "accepted"
+    assert raw["metrics"][0]["validation"]["status"] == "accepted"
+    assert raw["metrics"][0]["evidence"]
 
 
 def test_metric_only_numeric_values_require_metric_evidence(tmp_path):

@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     enrichment_runs_retention_days: int = Field(default=30, validation_alias="AI_MARKET_ENRICHMENT_RUNS_RETENTION_DAYS")
     expired_cache_retention_days: int = Field(default=7, validation_alias="AI_MARKET_EXPIRED_CACHE_RETENTION_DAYS")
     market_news_retention_days: int = Field(default=30, validation_alias="AI_MARKET_MARKET_NEWS_RETENTION_DAYS")
+    market_facts_retention_days: int = Field(default=30, validation_alias="AI_MARKET_MARKET_FACTS_RETENTION_DAYS")
+    economic_events_history_retention_days: int = Field(default=730, validation_alias="AI_MARKET_ECONOMIC_EVENTS_HISTORY_RETENTION_DAYS")
+    snapshot_history_retention_days: int = Field(default=90, validation_alias="AI_MARKET_SNAPSHOT_HISTORY_RETENTION_DAYS")
     db_vacuum_min_size_mb: int = Field(default=250, validation_alias="AI_MARKET_DB_VACUUM_MIN_SIZE_MB")
     db_vacuum_min_reclaimable_mb: int = Field(default=50, validation_alias="AI_MARKET_DB_VACUUM_MIN_RECLAIMABLE_MB")
     storage_cleanup_interval_hours: int = Field(default=24, validation_alias="AI_MARKET_STORAGE_CLEANUP_INTERVAL_HOURS")
@@ -52,7 +55,7 @@ class Settings(BaseSettings):
     timeout_sentiment_seconds: float = Field(default=8.0, validation_alias="AI_MARKET_TIMEOUT_SENTIMENT_SECONDS")
     timeout_canonical_seconds: float = Field(default=4.0, validation_alias="AI_MARKET_TIMEOUT_CANONICAL_SECONDS")
     timeout_article_fetch_seconds: float = Field(default=4.0, validation_alias="AI_MARKET_TIMEOUT_ARTICLE_FETCH_SECONDS")
-    timeout_ai_research_seconds: float = Field(default=60.0, validation_alias="AI_MARKET_TIMEOUT_AI_RESEARCH_SECONDS")
+    timeout_ai_research_seconds: float = Field(default=180.0, validation_alias="AI_MARKET_TIMEOUT_AI_RESEARCH_SECONDS")
 
     fred_api_key: str | None = Field(
         default=None,

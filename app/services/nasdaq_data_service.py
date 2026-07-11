@@ -73,6 +73,8 @@ class NasdaqDataService:
         quality_data.setdefault("final_data_available", bool(holdings))
         quality_data.setdefault("weights_available", all(item.weight is not None for item in holdings) if holdings else False)
         quality_data.setdefault("weight_data_available", all(item.weight is not None for item in holdings) if holdings else False)
+        quality_data.setdefault("provider_calls", int(quality_data.get("actual_network_calls") or 0))
+        quality_data.setdefault("cache_used", result.metadata.provider_type in {ProviderType.CACHE, ProviderType.DB})
         quality = QQQHoldingsQuality.model_validate(quality_data)
         response = QQQHoldingsResponse(
             status=data.get("status") or quality.final_status or ("found" if holdings else "not_found"),
@@ -109,6 +111,12 @@ class NasdaqDataService:
         run_cache: dict[str, Any] | None = None,
         force: bool = False,
     ) -> MegaCapSnapshotResponse:
+        cache_key = f"mega_cap_snapshot:force={force}"
+        if run_cache is not None and cache_key in run_cache:
+            cached = run_cache[cache_key]
+            cached.data_quality.run_cache_used = True
+            cached.data_quality.run_deduplicated_calls += 1
+            return cached
         holdings = await self.qqq_holdings(run_cache=run_cache, force=force)
         weights = {item.symbol: item for item in holdings.holdings}
         result = await self.mega_cap_snapshot_provider.fetch_safe()
@@ -128,11 +136,12 @@ class NasdaqDataService:
         quality_data.setdefault("final_data_available", bool(stocks))
         quality_data.setdefault("tracked_count", len(MEGA_CAP_TICKERS))
         quality_data["resolved_count"] = len(stocks)
+        _set_provider_runtime(quality_data, result.metadata.provider_type)
         quality_data.setdefault(
             "missing_prices",
             [stock.symbol for stock in stocks if stock.last_price is None],
         )
-        return MegaCapSnapshotResponse(
+        response = MegaCapSnapshotResponse(
             retrieved_at=result.metadata.retrieved_at,
             source=result.metadata.source,
             provider_type=result.metadata.provider_type,
@@ -140,6 +149,9 @@ class NasdaqDataService:
             stocks=stocks,
             data_quality=MegaCapSnapshotQuality.model_validate(quality_data),
         )
+        if run_cache is not None:
+            run_cache[cache_key] = response
+        return response
 
     async def mega_cap_breadth(
         self,
@@ -277,6 +289,7 @@ class NasdaqDataService:
         quality_data["errors"] = _merge_errors(quality_data.get("errors", []), result.metadata.errors)
         quality_data.setdefault("warnings", [])
         quality_data.setdefault("final_data_available", True)
+        _set_provider_runtime(quality_data, result.metadata.provider_type)
         return EarningsResponse(
             retrieved_at=result.metadata.retrieved_at,
             days=days,
@@ -305,6 +318,7 @@ class NasdaqDataService:
         quality_data["errors"] = _merge_errors(quality_data.get("errors", []), result.metadata.errors)
         quality_data.setdefault("warnings", [])
         quality_data.setdefault("final_data_available", bool(data.get("articles", [])))
+        _set_provider_runtime(quality_data, result.metadata.provider_type)
         return NewsResponse(
             retrieved_at=result.metadata.retrieved_at,
             articles=data.get("articles", [])[:limit],
@@ -367,6 +381,10 @@ class NasdaqDataService:
                 warnings=warnings,
                 fallback_notes=fallback_notes,
             )
+        runtime_qualities = (holdings.data_quality, snapshot.data_quality, earnings.data_quality, news.data_quality)
+        provider_calls = sum(int(quality.provider_calls) for quality in runtime_qualities)
+        actual_network_calls = sum(int(quality.actual_network_calls) for quality in runtime_qualities)
+        run_deduplicated_calls = int(holdings.data_quality.run_deduplicated_calls) + int(snapshot.data_quality.run_deduplicated_calls)
         return NasdaqContextResponse(
             generated_at=datetime.now(UTC),
             qqq_holdings=holdings,
@@ -388,6 +406,9 @@ class NasdaqDataService:
                 "warnings": _merge_errors(warnings),
                 "fallback_notes": _merge_errors(fallback_notes),
                 "fallback_used": fallback_used,
+                "provider_calls": provider_calls,
+                "actual_network_calls": actual_network_calls,
+                "run_deduplicated_calls": run_deduplicated_calls,
             },
         )
 
@@ -399,6 +420,13 @@ def _merge_errors(*groups) -> list[str]:
             if error and error not in merged:
                 merged.append(error)
     return merged
+
+
+def _set_provider_runtime(quality: dict[str, Any], provider_type: ProviderType) -> None:
+    cache_used = provider_type in {ProviderType.CACHE, ProviderType.DB}
+    quality.setdefault("provider_calls", 0 if cache_used else 1)
+    quality.setdefault("actual_network_calls", 0 if cache_used else 1)
+    quality.setdefault("cache_used", cache_used)
 
 
 def _provider_timeout(provider, name: str, default: float) -> float:

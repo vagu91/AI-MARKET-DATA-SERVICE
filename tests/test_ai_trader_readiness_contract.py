@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -166,6 +167,7 @@ def test_consumer_aggregates_optional_enrichment_warnings_and_keeps_debug_detail
 
 
 def test_snapshot_summary_is_present_and_data_only() -> None:
+    published_at = datetime.now(ZoneInfo("America/New_York")).isoformat()
     full = {
         "symbol": "MNQ",
         "generated_at_utc": "2099-01-01T00:00:00Z",
@@ -180,7 +182,12 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
             "other_economic_events": [],
         },
         "nasdaq_context": {"qqq_holdings": {"holdings_count": 104}, "earnings": {"events": [{"symbol": "NVDA"}]}},
-        "news_context": {"latest": [{"title": "A"}, {"title": "B"}]},
+        "news_context": {
+            "latest": [
+                {"title": "A", "published_at": published_at},
+                {"title": "B", "published_at": published_at},
+            ]
+        },
         "social_sentiment": {"status": "found"},
         "risk_context": {"status": "COMPLETE", "vvix": {"status": "found"}},
         "market_schedule": {"nasdaq_cash_session": {"status": "closed"}},
@@ -203,7 +210,7 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_event_enrichment_deadline_skips_ai_without_claiming_timeout(tmp_path: Path) -> None:
+async def test_deterministic_enrichment_timeout_falls_through_to_ai(tmp_path: Path) -> None:
     cfg = Settings(
         _env_file=None,
         database_path=tmp_path / "market.sqlite",
@@ -234,7 +241,20 @@ async def test_event_enrichment_deadline_skips_ai_without_claiming_timeout(tmp_p
             await asyncio.sleep(2)
             return kwargs["events"], {}
 
-    orchestrator = EnrichmentOrchestrator(cfg, event_enrichment_service=SlowEnrichment())
+    class EmptyAI:
+        def __init__(self):
+            self.calls = 0
+
+        async def research_and_save(self, events):
+            self.calls += 1
+            return [], {"status": "no_data_available"}
+
+    ai = EmptyAI()
+    orchestrator = EnrichmentOrchestrator(
+        cfg,
+        event_enrichment_service=SlowEnrichment(),
+        ai_researcher_service=ai,
+    )
     service = DiagnosticsService(
         cfg,
         macro_service=Macro(),
@@ -248,23 +268,27 @@ async def test_event_enrichment_deadline_skips_ai_without_claiming_timeout(tmp_p
     assert "event_enrichment_timeout" not in quality.get("missing_critical_fields", [])
     assert quality["enrichment_timeout"] is False
     enrichment = model["metadata"]["event_enrichment"]
-    assert enrichment["status"] == "not_required"
-    assert enrichment["AI_called"] is False
-    assert enrichment["attempted_event_count"] == 0
+    assert enrichment["status"] == "completed"
+    assert enrichment["AI_called"] is True
+    assert enrichment["attempted_event_count"] == 1
     assert enrichment["timeout_event_count"] == 0
-    assert all(row["attempted"] is False and row["timeout"] is False for row in enrichment["events"])
+    assert all(row["attempted"] is True and row["timeout"] is False for row in enrichment["events"])
+    assert enrichment["persisted_event_count"] == 1
+    assert enrichment["read_back_event_count"] == 1
+    assert ai.calls == 1
     assert model["event_calendar"]["critical_macro_events"]
     latest_run = EnrichmentRunRepository(cfg).latest()
     assert latest_run["finished_at"] is not None
-    assert latest_run["status"] in {"failed", "completed"}
+    assert latest_run["status"] == "completed"
 
 
 @pytest.mark.asyncio
-async def test_event_enrichment_deadline_marks_started_ai_as_cancelled(tmp_path: Path) -> None:
+async def test_ai_stage_timeout_is_reported_without_outer_cancellation(tmp_path: Path) -> None:
     cfg = Settings(
         _env_file=None,
         database_path=tmp_path / "market.sqlite",
         timeout_events_seconds=1,
+        timeout_ai_research_seconds=1,
         enable_ai_researcher=True,
     )
 
@@ -313,13 +337,15 @@ async def test_event_enrichment_deadline_marks_started_ai_as_cancelled(tmp_path:
     enrichment = model["metadata"]["event_enrichment"]
     row = enrichment["events"][0]
 
-    assert enrichment["status"] == "cancelled"
+    assert enrichment["status"] == "timeout"
     assert enrichment["AI_called"] is True
     assert enrichment["attempted_event_count"] == 1
-    assert enrichment["timeout_event_count"] == 0
+    assert enrichment["timeout_event_count"] == 1
     assert row["AI_called"] is True
     assert row["attempted"] is True
-    assert row["timeout"] is False
+    assert row["timeout"] is True
+    assert enrichment["persisted_event_count"] == 1
+    assert enrichment["read_back_event_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -376,6 +402,42 @@ def test_ai_enrichment_reports_same_run_persistence_read_back() -> None:
 
     assert metadata["persisted_event_count"] == 1
     assert metadata["read_back_event_count"] == 1
+
+
+def test_ai_event_and_field_counts_are_semantically_distinct_and_attempts_are_prioritized() -> None:
+    attempted = _event().model_copy(deep=True)
+    attempted.event_id = "attempted"
+    attempted.enrichment = EventEnrichment(
+        previous=0.5,
+        consensus=0.4,
+        source="BLS",
+        source_url="https://www.bls.gov/news.release/cpi.htm",
+        cache_status="refreshed",
+        summary={"persistence": {"persisted": True, "read_back": True}},
+    )
+    others = []
+    for index in range(30):
+        event = _event().model_copy(deep=True)
+        event.event_id = f"other-{index:02d}"
+        event.name = f"Other {index:02d}"
+        others.append(event)
+    metadata = _event_enrichment_metadata(
+        {
+            "data_quality": {
+                "ai_research_enabled": True,
+                "ai_research_configured": True,
+                "ai_research_called": True,
+                "ai_candidate_event_ids": ["attempted"],
+                "ai_research_status": "success",
+            }
+        },
+        [*others, attempted],
+    )
+    assert metadata["accepted_event_count"] == 1
+    assert metadata["accepted_field_count"] == 2
+    assert metadata["persisted_event_count"] == 1
+    assert metadata["read_back_event_count"] == 1
+    assert metadata["events"][0]["event_id"] == "attempted"
 
 
 def _event() -> EconomicEvent:

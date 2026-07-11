@@ -87,6 +87,18 @@ def _migrate_legacy_event_enrichment_facts(conn: sqlite3.Connection) -> int:
     }
     if "market_facts" not in tables:
         return 0
+    pending = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM market_facts
+            WHERE fact_type = 'ai_research_result'
+              AND fact_key LIKE '%:macro_event_enrichment'
+            """
+        ).fetchone()["count"]
+    )
+    if pending == 0:
+        return 0
     cursor = conn.execute(
         """
         UPDATE market_facts

@@ -248,6 +248,11 @@ def _build_checks(
     pipeline = data_quality.get("pipeline_integrity") or {}
     news_pipeline = data_quality.get("news_pipeline") or {}
     macro_pipeline = data_quality.get("macro_pipeline") or {}
+    news_context = market_context.get("news_context") or {}
+    news_status = str(news_context.get("status") or "").upper()
+    no_fresh_news_expected = news_status == "MARKET_CLOSED_NO_FRESH_NEWS"
+    news_claims_available = news_status in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"}
+    runtime_io = (market_context.get("metadata") or {}).get("runtime_io") or {}
     bls_status = _bls_status_from_macro_pipeline(macro_pipeline)
     bls_actual = {"missing": bls_status["missing"], "invalid": bls_status["invalid"]}
     add("SERVICE_REACHABLE", "CRITICAL", service_status != "ok", "Service must be reachable.", service_status, "ok")
@@ -274,7 +279,8 @@ def _build_checks(
     add("RELEASE_QUEUE_RETRY_CONFIGURED", "CRITICAL", not release["retry_seconds"], "Release retry schedule must be configured.", release["retry_seconds"], DEFAULT_RETRY_SECONDS)
     add("RELEASE_QUEUE_MAX_ATTEMPTS_VALID", "CRITICAL", int(release.get("max_attempts") or 0) <= 0, "Max release refresh attempts must be positive.", release.get("max_attempts"), ">0")
 
-    add("NEWS_LATEST_NOT_EMPTY", "CRITICAL", model_counts["latest_news"] == 0, "Latest news must not be empty.", model_counts["latest_news"], ">0")
+    add("NEWS_LATEST_NOT_EMPTY", "CRITICAL", news_claims_available and model_counts["latest_news"] == 0, "News status AVAILABLE/PARTIAL/LAST_KNOWN_GOOD requires current articles.", model_counts["latest_news"], ">0 when status claims availability")
+    add("NEWS_MARKET_CLOSED_NO_FRESH_EXPECTED", "INFO", no_fresh_news_expected, "No current-date news is expected for the closed market session.", news_status, "MARKET_CLOSED_NO_FRESH_NEWS")
     add("NEWS_EXPIRED_NOT_IN_LATEST", "CRITICAL", news["expired_in_latest_count"] > 0, "Expired news must not appear in latest.", news["expired_in_latest_count"], 0)
     add("NEWS_PLACEHOLDER_EMPTY", "CRITICAL", news["placeholder_news_count"] > 0, "Placeholder news titles must not appear in latest.", news["placeholder_news_count"], 0)
     add("NEWS_INVALID_CONTENT_TRACKED", "INFO", news["invalid_content_count"] > 0, "Invalid news content was tracked in history.", news["invalid_content_count"], 0)
@@ -282,7 +288,7 @@ def _build_checks(
     add("NEWS_MOJIBAKE_ZERO", "WARNING", news["mojibake_count"] > 0, "News latest contains mojibake.", news["mojibake_count"], 0)
     add("NEWS_SUMMARY_COVERAGE", "WARNING", _missing_summary_ratio(latest_news) > 0.5, "More than half of latest news have null summaries.", round(_missing_summary_ratio(latest_news), 3), 0.5)
     add("NEWS_OFFICIAL_PRESENT", "WARNING", sources["official_news_count"] == 0 and model_counts["latest_news"] > 0, "No official news source in current batch.", sources["official_news_count"], ">0")
-    add("NEWS_COLD_START_COMPLETE", "CRITICAL", int(news_pipeline.get("read_back_count") or 0) > 0 and int(news_pipeline.get("materialized_count") or 0) == 0, "News saved in DB must materialize into latest context.", news_pipeline.get("materialized_count"), ">0")
+    add("NEWS_COLD_START_COMPLETE", "CRITICAL", int(news_pipeline.get("eligible_count") or 0) > 0 and int(news_pipeline.get("read_back_count") or 0) > 0 and int(news_pipeline.get("materialized_count") or 0) == 0, "Current-date eligible news saved in DB must materialize into latest context.", news_pipeline.get("materialized_count"), ">0 when eligible_count>0")
     add("NEWS_ELIGIBLE_MATERIALIZED", "CRITICAL", int(news_pipeline.get("eligible_count") or 0) > 0 and int(news_pipeline.get("materialized_count") or 0) == 0, "Eligible news must be materialized.", news_pipeline.get("materialized_count"), ">0")
 
     add("SOURCES_OFFICIAL_CLASSIFICATION", "INFO", sources["official_news_count"] == 0 and sources["misclassified_source_count"] == 0 and model_counts["latest_news"] > 0, "No official news source in current batch; source classification is otherwise coherent.", sources["official_news_count"], "classification coherent")
@@ -322,7 +328,7 @@ def _build_checks(
     active_threshold = _int_env("AI_MARKET_HEALTH_MIN_ACTIVE_FACTS", 0)
     add("CACHE_MARKET_FACTS_ACTIVE", "WARNING", active_threshold > 0 and model_counts["market_facts_active"] < active_threshold, "Active market facts below configured threshold.", model_counts["market_facts_active"], active_threshold)
     add("CACHE_REFRESH_FALSE_NO_AI", "WARNING", refresh_mode == "false" and (providers["ai_research_called"] or providers["ai_research_requests"] > 0), "AI Researcher should not be called with refresh=false.", providers["ai_research_requests"], 0)
-    add("CACHE_REFRESH_FALSE_LOW_DB_MISSES", "WARNING", refresh_mode == "false" and providers["db_misses"] > 0, "DB misses are anomalous with refresh=false.", providers["db_misses"], 0)
+    add("CACHE_REFRESH_FALSE_LOW_DB_MISSES", "WARNING", refresh_mode == "false" and providers["db_misses"] > 0 and not bool(runtime_io.get("cache_used")), "DB misses are anomalous only when cache-only coverage is unavailable.", providers["db_misses"], "allowed with cache_used=true")
 
     add("PROVIDER_FAILURES", "CRITICAL", providers["blocking_provider_error"] > 0, _provider_warning_message("Blocking provider error reported.", providers), providers["blocking_provider_error"], 0)
     add("PROVIDER_WARNINGS", "WARNING", providers["degraded_provider_warning"] > 0, _provider_warning_message("Provider warnings reported.", providers), providers["degraded_provider_warning"], 0)
@@ -470,7 +476,9 @@ def _provider_summary(model: dict[str, Any]) -> dict[str, Any]:
         + int(nasdaq.get("provider_failures") or 0)
         + len(multi_source.get("errors") or [])
     )
-    warning_details = _provider_warning_details(quality, macro, nasdaq, multi_source)
+    warning_details = _deduplicate_provider_warning_details(
+        _provider_warning_details(quality, macro, nasdaq, multi_source)
+    )
     return {
         "provider_failures": provider_failures,
         "provider_warnings": len(warning_details),
@@ -609,7 +617,7 @@ def _provider_warning_detail(provider: str, message: str, occurred_at: str, *, d
     if failures > 0 and db_hits == 0 and provider_hits == 0 and db_misses > 0:
         code = "blocking_provider_error"
         is_blocking = True
-    elif is_cached_failure or "preview" in lowered or "fallback" in lowered:
+    elif is_cached_failure or "preview" in lowered or "fallback" in lowered or "disabled" in lowered or "excluded" in lowered:
         code = "expected_provider_warning"
         is_blocking = False
     else:
@@ -623,6 +631,18 @@ def _provider_warning_detail(provider: str, message: str, occurred_at: str, *, d
         "is_cached_failure": is_cached_failure,
         "is_blocking": is_blocking,
     }
+
+
+def _deduplicate_provider_warning_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in details:
+        key = (str(item.get("provider")), str(item.get("code")), str(item.get("message")))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
 
 
 def _provider_warning_message(prefix: str, providers: dict[str, Any]) -> str:

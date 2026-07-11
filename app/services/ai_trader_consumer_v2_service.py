@@ -10,7 +10,7 @@ from app.services.market_context_hardening_service import harden_market_context
 
 logger = logging.getLogger(__name__)
 CONTRACT_NAME = "ai_trader_market_context_consumer"
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 INCLUDED_SECTIONS = [
     "readiness",
     "snapshot_summary",
@@ -48,16 +48,14 @@ def build_ai_trader_consumer_v2(
 ) -> dict[str, Any]:
     hardened = harden_market_context(full, settings=settings)
     readiness = dict(hardened.get("readiness") or {})
-    materialization = dict((hardened.get("metadata") or {}).get("materialization") or {})
-    materialization["consumer_materialization_completed"] = True
     consumer = {
         "contract": CONTRACT_NAME,
         "schema_version": SCHEMA_VERSION,
         "symbol": hardened.get("symbol") or "MNQ",
         "generated_at": hardened.get("generated_at_utc") or hardened.get("generated_at"),
-        "service_role": "data provider only",
+        "context_date": (hardened.get("market_schedule") or {}).get("context_date"),
         "readiness": readiness,
-        "snapshot_summary": _snapshot_summary(hardened, materialization),
+        "snapshot_summary": _snapshot_summary(hardened),
         "macro": _macro(hardened.get("macro_snapshot") or {}),
         "event_risk": _event_risk(hardened),
         "rates": _rates(hardened.get("rates_expectations") or {}),
@@ -70,35 +68,23 @@ def build_ai_trader_consumer_v2(
         "market_schedule": _schedule(hardened.get("market_schedule") or {}),
         "quality": hardened.get("quality") or {},
         "warnings": _warnings(hardened),
-        "payload_view": "consumer",
-        "included_sections": INCLUDED_SECTIONS,
-        "excluded_debug_sections": EXCLUDED_DEBUG_SECTIONS,
-        "decisions_delegated_to": "AI-TRADER",
-        "trading_logic": "not implemented; data service only",
-        "debug_available": "/market-context/mnq/debug",
-        "payload_size_bytes": 0,
     }
-    for _ in range(4):
-        size = _payload_size(consumer)
-        consumer["payload_size_bytes"] = size
-        consumer["snapshot_summary"]["payload_size_bytes"] = size
-        consumer["snapshot_summary"]["consumer_payload_under_100kb"] = size < 100_000
-    logger.info("consumer_payload_materialized", extra={"payload_size_bytes": consumer["payload_size_bytes"]})
+    size = _payload_size(consumer)
+    logger.info("consumer_payload_materialized", extra={"payload_size_bytes": size})
     logger.info(
         "consumer_payload_size_validated",
-        extra={"payload_size_bytes": consumer["payload_size_bytes"], "under_100kb": consumer["payload_size_bytes"] < 100_000},
+        extra={"payload_size_bytes": size, "under_100kb": size < 100_000},
     )
     logger.info("consumer_contract_validated", extra={"contract": CONTRACT_NAME, "schema_version": SCHEMA_VERSION})
     return consumer
 
 
-def _snapshot_summary(full: dict[str, Any], materialization: dict[str, Any]) -> dict[str, Any]:
+def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
     news = full.get("news_context") or {}
     event_context = full.get("events_today_context") or {}
     nasdaq = full.get("nasdaq_context") or {}
     earnings = (nasdaq.get("earnings") or {}).get("upcoming") or []
     runtime = (full.get("metadata") or {}).get("multi_source_runtime") or {}
-    runtime_io = (full.get("metadata") or {}).get("runtime_io") or {}
     return {
         "generated_at": full.get("generated_at_utc") or full.get("generated_at"),
         "symbol": full.get("symbol"),
@@ -113,8 +99,6 @@ def _snapshot_summary(full: dict[str, Any], materialization: dict[str, Any]) -> 
         "next_earnings_count_14d": len(earnings),
         "risk_context_status": (full.get("risk_context") or {}).get("status"),
         "cache_used": bool(runtime.get("cache_used") or runtime.get("db_hits") or runtime.get("refresh_mode") == "false"),
-        "runtime_io": runtime_io,
-        "materialization": materialization,
     }
 
 
@@ -141,7 +125,10 @@ def _macro(snapshot: dict[str, Any]) -> dict[str, Any]:
         "NFP": labor.get("CES0000000001"),
         "unemployment": labor.get("LNS14000000"),
     }
-    return {key: _metric(value or {}) for key, value in rows.items()}
+    return {
+        **{key: _metric(value or {}) for key, value in rows.items()},
+        "lifecycle": snapshot.get("lifecycle") or {},
+    }
 
 
 def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
@@ -152,6 +139,8 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
     active = list(windows.get("active") or windows.get("active_event_windows") or [])
     upcoming = [item for item in (windows.get("upcoming") or windows.get("upcoming_event_windows") or []) if str(item.get("impact") or "").upper() == "HIGH"]
     return {
+        "consensus_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_consensus") or {},
+        "actual_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_actual") or {},
         "events_today": _events_today(full.get("events_today_context") or {}),
         "event_risk_window_status": windows.get("event_risk_window_status"),
         "active_windows": [_event(item) for item in active[:6]],
@@ -164,6 +153,7 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
 
 def _rates(rates: dict[str, Any]) -> dict[str, Any]:
     return {
+        "lifecycle": rates.get("lifecycle") or {},
         "status": rates.get("status"),
         "current_fed_state": rates.get("current_fed_state") or {},
         "next_meeting": _meeting(rates.get("next_meeting") or {}),
@@ -201,11 +191,13 @@ def _risk(risk: dict[str, Any]) -> dict[str, Any]:
         "qqq_open_interest_put_call",
     ]
     return {
+        "lifecycle": risk.get("lifecycle") or {},
         "status": risk.get("status"),
         "VIX": _risk_metric(risk.get("vix") or {}),
         "VVIX": _risk_metric(risk.get("vvix") or {}),
         "SKEW": _risk_metric(risk.get("skew") or {}),
         "term_structure": {
+            "lifecycle": curve.get("lifecycle") or {},
             "status": curve.get("status"),
             "structure": curve.get("structure"),
             "m1_m2_spread_points": curve.get("m1_m2_spread_points"),
@@ -215,6 +207,7 @@ def _risk(risk: dict[str, Any]) -> dict[str, Any]:
             "freshness": curve.get("freshness"),
         },
         "put_call": {key: _ratio(ratios[key]) for key in ratio_ids if key in ratios},
+        "put_call_lifecycle": (risk.get("put_call") or {}).get("lifecycle") or {},
         "relative_regimes": risk.get("derived_context") or {},
         "quality": risk.get("quality") or {},
         "warnings": risk.get("warnings") or [],
@@ -224,6 +217,7 @@ def _risk(risk: dict[str, Any]) -> dict[str, Any]:
 def _positioning(positioning: dict[str, Any]) -> dict[str, Any]:
     cot = (positioning.get("cot") or {}).get("nasdaq_100") or positioning
     return {
+        "lifecycle": positioning.get("lifecycle") or cot.get("lifecycle") or {},
         "status": positioning.get("status") or cot.get("status"),
         "report_date": cot.get("report_date"),
         "asset_managers": cot.get("asset_managers") or {},
@@ -241,6 +235,7 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
     holdings = qqq.get("holdings") or qqq.get("top_holdings") or []
     breadth = nasdaq.get("mega_cap_breadth") or {}
     return {
+        "lifecycle": qqq.get("lifecycle") or {},
         "status": nasdaq.get("status"),
         "top_20_holdings": [_holding(item) for item in holdings[:20]],
         "holdings_count": qqq.get("holdings_count"),
@@ -271,6 +266,7 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
     earnings = (full.get("nasdaq_context") or {}).get("earnings") or {}
     events = earnings.get("upcoming") or earnings.get("events") or []
     return {
+        "lifecycle": earnings.get("lifecycle") or {},
         "status": earnings.get("status") or (
             "AVAILABLE"
             if events
@@ -287,7 +283,9 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
 
 def _news(news: dict[str, Any], digest: dict[str, Any]) -> dict[str, Any]:
     return {
+        "lifecycle": news.get("lifecycle") or {},
         "status": news.get("status"),
+        "context_date": news.get("context_date"),
         "search_completed": news.get("search_completed"),
         "market_session_status": news.get("market_session_status"),
         "usable_for_analysis": news.get("usable_for_analysis"),
@@ -311,9 +309,9 @@ def _news(news: dict[str, Any], digest: dict[str, Any]) -> dict[str, Any]:
 
 def _sentiment(sentiment: dict[str, Any]) -> dict[str, Any]:
     return {
-        "AAII": _select(sentiment.get("aaii") or {}, "status", "survey_date", "bullish_pct", "neutral_pct", "bearish_pct", "bull_bear_spread", "source", "reliability", "warnings"),
+        "AAII": _select(sentiment.get("aaii") or {}, "status", "survey_date", "bullish_pct", "neutral_pct", "bearish_pct", "bull_bear_spread", "source", "reliability", "warnings", "lifecycle"),
         "retail_QQQ": sentiment.get("retail_qqq") or {},
-        "technology_discussion": _select(sentiment.get("technology_discussion") or {}, "status", "classification", "mention_count", "source_count", "social_market_sentiment", "source", "reliability", "warnings"),
+        "technology_discussion": _select(sentiment.get("technology_discussion") or {}, "status", "classification", "mention_count", "source_count", "social_market_sentiment", "source", "reliability", "warnings", "lifecycle"),
         "Fear_Greed": sentiment.get("fear_greed") or {},
         "prediction_markets": _compact_prediction(sentiment.get("prediction_markets") or {}),
         "quality": sentiment.get("sentiment_quality") or {},
@@ -322,7 +320,10 @@ def _sentiment(sentiment: dict[str, Any]) -> dict[str, Any]:
 
 def _schedule(schedule: dict[str, Any]) -> dict[str, Any]:
     return {
+        "lifecycle": schedule.get("lifecycle") or {},
+        "holiday_calendar_lifecycle": schedule.get("holiday_calendar_lifecycle") or {},
         "status": schedule.get("status"),
+        "context_date": schedule.get("context_date"),
         "market_session_status": schedule.get("market_session_status"),
         "last_market_session_date": schedule.get("last_market_session_date"),
         "mnq_session": _session(schedule.get("mnq_session") or {}),
@@ -357,11 +358,26 @@ def _warnings(full: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _metric(item: dict[str, Any]) -> dict[str, Any]:
-    return _select(item, "value", "unit", "frequency", "data_as_of", "source", "source_url", "freshness", "reliability", "cache_status")
+    return _select(
+        item,
+        "value",
+        "unit",
+        "frequency",
+        "data_as_of",
+        "source",
+        "source_url",
+        "provider_type",
+        "freshness",
+        "reliability",
+        "confidence",
+        "cache_status",
+        "valid_until",
+        "next_refresh_at",
+    )
 
 
 def _risk_metric(item: dict[str, Any]) -> dict[str, Any]:
-    return _select(item, "status", "value", "previous_close", "change_pct", "data_as_of", "relative_regime", "tail_risk_regime", "percentile_1y", "z_score_1y", "source", "freshness", "reliability", "confidence")
+    return _select(item, "status", "value", "previous_close", "change_pct", "data_as_of", "relative_regime", "tail_risk_regime", "percentile_1y", "z_score_1y", "source", "source_url", "provider_type", "freshness", "reliability", "confidence", "valid_until", "next_refresh_at", "lifecycle")
 
 
 def _contract(item: dict[str, Any]) -> dict[str, Any]:
@@ -376,12 +392,50 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
     if not item:
         return {}
     enrichment = item.get("enrichment") or {}
+    lineage = _select(
+        enrichment,
+        "source",
+        "source_url",
+        "provider_type",
+        "confidence",
+        "reliability",
+        "evidence",
+        "evidence_text",
+        "validation",
+        "field_lineage",
+        "cache_status",
+        "valid_until",
+        "next_refresh_at",
+    )
     return {
         **_select(item, "event_id", "name", "event_name", "category", "impact", "date", "time_utc", "release_at", "event_type", "release_period", "period_date_consistent", "event_risk_window_status"),
         "consensus": enrichment.get("consensus"),
         "previous": enrichment.get("previous"),
         "actual": enrichment.get("actual"),
-        "metrics": [_select(metric, "metric_id", "name", "consensus", "forecast", "previous", "actual", "unit", "frequency") for metric in (enrichment.get("metrics") or [])[:6]],
+        "lineage": lineage,
+        "metrics": [
+            _select(
+                metric,
+                "metric_id",
+                "name",
+                "consensus",
+                "forecast",
+                "previous",
+                "actual",
+                "unit",
+                "frequency",
+                "source",
+                "source_url",
+                "provider_type",
+                "confidence",
+                "reliability",
+                "evidence",
+                "evidence_text",
+                "validation",
+                "field_lineage",
+            )
+            for metric in (enrichment.get("metrics") or [])[:6]
+        ],
     }
 
 

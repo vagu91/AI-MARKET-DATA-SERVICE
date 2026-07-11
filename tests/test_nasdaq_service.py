@@ -310,27 +310,28 @@ async def test_context_run_deduplicates_qqq_holdings_provider_call() -> None:
         },
         provider_type=ProviderType.CSV,
     )
+    snapshot_provider = CountingProvider(
+        {
+            "stocks": [
+                {
+                    "symbol": "NVDA",
+                    "name": "NVIDIA",
+                    "last_price": 100.0,
+                    "change": 1.0,
+                    "change_pct": 1.0,
+                    "volume": 10,
+                    "market_session": "REGULAR",
+                    "currency": "USD",
+                    "source": "fixture",
+                    "retrieved_at": datetime.now(UTC).isoformat(),
+                }
+            ],
+            "data_quality": {"tracked_count": 1, "resolved_count": 1, "missing_prices": [], "final_data_available": True},
+        }
+    )
     service = NasdaqDataService(
         qqq_holdings_provider=qqq_provider,
-        mega_cap_snapshot_provider=FakeProvider(
-            {
-                "stocks": [
-                    {
-                        "symbol": "NVDA",
-                        "name": "NVIDIA",
-                        "last_price": 100.0,
-                        "change": 1.0,
-                        "change_pct": 1.0,
-                        "volume": 10,
-                        "market_session": "REGULAR",
-                        "currency": "USD",
-                        "source": "fixture",
-                        "retrieved_at": datetime.now(UTC).isoformat(),
-                    }
-                ],
-                "data_quality": {"tracked_count": 1, "resolved_count": 1, "missing_prices": [], "final_data_available": True},
-            }
-        ),
+        mega_cap_snapshot_provider=snapshot_provider,
         earnings_provider=FakeProvider({"events": [], "data_quality": {"errors": [], "fallback_used": False, "final_data_available": True}}),
         news_provider=FakeProvider({"articles": [], "data_quality": {"errors": [], "fallback_used": False, "final_data_available": True}}),
     )
@@ -338,5 +339,9 @@ async def test_context_run_deduplicates_qqq_holdings_provider_call() -> None:
     context = await service.context()
 
     assert qqq_provider.calls == 1
+    assert snapshot_provider.calls == 1
     assert context.qqq_holdings.data_quality.run_cache_used is True
     assert context.qqq_holdings.data_quality.run_deduplicated_calls >= 2
+    assert context.mega_cap_snapshot.data_quality.run_cache_used is True
+    assert context.mega_cap_snapshot.data_quality.run_deduplicated_calls == 1
+    assert context.metadata["actual_network_calls"] == 4

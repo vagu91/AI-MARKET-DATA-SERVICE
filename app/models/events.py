@@ -33,6 +33,10 @@ class EventEnrichment(BaseModel):
     next_refresh_at: datetime | None = None
     reliability: float = Field(default=0.0, ge=0.0, le=1.0)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: str | None = None
+    evidence_text: str | None = None
+    validation: dict[str, Any] = Field(default_factory=dict)
+    field_lineage: dict[str, dict[str, Any]] = Field(default_factory=dict)
     cache_status: str | None = None
     matched_by: str | None = None
     warnings: list[str] = Field(default_factory=list)

@@ -263,6 +263,51 @@ def test_lower_precedence_consensus_does_not_erase_actual_forecast_or_stronger_c
     assert len(metric["provenance"]) == 2
 
 
+def test_mixed_ai_and_deterministic_consensus_has_field_level_lineage(tmp_path):
+    cfg = settings(tmp_path)
+    event = official_event()
+    event.enrichment = EventEnrichment(
+        forecast=0.25,
+        previous=0.5,
+        metrics=[
+            {
+                "metric_id": "headline_cpi_mom",
+                "forecast": 0.25,
+                "previous": 0.5,
+                "source": "AI researched source",
+                "source_url": "https://research.test/cpi",
+                "provider_type": "AI_RESEARCHER_CODEX_CLI",
+                "reliability": 0.9,
+                "confidence": 0.9,
+                "evidence": "The cited source reports the forecast and previous value.",
+                "validation": {"status": "accepted", "reasons": []},
+            }
+        ],
+        source="AI researched source",
+        source_url="https://research.test/cpi",
+        provider_type=ProviderType.AI_RESEARCHER_CODEX_CLI,
+        reliability=0.9,
+        confidence=0.9,
+        validation={"status": "accepted", "reasons": []},
+    )
+
+    enriched, _, _ = MacroConsensusService(cfg).enrich_and_persist(
+        [event], {"status": "found", "items": [occurrence(consensus=0.3)]}, refresh_mode="force"
+    )
+
+    result = enriched[0].enrichment
+    metric = result.metrics[0]
+    assert result.provider_type == ProviderType.MIXED
+    assert metric["provider_type"] == "MIXED"
+    assert metric["field_lineage"]["forecast"]["provider_type"] == "AI_RESEARCHER_CODEX_CLI"
+    assert metric["field_lineage"]["previous"]["evidence"]
+    assert metric["field_lineage"]["consensus"]["provider_type"] == "API"
+    fact = MarketFactRepository(cfg).get_event_enrichment_fact(
+        EconomicEventMaterializationService(cfg).fact_key(event)
+    )
+    assert fact["provider_type"] == "MIXED"
+
+
 def test_persistence_readback_new_service_and_json_fields_survive(tmp_path):
     cfg = settings(tmp_path)
     candidate = {

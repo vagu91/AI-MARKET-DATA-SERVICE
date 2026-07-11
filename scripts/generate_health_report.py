@@ -51,7 +51,7 @@ def collect_report(args: argparse.Namespace) -> dict[str, Any]:
     errors: dict[str, str] = {}
     endpoints = {
         "db_health": "/db/health",
-        "market_context": f"/market-context/mnq?refresh={urllib.parse.quote(args.refresh)}",
+        "market_context": market_context_path(args.refresh),
         "temporal_integrity": "/diagnostics/temporal-integrity",
         "release_refresh": "/diagnostics/release-refresh-status",
         "news_freshness": "/diagnostics/news-freshness",
@@ -84,6 +84,10 @@ def collect_report(args: argparse.Namespace) -> dict[str, Any]:
     if errors:
         report["infos"].append({"endpoint_errors": errors})
     return report
+
+
+def market_context_path(refresh: str) -> str:
+    return f"/market-context/mnq/debug?refresh={urllib.parse.quote(refresh)}"
 
 
 def fetch_json(url: str, *, timeout: float) -> dict[str, Any]:

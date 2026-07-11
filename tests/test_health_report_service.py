@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from app.services.bls_required_series import BLS_REQUIRED_SERIES_IDS, bls_required_series_status_from_macro_snapshot
 from app.services.health_report_service import HealthReportService
+from scripts.generate_health_report import market_context_path
 
 
 def clean_inputs():
@@ -187,6 +188,11 @@ def test_clean_report_pass_exit_zero():
     assert data["summary"]["critical_error_count"] == 0
 
 
+def test_health_collector_uses_full_debug_contract():
+    assert market_context_path("false") == "/market-context/mnq/debug?refresh=false"
+    assert market_context_path("force") == "/market-context/mnq/debug?refresh=force"
+
+
 def test_warning_report_exit_one_and_fail_on_warning_exit_two():
     context = market_context()
     context["data_quality"]["overall_data_quality"]["freshness_score"] = 0.8
@@ -254,6 +260,34 @@ def test_official_news_zero_generates_single_warning_without_duplicate_classific
     assert check(data, "SOURCES_OFFICIAL_CLASSIFICATION")["status"] in {"PASS", "INFO"}
 
 
+def test_market_closed_without_current_news_is_expected_not_critical():
+    context = market_context()
+    context["news_context"] = {
+        "status": "MARKET_CLOSED_NO_FRESH_NEWS",
+        "latest": [],
+    }
+    context["data_quality"]["news_pipeline"] = {
+        "read_back_count": 8,
+        "eligible_count": 0,
+        "materialized_count": 0,
+    }
+
+    data = report(market_context=context)
+
+    assert check(data, "NEWS_LATEST_NOT_EMPTY")["status"] == "PASS"
+    assert check(data, "NEWS_COLD_START_COMPLETE")["status"] == "PASS"
+    assert check(data, "NEWS_MARKET_CLOSED_NO_FRESH_EXPECTED")["status"] == "INFO"
+
+
+def test_available_news_status_without_articles_is_critical():
+    context = market_context()
+    context["news_context"] = {"status": "AVAILABLE", "latest": []}
+
+    data = report(market_context=context)
+
+    assert check(data, "NEWS_LATEST_NOT_EMPTY")["status"] == "FAIL"
+
+
 def test_provider_warning_detail_present_and_fallback_warning_is_not_critical():
     context = market_context()
     context["data_quality"]["macro"] = {
@@ -292,6 +326,22 @@ def test_degraded_provider_warning_message_includes_detail():
     assert provider_check["status"] == "WARNING"
     assert "macro:degraded_provider_warning:temporary latency from macro provider" in provider_check["message"]
     assert data["provider_health"]["degraded_provider_warning"] == 1
+
+
+def test_duplicate_provider_warning_details_are_collapsed():
+    context = market_context()
+    context["data_quality"]["warnings"] = ["Polymarket excluded", "Polymarket excluded"]
+
+    data = report(market_context=context)
+    details = [
+        item
+        for item in data["provider_health"]["warning_details"]
+        if item["message"] == "Polymarket excluded"
+    ]
+
+    assert len(details) == 1
+    assert details[0]["code"] == "expected_provider_warning"
+    assert details[0]["is_blocking"] is False
 
 
 def test_essential_provider_without_fallback_is_critical():
@@ -393,6 +443,9 @@ def test_cache_refresh_false_ai_warning_and_db_miss_warning():
     context = market_context()
     context["data_quality"]["db_misses"] = 2
     assert check(report(market_context=context), "CACHE_REFRESH_FALSE_LOW_DB_MISSES")["status"] == "WARNING"
+
+    context["metadata"]["runtime_io"] = {"cache_used": True}
+    assert check(report(market_context=context), "CACHE_REFRESH_FALSE_LOW_DB_MISSES")["status"] == "PASS"
 
 
 def test_report_files_latest_history_json_and_retention(tmp_path):

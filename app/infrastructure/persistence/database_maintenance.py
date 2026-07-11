@@ -55,6 +55,56 @@ def purge_old_market_news(settings: Settings, *, dry_run: bool = True, now: date
     )
 
 
+def purge_expired_market_facts(settings: Settings, *, dry_run: bool = True, now: datetime | None = None) -> dict[str, Any]:
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=settings.market_facts_retention_days)
+    return _delete_before(
+        settings.database_path,
+        table="market_facts",
+        timestamp_column="valid_until",
+        cutoff=cutoff,
+        dry_run=dry_run,
+        extra_where="valid_until IS NOT NULL",
+    )
+
+
+def purge_old_economic_events(settings: Settings, *, dry_run: bool = True, now: datetime | None = None) -> dict[str, Any]:
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=settings.economic_events_history_retention_days)
+    return _delete_before(
+        settings.database_path,
+        table="economic_events_history",
+        timestamp_column="COALESCE(release_at, time_utc, date, updated_at, created_at)",
+        cutoff=cutoff,
+        dry_run=dry_run,
+        extra_where="COALESCE(release_at, time_utc, date, updated_at, created_at) IS NOT NULL",
+    )
+
+
+def purge_old_snapshot_history(settings: Settings, *, dry_run: bool = True, now: datetime | None = None) -> dict[str, Any]:
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=settings.snapshot_history_retention_days)
+    fed = _delete_before(
+        settings.database_path,
+        table="fed_expectation_snapshots",
+        timestamp_column="retrieved_at",
+        cutoff=cutoff,
+        dry_run=dry_run,
+    )
+    risk = _delete_before(
+        settings.database_path,
+        table="risk_context_snapshots",
+        timestamp_column="retrieved_at",
+        cutoff=cutoff,
+        dry_run=dry_run,
+    )
+    return {
+        "table": "snapshot_history",
+        "cutoff": cutoff.replace(microsecond=0).isoformat(),
+        "dry_run": dry_run,
+        "deleted_rows": int(fed["deleted_rows"]) + int(risk["deleted_rows"]),
+        "matched_rows": int(fed["matched_rows"]) + int(risk["matched_rows"]),
+        "tables": {"fed_expectation_snapshots": fed, "risk_context_snapshots": risk},
+    }
+
+
 def purge_temporary_provider_state(settings: Settings, *, dry_run: bool = True, now: datetime | None = None) -> dict[str, Any]:
     cutoff = (now or datetime.now(UTC)) - timedelta(days=settings.expired_cache_retention_days)
     return _delete_before(
@@ -75,6 +125,9 @@ def run_database_maintenance(settings: Settings, *, dry_run: bool = True, now: d
         "provider_observations": purge_old_provider_observations(settings, dry_run=dry_run, now=now),
         "enrichment_runs": purge_old_enrichment_runs(settings, dry_run=dry_run, now=now),
         "market_news": purge_old_market_news(settings, dry_run=dry_run, now=now),
+        "market_facts": purge_expired_market_facts(settings, dry_run=dry_run, now=now),
+        "economic_events_history": purge_old_economic_events(settings, dry_run=dry_run, now=now),
+        "snapshot_history": purge_old_snapshot_history(settings, dry_run=dry_run, now=now),
         "provider_state": purge_temporary_provider_state(settings, dry_run=dry_run, now=now),
     }
     return {

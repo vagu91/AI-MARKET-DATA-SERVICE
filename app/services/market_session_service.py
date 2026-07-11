@@ -81,6 +81,7 @@ def build_session_aware_schedule(
     return {
         **existing,
         "status": "AVAILABLE",
+        "context_date": local.date().isoformat(),
         "market_session_status": cash["status"],
         "last_market_session_date": last_session.isoformat(),
         "nasdaq_cash_session": cash_view,

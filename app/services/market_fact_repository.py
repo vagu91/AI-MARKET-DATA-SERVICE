@@ -42,6 +42,12 @@ def decode(value: str | None, default: Any) -> Any:
         return default
 
 
+def database_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
 def connect_market_db(settings: Settings) -> Any:
     return connect_sqlite(settings.database_path)
 
@@ -59,6 +65,11 @@ class MarketFactRepository:
         payload = normalize_payload_text(dict(fact))
         if payload.get("fact_type") == LEGACY_EVENT_ENRICHMENT_TYPE:
             payload["fact_type"] = CANONICAL_EVENT_ENRICHMENT_TYPE
+        if payload.get("fact_type") == "official_macro_latest" and payload.get("category"):
+            payload["fact_key"] = _canonical_macro_fact_key(payload)
+            existing = self.get_fact(payload["fact_key"])
+            if existing and _official_macro_rank(existing) > _official_macro_rank(payload):
+                return existing
         timestamp = now_iso()
         payload.setdefault("retrieved_at", timestamp)
         payload.setdefault("created_at", timestamp)
@@ -76,7 +87,7 @@ class MarketFactRepository:
                 INSERT INTO market_facts ({", ".join(columns)}) VALUES ({", ".join("?" for _ in columns)})
                 ON CONFLICT(fact_key) DO UPDATE SET {updates}
                 """,
-                [payload[column] for column in columns],
+                [database_value(payload[column]) for column in columns],
             )
             conn.commit()
         return self.get_fact(payload["fact_key"]) or payload
@@ -130,8 +141,12 @@ class MarketFactRepository:
         with connect_market_db(self.settings) as conn:
             total = conn.execute("SELECT COUNT(*) c FROM market_facts WHERE country = ?", (country.upper(),)).fetchone()["c"]
             active = conn.execute(
-                "SELECT COUNT(*) c FROM market_facts WHERE country = ? AND status = 'active'",
-                (country.upper(),),
+                """
+                SELECT COUNT(*) c FROM market_facts
+                WHERE country = ? AND status = 'active'
+                  AND (valid_until IS NULL OR valid_until > ?)
+                """,
+                (country.upper(), now_iso()),
             ).fetchone()["c"]
             stale = conn.execute(
                 "SELECT COUNT(*) c FROM market_facts WHERE country = ? AND valid_until IS NOT NULL AND valid_until <= ?",
@@ -162,7 +177,15 @@ class MarketFactRepository:
 
     def active_count(self) -> int:
         with connect_market_db(self.settings) as conn:
-            return int(conn.execute("SELECT COUNT(*) c FROM market_facts WHERE status = 'active'").fetchone()["c"])
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) c FROM market_facts
+                    WHERE status = 'active' AND (valid_until IS NULL OR valid_until > ?)
+                    """,
+                    (now_iso(),),
+                ).fetchone()["c"]
+            )
 
     def get_valid_facts_by_type(self, fact_type: str, *, allow_stale: bool = False) -> list[dict[str, Any]]:
         fact_types = EVENT_ENRICHMENT_TYPES if fact_type == CANONICAL_EVENT_ENRICHMENT_TYPE else (fact_type,)
@@ -279,7 +302,14 @@ class MarketFactRepository:
     def db_summary(self) -> dict[str, Any]:
         with connect_market_db(self.settings) as conn:
             facts_total = conn.execute("SELECT COUNT(*) c FROM market_facts").fetchone()["c"]
-            facts_active = conn.execute("SELECT COUNT(*) c FROM market_facts WHERE status = 'active'").fetchone()["c"]
+            facts_persisted_active = conn.execute("SELECT COUNT(*) c FROM market_facts WHERE status = 'active'").fetchone()["c"]
+            facts_active = conn.execute(
+                """
+                SELECT COUNT(*) c FROM market_facts
+                WHERE status = 'active' AND (valid_until IS NULL OR valid_until > ?)
+                """,
+                (now_iso(),),
+            ).fetchone()["c"]
             facts_stale = conn.execute(
                 "SELECT COUNT(*) c FROM market_facts WHERE valid_until IS NOT NULL AND valid_until <= ?",
                 (now_iso(),),
@@ -303,7 +333,13 @@ class MarketFactRepository:
         if legacy_count:
             facts_by_type[CANONICAL_EVENT_ENRICHMENT_TYPE] = int(facts_by_type.get(CANONICAL_EVENT_ENRICHMENT_TYPE, 0)) + legacy_count
         return {
-            "market_facts": {"total": facts_total, "active": facts_active, "stale": facts_stale},
+            "market_facts": {
+                "total": facts_total,
+                "active": facts_active,
+                "usable_active": facts_active,
+                "persisted_active": facts_persisted_active,
+                "stale": facts_stale,
+            },
             "economic_events_history": {"total": events_total},
             "market_news": {"total": news_total},
             "provider_observations": {"total": observations_total},
@@ -337,6 +373,25 @@ class MarketFactRepository:
 
 def _canonical_event_fact_key(fact_key: str) -> str:
     return fact_key.replace(f":{LEGACY_EVENT_ENRICHMENT_TYPE}", f":{CANONICAL_EVENT_ENRICHMENT_TYPE}")
+
+
+def _canonical_macro_fact_key(fact: dict[str, Any]) -> str:
+    country = str(fact.get("country") or "US").upper()
+    category = str(fact.get("category") or "unknown").upper()
+    return f"{country}:{category}:latest:official_macro_latest"
+
+
+def _official_macro_rank(fact: dict[str, Any]) -> tuple[int, int, str, float]:
+    source = str(fact.get("source") or "").lower()
+    source_rank = 1 if " via fred" in source else 3 if any(token in source for token in ("bls", "bea")) else 2
+    valid_until = _parse_datetime(fact.get("valid_until"))
+    usable = valid_until is None or valid_until > datetime.now(UTC)
+    return (
+        int(usable),
+        source_rank,
+        str(fact.get("release_at") or fact.get("retrieved_at") or ""),
+        float(fact.get("reliability") or 0),
+    )
 
 
 def _event_fact_rank(fact: dict[str, Any]) -> tuple[int, int, str, int]:

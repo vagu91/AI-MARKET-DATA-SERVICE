@@ -17,6 +17,7 @@ class ProviderType(StrEnum):
     AI_RESEARCHER_CODEX_CLI = "AI_RESEARCHER_CODEX_CLI"
     AI_WEB_FALLBACK = "AI_WEB_FALLBACK"
     SEARCH_SNIPPET = "SEARCH_SNIPPET"
+    MIXED = "MIXED"
 
 
 class Freshness(StrEnum):

@@ -221,6 +221,7 @@ async def market_context_mnq(
         metadata={
             "event_enrichment": event_service.last_enrichment_metadata,
             "persistent_enrichment": orchestrator_metadata,
+            "request_refresh_mode": refresh,
         },
         news_context_override=news_context,
     )
@@ -401,6 +402,9 @@ async def storage_retention_policy(
             "enrichment_runs_retention_days": settings.enrichment_runs_retention_days,
             "expired_cache_retention_days": settings.expired_cache_retention_days,
             "market_news_retention_days": settings.market_news_retention_days,
+            "market_facts_retention_days": settings.market_facts_retention_days,
+            "economic_events_history_retention_days": settings.economic_events_history_retention_days,
+            "snapshot_history_retention_days": settings.snapshot_history_retention_days,
             "vacuum_manual_or_scheduled": True,
         },
         "service_role": "data provider only",

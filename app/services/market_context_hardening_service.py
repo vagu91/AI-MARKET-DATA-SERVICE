@@ -10,7 +10,9 @@ from typing import Any
 from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
 from app.services.data_integrity_service import classify_source
+from app.services.data_lifecycle_service import attach_lifecycle_metadata
 from app.services.market_session_service import (
+    NEW_YORK,
     build_session_aware_schedule,
     is_market_closed,
     last_market_session_date,
@@ -20,6 +22,7 @@ from app.services.market_session_service import (
 logger = logging.getLogger(__name__)
 READINESS_VERSION = "session_aware_readiness_v2"
 QUALITY_VERSION = "available_data_quality_v2"
+HARDENING_VERSION = "market_context_hardening_v3"
 NEWS_STATUSES = {
     "AVAILABLE",
     "PARTIAL",
@@ -47,6 +50,14 @@ def harden_market_context(
 ) -> dict[str, Any]:
     settings = settings or Settings(_env_file=None)
     now = _aware(now or datetime.now(UTC))
+    context_date = now.astimezone(NEW_YORK).date().isoformat()
+    existing_hardening = ((full.get("metadata") or {}).get("hardening") or {})
+    if (
+        existing_hardening.get("completed") is True
+        and existing_hardening.get("version") == HARDENING_VERSION
+        and existing_hardening.get("context_date") == context_date
+    ):
+        return dict(full)
     output = dict(full)
     output["market_schedule"] = build_session_aware_schedule(output.get("market_schedule") or {}, now=now)
     session_status = output["market_schedule"]["market_session_status"]
@@ -81,6 +92,16 @@ def harden_market_context(
     output["readiness"] = evaluate_readiness(output, settings=settings)
     output["data_quality"] = _update_data_quality(output.get("data_quality") or {}, output)
     output["metadata"] = _materialization_metadata(output.get("metadata") or {}, output)
+    output = attach_lifecycle_metadata(output, settings=settings, now=now)
+    metadata = dict(output.get("metadata") or {})
+    metadata["ai_fallback_audit"] = _ai_fallback_audit(output)
+    metadata["hardening"] = {
+        "completed": True,
+        "version": HARDENING_VERSION,
+        "context_date": context_date,
+        "pass_count": 1,
+    }
+    output["metadata"] = metadata
     _walk_semantics(output, session_status=session_status, now=now)
     logger.info(
         "readiness_evaluated",
@@ -107,7 +128,12 @@ def apply_news_semantics(
     now = _aware(now or datetime.now(UTC))
     output = dict(context)
     pipeline = dict(pipeline or {})
-    articles = list(output.get("latest") or output.get("articles") or [])
+    articles = _deduplicate_articles(
+        [
+            *(output.get("latest") or output.get("articles") or []),
+            *(output.get("historical_articles") or []),
+        ]
+    )
     diagnostics = dict(output.get("diagnostics") or {})
     candidate_count = int(
         output.get("candidate_article_count")
@@ -116,12 +142,13 @@ def apply_news_semantics(
         or 0
     )
     accepted_count = len(articles)
-    rejected_count = int(
-        output.get("rejected_article_count")
-        or diagnostics.get("excluded_count")
+    pipeline_rejected_count = int(
+        diagnostics.get("excluded_count")
         or pipeline.get("excluded_count")
+        or (output.get("rejected_article_count") if not output.get("context_date") else 0)
         or max(candidate_count - accepted_count, 0)
     )
+    candidate_count = max(candidate_count, len(articles) + pipeline_rejected_count)
     explicit_errors = list(output.get("errors") or [])
     provider_failure_count = int(output.get("provider_failure_count") or pipeline.get("provider_failure_count") or 0)
     provider_success_count = int(output.get("provider_success_count") or pipeline.get("provider_success_count") or 0)
@@ -136,17 +163,23 @@ def apply_news_semantics(
     closed = is_market_closed(session_status)
     coverage = _news_lookback(settings, session_status)
     cutoff = now - timedelta(hours=coverage)
-    in_window: list[dict[str, Any]] = []
+    context_date = str(market_schedule.get("context_date") or now.astimezone(NEW_YORK).date().isoformat())
+    current_articles: list[dict[str, Any]] = []
+    historical_articles: list[dict[str, Any]] = []
     filtered_out = 0
     for article in articles:
         published = parse_datetime(article.get("published_at"))
-        if published is not None and _aware(published) < cutoff:
+        if published is None or _aware(published) < cutoff:
             filtered_out += 1
             continue
-        in_window.append(article)
-    articles = in_window
+        if _aware(published).astimezone(NEW_YORK).date().isoformat() != context_date:
+            historical_articles.append(article)
+            filtered_out += 1
+            continue
+        current_articles.append(article)
+    articles = current_articles
     accepted_count = len(articles)
-    rejected_count += filtered_out
+    rejected_count = min(candidate_count, pipeline_rejected_count + filtered_out)
     pipeline_error = bool(output.get("pipeline_error") or explicit_errors)
     configured = output.get("configured", True) is not False
     if articles:
@@ -184,6 +217,7 @@ def apply_news_semantics(
             "usable_for_analysis": bool(articles),
             "blocking": False,
             "market_session_status": session_status,
+            "context_date": context_date,
             "coverage_window_hours": coverage,
             "last_market_session_date": last_market_session_date(market_schedule, now=now),
             "search_completed": search_completed,
@@ -196,8 +230,11 @@ def apply_news_semantics(
             "reason": reason,
             "articles": articles,
             "latest": articles,
+            "historical_articles": historical_articles,
+            "historical_article_count": len(historical_articles),
+            "historical_context_available": bool(historical_articles),
             "confidence": float((output.get("digest") or {}).get("confidence") or output.get("confidence") or 0.0),
-            "last_known_good_used": bool(output.get("last_known_good_used")),
+            "last_known_good_used": bool(output.get("last_known_good_used") and articles),
             "last_known_good_age_hours": lkg_age,
             "last_known_good_original_published_at": (
                 latest_published.isoformat() if output.get("last_known_good_used") and latest_published else output.get("last_known_good_original_published_at")
@@ -707,15 +744,79 @@ def _materialization_metadata(metadata: dict[str, Any], full: dict[str, Any]) ->
     output = dict(metadata)
     output["materialization"] = _materialization_flags(full)
     runtime = output.get("multi_source_runtime") or {}
-    refresh_mode = str(runtime.get("refresh_mode") or "unknown")
+    refresh_mode = str(output.get("request_refresh_mode") or runtime.get("refresh_mode") or "unknown")
     enrichment = output.get("event_enrichment") or {}
+    persistent = output.get("persistent_enrichment") or {}
+    provider_metadata = persistent.get("provider_metadata") or {}
+    quality = full.get("data_quality") or {}
+    multi = quality.get("multi_source_pipeline") or {}
+    macro = quality.get("macro") or {}
+    nasdaq = quality.get("nasdaq") or {}
+    positioning = full.get("positioning") or {}
+    social = full.get("social_sentiment") or {}
+    risk_diagnostics = (full.get("risk_context") or {}).get("diagnostics") or {}
+    multi_blocks = multi.get("blocks") or {}
+    multi_risk_network = sum(
+        int((multi_blocks.get(name) or {}).get("actual_network_calls") or 0)
+        for name in ("cboe_risk_indices", "nasdaq_qqq_options")
+    )
+    multi_risk_calls = sum(
+        int((multi_blocks.get(name) or {}).get("provider_calls") or 0)
+        for name in ("cboe_risk_indices", "nasdaq_qqq_options")
+    )
+    components = {
+        "macro": {
+            "provider_calls": int(macro.get("provider_calls") or 0),
+            "actual_network_calls": int(macro.get("actual_network_calls") or 0),
+        },
+        "nasdaq": {
+            "provider_calls": int(nasdaq.get("provider_calls") or 0),
+            "actual_network_calls": int(nasdaq.get("actual_network_calls") or 0),
+        },
+        "event_enrichment": {
+            "provider_calls": int(provider_metadata.get("provider_calls") or 0),
+            "actual_network_calls": int(provider_metadata.get("actual_network_calls") or 0),
+        },
+        "multi_source": {
+            "provider_calls": int(multi.get("provider_calls") or runtime.get("provider_calls") or 0),
+            "actual_network_calls": int(multi.get("actual_network_calls") or runtime.get("actual_network_calls") or 0),
+        },
+        "risk_additional": {
+            "provider_calls": max(int(risk_diagnostics.get("provider_calls") or 0) - multi_risk_calls, 0),
+            "actual_network_calls": max(int(risk_diagnostics.get("actual_network_calls") or 0) - multi_risk_network, 0),
+        },
+        "positioning": {
+            "provider_calls": int(positioning.get("provider_calls") or 0),
+            "actual_network_calls": int(positioning.get("actual_network_calls") or 0),
+        },
+        "social_sentiment": {
+            "provider_calls": int(social.get("provider_calls") or 0),
+            "actual_network_calls": int(social.get("actual_network_calls") or social.get("provider_calls") or 0),
+        },
+    }
+    provider_calls = sum(item["provider_calls"] for item in components.values())
+    actual_network_calls = sum(item["actual_network_calls"] for item in components.values())
+    browser_calls = int(provider_metadata.get("browser_calls") or 0)
+    if refresh_mode == "false":
+        components = {
+            name: {"provider_calls": 0, "actual_network_calls": 0}
+            for name in components
+        }
+        provider_calls = 0
+        actual_network_calls = 0
+        browser_calls = 0
     output["runtime_io"] = {
         "refresh_mode": refresh_mode,
-        "provider_calls": 0 if refresh_mode == "false" else int(runtime.get("provider_calls") or 0),
-        "actual_network_calls": 0 if refresh_mode == "false" else int(runtime.get("provider_calls") or 0),
-        "browser_calls": 0,
-        "AI_called": False if refresh_mode == "false" else bool(enrichment.get("AI_called")),
-        "cache_used": True if refresh_mode == "false" else bool(runtime.get("cache_used")),
+        "provider_calls": provider_calls,
+        "actual_network_calls": actual_network_calls,
+        "browser_calls": browser_calls,
+        "AI_called": False if refresh_mode == "false" else bool(
+            enrichment.get("AI_called") or (persistent.get("data_quality") or {}).get("ai_research_called")
+        ),
+        "cache_used": True if refresh_mode == "false" else bool(actual_network_calls == 0 or runtime.get("cache_used")),
+        "network_used": actual_network_calls > 0,
+        "provider_call_components": components,
+        "count_scope": "instrumented_runtime_components",
         "persisted_diagnostics_are_historical": True,
     }
     return output
@@ -734,6 +835,33 @@ def _materialization_flags(full: dict[str, Any]) -> dict[str, bool]:
         "snapshot_serialization_completed": serialized,
         "snapshot_contract_validation_completed": required and bool(full.get("symbol")),
         "consumer_materialization_completed": False,
+    }
+
+
+def _ai_fallback_audit(full: dict[str, Any]) -> dict[str, Any]:
+    metadata = full.get("metadata") or {}
+    persistent = metadata.get("persistent_enrichment") or {}
+    quality = persistent.get("data_quality") or full.get("data_quality") or {}
+    candidate_ids = list(quality.get("ai_candidate_event_ids") or [])
+    return {
+        "scope": "eligible_macro_event_enrichment_only",
+        "pipeline": [
+            "deterministic_providers",
+            "missing_data_manifest",
+            "ai_researcher",
+            "validation",
+            "persistence",
+            "read_back",
+            "consumer_materialization",
+        ],
+        "missing_data_manifest": candidate_ids,
+        "allowed_data_types": ["macro_consensus", "macro_previous", "news_summary", "canonical_url", "earnings_date"],
+        "forbidden_data_types": ["prices", "volumes", "open_interest", "probabilities", "official_weights"],
+        "required_lineage": ["source", "source_url", "provider_type", "confidence", "evidence", "validation"],
+        "AI_called": bool(quality.get("ai_research_called")),
+        "validation_completed": int(quality.get("ai_results_valid") or 0) + int(quality.get("ai_results_rejected") or 0),
+        "persisted_count": int(quality.get("facts_written") or 0),
+        "read_back_count": int(quality.get("enrichment_read_back_count") or 0),
     }
 
 
@@ -826,6 +954,26 @@ def _news_lookback(settings: Settings, status: str) -> int:
     if status == "holiday":
         return int(settings.news_holiday_lookback_hours)
     return int(settings.news_market_open_lookback_hours)
+
+
+def _deduplicate_articles(articles: list[Any]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in articles:
+        if not isinstance(raw, dict):
+            continue
+        key = str(
+            raw.get("article_id")
+            or raw.get("news_key")
+            or raw.get("canonical_url")
+            or raw.get("source_url")
+            or f"{raw.get('title')}:{raw.get('published_at')}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(raw)
+    return output
 
 
 def _issuer_event_id(issuer: str, event_date: str) -> str:

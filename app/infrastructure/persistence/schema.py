@@ -208,9 +208,52 @@ CREATE INDEX IF NOT EXISTS idx_risk_context_retrieved_at
 """
 
 
+CANONICAL_MACRO_FACTS_SCHEMA = """
+DELETE FROM market_facts
+WHERE id IN (
+  SELECT id
+  FROM (
+    SELECT
+      id,
+      ROW_NUMBER() OVER (
+        PARTITION BY COALESCE(country, ''), UPPER(COALESCE(category, ''))
+        ORDER BY
+          CASE WHEN LOWER(COALESCE(source, '')) LIKE '% via fred%' THEN 0 ELSE 1 END DESC,
+          COALESCE(retrieved_at, updated_at, created_at, '') DESC,
+          id DESC
+      ) AS duplicate_rank
+    FROM market_facts
+    WHERE fact_type = 'official_macro_latest'
+  ) ranked
+  WHERE duplicate_rank > 1
+);
+
+UPDATE market_facts
+SET fact_key = UPPER(COALESCE(country, 'US')) || ':' || UPPER(category) || ':latest:official_macro_latest'
+WHERE fact_type = 'official_macro_latest'
+  AND category IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_market_facts_official_macro_series
+  ON market_facts(country, category)
+  WHERE fact_type = 'official_macro_latest';
+"""
+
+
+MIXED_EVENT_LINEAGE_SCHEMA = """
+UPDATE market_facts
+SET provider_type = 'MIXED'
+WHERE fact_type = 'macro_event_enrichment'
+  AND provider_type = 'API'
+  AND raw_payload_json LIKE '%AI_RESEARCHER_CODEX_CLI%'
+  AND raw_payload_json LIKE '%consensus_verified%';
+"""
+
+
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
     ("002_provider_cache_and_state", PROVIDER_CACHE_SCHEMA),
     ("003_fed_expectation_history", FED_EXPECTATIONS_SCHEMA),
     ("004_risk_context_history", RISK_CONTEXT_SCHEMA),
+    ("005_canonical_macro_facts", CANONICAL_MACRO_FACTS_SCHEMA),
+    ("006_mixed_event_lineage", MIXED_EVENT_LINEAGE_SCHEMA),
 )

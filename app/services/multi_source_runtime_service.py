@@ -183,7 +183,7 @@ class MultiSourceRuntimeService:
                 source="Polymarket",
                 refresh=refresh,
             ),
-            "quikstrike_review": self._quikstrike_review(),
+            "quikstrike_review": self._quikstrike_review(refresh=refresh),
         }
         quality = _quality_summary(blocks)
         return {
@@ -325,7 +325,7 @@ class MultiSourceRuntimeService:
                 refresh=refresh,
             )
         if name == "quikstrike_review":
-            return self._quikstrike_review()
+            return self._quikstrike_review(refresh=refresh)
         raise KeyError(name)
 
     async def _run_provider(
@@ -386,7 +386,21 @@ class MultiSourceRuntimeService:
             item_count=found,
         )
 
-    def _quikstrike_review(self) -> dict[str, Any]:
+    def _quikstrike_review(self, *, refresh: str) -> dict[str, Any]:
+        cached = [] if refresh == "force" else self.facts.get_valid_facts_by_type(FACT_TYPES["quikstrike_review"])
+        if cached:
+            raw = cached[0].get("raw_payload") if isinstance(cached[0].get("raw_payload"), dict) else {}
+            return _with_runtime_fields(
+                raw,
+                enabled=True,
+                cache_used=True,
+                provider_calls=0,
+                attempted=False,
+                persisted_count=0,
+                read_back_count=1,
+                materialized_count=1,
+                item_count=1,
+            )
         payload = {
             "status": "reviewed_excluded",
             "provider": "CME QuikStrike",
@@ -402,8 +416,27 @@ class MultiSourceRuntimeService:
             "diagnostics": {"reviewed": True, "credentials_used": False},
             "service_role": "data provider only",
         }
-        self._save_fact("quikstrike_review", FACT_TYPES["quikstrike_review"], payload, source="CME QuikStrike")
-        return _with_runtime_fields(payload, enabled=True, cache_used=True, provider_calls=0, attempted=False, persisted_count=1, read_back_count=1, materialized_count=1, item_count=1)
+        persisted = 0
+        read_back = 0
+        if refresh != "false":
+            persisted = self._save_fact(
+                "quikstrike_review",
+                FACT_TYPES["quikstrike_review"],
+                payload,
+                source="CME QuikStrike",
+            )
+            read_back = 1 if persisted else 0
+        return _with_runtime_fields(
+            payload,
+            enabled=True,
+            cache_used=refresh == "false",
+            provider_calls=0,
+            attempted=False,
+            persisted_count=persisted,
+            read_back_count=read_back,
+            materialized_count=1,
+            item_count=1,
+        )
 
     def _save_fact(self, name: str, fact_type: str, result: dict[str, Any], *, source: str) -> int:
         valid_until = result.get("valid_until") or (datetime.now(UTC) + timedelta(hours=self.settings.default_fact_ttl_hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -582,6 +615,7 @@ def apply_multi_source_context(contract: dict[str, Any], snapshot: dict[str, Any
     metadata["multi_source_runtime"] = {
         "refresh_mode": snapshot.get("refresh_mode"),
         "provider_calls": (snapshot.get("data_quality") or {}).get("provider_calls"),
+        "actual_network_calls": (snapshot.get("data_quality") or {}).get("actual_network_calls"),
         "cache_used": (snapshot.get("data_quality") or {}).get("cache_used"),
     }
     contract["metadata"] = metadata
@@ -591,6 +625,7 @@ def apply_multi_source_context(contract: dict[str, Any], snapshot: dict[str, Any
 def _quality_summary(blocks: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {
         "provider_calls": sum(int(block.get("provider_calls") or 0) for block in blocks.values()),
+        "actual_network_calls": sum(int(block.get("actual_network_calls") or 0) for block in blocks.values()),
         "cache_used": all(bool(block.get("cache_used")) or int(block.get("provider_calls") or 0) == 0 for block in blocks.values()),
         "fetched_count": sum(int(block.get("fetched_count") or 0) for block in blocks.values()),
         "validated_count": sum(int(block.get("validated_count") or 0) for block in blocks.values()),
@@ -604,6 +639,7 @@ def _quality_summary(blocks: dict[str, dict[str, Any]]) -> dict[str, Any]:
             name: {
                 "status": block.get("status"),
                 "provider_calls": block.get("provider_calls"),
+                "actual_network_calls": block.get("actual_network_calls"),
                 "cache_used": block.get("cache_used"),
                 "fetched_count": block.get("fetched_count"),
                 "persisted_count": block.get("persisted_count"),
@@ -635,6 +671,15 @@ def _with_runtime_fields(
             "enabled": enabled,
             "attempted": attempted,
             "provider_calls": provider_calls,
+            "actual_network_calls": (
+                0
+                if cache_used
+                else int(
+                    output.get("actual_network_calls")
+                    or (output.get("diagnostics") or {}).get("actual_network_calls")
+                    or provider_calls
+                )
+            ),
             "cache_used": cache_used,
             "AI_called": False,
             "fetched_count": fetched,

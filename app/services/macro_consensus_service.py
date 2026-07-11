@@ -219,7 +219,11 @@ class MacroConsensusService:
             "actual": enrichment.actual,
             "source": enrichment.consensus_source or enrichment.source,
             "source_url": enrichment.consensus_source_url or enrichment.source_url,
-            "provider_type": ProviderType.API.value,
+            "provider_type": (
+                enrichment.provider_type.value
+                if isinstance(enrichment.provider_type, ProviderType)
+                else str(enrichment.provider_type or ProviderType.API.value)
+            ),
             "reliability": enrichment.reliability,
             "confidence": enrichment.confidence,
             "retrieved_at": enrichment.consensus_retrieved_at or enrichment.retrieved_at or datetime.now(UTC),
@@ -365,6 +369,11 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
         "consensus_source_url": candidate.get("consensus_source_url") or candidate.get("source_url"),
         "source": "Investing Economic Calendar",
         "source_url": candidate.get("consensus_source_url") or candidate.get("source_url"),
+        "provider_type": ProviderType.API.value,
+        "validation": {
+            "status": "deterministic_verified",
+            "checks": ["event_family", "country", "release_time", "reference_period", "unit", "consensus_numeric"],
+        },
         "retrieved_at": candidate.get("consensus_retrieved_at"),
         "valid_until": valid_until,
         "period": candidate.get("reference_period"),
@@ -449,6 +458,54 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
         merged["forecast_source_url"] = existing.get("forecast_source_url") or existing.get("source_url")
     merged["field_semantics"] = merged_semantics
     merged["provenance"] = provenance
+    field_lineage = dict(existing.get("field_lineage") or {})
+    for field in ("actual", "forecast", "previous"):
+        if existing.get(field) in (None, ""):
+            continue
+        field_lineage[field] = {
+            "source": existing.get(f"{field}_source") or existing.get("source"),
+            "source_url": existing.get(f"{field}_source_url") or existing.get("source_url"),
+            "provider_type": existing.get("provider_type"),
+            "confidence": existing.get("confidence"),
+            "reliability": existing.get("reliability"),
+            "evidence": existing.get("evidence") or existing.get("evidence_text"),
+            "validation": existing.get("validation") or {},
+        }
+    if preserve_existing_consensus:
+        field_lineage["consensus"] = {
+            "source": existing.get("consensus_source") or existing.get("source"),
+            "source_url": existing.get("consensus_source_url") or existing.get("source_url"),
+            "provider_type": existing.get("provider_type"),
+            "confidence": existing.get("confidence"),
+            "reliability": existing.get("reliability"),
+            "evidence": existing.get("evidence") or existing.get("evidence_text"),
+            "validation": existing.get("validation") or {},
+        }
+    else:
+        field_lineage["consensus"] = {
+            "source": incoming["source"],
+            "source_url": incoming["source_url"],
+            "provider_type": ProviderType.API.value,
+            "confidence": incoming["confidence"],
+            "reliability": incoming["reliability"],
+            "evidence": candidate.get("evidence") or candidate.get("evidence_text"),
+            "validation": incoming["validation"],
+        }
+    existing_provider = str(existing.get("provider_type") or "")
+    preserved_existing_fields = any(existing.get(field) not in (None, "") for field in ("actual", "forecast", "previous"))
+    if preserve_existing_consensus:
+        merged["provider_type"] = existing_provider or ProviderType.API.value
+        merged["validation"] = existing.get("validation") or incoming["validation"]
+    elif preserved_existing_fields and existing_provider not in {"", ProviderType.API.value}:
+        merged["provider_type"] = ProviderType.MIXED.value
+        merged["validation"] = {
+            "status": "field_level_validated",
+            "provider_types": sorted({existing_provider, ProviderType.API.value}),
+        }
+    else:
+        merged["provider_type"] = ProviderType.API.value
+        merged["validation"] = incoming["validation"]
+    merged["field_lineage"] = field_lineage
     existing.update(merged)
 
 
@@ -495,6 +552,12 @@ def _promote_primary_metric(event: EconomicEvent) -> None:
     enrichment.source_url = enrichment.consensus_source_url
     enrichment.reliability = max(enrichment.reliability, float(primary.get("reliability") or 0))
     enrichment.confidence = max(enrichment.confidence, float(primary.get("confidence") or 0))
+    enrichment.field_lineage = dict(primary.get("field_lineage") or {})
+    enrichment.validation = dict(primary.get("validation") or enrichment.validation)
+    try:
+        enrichment.provider_type = ProviderType(str(primary.get("provider_type") or enrichment.provider_type or ProviderType.API.value))
+    except ValueError:
+        enrichment.provider_type = ProviderType.MIXED
 
 
 def _has_verified_consensus(event: EconomicEvent) -> bool:

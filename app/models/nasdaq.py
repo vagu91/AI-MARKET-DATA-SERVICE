@@ -34,6 +34,11 @@ class DataQuality(BaseModel):
     no_data_found: bool = False
     provider_failed: bool = False
     rate_limited: bool = False
+    provider_calls: int = 0
+    actual_network_calls: int = 0
+    cache_used: bool = False
+    run_cache_used: bool = False
+    run_deduplicated_calls: int = 0
 
 
 class QQQHolding(BaseModel):

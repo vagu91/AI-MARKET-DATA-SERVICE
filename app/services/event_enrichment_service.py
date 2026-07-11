@@ -77,6 +77,10 @@ class EventEnrichmentService:
                 "missing_enrichment_count": 0,
                 "provider_statuses": [],
                 "providers_attempted": 0,
+                "providers_considered": 0,
+                "providers_skipped": 0,
+                "provider_calls": 0,
+                "actual_network_calls": 0,
                 "providers_succeeded": 0,
                 "providers_failed": 0,
                 "provider_errors": [],
@@ -138,11 +142,27 @@ class EventEnrichmentService:
             for status in provider_statuses
             if status["status"] in {"provider_unavailable", "provider_failed"}
         )
+        provider_calls = sum(1 for status in provider_statuses if status["status"] != "skipped")
+        actual_network_calls = sum(
+            1
+            for status in provider_statuses
+            if status["status"] != "skipped" and str(status.get("source") or "") != "Manual Event Enrichment"
+        )
+        browser_calls = sum(
+            1
+            for status in provider_statuses
+            if status["status"] != "skipped" and str(status.get("source") or "").startswith("Playwright")
+        )
         return enriched_events, {
             "enriched_count": enriched_count,
             "missing_enrichment_count": len(enriched_events) - enriched_count,
             "provider_statuses": provider_statuses,
-            "providers_attempted": len(provider_statuses),
+            "providers_attempted": provider_calls,
+            "providers_considered": len(provider_statuses),
+            "providers_skipped": len(provider_statuses) - provider_calls,
+            "provider_calls": provider_calls,
+            "actual_network_calls": actual_network_calls,
+            "browser_calls": browser_calls,
             "providers_succeeded": sum(1 for status in provider_statuses if status["status"] == "succeeded"),
             "providers_failed": providers_failed,
             "provider_errors": _dedupe(provider_errors),

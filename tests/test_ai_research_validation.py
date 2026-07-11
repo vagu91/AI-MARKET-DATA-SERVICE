@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.services.ai_research_validation_service import (
     ValidationRequest,
     validate_ai_research_result,
@@ -83,3 +85,20 @@ def test_invalid_earnings_date_rejected():
     )
     assert result.status == "rejected_invalid_earnings_date"
 
+
+@pytest.mark.parametrize(
+    ("data_type", "field"),
+    [
+        ("market_price", "price"),
+        ("market_volume", "volume"),
+        ("open_interest", "open_interest"),
+        ("prediction_probability", "probability"),
+        ("official_weight", "weight_pct"),
+    ],
+)
+def test_ai_forbidden_market_data_is_rejected_even_with_evidence(data_type, field):
+    result = validate_ai_research_result(
+        base_item(data_type=data_type, **{field: 1.0}),
+        request(data_type=data_type, expected_period=None, release_at=None),
+    )
+    assert result.status == "rejected_forbidden_data_type"

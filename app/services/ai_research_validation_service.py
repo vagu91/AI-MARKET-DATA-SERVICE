@@ -17,6 +17,27 @@ CONSENSUS_TERMS = (
     "surveyed economists",
     "economists surveyed",
 )
+FORBIDDEN_AI_DATA_TYPE_TOKENS = (
+    "price",
+    "quote",
+    "volume",
+    "open_interest",
+    "probability",
+    "official_weight",
+    "etf_weight",
+    "holdings_weight",
+)
+FORBIDDEN_AI_VALUE_FIELDS = (
+    "price",
+    "last_price",
+    "close",
+    "volume",
+    "open_interest",
+    "probability",
+    "weight",
+    "weight_pct",
+    "official_weight",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +72,13 @@ def validate_ai_research_result(
     if status != "found":
         return ValidationResult(status if status in {"not_found", "ambiguous", "blocked", "access_restricted"} else "not_found")
 
+    data_type = request.data_type.lower().replace("-", "_").replace(" ", "_")
+    if any(token in data_type for token in FORBIDDEN_AI_DATA_TYPE_TOKENS) or _contains_forbidden_market_value(item):
+        return ValidationResult(
+            "rejected_forbidden_data_type",
+            ["ai_must_not_supply_prices_volumes_open_interest_probabilities_or_official_weights"],
+        )
+
     source_url = str(item.get("source_url") or _first_metric_field(item, "source_url") or "").strip()
     if not _valid_http_url(source_url):
         return ValidationResult("rejected_invalid_source", ["missing_or_invalid_source_url"])
@@ -62,7 +90,6 @@ def validate_ai_research_result(
     if confidence is None or confidence < request.min_confidence:
         return ValidationResult("rejected_missing_evidence", ["confidence_below_minimum"])
 
-    data_type = request.data_type.lower()
     if data_type in {"macro_forecast", "macro_consensus", "macro_previous", "forecast_macro", "consensus_macro"}:
         macro = _validate_macro(item, request, now=now)
         if not macro.accepted:
@@ -162,6 +189,11 @@ def _has_numeric_value(item: dict[str, Any]) -> bool:
     if any(_float(item.get(field)) is not None for field in fields):
         return True
     return any(any(_float(metric.get(field)) is not None for field in fields) for metric in _metrics(item))
+
+
+def _contains_forbidden_market_value(item: dict[str, Any]) -> bool:
+    candidates = [item, *_metrics(item)]
+    return any(candidate.get(field) not in (None, "") for candidate in candidates for field in FORBIDDEN_AI_VALUE_FIELDS)
 
 
 def _float(value: Any) -> float | None:

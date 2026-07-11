@@ -167,13 +167,13 @@ class EconomicEventMaterializationService:
         return updated
 
     def enrichment_from_fact(self, fact: dict[str, Any], cache_status: str, warnings: list[str]) -> EventEnrichment:
-        provider_type = str(fact.get("provider_type") or "DB").split(".")[-1]
+        raw_payload = fact.get("raw_payload") if isinstance(fact.get("raw_payload"), dict) else {}
+        raw_enrichment = raw_payload.get("enrichment") if isinstance(raw_payload.get("enrichment"), dict) else raw_payload
+        provider_type = str(raw_enrichment.get("provider_type") or fact.get("provider_type") or "DB").split(".")[-1]
         try:
             parsed_provider_type = ProviderType(provider_type)
         except ValueError:
             parsed_provider_type = ProviderType.DB
-        raw_payload = fact.get("raw_payload") if isinstance(fact.get("raw_payload"), dict) else {}
-        raw_enrichment = raw_payload.get("enrichment") if isinstance(raw_payload.get("enrichment"), dict) else raw_payload
 
         def value(field: str) -> Any:
             return raw_enrichment[field] if field in raw_enrichment else fact.get(field)
@@ -181,6 +181,29 @@ class EconomicEventMaterializationService:
         fact_warnings = list(fact.get("warnings") or [])
         if fact.get("status") == "no_data_available" and "no_data_available" not in fact_warnings:
             fact_warnings.append("no_data_available")
+        normalized_metrics = _metrics_with_lineage(raw_enrichment, provider_type=parsed_provider_type, fact=fact)
+        if any(metric.get("provider_type") == ProviderType.MIXED.value for metric in normalized_metrics):
+            parsed_provider_type = ProviderType.MIXED
+        field_lineage = dict(raw_enrichment.get("field_lineage") or {})
+        if not field_lineage:
+            top_consensus = value("consensus")
+            primary = next(
+                (metric for metric in normalized_metrics if metric.get("consensus") == top_consensus and metric.get("field_lineage")),
+                None,
+            )
+            field_lineage = dict((primary or {}).get("field_lineage") or {})
+        validation = dict(raw_enrichment.get("validation") or {})
+        if parsed_provider_type == ProviderType.MIXED:
+            validation = {
+                "status": "field_level_validated",
+                "provider_types": sorted(
+                    {
+                        str(item.get("provider_type"))
+                        for item in field_lineage.values()
+                        if item.get("provider_type")
+                    }
+                ),
+            }
         return EventEnrichment(
             forecast=value("forecast"),
             previous=value("previous"),
@@ -197,7 +220,7 @@ class EconomicEventMaterializationService:
             consensus_retrieved_at=raw_enrichment.get("consensus_retrieved_at"),
             consensus_valid_until=raw_enrichment.get("consensus_valid_until"),
             consensus_verified=bool(raw_enrichment.get("consensus_verified")),
-            metrics=list(raw_enrichment.get("metrics") or []),
+            metrics=normalized_metrics,
             summary=dict(raw_enrichment.get("summary") or {}),
             fomc_context=raw_enrichment.get("fomc_context"),
             source=fact.get("source"),
@@ -208,11 +231,14 @@ class EconomicEventMaterializationService:
             next_refresh_at=fact.get("next_refresh_at"),
             reliability=fact.get("reliability") or 0,
             confidence=fact.get("confidence") or 0,
+            evidence=raw_enrichment.get("evidence") or raw_enrichment.get("evidence_text") or raw_enrichment.get("extracted_text"),
+            evidence_text=raw_enrichment.get("evidence_text") or raw_enrichment.get("extracted_text"),
+            validation=validation,
+            field_lineage=field_lineage,
             cache_status=cache_status,
             warnings=[*warnings, *fact_warnings],
             errors=list(fact.get("errors") or []),
         )
-
     def fact_key(self, event: EconomicEvent) -> str:
         return self.keys.macro_event_key(
             country=event.country,
@@ -238,3 +264,63 @@ class EconomicEventMaterializationService:
             "provider_type": fact.get("provider_type"),
             "valid_until": fact.get("valid_until"),
         }
+
+
+def _metrics_with_lineage(
+    raw_enrichment: dict[str, Any],
+    *,
+    provider_type: ProviderType,
+    fact: dict[str, Any],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    raw_provider_type = str(raw_enrichment.get("provider_type") or provider_type.value)
+    for raw in raw_enrichment.get("metrics") or []:
+        if not isinstance(raw, dict):
+            continue
+        metric = dict(raw)
+        if not metric.get("provider_type"):
+            metric["provider_type"] = raw_provider_type
+        if not metric.get("validation"):
+            metric["validation"] = raw_enrichment.get("validation") or {}
+        if not metric.get("evidence"):
+            metric["evidence"] = (
+                metric.get("evidence_text") or raw_enrichment.get("evidence") or raw_enrichment.get("evidence_text")
+            )
+        if (
+            raw_provider_type == ProviderType.AI_RESEARCHER_CODEX_CLI.value
+            and bool(metric.get("consensus_verified") or (metric.get("field_semantics") or {}).get("consensus_verified"))
+            and metric.get("consensus_source")
+        ):
+            ai_validation = metric.get("validation") or raw_enrichment.get("validation") or {}
+            field_lineage = dict(metric.get("field_lineage") or {})
+            for field in ("forecast", "previous", "actual"):
+                if metric.get(field) in (None, ""):
+                    continue
+                field_lineage[field] = {
+                    "source": metric.get(f"{field}_source") or metric.get("source"),
+                    "source_url": metric.get(f"{field}_source_url") or metric.get("source_url"),
+                    "provider_type": raw_provider_type,
+                    "confidence": metric.get("confidence"),
+                    "reliability": metric.get("reliability"),
+                    "evidence": metric.get("evidence") or metric.get("evidence_text"),
+                    "validation": ai_validation,
+                }
+            field_lineage["consensus"] = {
+                "source": metric.get("consensus_source"),
+                "source_url": metric.get("consensus_source_url") or metric.get("source_url"),
+                "provider_type": ProviderType.API.value,
+                "confidence": metric.get("confidence"),
+                "reliability": metric.get("reliability"),
+                "evidence": None,
+                "validation": {"status": "deterministic_verified"},
+            }
+            metric["provider_type"] = ProviderType.MIXED.value
+            metric["validation"] = {
+                "status": "field_level_validated",
+                "provider_types": [ProviderType.AI_RESEARCHER_CODEX_CLI.value, ProviderType.API.value],
+            }
+            metric["field_lineage"] = field_lineage
+        metric.setdefault("source", fact.get("source"))
+        metric.setdefault("source_url", fact.get("source_url"))
+        output.append(metric)
+    return output
