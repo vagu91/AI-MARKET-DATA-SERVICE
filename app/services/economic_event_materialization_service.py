@@ -173,17 +173,33 @@ class EconomicEventMaterializationService:
         except ValueError:
             parsed_provider_type = ProviderType.DB
         raw_payload = fact.get("raw_payload") if isinstance(fact.get("raw_payload"), dict) else {}
+        raw_enrichment = raw_payload.get("enrichment") if isinstance(raw_payload.get("enrichment"), dict) else raw_payload
+
+        def value(field: str) -> Any:
+            return raw_enrichment[field] if field in raw_enrichment else fact.get(field)
+
         fact_warnings = list(fact.get("warnings") or [])
         if fact.get("status") == "no_data_available" and "no_data_available" not in fact_warnings:
             fact_warnings.append("no_data_available")
         return EventEnrichment(
-            forecast=fact.get("forecast"),
-            previous=fact.get("previous"),
-            consensus=fact.get("consensus"),
-            actual=fact.get("actual"),
-            metrics=list(raw_payload.get("metrics") or []),
-            summary=dict(raw_payload.get("summary") or {}),
-            fomc_context=raw_payload.get("fomc_context"),
+            forecast=value("forecast"),
+            previous=value("previous"),
+            consensus=value("consensus"),
+            actual=value("actual"),
+            estimate_count=raw_enrichment.get("estimate_count"),
+            estimate_low=raw_enrichment.get("estimate_low"),
+            estimate_high=raw_enrichment.get("estimate_high"),
+            median_estimate=raw_enrichment.get("median_estimate"),
+            average_estimate=raw_enrichment.get("average_estimate"),
+            forecast_origin=raw_enrichment.get("forecast_origin"),
+            consensus_source=raw_enrichment.get("consensus_source"),
+            consensus_source_url=raw_enrichment.get("consensus_source_url"),
+            consensus_retrieved_at=raw_enrichment.get("consensus_retrieved_at"),
+            consensus_valid_until=raw_enrichment.get("consensus_valid_until"),
+            consensus_verified=bool(raw_enrichment.get("consensus_verified")),
+            metrics=list(raw_enrichment.get("metrics") or []),
+            summary=dict(raw_enrichment.get("summary") or {}),
+            fomc_context=raw_enrichment.get("fomc_context"),
             source=fact.get("source"),
             source_url=fact.get("source_url"),
             provider_type=parsed_provider_type,

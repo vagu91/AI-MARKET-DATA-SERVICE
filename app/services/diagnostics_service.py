@@ -38,6 +38,7 @@ from app.services.data_integrity_service import (
     parse_retry_seconds,
 )
 from app.services.market_news_repository import MarketNewsRepository
+from app.services.macro_consensus_service import MacroConsensusService
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
@@ -63,6 +64,7 @@ class DiagnosticsService:
         self.enrichment_orchestrator = enrichment_orchestrator
         self.facts = MarketFactRepository(settings)
         self.event_materializer = EconomicEventMaterializationService(settings, facts=self.facts)
+        self.macro_consensus = MacroConsensusService(settings, facts=self.facts)
         self.news = MarketNewsRepository(settings)
         self.freshness = DataFreshnessService(settings)
         self.positioning_runtime = PositioningRuntimeService(settings)
@@ -266,6 +268,26 @@ class DiagnosticsService:
             load_nasdaq(),
             load_event_windows(),
         )
+        multi_runtime = MultiSourceRuntimeService(self.settings)
+        investing_refresh = refresh if force or (refresh == "auto" and self.macro_consensus.needs_refresh(enriched)) else "false"
+        investing_payload = await multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh)
+        consensus_quality = {field: 0 for field in (
+            "consensus_lookup_count", "consensus_candidate_count", "consensus_match_count",
+            "consensus_rejected_count", "consensus_persisted_count", "consensus_read_back_count",
+            "consensus_materialized_count", "consensus_missing_count",
+        )}
+        if refresh != "false":
+            enriched, consensus_quality, investing_payload = self.macro_consensus.enrich_and_persist(
+                enriched,
+                investing_payload,
+                refresh_mode=refresh,
+            )
+            if investing_payload.get("status") == "found":
+                multi_runtime.persist_provider_result(
+                    "investing_economic_calendar",
+                    investing_payload,
+                    source="Investing Economic Calendar",
+                )
         if refresh == "false":
             if hasattr(self.event_window_service, "from_events"):
                 event_windows = self.event_window_service.from_events(symbol=symbol, events=enriched)
@@ -292,6 +314,7 @@ class DiagnosticsService:
         event_facts = self.facts.search_facts(country=country, limit=500)
         quality = {
             **enrichment_metadata.get("data_quality", {}),
+            **consensus_quality,
             "macro": macro_quality,
             "nasdaq": nasdaq_quality,
             "missing_critical_fields": enrichment_metadata.get("data_quality", {}).get("missing_critical_fields", []),
@@ -320,7 +343,10 @@ class DiagnosticsService:
         overall_quality = contract["data_quality"].get("overall_data_quality") or {}
         contract["data_quality"]["missing_critical_fields"] = overall_quality.get("missing_critical_fields") or contract["data_quality"].get("missing_critical_fields") or []
         multi_refresh = "force" if refresh == "force" else "false"
-        multi_source = await MultiSourceRuntimeService(self.settings).snapshot(refresh=multi_refresh)
+        multi_source = await multi_runtime.snapshot(
+            refresh=multi_refresh,
+            preloaded_blocks={"investing_economic_calendar": investing_payload},
+        )
         apply_multi_source_context(contract, multi_source)
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
         return contract

@@ -11,6 +11,17 @@ class EventEnrichment(BaseModel):
     previous: Any | None = None
     consensus: Any | None = None
     actual: Any | None = None
+    estimate_count: int | None = None
+    estimate_low: Any | None = None
+    estimate_high: Any | None = None
+    median_estimate: Any | None = None
+    average_estimate: Any | None = None
+    forecast_origin: str | None = None
+    consensus_source: str | None = None
+    consensus_source_url: str | None = None
+    consensus_retrieved_at: datetime | None = None
+    consensus_valid_until: datetime | None = None
+    consensus_verified: bool = False
     metrics: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
     fomc_context: dict[str, Any] | None = None

@@ -66,13 +66,18 @@ class InvestingEconomicCalendarProvider:
                     rejected_future_actual += 1
                     continue
                 normalized.append(item)
+        retrieved_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        valid_until = (datetime.now(UTC) + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        for item in normalized:
+            item["consensus_retrieved_at"] = retrieved_at
+            item["consensus_valid_until"] = valid_until
         return {
             "status": "found" if normalized else "not_found",
             "provider": self.source,
             "source": self.source,
             "source_url": self.settings.investing_economic_calendar_api_url,
-            "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            "valid_until": (datetime.now(UTC) + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "retrieved_at": retrieved_at,
+            "valid_until": valid_until,
             "items": normalized,
             "diagnostics": {
                 "pages_fetched": len(pages),
@@ -111,17 +116,28 @@ def _normalize(event: dict[str, Any], occurrence: dict[str, Any], *, now: dateti
         "actual": actual["value"] if actual["parse_status"] == "parsed" else None,
         "actual_is_official": False,
         "source_type": "secondary",
-        "forecast": forecast["value"] if forecast["parse_status"] == "parsed" else None,
+        "forecast": None,
         "consensus": forecast["value"] if forecast["parse_status"] == "parsed" else None,
         "consensus_verified": forecast["parse_status"] == "parsed",
         "consensus_origin": "investing_economic_calendar" if forecast["parse_status"] == "parsed" else None,
+        "forecast_origin": None,
+        "estimate_count": None,
+        "estimate_low": None,
+        "estimate_high": None,
+        "median_estimate": None,
+        "average_estimate": None,
         "previous": previous["value"] if previous["parse_status"] == "parsed" else None,
         "revised_previous": revised["value"] if revised["parse_status"] == "parsed" else None,
         "reference_period": occurrence.get("period") or occurrence.get("reference_period"),
         "unit": occurrence.get("unit") or forecast.get("unit") or previous.get("unit"),
-        "source": event.get("source") or "Investing.com",
-        "source_url": event.get("source_url") or "https://www.investing.com/economic-calendar/",
-        "status": "MATCHED" if False else "UNMATCHED",
+        "frequency": _frequency(event.get("event_translated") or event.get("long_name") or event.get("short_name")),
+        "source": "Investing Economic Calendar",
+        "source_url": "https://www.investing.com/economic-calendar/",
+        "consensus_source": "Investing Economic Calendar",
+        "consensus_source_url": "https://www.investing.com/economic-calendar/",
+        "official_release_source": event.get("source"),
+        "official_release_source_url": event.get("source_url"),
+        "status": "UNMATCHED",
         "raw_values": {
             "actual": occurrence.get("actual"),
             "forecast": occurrence.get("forecast"),
@@ -159,3 +175,11 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _json_headers() -> dict[str, str]:
     return {**REQUEST_HEADERS, "Accept": "application/json"}
+
+
+def _frequency(value: Any) -> str | None:
+    text = str(value or "").upper()
+    for token, frequency in (("MOM", "MoM"), ("YOY", "YoY"), ("QOQ", "QoQ"), ("WOW", "WoW")):
+        if token in text.replace("/", "").replace(" ", ""):
+            return frequency
+    return None

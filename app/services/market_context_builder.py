@@ -487,19 +487,34 @@ def _critical_event_quality(events: list[EconomicEvent], *, refresh_mode: str) -
             not_applicable += 1
             continue
         quantitative += 1
-        applicable_fields = ["forecast", "consensus", "previous"]
+        applicable_fields = ["expectation", "previous"]
         release_at = parse_datetime(event.time_utc or event.date)
         if release_at is not None and datetime.now(UTC) >= release_at:
             applicable_fields.append("actual")
-        present = {
-            field
-            for field in applicable_fields
-            if getattr(event.enrichment, field, None) not in (None, "")
+        has_expectation = (
+            event.enrichment.forecast not in (None, "")
+            or (event.enrichment.consensus_verified and event.enrichment.consensus not in (None, ""))
             or any(
-                isinstance(metric, dict) and metric.get(field) not in (None, "")
+                isinstance(metric, dict)
+                and (
+                    metric.get("forecast") not in (None, "")
+                    or (
+                        bool(metric.get("consensus_verified") or (metric.get("field_semantics") or {}).get("consensus_verified"))
+                        and metric.get("consensus") not in (None, "")
+                    )
+                )
                 for metric in event.enrichment.metrics
             )
-        }
+        )
+        present = {"expectation"} if has_expectation else set()
+        for field in ("previous", "actual"):
+            if field not in applicable_fields:
+                continue
+            if getattr(event.enrichment, field, None) not in (None, "") or any(
+                isinstance(metric, dict) and metric.get(field) not in (None, "")
+                for metric in event.enrichment.metrics
+            ):
+                present.add(field)
         score = len(present) / len(applicable_fields) if applicable_fields else 1.0
         scores.append(score)
         if not present:
@@ -736,11 +751,48 @@ def _enrichment_summary(enrichment: dict[str, Any]) -> dict[str, Any]:
         for field in fields
     }
     filled = sum(1 for field in fields if values[field])
+    verified_consensus = bool(enrichment.get("consensus_verified") and enrichment.get("consensus") not in (None, "")) or any(
+        metric.get("consensus") not in (None, "")
+        and bool(metric.get("consensus_verified") or (metric.get("field_semantics") or {}).get("consensus_verified"))
+        for metric in metrics
+    )
+    single_source_forecast = any(
+        metric.get("forecast") not in (None, "")
+        and str(metric.get("forecast_origin") or (metric.get("field_semantics") or {}).get("forecast_origin") or "").lower()
+        in {"single_institution", "institution", "source_forecast"}
+        for metric in metrics
+    ) or (
+        enrichment.get("forecast") not in (None, "")
+        and str(enrichment.get("forecast_origin") or "").lower() in {"single_institution", "institution", "source_forecast"}
+    )
+    estimate_distribution = any(
+        any(metric.get(field) not in (None, "") for field in ("estimate_count", "estimate_low", "estimate_high", "median_estimate", "average_estimate"))
+        for metric in metrics
+    ) or any(
+        enrichment.get(field) not in (None, "")
+        for field in ("estimate_count", "estimate_low", "estimate_high", "median_estimate", "average_estimate")
+    )
+    surprise_ready = any(
+        metric.get("actual") not in (None, "")
+        and bool((metric.get("field_semantics") or {}).get("actual_is_official"))
+        and (
+            (
+                metric.get("consensus") not in (None, "")
+                and bool(metric.get("consensus_verified") or (metric.get("field_semantics") or {}).get("consensus_verified"))
+            )
+            or metric.get("forecast") not in (None, "")
+        )
+        for metric in metrics
+    )
     return {
         "has_forecast": values["forecast"],
         "has_consensus": values["consensus"],
         "has_previous": values["previous"],
         "has_actual": values["actual"],
+        "has_verified_consensus": verified_consensus,
+        "has_single_source_forecast": single_source_forecast,
+        "has_estimate_distribution": estimate_distribution,
+        "surprise_ready": surprise_ready,
         "completeness_score": round(filled / len(fields), 3),
     }
 
@@ -932,8 +984,29 @@ def _normalize_metric(metric: dict[str, Any], event: EconomicEvent) -> dict[str,
     semantics.setdefault("period_match", True)
     semantics.setdefault("release_time_match", True)
     metric["field_semantics"] = semantics
-    surprise = calculate_surprise(metric)
+    actual_verified = bool(semantics.get("actual_is_official") and semantics.get("actual_release_verified"))
+    consensus_verified = bool(semantics.get("consensus_verified") or metric.get("consensus_verified"))
+    surprise = calculate_surprise(metric) if actual_verified and (consensus_verified or metric.get("forecast") not in (None, "")) else None
     if surprise:
+        baseline_name = "consensus" if consensus_verified and metric.get("consensus") not in (None, "") else "forecast"
+        baseline = metric.get(baseline_name)
+        actual = metric.get("actual")
+        surprise_value = surprise["vs_consensus"] if baseline_name == "consensus" else surprise["vs_forecast"]
+        try:
+            surprise_pct = None if float(str(baseline).replace("%", "").replace(",", "")) == 0 else round(
+                float(surprise_value) / abs(float(str(baseline).replace("%", "").replace(",", ""))) * 100,
+                6,
+            )
+        except (TypeError, ValueError):
+            surprise_pct = None
+        surprise.update({
+            "surprise_value": surprise_value,
+            "surprise_pct": surprise_pct,
+            "surprise_direction": surprise.get("direction"),
+            "surprise_baseline": baseline_name,
+            "actual": actual,
+            "baseline_value": baseline,
+        })
         metric["surprise"] = surprise
     return metric
 

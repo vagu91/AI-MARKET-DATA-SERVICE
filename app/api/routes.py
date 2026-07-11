@@ -157,6 +157,20 @@ async def market_context_mnq(
             "data_quality": {},
             "service_role": "data provider only",
         }
+    multi_runtime = MultiSourceRuntimeService(enrichment_orchestrator.settings)
+    investing_refresh = "auto" if diagnostics.macro_consensus.needs_refresh(upcoming) else "false"
+    investing_payload = await multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh)
+    upcoming, consensus_quality, investing_payload = diagnostics.macro_consensus.enrich_and_persist(
+        upcoming,
+        investing_payload,
+        refresh_mode="auto",
+    )
+    if investing_payload.get("status") == "found":
+        multi_runtime.persist_provider_result(
+            "investing_economic_calendar",
+            investing_payload,
+            source="Investing Economic Calendar",
+        )
     event_windows = await event_window_service.event_windows(symbol="MNQ")
     nasdaq_context, nasdaq_quality = await diagnostics._nasdaq_db_first(symbol="MNQ", fetch_missing=False)
     news_items = MarketNewsRepository(enrichment_orchestrator.settings).stored(days=30, limit=100)
@@ -176,6 +190,7 @@ async def market_context_mnq(
     aaii_payload = await positioning_runtime.aaii(refresh=refresh)
     quality = {
         **orchestrator_metadata.get("data_quality", {}),
+        **consensus_quality,
         "macro": macro_quality,
         "nasdaq": nasdaq_quality,
         "pipeline_integrity": pipeline_integrity,
@@ -201,8 +216,10 @@ async def market_context_mnq(
         },
     )
     contract["data_quality"]["macro_pipeline"] = _macro_pipeline_status(macro, contract.get("macro_snapshot") or {})
-    multi_refresh = "force" if refresh == "force" else "false"
-    multi_source = await MultiSourceRuntimeService(enrichment_orchestrator.settings).snapshot(refresh=multi_refresh)
+    multi_source = await multi_runtime.snapshot(
+        refresh="false",
+        preloaded_blocks={"investing_economic_calendar": investing_payload},
+    )
     apply_multi_source_context(contract, multi_source)
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
     return contract if view == "debug" else build_ai_trader_market_context(contract)

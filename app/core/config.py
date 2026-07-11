@@ -238,7 +238,7 @@ class Settings(BaseSettings):
     provider_circuit_breaker_minutes: int = Field(default=15, validation_alias="AI_MARKET_PROVIDER_CIRCUIT_BREAKER_MINUTES")
     investing_domain_id: int = Field(default=1, validation_alias="AI_MARKET_INVESTING_DOMAIN_ID")
     investing_country_ids: str = Field(default="5", validation_alias="AI_MARKET_INVESTING_COUNTRY_IDS")
-    investing_calendar_lookahead_days: int = Field(default=14, validation_alias="AI_MARKET_INVESTING_CALENDAR_LOOKAHEAD_DAYS")
+    investing_calendar_lookahead_days: int = Field(default=35, validation_alias="AI_MARKET_INVESTING_CALENDAR_LOOKAHEAD_DAYS")
     investing_calendar_page_limit: int = Field(default=100, validation_alias="AI_MARKET_INVESTING_CALENDAR_PAGE_LIMIT")
     marketbeat_timeout_seconds: float = Field(default=10.0, validation_alias="AI_MARKET_MARKETBEAT_TIMEOUT_SECONDS")
     marketbeat_holidays_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_MARKETBEAT_HOLIDAYS_TTL_HOURS")

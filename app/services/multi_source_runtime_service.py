@@ -60,9 +60,15 @@ class MultiSourceRuntimeService:
         self.macromicro = MacroMicroAaiiCrosscheckProvider(settings)
         self.polymarket = PolymarketPredictionProvider(settings)
 
-    async def snapshot(self, *, refresh: str = "auto") -> dict[str, Any]:
+    async def snapshot(
+        self,
+        *,
+        refresh: str = "auto",
+        preloaded_blocks: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        preloaded_blocks = preloaded_blocks or {}
         blocks = {
-            "investing_economic_calendar": await self._run_provider(
+            "investing_economic_calendar": preloaded_blocks.get("investing_economic_calendar") or await self._run_provider(
                 "investing_economic_calendar",
                 FACT_TYPES["investing_economic_calendar"],
                 self.investing_calendar.fetch,
@@ -175,6 +181,9 @@ class MultiSourceRuntimeService:
             "data_quality": quality,
             "service_role": "data provider only",
         }
+
+    def persist_provider_result(self, name: str, result: dict[str, Any], *, source: str) -> int:
+        return self._save_fact(name, FACT_TYPES[name], result, source=source)
 
     async def provider(self, name: str, *, refresh: str = "auto") -> dict[str, Any]:
         if name == "investing_economic_calendar":
