@@ -2,7 +2,7 @@ import httpx
 import pytest
 import respx
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderType
 from app.providers.bea import BeaProvider
@@ -74,7 +74,7 @@ def settings(tmp_path) -> Settings:
 
 @pytest.mark.asyncio
 async def test_bea_provider_returns_requested_macro_series(tmp_path) -> None:
-    provider = BeaProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings(tmp_path))
+    provider = BeaProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 
     def handler(request: httpx.Request) -> httpx.Response:
         table = request.url.params["TableName"]
@@ -105,7 +105,7 @@ async def test_bea_provider_returns_requested_macro_series(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_bea_provider_reports_missing_series_without_breaking_response(tmp_path) -> None:
-    provider = BeaProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings(tmp_path))
+    provider = BeaProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 
     def handler(request: httpx.Request) -> httpx.Response:
         table = request.url.params["TableName"]

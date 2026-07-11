@@ -21,8 +21,7 @@ from app.services.market_news_repository import MarketNewsRepository
 def settings(tmp_path, **overrides) -> Settings:
     return Settings(
         _env_file=None,
-        market_db_path=tmp_path / "market.sqlite",
-        database_path=tmp_path / "cache.sqlite",
+        database_path=tmp_path / "market.sqlite",
         codex_workspace_dir=tmp_path / "ai_workspace",
         **overrides,
     )

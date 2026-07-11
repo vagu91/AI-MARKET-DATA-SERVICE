@@ -223,22 +223,17 @@ async def db_health(
     init_market_db(enrichment_orchestrator.settings)
     repository = MarketFactRepository(enrichment_orchestrator.settings)
     settings = enrichment_orchestrator.settings
-    canonical_health = database_health(settings.canonical_store_db_path or settings.market_db_path)
-    provider_cache_health = database_health(settings.provider_cache_db_path or settings.database_path)
+    health = database_health(settings.database_path)
     return {
         "status": "ok",
-        "db_path": str(settings.canonical_store_db_path or settings.market_db_path),
-        "canonical_store_db_path": str(settings.canonical_store_db_path or settings.market_db_path),
-        "provider_cache_db_path": str(settings.provider_cache_db_path or settings.database_path),
-        "single_physical_database": canonical_health["path"] == provider_cache_health["path"],
+        "database_path": str(settings.database_path),
+        "single_physical_database": True,
         "service_role": "data provider only",
+        "schema_version": health["user_version"],
+        "integrity": health["integrity_check"],
         "ai_researcher_enabled": settings.enable_ai_researcher,
         "ai_researcher_mode": settings.ai_researcher_mode,
         "db_summary": repository.db_summary(),
-        "database": {
-            "canonical_store": canonical_health,
-            "provider_cache": provider_cache_health,
-        },
     }
 
 
@@ -247,13 +242,22 @@ async def db_health_details(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
     settings = enrichment_orchestrator.settings
-    migrate_database(settings.canonical_store_db_path or settings.market_db_path)
-    if (settings.provider_cache_db_path or settings.database_path) != (settings.canonical_store_db_path or settings.market_db_path):
-        migrate_database(settings.provider_cache_db_path or settings.database_path)
+    migrate_database(settings.database_path)
+    health = database_health(settings.database_path)
     return {
         "status": "ok",
-        "canonical_store": database_health(settings.canonical_store_db_path or settings.market_db_path),
-        "provider_cache": database_health(settings.provider_cache_db_path or settings.database_path),
+        "database_path": str(settings.database_path),
+        "single_physical_database": True,
+        "file_size": health["file_size"],
+        "schema_version": health["user_version"],
+        "integrity": health["integrity_check"],
+        "journal_mode": health["journal_mode"],
+        "foreign_keys": health["foreign_keys"],
+        "busy_timeout": health["busy_timeout"],
+        "tables": health["tables"],
+        "pending_migrations": health["pending_migrations"],
+        "cache_stats": ProviderCacheRepository(settings.database_path).stats(),
+        "canonical_stats": MarketFactRepository(settings).db_summary(),
         "service_role": "data provider only",
     }
 
@@ -263,11 +267,11 @@ async def db_schema_version(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
     settings = enrichment_orchestrator.settings
-    canonical = migrate_database(settings.canonical_store_db_path or settings.market_db_path)
-    provider_cache = migrate_database(settings.provider_cache_db_path or settings.database_path)
+    migration = migrate_database(settings.database_path)
     return {
-        "canonical_store": canonical,
-        "provider_cache": provider_cache,
+        "database_path": str(settings.database_path),
+        "single_physical_database": True,
+        "schema": migration,
         "service_role": "data provider only",
     }
 
@@ -277,9 +281,10 @@ async def db_cache_stats(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
     settings = enrichment_orchestrator.settings
-    repository = ProviderCacheRepository(settings.provider_cache_db_path or settings.database_path)
+    repository = ProviderCacheRepository(settings.database_path)
     return {
-        "provider_cache_db_path": str(settings.provider_cache_db_path or settings.database_path),
+        "database_path": str(settings.database_path),
+        "single_physical_database": True,
         "stats": repository.stats(),
         "service_role": "data provider only",
     }

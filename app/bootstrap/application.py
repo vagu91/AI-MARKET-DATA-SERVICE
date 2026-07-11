@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-from app.core.cache import SQLiteCache
 from app.core.config import Settings
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.providers.bea import BeaProvider
 from app.providers.bea_calendar import BeaReleaseScheduleProvider
 from app.providers.bls import BlsProvider
@@ -41,14 +40,9 @@ from app.services.market_fact_repository import init_market_db
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.nasdaq_data_service import NasdaqDataService
 
-logger = logging.getLogger(__name__)
-
 
 def build_application_state(settings: Settings) -> dict[str, Any]:
-    legacy_aliases = settings.legacy_persistence_aliases_in_use()
-    if legacy_aliases:
-        logger.warning("Legacy persistence environment aliases in use: %s", ", ".join(legacy_aliases))
-    cache = SQLiteCache(settings.provider_cache_db_path or settings.database_path)
+    cache = ProviderCacheRepository(settings.database_path)
     init_market_db(settings)
 
     macro_service = MacroService(

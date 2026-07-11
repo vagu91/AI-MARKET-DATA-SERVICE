@@ -18,7 +18,7 @@ from app.models.events import EconomicEvent, EventEnrichment
 
 
 def settings(tmp_path) -> Settings:
-    return Settings(_env_file=None, market_db_path=tmp_path / "market.sqlite", database_path=tmp_path / "cache.sqlite")
+    return Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
 
 
 def event_with_metric(metric: dict, *, release_at: datetime | None = None) -> EconomicEvent:

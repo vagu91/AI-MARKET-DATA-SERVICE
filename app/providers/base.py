@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from typing import Any
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.redaction import redact_sensitive
 from app.models.common import Freshness, ProviderMetadata, ProviderResult, ProviderType
 
@@ -20,7 +20,7 @@ class BaseProvider(ABC):
     reliability: float
     cache_key: str
 
-    def __init__(self, cache: SQLiteCache) -> None:
+    def __init__(self, cache: ProviderCacheProtocol) -> None:
         self.cache = cache
 
     @abstractmethod

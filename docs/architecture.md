@@ -15,13 +15,12 @@ All application SQLite access is centralized under `app.infrastructure.persisten
 - `migrations.py`: idempotent schema migrations and legacy `cache_entries` import.
 - `provider_cache_repository.py`: provider cache repository.
 
-Canonical repositories keep their public APIs but obtain connections through the persistence layer.
+Canonical repositories keep their public APIs but obtain connections through the same `Settings.database_path`.
 
 Default operational DB:
 
 ```env
-AI_MARKET_CANONICAL_STORE_DB_PATH=./data/market_data_service.sqlite
-AI_MARKET_PROVIDER_CACHE_DB_PATH=./data/market_data_service.sqlite
+AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
 
 ## Refresh Semantics
@@ -59,9 +58,9 @@ flowchart LR
 
 ## Operational Scripts
 
-- `scripts/migrate_persistence.py`
+- `scripts/migrate_legacy_database.py`
 - `scripts/backup_database.py`
 - `scripts/reset_database.py`
 - `scripts/validate_database.py`
 
-Use `--dry-run` on migration/reset checks before applying destructive operations.
+Use `--dry-run` on legacy migration/reset checks before applying destructive operations.

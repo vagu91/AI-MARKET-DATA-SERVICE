@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.models.common import Freshness, ProviderMetadata, ProviderResult, ProviderType
 from app.providers.base import BaseProvider, redact_sensitive
 from app.services.market_fact_repository import encode
@@ -14,7 +14,7 @@ class FlakyProvider(BaseProvider):
     reliability = 0.7
     cache_key = "test:flaky"
 
-    def __init__(self, cache: SQLiteCache) -> None:
+    def __init__(self, cache: ProviderCacheRepository) -> None:
         super().__init__(cache)
         self.fail = False
 
@@ -36,7 +36,7 @@ class FlakyProvider(BaseProvider):
 
 @pytest.mark.asyncio
 async def test_provider_uses_last_valid_cache_on_failure(tmp_path) -> None:
-    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
     provider = FlakyProvider(cache)
 
     first = await provider.fetch_safe()
@@ -51,7 +51,7 @@ async def test_provider_uses_last_valid_cache_on_failure(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_provider_does_not_report_cache_fallback_when_cache_is_empty(tmp_path) -> None:
-    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
     provider = FlakyProvider(cache)
     provider.fail = True
 

@@ -4,7 +4,7 @@ import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.core.config import Settings
 from app.models.common import Impact
 from app.models.events import EconomicEvent
@@ -21,8 +21,7 @@ from app.services.market_fact_repository import MarketFactRepository
 def settings(tmp_path, **overrides) -> Settings:
     return Settings(
         _env_file=None,
-        market_db_path=tmp_path / "market.sqlite",
-        database_path=tmp_path / "cache.sqlite",
+        database_path=tmp_path / "market.sqlite",
         codex_workspace_dir=tmp_path / "workspace",
         enable_ai_researcher=True,
         **overrides,
@@ -282,7 +281,7 @@ def test_metric_only_ai_result_counts_as_valid_fact(tmp_path):
 
 async def test_provider_failure_cache_skips_immediate_retry(tmp_path):
     cfg = settings(tmp_path)
-    cache = SQLiteCache(cfg.database_path)
+    cache = ProviderCacheRepository(cfg.database_path)
     calls = 0
 
     class FailingProvider:

@@ -6,11 +6,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from app.infrastructure.persistence.database import connect_sqlite
+from app.infrastructure.persistence.database import Database, connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 
 
-class ProviderCacheRepositoryProtocol(Protocol):
+class ProviderCacheProtocol(Protocol):
     def get(self, cache_key: str) -> dict[str, Any] | list[dict[str, Any]] | None: ...
     def get_entry(self, cache_key: str) -> dict[str, Any] | None: ...
     def set(self, cache_key: str, payload: Any, **metadata: Any) -> None: ...
@@ -21,9 +21,10 @@ class ProviderCacheRepositoryProtocol(Protocol):
 
 
 class ProviderCacheRepository:
-    def __init__(self, database_path: Path) -> None:
-        self.database_path = database_path
-        migrate_database(database_path)
+    def __init__(self, database: Path | Database) -> None:
+        self.database = database if isinstance(database, Database) else Database(database)
+        self.database_path = self.database.path
+        migrate_database(self.database_path)
 
     def set(self, cache_key: str, payload: Any, **metadata: Any) -> None:
         now = datetime.now(UTC).isoformat()

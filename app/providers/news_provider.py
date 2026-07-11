@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderResult, ProviderType
 from app.models.nasdaq import Relevance
@@ -41,7 +41,7 @@ class NewsProvider(BaseProvider):
 
     def __init__(
         self,
-        cache: SQLiteCache,
+        cache: ProviderCacheProtocol,
         settings: Settings,
         market_news_repository: MarketNewsRepository | None = None,
     ) -> None:

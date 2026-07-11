@@ -38,7 +38,7 @@ def test_aaii_parser_requires_three_percentages():
 
 
 def test_credential_audit_redacts_and_allows_proceed(tmp_path):
-    cfg = Settings(_env_file=None, market_db_path=tmp_path / "m.sqlite", database_path=tmp_path / "c.sqlite")
+    cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
     audit = credential_audit(cfg)
 
     assert audit["secrets_redacted"] is True
@@ -55,7 +55,7 @@ def test_acquisition_routes_registered():
 
 
 def test_acquisition_status_counts_official_news_from_market_news(tmp_path):
-    cfg = Settings(_env_file=None, market_db_path=tmp_path / "m.sqlite", database_path=tmp_path / "c.sqlite")
+    cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
     MarketNewsRepository(cfg).upsert_news(
         {
             "title": "Federal Reserve official release",
@@ -79,7 +79,7 @@ def test_acquisition_status_counts_official_news_from_market_news(tmp_path):
 
 
 def test_acquisition_bls_required_series_present_has_no_snapshot_gap(tmp_path):
-    cfg = Settings(_env_file=None, market_db_path=tmp_path / "m.sqlite", database_path=tmp_path / "c.sqlite")
+    cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
     repo = MarketFactRepository(cfg)
     for category, value in {
         "CPI": "320.0",
@@ -113,7 +113,7 @@ def test_acquisition_bls_required_series_present_has_no_snapshot_gap(tmp_path):
 
 
 def test_acquisition_bls_materialized_from_event_fact_metrics(tmp_path):
-    cfg = Settings(_env_file=None, market_db_path=tmp_path / "m.sqlite", database_path=tmp_path / "c.sqlite")
+    cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
     MarketFactRepository(cfg).upsert_fact(
         {
             "fact_key": "US:NFP:2026-08-07:macro_event_enrichment",
@@ -168,7 +168,7 @@ def test_pipeline_gap_only_when_db_saved_series_missing_from_snapshot():
 
 
 async def test_cot_refresh_force_persists_and_refresh_false_reads_db_without_network(tmp_path):
-    cfg = Settings(_env_file=None, market_db_path=tmp_path / "m.sqlite", database_path=tmp_path / "c.sqlite")
+    cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
     service = PositioningRuntimeService(cfg)
     fake = FakeCotProvider()
     service.cot_provider = fake

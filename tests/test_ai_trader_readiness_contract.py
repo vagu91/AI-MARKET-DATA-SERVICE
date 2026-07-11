@@ -84,8 +84,7 @@ def test_fed_rate_monitor_timestamps_are_iso_timezone_aware() -> None:
 async def test_hacker_news_social_sentiment_provider_mock(tmp_path: Path) -> None:
     cfg = Settings(
         _env_file=None,
-        canonical_store_db_path=tmp_path / "market.sqlite",
-        provider_cache_db_path=tmp_path / "market.sqlite",
+        database_path=tmp_path / "market.sqlite",
         hacker_news_algolia_url="https://hn.test/search",
     )
     with respx.mock(assert_all_called=True) as router:
@@ -130,8 +129,7 @@ def test_consumer_contract_is_compact_and_excludes_debug_blocks() -> None:
 async def test_event_enrichment_timeout_keeps_base_events_and_closes_run(tmp_path: Path) -> None:
     cfg = Settings(
         _env_file=None,
-        canonical_store_db_path=tmp_path / "market.sqlite",
-        provider_cache_db_path=tmp_path / "market.sqlite",
+        database_path=tmp_path / "market.sqlite",
         timeout_events_seconds=1,
         enable_ai_researcher=False,
     )

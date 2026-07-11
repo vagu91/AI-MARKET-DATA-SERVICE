@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderResult, ProviderType
 from app.models.nasdaq import QQQHolding
@@ -24,7 +24,7 @@ class QQQHoldingsProvider(BaseProvider):
     cache_key = "provider:qqq_holdings:v2"
     alpha_negative_cache_key = "provider:qqq_holdings:alpha_vantage:negative"
 
-    def __init__(self, cache: SQLiteCache, settings: Settings) -> None:
+    def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
         self.settings = settings
 

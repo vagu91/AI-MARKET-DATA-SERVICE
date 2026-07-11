@@ -11,12 +11,12 @@ from app.core.config import Settings
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a timestamped SQLite database backup.")
-    parser.add_argument("--database", type=Path, help="Database path. Defaults to canonical store.")
+    parser.add_argument("--database", type=Path, help="Database path. Defaults to AI_MARKET_DATABASE_PATH.")
     parser.add_argument("--output-dir", type=Path, default=Path("data/backups"))
     args = parser.parse_args()
 
     settings = Settings()
-    database = args.database or settings.canonical_store_db_path or settings.market_db_path
+    database = args.database or settings.database_path
     if not database.exists():
         raise SystemExit(f"Database not found: {database}")
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")

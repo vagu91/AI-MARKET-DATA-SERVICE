@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.core.config import Settings
 from app.models.common import Impact
 from app.models.events import EconomicEvent
@@ -21,7 +21,7 @@ def test_bls_upcoming_parser_uses_fixture_content_not_silent_mock(tmp_path) -> N
     <p>June 2026</p>
     <p>08:30 AM</p>
     """
-    provider = BlsReleaseCalendarProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings(tmp_path))
+    provider = BlsReleaseCalendarProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 
     events = [EconomicEvent.model_validate(item) for item in provider._parse_month(html, "https://bls.test", 2026, 7)]
 
@@ -41,7 +41,7 @@ def test_bea_release_schedule_parser_marks_high_impact_timed_events(tmp_path) ->
     <p>July 30</p><p>8:30 AM</p><p>N ews</p>
     <p>GDP (Advance Estimate), 2nd Quarter 2026</p>
     """
-    provider = BeaReleaseScheduleProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings(tmp_path))
+    provider = BeaReleaseScheduleProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 
     events = [EconomicEvent.model_validate(item) for item in provider._parse(html)]
 
@@ -58,7 +58,7 @@ def test_fed_calendar_parser_reads_fomc_from_fixture(tmp_path) -> None:
     <h6>Time:</h6><h6>Release Date(s):</h6>
     <p>2:00 p.m.</p><p>FOMC Meeting</p><p>Two-day meeting, July 28 - 29</p><p>29</p>
     """
-    provider = FederalReserveCalendarProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings(tmp_path))
+    provider = FederalReserveCalendarProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 
     events = [EconomicEvent.model_validate(item) for item in provider._parse_month(html, "https://fed.test", 2026, 7)]
 

@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.models.common import Freshness, Impact, ProviderMetadata, ProviderResult, ProviderType
 from app.models.events import EconomicEvent
 from app.core.config import Settings
@@ -334,7 +334,7 @@ async def test_playwright_disabled_provider_skipped_no_error(tmp_path) -> None:
     settings = Settings(enable_browser_scraping=False)
     provider = PlaywrightDailyFXProvider(settings)
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[provider],
     )
     event = make_event()
@@ -362,7 +362,7 @@ async def test_playwright_unavailable_is_provider_unavailable(tmp_path) -> None:
     )
     provider = PlaywrightDailyFXProvider(settings)
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[provider],
     )
     event = make_event()
@@ -399,7 +399,7 @@ async def test_provider_blocked_captcha_is_unavailable(respx_mock, tmp_path) -> 
 async def test_matching_cpi_official_event_to_dailyfx_enrichment(tmp_path) -> None:
     event = make_event()
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[make_item()])],
     )
 
@@ -421,7 +421,7 @@ async def test_matching_ppi_official_event(tmp_path) -> None:
     event = make_event(event_id="evt-ppi", name="Producer Price Index", category="PPI")
     item = make_item(name="US PPI", category="PPI", forecast="0.2%", previous="0.1%")
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[item])],
     )
 
@@ -441,7 +441,7 @@ async def test_matching_nfp_official_event(tmp_path) -> None:
     event = make_event(event_id="evt-nfp", name="Nonfarm Payrolls", category="NFP")
     item = make_item(name="US Nonfarm Payrolls", category="NFP", forecast="180K", previous="175K")
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[item])],
     )
 
@@ -460,7 +460,7 @@ async def test_matching_nfp_official_event(tmp_path) -> None:
 async def test_event_without_match_has_null_enrichment_warning(tmp_path) -> None:
     event = make_event(name="Retail Sales", category="Retail Sales")
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[make_item()])],
     )
 
@@ -481,7 +481,7 @@ async def test_time_mismatch_inside_window_matches_with_warning(tmp_path) -> Non
     event = make_event()
     item = make_item(time_utc=event.time_utc + timedelta(minutes=10))
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[item])],
     )
 
@@ -500,7 +500,7 @@ async def test_time_mismatch_inside_window_matches_with_warning(tmp_path) -> Non
 async def test_provider_failure_uses_next_provider(tmp_path) -> None:
     event = make_event()
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[
             FakeEnrichmentProvider(errors=["DailyFX provider_failed: timeout"]),
             FakeEnrichmentProvider(items=[make_item(source="ForexFactory Calendar")]),
@@ -524,7 +524,7 @@ async def test_provider_failure_uses_next_provider(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_all_providers_fail_with_cache_uses_cached_enrichment(tmp_path) -> None:
-    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
     event = make_event()
     cache.set("macro_event_enrichment:v1:US:2099-07-14", [make_item().model_dump(mode="json")])
     service = EventEnrichmentService(
@@ -548,7 +548,7 @@ async def test_all_providers_fail_with_cache_uses_cached_enrichment(tmp_path) ->
 async def test_all_providers_fail_without_cache_does_not_break(tmp_path) -> None:
     event = make_event()
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(errors=["provider_failed: timeout"])],
     )
 
@@ -568,7 +568,7 @@ async def test_all_providers_fail_without_cache_does_not_break(tmp_path) -> None
 async def test_structured_providers_403_429_surface_provider_unavailable(tmp_path) -> None:
     event = make_event()
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[
             FakeEnrichmentProvider(
                 errors=["DailyFX Economic Calendar provider_failed: 403 Forbidden"],
@@ -607,7 +607,7 @@ async def test_structured_providers_403_429_surface_provider_unavailable(tmp_pat
 async def test_empty_cache_does_not_mark_cache_used(tmp_path) -> None:
     event = make_event()
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(errors=["provider_failed: timeout"])],
     )
 
@@ -624,7 +624,7 @@ async def test_empty_cache_does_not_mark_cache_used(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_cache_with_non_matching_item_does_not_mark_cache_used(tmp_path) -> None:
-    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
     event = make_event()
     cache.set(
         "macro_event_enrichment:v1:US:2099-07-14",
@@ -649,7 +649,7 @@ async def test_cache_with_non_matching_item_does_not_mark_cache_used(tmp_path) -
 
 @pytest.mark.asyncio
 async def test_v2_cache_with_useful_enrichment_sets_cache_used(tmp_path) -> None:
-    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
     event = make_event()
     cache.set("macro_event_enrichment_merged:v2:US:2099-07-14", [make_item().model_dump(mode="json")])
     service = EventEnrichmentService(
@@ -673,7 +673,7 @@ async def test_v2_cache_with_useful_enrichment_sets_cache_used(tmp_path) -> None
 async def test_high_impact_only_filter_skips_low_impact_event(tmp_path) -> None:
     low_event = make_event(impact=Impact.LOW)
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[make_item()])],
     )
 
@@ -709,7 +709,7 @@ async def test_targeted_search_provider_enriches_cpi_and_metadata(respx_mock, tm
         ),
     )
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[TargetedSearchEventEnrichmentProvider(settings)],
     )
 
@@ -759,7 +759,7 @@ async def test_manual_event_enrichment_file_matches_cpi(tmp_path) -> None:
     settings = Settings(manual_event_enrichment_path=manual_path)
     event = make_event()
     service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[
             FakeEnrichmentProvider(errors=["DailyFX provider_failed: 403"], source="DailyFX Economic Calendar"),
             ManualEventEnrichmentProvider(settings),
@@ -799,7 +799,7 @@ async def test_openai_event_enrichment_disabled_has_no_error(tmp_path) -> None:
 async def test_events_upcoming_service_includes_enrichment(tmp_path) -> None:
     event = make_event()
     enrichment_service = EventEnrichmentService(
-        SQLiteCache(tmp_path / "cache.sqlite3"),
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
         providers=[FakeEnrichmentProvider(items=[make_item()])],
     )
     service = EventService(

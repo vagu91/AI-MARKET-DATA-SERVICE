@@ -6,10 +6,7 @@ Accepted.
 
 ## Context
 
-The service had two operational SQLite paths:
-
-- `AI_MARKET_DATABASE_PATH` / `settings.database_path` for provider response cache.
-- `AI_MARKET_DB_PATH` / `settings.market_db_path` for canonical market facts, news, observations, and enrichment runs.
+The service previously allowed multiple operational SQLite paths for provider cache and canonical market data.
 
 That split made cold-start, refresh, and backup semantics harder to reason about.
 
@@ -52,7 +49,13 @@ Disadvantages:
 
 ## Decision
 
-Use one operational SQLite database by default: `AI_MARKET_CANONICAL_STORE_DB_PATH` and `AI_MARKET_PROVIDER_CACHE_DB_PATH` both resolve to `./data/market_data_service.sqlite` unless explicitly overridden.
+Use one operational SQLite database only:
+
+```env
+AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
+```
+
+`Settings.database_path` is the only runtime persistence setting. The default is `./data/market_data_service.sqlite`.
 
 Logical ownership remains separate:
 
@@ -60,17 +63,11 @@ Logical ownership remains separate:
 - Provider cache tables: `provider_cache_entries`, `provider_state`.
 - Schema management: `schema_migrations`.
 
-Legacy aliases remain supported during migration:
-
-- `AI_MARKET_DATABASE_PATH`
-- `AI_MARKET_DB_PATH`
-- `DB_PATH`
-
-When legacy aliases are present in the environment, startup logs a non-secret compatibility warning.
+Runtime does not support legacy persistence aliases. Legacy source files can still be imported through the explicit migration script.
 
 ## Migration Strategy
 
-`scripts/migrate_persistence.py` migrates legacy `cache_entries` into `provider_cache_entries`, preserving key, payload, timestamps, and calculating a SHA-256 checksum over the stored JSON payload. The source DB is left intact. The migration supports `--dry-run`, `--apply`, `--source`, `--target`, and `--report`.
+`scripts/migrate_legacy_database.py` migrates legacy `cache_entries` into `provider_cache_entries`, preserving key, payload, timestamps, and calculating a SHA-256 checksum over the stored JSON payload. The source DB is left intact. The migration supports `--dry-run`, `--apply`, `--source`, `--target`, and `--report`.
 
 Schema migrations are tracked in `schema_migrations` and are idempotent. Destructive migrations require an external backup step and must be added as explicit numbered migrations.
 
@@ -84,7 +81,7 @@ Rollback is operational rather than implicit:
 
 ## Test Impact
 
-Architecture tests cover default single-DB resolution, legacy alias compatibility, idempotent migrations, legacy cache import, cache repository behavior, centralized SQLite access, and schema ownership.
+Architecture tests cover default single-DB resolution, rejection of legacy runtime aliases, idempotent migrations, legacy cache import, cache repository behavior, centralized SQLite access, and schema ownership.
 
 ## Operational Impact
 
@@ -96,4 +93,4 @@ Provider and service code must access SQLite through `app.infrastructure.persist
 
 `refresh=false` remains cache/DB-only. `refresh=auto` is DB-first and may call providers only when needed. `refresh=force` may bypass valid cache and call providers, while still persisting and reading back through the same store.
 
-Backups, validation, migrations, and reset scripts operate on the canonical path unless a path is provided explicitly.
+Backups, validation, and reset scripts operate on `Settings.database_path` unless a path is provided explicitly. Legacy migration operates only on the explicit `--source` path and the configured single target DB.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import respx
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.core.config import Settings
 from app.providers.bls import BLS_FRED_FALLBACK_SERIES, BlsProvider
 
@@ -15,7 +15,7 @@ async def test_bls_daily_threshold_uses_fred_mirror_with_bls_ids(tmp_path) -> No
         fred_base_url="https://fred.test/fred",
         fred_api_key="fred-key",
     )
-    provider = BlsProvider(SQLiteCache(tmp_path / "cache.sqlite"), settings)
+    provider = BlsProvider(ProviderCacheRepository(tmp_path / "cache.sqlite"), settings)
 
     with respx.mock(assert_all_called=True) as router:
         router.post("https://bls.test/publicAPI/v2/timeseries/data").mock(

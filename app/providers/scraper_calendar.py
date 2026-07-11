@@ -1,4 +1,4 @@
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import ProviderResult, ProviderType
 from app.providers.base import BaseProvider, ProviderError
@@ -10,7 +10,7 @@ class EconomicCalendarScraperProvider(BaseProvider):
     reliability = 0.45
     cache_key = "provider:scraper_calendar:events:v2"
 
-    def __init__(self, cache: SQLiteCache, settings: Settings) -> None:
+    def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
         self.settings = settings
 

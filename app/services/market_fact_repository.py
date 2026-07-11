@@ -40,11 +40,11 @@ def decode(value: str | None, default: Any) -> Any:
 
 
 def connect_market_db(settings: Settings) -> Any:
-    return connect_sqlite(settings.canonical_store_db_path or settings.market_db_path)
+    return connect_sqlite(settings.database_path)
 
 
 def init_market_db(settings: Settings) -> None:
-    migrate_database(settings.canonical_store_db_path or settings.market_db_path)
+    migrate_database(settings.database_path)
 
 
 class MarketFactRepository:

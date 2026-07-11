@@ -37,9 +37,6 @@ def _legacy_rows(source: Path) -> list[sqlite3.Row]:
 
 def _import_legacy_cache(source: Path, target: Path, *, dry_run: bool) -> dict[str, object]:
     rows = _legacy_rows(source)
-    invalid = 0
-    duplicates = 0
-    migrated = 0
     if dry_run:
         return {
             "records_read": len(rows),
@@ -49,6 +46,10 @@ def _import_legacy_cache(source: Path, target: Path, *, dry_run: bool) -> dict[s
             "errors": [],
             "checksum_comparison": "planned",
         }
+
+    invalid = 0
+    duplicates = 0
+    migrated = 0
     import_errors: list[str] = []
     with sqlite3.connect(target) as conn:
         conn.row_factory = sqlite3.Row
@@ -90,34 +91,23 @@ def _import_legacy_cache(source: Path, target: Path, *, dry_run: bool) -> dict[s
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Migrate AI-MARKET-DATA-SERVICE SQLite persistence.")
-    parser.add_argument("--source", type=Path, help="Optional legacy SQLite source to copy before migrating.")
+    parser = argparse.ArgumentParser(description="One-shot migration from a legacy SQLite database.")
+    parser.add_argument("--source", type=Path, required=True, help="Legacy SQLite database to inspect/import.")
     parser.add_argument("--target", type=Path, help="Target operational SQLite database.")
     parser.add_argument("--dry-run", action="store_true", help="Plan migration without changing the target.")
-    parser.add_argument("--apply", action="store_true", help="Apply migrations. Without this flag, performs a dry run.")
+    parser.add_argument("--apply", action="store_true", help="Apply migration. Without this flag, performs a dry run.")
     parser.add_argument("--report", type=Path, help="Optional JSON report path.")
     args = parser.parse_args()
 
     settings = Settings()
-    target = args.target or settings.canonical_store_db_path or settings.market_db_path
+    target = args.target or settings.database_path
     dry_run = args.dry_run or not args.apply
-    copied = _copy_if_needed(args.source, target, dry_run=dry_run) if args.source else False
+    copied = _copy_if_needed(args.source, target, dry_run=dry_run)
     migration = None if dry_run else migrate_database(target)
-    legacy_cache = (
-        _import_legacy_cache(args.source, target, dry_run=dry_run)
-        if args.source and args.source.exists()
-        else {
-            "records_read": 0,
-            "records_migrated": 0,
-            "duplicates": 0,
-            "invalid": 0,
-            "errors": [],
-            "checksum_comparison": None,
-        }
-    )
+    legacy_cache = _import_legacy_cache(args.source, target, dry_run=dry_run)
     report = {
         "dry_run": dry_run,
-        "source": str(args.source) if args.source else None,
+        "source": str(args.source),
         "target": str(target),
         "copied_source_to_target": copied,
         "migration": migration,

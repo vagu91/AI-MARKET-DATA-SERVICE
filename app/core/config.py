@@ -1,8 +1,7 @@
 from functools import lru_cache
-import os
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,19 +17,7 @@ class Settings(BaseSettings):
     service_name: str = "AI-MARKET-DATA-SERVICE"
     environment: str = "local"
     log_level: str = "INFO"
-    provider_cache_db_path: Path | None = Field(
-        default=None,
-        validation_alias=AliasChoices("AI_MARKET_PROVIDER_CACHE_DB_PATH", "AI_MARKET_DATABASE_PATH"),
-    )
-    canonical_store_db_path: Path | None = Field(
-        default=None,
-        validation_alias=AliasChoices("AI_MARKET_CANONICAL_STORE_DB_PATH", "AI_MARKET_DB_PATH", "DB_PATH"),
-    )
-    database_path: Path | None = Field(default=None, validation_alias="AI_MARKET_DATABASE_PATH")
-    market_db_path: Path | None = Field(
-        default=None,
-        validation_alias=AliasChoices("AI_MARKET_DB_PATH", "DB_PATH"),
-    )
+    database_path: Path = Path("./data/market_data_service.sqlite")
     timezone: str = "Europe/Rome"
     http_timeout_seconds: float = 15.0
     timeout_macro_seconds: float = Field(default=30.0, validation_alias="AI_MARKET_TIMEOUT_MACRO_SECONDS")
@@ -299,23 +286,6 @@ class Settings(BaseSettings):
     macromicro_aaii_api_url: str = "https://en.macromicro.me/api/view/chart/20828"
     hacker_news_algolia_url: str = "https://hn.algolia.com/api/v1/search_by_date"
     hacker_news_rss_url: str = "https://news.ycombinator.com/rss"
-
-    @model_validator(mode="after")
-    def resolve_persistence_paths(self) -> "Settings":
-        canonical = self.canonical_store_db_path or self.market_db_path or Path("./data/market_data_service.sqlite")
-        provider_cache = self.provider_cache_db_path or self.database_path or canonical
-        self.canonical_store_db_path = canonical
-        self.market_db_path = canonical
-        self.provider_cache_db_path = provider_cache
-        self.database_path = provider_cache
-        return self
-
-    def legacy_persistence_aliases_in_use(self) -> list[str]:
-        return [
-            name
-            for name in ("AI_MARKET_DATABASE_PATH", "AI_MARKET_DB_PATH", "DB_PATH")
-            if name in os.environ
-        ]
 
     @classmethod
     def settings_customise_sources(

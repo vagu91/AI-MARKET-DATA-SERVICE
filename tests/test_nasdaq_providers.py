@@ -5,7 +5,7 @@ import httpx
 import pytest
 import respx
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderMetadata, ProviderResult, ProviderType
 from app.providers.earnings_provider import EarningsProvider
@@ -89,7 +89,7 @@ async def test_qqq_holdings_invesco_403_alpha_rate_limit_then_nasdaq_proxy(tmp_p
         invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
         nasdaq_100_constituents_url="https://nasdaq.test/constituents",
     )
-    provider = QQQHoldingsProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    provider = QQQHoldingsProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings)
     nasdaq_payload = {"data": {"rows": [{"symbol": "MSFT", "companyName": "Microsoft", "sector": "Technology"}]}}
 
     with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
@@ -138,7 +138,7 @@ async def test_qqq_holdings_no_retry_when_alpha_negative_cache_is_open(tmp_path)
         invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
         nasdaq_100_constituents_url="https://nasdaq.test/constituents",
     )
-    cache = SQLiteCache(tmp_path / "cache.sqlite3")
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
     provider = QQQHoldingsProvider(cache, settings)
     cache.set(
         provider.alpha_negative_cache_key,
@@ -172,7 +172,7 @@ async def test_qqq_holdings_last_known_good_preserved_when_upstreams_fail(tmp_pa
         qqq_holdings_ttl_hours=0,
         qqq_holdings_stale_tolerance_hours=24,
     )
-    provider = QQQHoldingsProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    provider = QQQHoldingsProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings)
     cached = ProviderResult(
         metadata=ProviderMetadata(
             source="Invesco QQQ Holdings",
@@ -344,7 +344,7 @@ async def test_earnings_no_events_does_not_call_yahoo_fallback(tmp_path) -> None
         alpha_vantage_base_url="https://alpha.test/query",
         yahoo_quote_summary_url="https://yahoo.test/v10/finance/quoteSummary",
     )
-    provider = EarningsProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    provider = EarningsProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings)
     csv_text = "symbol,name,reportDate,fiscalDateEnding,estimate,currency\nIBM,IBM,2099-07-30,2099-06-30,2.00,USD\n"
 
     with respx.mock(base_url="https://alpha.test", assert_all_mocked=True) as router:
@@ -416,7 +416,7 @@ async def test_news_rss_fallback_after_alpha_and_gdelt_rate_limits(tmp_path) -> 
         marketwatch_rss_url="https://marketwatch.test/rss",
         federal_reserve_rss_url="https://fed.test/rss",
     )
-    provider = NewsProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    provider = NewsProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings)
     pub_date = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
     rss = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss><channel>
@@ -501,7 +501,7 @@ async def test_snapshot_uses_yahoo_chart_without_stooq_noise(tmp_path) -> None:
         alpha_vantage_api_key=None,
         yahoo_quote_url="https://quote.test/v7/finance/quote",
     )
-    provider = MegaCapSnapshotProvider(SQLiteCache(tmp_path / "cache.sqlite3"), settings)
+    provider = MegaCapSnapshotProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings)
     payload = {
         "chart": {
             "result": [

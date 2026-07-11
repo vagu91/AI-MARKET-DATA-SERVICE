@@ -55,14 +55,11 @@ API docs: <http://127.0.0.1:8000/docs>
 
 ## Persistent Data Store
 
-The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`. New deployments should configure both logical roles explicitly, usually to the same physical file:
+The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`. New deployments should configure one path only:
 
 ```env
-AI_MARKET_CANONICAL_STORE_DB_PATH=./data/market_data_service.sqlite
-AI_MARKET_PROVIDER_CACHE_DB_PATH=./data/market_data_service.sqlite
+AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
-
-Legacy aliases `AI_MARKET_DATABASE_PATH`, `AI_MARKET_DB_PATH`, and `DB_PATH` remain supported for migration compatibility.
 
 The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, and schema migrations.
 
@@ -89,7 +86,7 @@ Invoke-RestMethod -Method Post "http://127.0.0.1:8000/enrichment/run?country=US&
 Operational scripts:
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\migrate_persistence.py --apply
+.\.venv\Scripts\python.exe .\scripts\migrate_legacy_database.py --source .\data\old.sqlite --dry-run
 .\.venv\Scripts\python.exe .\scripts\backup_database.py
 .\.venv\Scripts\python.exe .\scripts\validate_database.py
 .\.venv\Scripts\python.exe .\scripts\reset_database.py --cache-only --dry-run

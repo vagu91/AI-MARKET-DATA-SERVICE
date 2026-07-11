@@ -2,7 +2,7 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.models.common import ProviderType
 from app.models.events import EconomicEvent, EventEnrichment
 from app.providers.event_enrichment import (
@@ -58,7 +58,7 @@ CATEGORY_ALIASES = {
 class EventEnrichmentService:
     def __init__(
         self,
-        cache: SQLiteCache,
+        cache: ProviderCacheProtocol,
         providers: list[CalendarEnrichmentProvider],
     ) -> None:
         self.cache = cache

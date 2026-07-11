@@ -20,7 +20,7 @@ from app.services.multi_source_runtime_service import MultiSourceRuntimeService,
 
 
 def settings(tmp_path) -> Settings:
-    return Settings(_env_file=None, market_db_path=tmp_path / "market.sqlite", database_path=tmp_path / "cache.sqlite")
+    return Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
 
 
 def test_marketbeat_table_parser_reads_closed_and_early_close_rows() -> None:

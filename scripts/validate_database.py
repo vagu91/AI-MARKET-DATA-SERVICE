@@ -11,11 +11,11 @@ from app.infrastructure.persistence.migrations import migrate_database
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate SQLite database health and schema version.")
-    parser.add_argument("--database", type=Path, help="Database path. Defaults to canonical store.")
+    parser.add_argument("--database", type=Path, help="Database path. Defaults to AI_MARKET_DATABASE_PATH.")
     args = parser.parse_args()
 
     settings = Settings()
-    database = args.database or settings.canonical_store_db_path or settings.market_db_path
+    database = args.database or settings.database_path
     migration = migrate_database(database)
     health = database_health(database)
     report = {

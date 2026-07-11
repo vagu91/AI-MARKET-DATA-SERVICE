@@ -44,18 +44,18 @@ def _clear(path: Path, tables: tuple[str, ...], *, dry_run: bool) -> dict[str, i
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Reset canonical and/or provider cache tables.")
+    parser = argparse.ArgumentParser(description="Reset selected tables in the operational SQLite database.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--canonical-only", action="store_true")
     group.add_argument("--cache-only", action="store_true")
     group.add_argument("--full", action="store_true")
-    parser.add_argument("--database", type=Path, help="Operational SQLite DB. Defaults to canonical store.")
+    parser.add_argument("--database", type=Path, help="Operational SQLite DB. Defaults to AI_MARKET_DATABASE_PATH.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-backup", action="store_true")
     args = parser.parse_args()
 
     settings = Settings()
-    database = args.database or settings.canonical_store_db_path or settings.market_db_path
+    database = args.database or settings.database_path
     tables = CACHE_TABLES if args.cache_only else CANONICAL_TABLES if args.canonical_only else CANONICAL_TABLES + CACHE_TABLES
     backup = None if args.dry_run or args.no_backup else _backup(database)
     report = {

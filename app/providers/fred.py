@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import httpx
 
-from app.core.cache import SQLiteCache
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderResult, ProviderType
 from app.providers.base import BaseProvider, ProviderError, latest_observation, metadata
@@ -25,7 +25,7 @@ class FredProvider(BaseProvider):
     reliability = 0.95
     cache_key = "provider:fred:macro_latest"
 
-    def __init__(self, cache: SQLiteCache, settings: Settings) -> None:
+    def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
         self.settings = settings
 
