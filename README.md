@@ -55,7 +55,16 @@ API docs: <http://127.0.0.1:8000/docs>
 
 ## Persistent Data Store
 
-The central persistent SQLite DB is configured with `AI_MARKET_DB_PATH` and defaults to `./data/market_data_service.sqlite`. It is separate from the existing response cache and stores reusable facts, official event history, deduplicated news, provider observations, and enrichment run metrics.
+The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`. New deployments should configure both logical roles explicitly, usually to the same physical file:
+
+```env
+AI_MARKET_CANONICAL_STORE_DB_PATH=./data/market_data_service.sqlite
+AI_MARKET_PROVIDER_CACHE_DB_PATH=./data/market_data_service.sqlite
+```
+
+Legacy aliases `AI_MARKET_DATABASE_PATH`, `AI_MARKET_DB_PATH`, and `DB_PATH` remain supported for migration compatibility.
+
+The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, and schema migrations.
 
 The required enrichment order is:
 
@@ -70,8 +79,20 @@ Useful persistent-data checks:
 
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:8000/db/health"
+Invoke-RestMethod "http://127.0.0.1:8000/db/health/details"
+Invoke-RestMethod "http://127.0.0.1:8000/db/schema-version"
+Invoke-RestMethod "http://127.0.0.1:8000/db/cache/stats"
 Invoke-RestMethod "http://127.0.0.1:8000/facts/coverage?country=US&days=30"
 Invoke-RestMethod -Method Post "http://127.0.0.1:8000/enrichment/run?country=US&days=30"
+```
+
+Operational scripts:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\migrate_persistence.py --apply
+.\.venv\Scripts\python.exe .\scripts\backup_database.py
+.\.venv\Scripts\python.exe .\scripts\validate_database.py
+.\.venv\Scripts\python.exe .\scripts\reset_database.py --cache-only --dry-run
 ```
 
 ## Data Sources

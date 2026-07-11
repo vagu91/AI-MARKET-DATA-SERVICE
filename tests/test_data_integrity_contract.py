@@ -205,8 +205,11 @@ def test_sector_exposure_classifies_top_qqq_holdings_below_unknown_threshold():
             {"symbol": "UNKNOWN", "weight": 1.0},
         ]
     )
-    assert exposure["unknown_weight_pct"] < 10
+    assert exposure["unknown_weight_pct"] == 80.0
     assert exposure["classified_weight_pct"] == 20.0
+    assert exposure["covered_holdings_weight_pct"] == 21.0
+    assert exposure["uncovered_holdings_weight_pct"] == 79.0
+    assert exposure["complete_portfolio_coverage"] is False
 
 
 def test_metric_previous_sets_summary_previous_true():

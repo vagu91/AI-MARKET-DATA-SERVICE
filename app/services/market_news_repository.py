@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.text_normalization import normalize_payload_text
 from app.core.redaction import redact_payload
 from app.core.config import Settings
 from app.services.data_freshness_service import DataFreshnessService
@@ -18,7 +19,7 @@ class MarketNewsRepository:
         init_market_db(settings)
 
     def upsert_news(self, article: dict[str, Any]) -> dict[str, Any]:
-        article = redact_payload(dict(article))
+        article = normalize_payload_text(redact_payload(dict(article)))
         content_status = news_content_status(article)
         if content_status == "invalid_content":
             article["content_status"] = "invalid_content"

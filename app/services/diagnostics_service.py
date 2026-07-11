@@ -40,6 +40,7 @@ from app.services.market_news_repository import MarketNewsRepository
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
+from app.services.social_sentiment_service import SocialSentimentService
 
 
 class DiagnosticsService:
@@ -135,12 +136,25 @@ class DiagnosticsService:
         async def load_events() -> tuple[list[Any], dict[str, Any]]:
             if refresh == "false":
                 events = self._events_from_history(country=country, start=now, end=now + timedelta(days=days))
-                return events, {"data_quality": {"refresh_mode": "false", "missing_critical_fields": []}}
+                return events, {"data_quality": {"refresh_mode": "false", "missing_critical_fields": [], "events_found": len(events), "enrichment_status": "cache_only"}}
             try:
                 events = await asyncio.wait_for(
                     self._official_events(country=country, start=now, end=now + timedelta(days=days)),
                     timeout=max(float(self.settings.timeout_events_seconds), 1.0),
                 )
+            except TimeoutError:
+                events = self._events_from_history(country=country, start=now, end=now + timedelta(days=days))
+                return events, {
+                    "data_quality": {
+                        "refresh_mode": refresh,
+                        "events_found": len(events),
+                        "enrichment_status": "events_timeout_fallback_to_history" if events else "events_timeout",
+                        "missing_critical_fields": [] if events else ["events_not_available"],
+                        "warnings": [f"events_fetch_timeout_after_{self.settings.timeout_events_seconds}s"],
+                    }
+                }
+            enrichment_timeout = max(float(self.settings.timeout_events_seconds), 1.0)
+            try:
                 return await asyncio.wait_for(
                     self.enrichment_orchestrator.enrich_events(
                         events=events,
@@ -149,14 +163,22 @@ class DiagnosticsService:
                         end=now + timedelta(days=days),
                         trigger="diagnostics_full_model" if not force else "diagnostics_full_model_force",
                     ),
-                    timeout=max(float(self.settings.timeout_events_seconds), 1.0),
+                    timeout=enrichment_timeout,
                 )
             except TimeoutError:
-                return [], {
+                for event in events:
+                    if hasattr(event, "enrichment"):
+                        event.enrichment.warnings.append("optional_enrichment_timeout")
+                return events, {
                     "data_quality": {
                         "refresh_mode": refresh,
-                        "missing_critical_fields": ["event_enrichment_timeout"],
-                        "warnings": [f"events_or_enrichment_timeout_after_{self.settings.timeout_events_seconds}s"],
+                        "events_found": len(events),
+                        "enrichment_complete": False,
+                        "enrichment_partial": bool(events),
+                        "enrichment_timeout": True,
+                        "enrichment_status": "enrichment_timeout",
+                        "missing_critical_fields": [],
+                        "warnings": [f"optional_event_enrichment_timeout_after_{enrichment_timeout}s"],
                     }
                 }
 
@@ -241,6 +263,7 @@ class DiagnosticsService:
         multi_refresh = "force" if refresh == "force" else "false"
         multi_source = await MultiSourceRuntimeService(self.settings).snapshot(refresh=multi_refresh)
         apply_multi_source_context(contract, multi_source)
+        contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
         return contract
 
     def temporal_integrity(self) -> dict[str, Any]:

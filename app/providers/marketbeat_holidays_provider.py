@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.core.text_normalization import normalize_text
 from app.providers.calendar_utils import REQUEST_HEADERS
 
 
@@ -284,7 +285,7 @@ def _status(status: str, reason: str, started: datetime, source_url: str) -> dic
 
 
 def _clean_cell(value: Any) -> str:
-    return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
+    return normalize_text(re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip())
 
 
 def _int(value: Any) -> int | None:

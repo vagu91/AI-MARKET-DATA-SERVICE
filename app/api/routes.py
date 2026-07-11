@@ -32,6 +32,7 @@ from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.macro_service import MacroService
 from app.services.market_fact_repository import MarketFactRepository, init_market_db
 from app.services.market_context_builder import build_market_context_contract
+from app.services.ai_trader_contract_service import build_ai_trader_market_context
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.health_report_service import HealthReportService
@@ -40,6 +41,10 @@ from app.services.credential_audit_service import credential_audit
 from app.services.context_extensions_service import enrich_nasdaq_context
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
+from app.services.social_sentiment_service import SocialSentimentService
+from app.infrastructure.persistence.database import database_health
+from app.infrastructure.persistence.migrations import migrate_database
+from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 
 router = APIRouter()
 
@@ -90,15 +95,16 @@ async def events_active_windows(
     return await event_window_service.event_windows(symbol=symbol)
 
 
-@router.get("/market-context/mnq", response_model=MarketContextResponse)
+@router.get("/market-context/mnq")
 async def market_context_mnq(
     refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
+    view: str = Query(default="consumer", pattern="^(consumer|debug)$"),
     macro_service: MacroService = Depends(get_macro_service),
     event_service: EventService = Depends(get_event_service),
     event_window_service: EventWindowService = Depends(get_event_window_service),
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
-) -> MarketContextResponse:
+) -> dict[str, object]:
     diagnostics = DiagnosticsService(
         enrichment_orchestrator.settings,
         macro_service=macro_service,
@@ -115,7 +121,7 @@ async def market_context_mnq(
             fetch_missing_nasdaq=refresh == "force",
             refresh=refresh,
         )
-        return MarketContextResponse.model_validate(contract)
+        return contract if view == "debug" else build_ai_trader_market_context(contract)
     macro, macro_quality = await diagnostics._macro_db_first()
     events_today_data = await event_service.today(country="US")
     now = datetime.now(UTC)
@@ -186,7 +192,28 @@ async def market_context_mnq(
     multi_refresh = "force" if refresh == "force" else "false"
     multi_source = await MultiSourceRuntimeService(enrichment_orchestrator.settings).snapshot(refresh=multi_refresh)
     apply_multi_source_context(contract, multi_source)
-    return MarketContextResponse.model_validate(contract)
+    contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
+    return contract if view == "debug" else build_ai_trader_market_context(contract)
+
+
+@router.get("/market-context/mnq/debug")
+async def market_context_mnq_debug(
+    refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await market_context_mnq(
+        refresh=refresh,
+        view="debug",
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
 
 
 @router.get("/db/health")
@@ -195,13 +222,66 @@ async def db_health(
 ) -> dict[str, object]:
     init_market_db(enrichment_orchestrator.settings)
     repository = MarketFactRepository(enrichment_orchestrator.settings)
+    settings = enrichment_orchestrator.settings
+    canonical_health = database_health(settings.canonical_store_db_path or settings.market_db_path)
+    provider_cache_health = database_health(settings.provider_cache_db_path or settings.database_path)
     return {
         "status": "ok",
-        "db_path": str(enrichment_orchestrator.settings.market_db_path),
+        "db_path": str(settings.canonical_store_db_path or settings.market_db_path),
+        "canonical_store_db_path": str(settings.canonical_store_db_path or settings.market_db_path),
+        "provider_cache_db_path": str(settings.provider_cache_db_path or settings.database_path),
+        "single_physical_database": canonical_health["path"] == provider_cache_health["path"],
         "service_role": "data provider only",
-        "ai_researcher_enabled": enrichment_orchestrator.settings.enable_ai_researcher,
-        "ai_researcher_mode": enrichment_orchestrator.settings.ai_researcher_mode,
+        "ai_researcher_enabled": settings.enable_ai_researcher,
+        "ai_researcher_mode": settings.ai_researcher_mode,
         "db_summary": repository.db_summary(),
+        "database": {
+            "canonical_store": canonical_health,
+            "provider_cache": provider_cache_health,
+        },
+    }
+
+
+@router.get("/db/health/details")
+async def db_health_details(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    migrate_database(settings.canonical_store_db_path or settings.market_db_path)
+    if (settings.provider_cache_db_path or settings.database_path) != (settings.canonical_store_db_path or settings.market_db_path):
+        migrate_database(settings.provider_cache_db_path or settings.database_path)
+    return {
+        "status": "ok",
+        "canonical_store": database_health(settings.canonical_store_db_path or settings.market_db_path),
+        "provider_cache": database_health(settings.provider_cache_db_path or settings.database_path),
+        "service_role": "data provider only",
+    }
+
+
+@router.get("/db/schema-version")
+async def db_schema_version(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    canonical = migrate_database(settings.canonical_store_db_path or settings.market_db_path)
+    provider_cache = migrate_database(settings.provider_cache_db_path or settings.database_path)
+    return {
+        "canonical_store": canonical,
+        "provider_cache": provider_cache,
+        "service_role": "data provider only",
+    }
+
+
+@router.get("/db/cache/stats")
+async def db_cache_stats(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    repository = ProviderCacheRepository(settings.provider_cache_db_path or settings.database_path)
+    return {
+        "provider_cache_db_path": str(settings.provider_cache_db_path or settings.database_path),
+        "stats": repository.stats(),
+        "service_role": "data provider only",
     }
 
 

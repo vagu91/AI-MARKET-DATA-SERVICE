@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.core.text_normalization import normalize_text
 from app.providers.calendar_utils import REQUEST_HEADERS
 from app.providers.mega_cap_snapshot_provider import MEGA_CAP_TICKERS
 from app.services.economic_value_parser import parse_economic_value
@@ -92,16 +93,74 @@ def _normalize(row: dict[str, Any]) -> dict[str, Any]:
     price = parse_economic_value(row.get("lastSalePrice"), default_unit="USD")
     net_change = parse_economic_value(row.get("netChange"))
     pct_change = parse_economic_value(row.get("percentageChange"), default_unit="percent")
+    signed_change = _normalize_change_sign(
+        raw_net_change=row.get("netChange"),
+        parsed_net_change=net_change["value"] if net_change["parse_status"] == "parsed" else None,
+        percentage_change=pct_change["value"] if pct_change["parse_status"] == "parsed" else None,
+        delta_indicator=row.get("deltaIndicator"),
+    )
     return {
         "symbol": str(row.get("symbol") or "").upper(),
-        "company_name": row.get("companyName") or row.get("company"),
+        "company_name": normalize_text(row.get("companyName") or row.get("company")),
         "market_cap": market_cap["value"] if market_cap["parse_status"] == "parsed" else None,
         "last_sale_price": price["value"] if price["parse_status"] == "parsed" else None,
-        "net_change": net_change["value"] if net_change["parse_status"] == "parsed" else None,
+        "net_change": signed_change["net_change"],
         "percentage_change": pct_change["value"] if pct_change["parse_status"] == "parsed" else None,
         "delta_indicator": row.get("deltaIndicator"),
         "sector": row.get("sector") or None,
+        "sign_diagnostics": signed_change["diagnostics"],
+        "warnings": signed_change["warnings"],
     }
+
+
+def _normalize_change_sign(
+    *,
+    raw_net_change: Any,
+    parsed_net_change: float | None,
+    percentage_change: float | None,
+    delta_indicator: Any,
+) -> dict[str, Any]:
+    diagnostics = {
+        "sign_normalized": False,
+        "normalization_basis": None,
+        "raw_net_change": raw_net_change,
+    }
+    warnings: list[str] = []
+    if parsed_net_change is None:
+        return {"net_change": None, "diagnostics": diagnostics, "warnings": warnings}
+    raw = str(raw_net_change or "").strip()
+    raw_has_negative = raw.startswith("-") or raw.startswith("−") or (raw.startswith("(") and raw.endswith(")"))
+    raw_has_positive = raw.startswith("+")
+    delta = str(delta_indicator or "").lower()
+    expected_sign: int | None = None
+    basis: str | None = None
+    if delta in {"down", "negative"}:
+        expected_sign, basis = -1, "delta_indicator"
+    elif delta in {"up", "positive"}:
+        expected_sign, basis = 1, "delta_indicator"
+    elif percentage_change is not None:
+        expected_sign = -1 if percentage_change < 0 else 1 if percentage_change > 0 else 0
+        basis = "percentage_change"
+    if raw_has_negative:
+        value = -abs(parsed_net_change)
+    elif raw_has_positive:
+        value = abs(parsed_net_change)
+    else:
+        value = parsed_net_change
+    if expected_sign == 0:
+        return {"net_change": 0.0 if value == 0 else None, "diagnostics": diagnostics, "warnings": [] if value == 0 else ["nasdaq_change_sign_conflict_zero_expected"]}
+    if expected_sign is not None and value != 0 and (value > 0) != (expected_sign > 0):
+        if not raw_has_negative and not raw_has_positive:
+            value = abs(value) * expected_sign
+            diagnostics["sign_normalized"] = True
+            diagnostics["normalization_basis"] = basis
+        else:
+            warnings.append("nasdaq_change_sign_conflict")
+            return {"net_change": None, "diagnostics": diagnostics, "warnings": warnings}
+    if percentage_change is not None and value not in (None, 0) and percentage_change != 0 and (value > 0) != (percentage_change > 0):
+        warnings.append("nasdaq_change_percentage_sign_conflict")
+        return {"net_change": None, "diagnostics": diagnostics, "warnings": warnings}
+    return {"net_change": value, "diagnostics": diagnostics, "warnings": warnings}
 
 
 def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:

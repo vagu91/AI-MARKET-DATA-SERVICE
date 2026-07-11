@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from app.core.text_normalization import normalize_text
 from app.services.data_freshness_service import parse_datetime
 
 
@@ -268,23 +269,7 @@ def classify_source(source: Any, source_url: Any = None) -> dict[str, Any]:
 
 
 def clean_text(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    replacements = {
-        "â€™": "'",
-        "â€˜": "'",
-        "â€œ": '"',
-        "â€�": '"',
-        "â€“": "-",
-        "â€”": "-",
-        "Ã¢": "a",
-        "Ã©": "e",
-        "Ã¨": "e",
-        "Ã": "A",
-    }
-    for bad, good in replacements.items():
-        value = value.replace(bad, good)
-    return value
+    return normalize_text(value)
 
 
 def classify_holding_sector(holding: dict[str, Any]) -> dict[str, Any]:
@@ -297,28 +282,52 @@ def classify_holding_sector(holding: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
-def sector_exposure(holdings: list[dict[str, Any]]) -> dict[str, Any]:
+def sector_exposure(holdings: list[dict[str, Any]], *, total_holdings_count: int | None = None, coverage_scope: str | None = None) -> dict[str, Any]:
     exposure: dict[str, float] = {}
     total = 0.0
     classified = 0.0
+    holdings_with_weight = 0
     for raw in holdings:
         holding = classify_holding_sector(raw)
-        weight = float(holding.get("weight") or 0.0)
+        weight_value = holding.get("weight")
+        if weight_value is None:
+            continue
+        weight = float(weight_value or 0.0)
+        holdings_with_weight += 1
         sector = str(holding.get("sector") or "Unknown")
         total += weight
         if sector != "Unknown":
             classified += weight
         exposure[sector] = exposure.get(sector, 0.0) + weight
-    unknown = exposure.get("Unknown", 0.0)
+    covered_count = len(holdings)
+    total_count = total_holdings_count or covered_count
+    complete_by_weight = 99.0 <= total <= 101.0
+    complete_by_count = total_count == covered_count and holdings_with_weight == covered_count and complete_by_weight
+    inferred_scope = coverage_scope or ("complete_portfolio" if complete_by_count else f"top_{covered_count}_holdings" if covered_count else "empty")
+    uncovered = 0.0 if complete_by_weight or total <= 0 else max(0.0, 100.0 - total)
+    unknown = exposure.get("Unknown", 0.0) + uncovered
+    sector_weights = {sector: round(weight, 4) for sector, weight in exposure.items() if sector != "Unknown"}
+    if exposure.get("Unknown"):
+        sector_weights["Unknown"] = round(exposure["Unknown"], 4)
     return {
-        "by_sector_weight_pct": exposure,
+        "by_sector_weight_pct": sector_weights,
+        "sector_weight_pct": sector_weights,
         "classified_weight_pct": round(classified, 4),
         "unknown_weight_pct": round(unknown, 4),
         "total_weight_pct": round(total, 4),
+        "covered_holdings_count": covered_count,
+        "total_holdings_count": total_count,
+        "covered_holdings_weight_pct": round(total, 4),
+        "uncovered_holdings_weight_pct": round(uncovered, 4),
+        "portfolio_weight_pct": 100.0 if total > 0 else 0.0,
+        "coverage_scope": inferred_scope,
+        "sector_classification_source": SECTOR_MAP_VERSION,
+        "complete_portfolio_coverage": complete_by_count,
+        "weight_data_available": holdings_with_weight > 0,
         "sector_map_version": SECTOR_MAP_VERSION,
         "data_quality": {
             "unknown_below_threshold": unknown < 10.0,
-            "warnings": [] if unknown < 10.0 else ["sector_unknown_weight_above_threshold"],
+            "warnings": [] if unknown < 10.0 else ["sector_unknown_or_uncovered_weight_above_threshold"],
         },
     }
 

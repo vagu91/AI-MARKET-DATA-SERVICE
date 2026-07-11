@@ -1,7 +1,8 @@
 from functools import lru_cache
+import os
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,9 +18,17 @@ class Settings(BaseSettings):
     service_name: str = "AI-MARKET-DATA-SERVICE"
     environment: str = "local"
     log_level: str = "INFO"
-    database_path: Path = Path("./data/market_data.sqlite3")
-    market_db_path: Path = Field(
-        default=Path("./data/market_data_service.sqlite"),
+    provider_cache_db_path: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_PROVIDER_CACHE_DB_PATH", "AI_MARKET_DATABASE_PATH"),
+    )
+    canonical_store_db_path: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_CANONICAL_STORE_DB_PATH", "AI_MARKET_DB_PATH", "DB_PATH"),
+    )
+    database_path: Path | None = Field(default=None, validation_alias="AI_MARKET_DATABASE_PATH")
+    market_db_path: Path | None = Field(
+        default=None,
         validation_alias=AliasChoices("AI_MARKET_DB_PATH", "DB_PATH"),
     )
     timezone: str = "Europe/Rome"
@@ -205,6 +214,10 @@ class Settings(BaseSettings):
     enable_nasdaq_market_info: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_MARKET_INFO")
     enable_nasdaq_qqq_options: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_QQQ_OPTIONS")
     enable_aaii_sentiment: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_AAII_SENTIMENT")
+    enable_social_sentiment: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_SOCIAL_SENTIMENT")
+    social_sentiment_ttl_minutes: int = Field(default=30, validation_alias="AI_MARKET_SOCIAL_SENTIMENT_TTL_MINUTES")
+    social_sentiment_timeout_seconds: float = Field(default=6.0, validation_alias="AI_MARKET_SOCIAL_SENTIMENT_TIMEOUT_SECONDS")
+    social_sentiment_max_items: int = Field(default=40, validation_alias="AI_MARKET_SOCIAL_SENTIMENT_MAX_ITEMS")
     enable_macromicro_aaii_crosscheck: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_MACROMICRO_AAII_CROSSCHECK")
     enable_polymarket: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_POLYMARKET")
     provider_failure_cache_minutes: int = Field(default=30, validation_alias="AI_MARKET_PROVIDER_FAILURE_CACHE_MINUTES")
@@ -284,6 +297,25 @@ class Settings(BaseSettings):
     nasdaq_qqq_option_chain_url: str = "https://api.nasdaq.com/api/quote/QQQ/option-chain"
     macromicro_aaii_chart_url: str = "https://en.macromicro.me/charts/20828/us-aaii-sentimentsurvey"
     macromicro_aaii_api_url: str = "https://en.macromicro.me/api/view/chart/20828"
+    hacker_news_algolia_url: str = "https://hn.algolia.com/api/v1/search_by_date"
+    hacker_news_rss_url: str = "https://news.ycombinator.com/rss"
+
+    @model_validator(mode="after")
+    def resolve_persistence_paths(self) -> "Settings":
+        canonical = self.canonical_store_db_path or self.market_db_path or Path("./data/market_data_service.sqlite")
+        provider_cache = self.provider_cache_db_path or self.database_path or canonical
+        self.canonical_store_db_path = canonical
+        self.market_db_path = canonical
+        self.provider_cache_db_path = provider_cache
+        self.database_path = provider_cache
+        return self
+
+    def legacy_persistence_aliases_in_use(self) -> list[str]:
+        return [
+            name
+            for name in ("AI_MARKET_DATABASE_PATH", "AI_MARKET_DB_PATH", "DB_PATH")
+            if name in os.environ
+        ]
 
     @classmethod
     def settings_customise_sources(

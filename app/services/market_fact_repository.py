@@ -1,150 +1,15 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import UTC, datetime
 from datetime import timedelta
 from typing import Any
 
+from app.core.text_normalization import normalize_payload_text
 from app.core.redaction import redact_payload
 from app.core.config import Settings
-
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS market_facts (
-  id INTEGER PRIMARY KEY,
-  fact_key TEXT UNIQUE NOT NULL,
-  fact_type TEXT NOT NULL,
-  country TEXT NULL,
-  symbol TEXT NULL,
-  category TEXT NULL,
-  event_name TEXT NULL,
-  period TEXT NULL,
-  value TEXT NULL,
-  unit TEXT NULL,
-  forecast TEXT NULL,
-  previous TEXT NULL,
-  consensus TEXT NULL,
-  actual TEXT NULL,
-  source TEXT NULL,
-  source_url TEXT NULL,
-  provider_type TEXT NULL,
-  reliability REAL DEFAULT 0,
-  confidence REAL DEFAULT 0,
-  retrieved_at TEXT NOT NULL,
-  release_at TEXT NULL,
-  valid_from TEXT NULL,
-  valid_until TEXT NULL,
-  next_refresh_at TEXT NULL,
-  status TEXT NOT NULL DEFAULT 'active',
-  raw_payload_json TEXT NULL,
-  notes TEXT NULL,
-  warnings_json TEXT NULL,
-  errors_json TEXT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS economic_events_history (
-  id INTEGER PRIMARY KEY,
-  event_id TEXT,
-  event_key TEXT UNIQUE,
-  country TEXT,
-  category TEXT,
-  name TEXT,
-  period TEXT,
-  date TEXT,
-  time_utc TEXT,
-  time_local TEXT,
-  impact TEXT,
-  event_risk_level TEXT,
-  source TEXT,
-  source_url TEXT,
-  official_reliability REAL,
-  forecast TEXT NULL,
-  previous TEXT NULL,
-  consensus TEXT NULL,
-  actual TEXT NULL,
-  actual_source TEXT NULL,
-  actual_source_url TEXT NULL,
-  forecast_source TEXT NULL,
-  forecast_source_url TEXT NULL,
-  surprise_value TEXT NULL,
-  surprise_direction TEXT NULL,
-  release_at TEXT NULL,
-  valid_until TEXT NULL,
-  status TEXT,
-  raw_payload_json TEXT NULL,
-  created_at TEXT,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS market_news (
-  id INTEGER PRIMARY KEY,
-  news_key TEXT UNIQUE,
-  title TEXT NOT NULL,
-  summary TEXT NULL,
-  content_snippet TEXT NULL,
-  source TEXT NULL,
-  source_url TEXT NOT NULL,
-  published_at TEXT NULL,
-  retrieved_at TEXT NOT NULL,
-  valid_from TEXT NULL,
-  valid_until TEXT NULL,
-  next_refresh_at TEXT NULL,
-  symbols_json TEXT NULL,
-  topics_json TEXT NULL,
-  country TEXT NULL,
-  category TEXT NULL,
-  relevance TEXT NULL,
-  reliability REAL DEFAULT 0,
-  confidence REAL DEFAULT 0,
-  provider_type TEXT NULL,
-  is_official INTEGER DEFAULT 0,
-  is_duplicate INTEGER DEFAULT 0,
-  raw_payload_json TEXT NULL,
-  created_at TEXT,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS provider_observations (
-  id INTEGER PRIMARY KEY,
-  run_id TEXT,
-  provider_name TEXT,
-  provider_type TEXT,
-  status TEXT,
-  country TEXT NULL,
-  symbol TEXT NULL,
-  category TEXT NULL,
-  query TEXT NULL,
-  url TEXT NULL,
-  item_count INTEGER DEFAULT 0,
-  error TEXT NULL,
-  warning TEXT NULL,
-  retrieved_at TEXT,
-  duration_ms INTEGER NULL,
-  raw_payload_json TEXT NULL
-);
-
-CREATE TABLE IF NOT EXISTS enrichment_runs (
-  id INTEGER PRIMARY KEY,
-  run_id TEXT UNIQUE,
-  started_at TEXT,
-  finished_at TEXT NULL,
-  status TEXT,
-  trigger TEXT,
-  events_checked INTEGER DEFAULT 0,
-  db_hits INTEGER DEFAULT 0,
-  db_misses INTEGER DEFAULT 0,
-  provider_hits INTEGER DEFAULT 0,
-  provider_misses INTEGER DEFAULT 0,
-  ai_research_requests INTEGER DEFAULT 0,
-  facts_written INTEGER DEFAULT 0,
-  news_written INTEGER DEFAULT 0,
-  errors_json TEXT NULL,
-  warnings_json TEXT NULL
-);
-"""
+from app.infrastructure.persistence.database import connect_sqlite
+from app.infrastructure.persistence.migrations import migrate_database
 
 FACT_COLUMNS = [
     "fact_key", "fact_type", "country", "symbol", "category", "event_name", "period", "value", "unit",
@@ -174,18 +39,12 @@ def decode(value: str | None, default: Any) -> Any:
         return default
 
 
-def connect_market_db(settings: Settings) -> sqlite3.Connection:
-    settings.market_db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(settings.market_db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def connect_market_db(settings: Settings) -> Any:
+    return connect_sqlite(settings.canonical_store_db_path or settings.market_db_path)
 
 
 def init_market_db(settings: Settings) -> None:
-    with connect_market_db(settings) as conn:
-        conn.executescript(SCHEMA)
-        conn.commit()
+    migrate_database(settings.canonical_store_db_path or settings.market_db_path)
 
 
 class MarketFactRepository:
@@ -194,7 +53,7 @@ class MarketFactRepository:
         init_market_db(settings)
 
     def upsert_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
-        payload = dict(fact)
+        payload = normalize_payload_text(dict(fact))
         timestamp = now_iso()
         payload.setdefault("retrieved_at", timestamp)
         payload.setdefault("created_at", timestamp)
@@ -301,7 +160,7 @@ class MarketFactRepository:
 
     def upsert_economic_event(self, event: Any, event_key: str, *, valid_until: str | None = None) -> None:
         timestamp = now_iso()
-        payload = event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event)
+        payload = normalize_payload_text(event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event))
         time_utc = payload.get("time_utc")
         forecast = (payload.get("enrichment") or {}).get("forecast") if isinstance(payload.get("enrichment"), dict) else None
         previous = (payload.get("enrichment") or {}).get("previous") if isinstance(payload.get("enrichment"), dict) else None
@@ -413,7 +272,7 @@ class MarketFactRepository:
                 conn.execute(f"DELETE FROM {table}")
             conn.commit()
 
-    def _row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _row(self, row: Any | None) -> dict[str, Any] | None:
         if row is None:
             return None
         data = dict(row)

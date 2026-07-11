@@ -435,11 +435,12 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
     snapshot = data.get("mega_cap_snapshot") or {}
     breadth = data.get("mega_cap_breadth") or {}
     earnings = data.get("upcoming_earnings") or data.get("earnings") or {}
+    holdings_count = holdings.get("holdings_count") or len(holdings.get("holdings") or top_holdings or [])
     return {
         "qqq_holdings": {
             "status": holdings.get("status") or ("found" if holdings.get("holdings") or top_holdings else "not_found"),
             "as_of": holdings.get("as_of") or summary.get("as_of"),
-            "holdings_count": holdings.get("holdings_count") or len(holdings.get("holdings") or top_holdings or []),
+            "holdings_count": holdings_count,
             "top_holdings": (top_holdings or [])[:15],
             "source": holdings.get("source") or summary.get("source"),
             "reliability": holdings.get("reliability") or summary.get("reliability"),
@@ -459,7 +460,11 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
         },
         "mega_cap_breadth": breadth,
         "earnings": {"upcoming": earnings.get("events") or [], "data_quality": earnings.get("data_quality", {})},
-        "sector_exposure": sector_exposure(top_holdings or holdings.get("holdings") or []),
+        "sector_exposure": sector_exposure(
+            top_holdings or holdings.get("holdings") or [],
+            total_holdings_count=holdings_count,
+            coverage_scope="complete_portfolio" if holdings.get("weight_data_available") and holdings_count == len(holdings.get("holdings") or top_holdings or []) else None,
+        ),
         "data_quality": data.get("metadata") or {},
     }
 

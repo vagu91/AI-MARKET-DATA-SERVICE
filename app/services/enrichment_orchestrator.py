@@ -65,186 +65,197 @@ class EnrichmentOrchestrator:
         self.runs.start(run_id=run_id, trigger=trigger)
         enriched_by_id: dict[str, EconomicEvent] = {}
         missing: list[EconomicEvent] = []
-
-        for event in events:
-            metrics["events_checked"] += 1
-            self.facts.upsert_economic_event(
-                event,
-                event_key=f"{event.country}:{event.date}:{event.event_id}",
-                valid_until=self.freshness.macro_valid_until(event),
-            )
-            if not self._should_enrich(event):
-                updated = event.model_copy(deep=True)
-                updated.enrichment.warnings.append("no_data_available: enrichment skipped by high-impact filter")
-                enriched_by_id[event.event_id] = updated
-                continue
-            fact_key = self.fact_key(event)
-            fact = self.facts.get_fact(fact_key)
-            if fact:
-                freshness = self.freshness.evaluate(fact)
-                if freshness.usable:
-                    updated = event.model_copy(deep=True)
-                    updated.enrichment = self._enrichment_from_fact(fact, freshness.cache_status, freshness.warnings)
-                    enriched_by_id[event.event_id] = updated
-                    metrics["db_hits"] += 1
-                    self.observations.record(
-                        run_id=run_id,
-                        provider_name="market_facts",
-                        provider_type="DB",
-                        status="cache_hit",
-                        country=event.country,
-                        category=event.category,
-                        query=fact_key,
-                        item_count=1,
-                    )
-                    continue
-            metrics["db_misses"] += 1
-            self.observations.record(
-                run_id=run_id,
-                provider_name="market_facts",
-                provider_type="DB",
-                status="cache_miss",
-                country=event.country,
-                category=event.category,
-                query=fact_key,
-            )
-            missing.append(event)
-
+        status = "completed"
         provider_metadata: dict[str, Any] = {}
-        provider_missing: list[EconomicEvent] = []
-        if missing and self.event_enrichment_service:
-            provider_events, provider_metadata = await self.event_enrichment_service.enrich_events(
-                events=missing,
-                country=country,
-                start=start,
-                end=end,
-            )
-            self.observations.record(
-                run_id=run_id,
-                provider_name="event_enrichment_service",
-                provider_type="SCRAPER",
-                status="success" if any(_has_values(event.enrichment) for event in provider_events) else "no_data_available",
-                country=country,
-                item_count=sum(1 for event in provider_events if _has_values(event.enrichment)),
-                raw_payload_json=provider_metadata,
-            )
-            for event in provider_events:
-                if _has_values(event.enrichment):
-                    fact = self._fact_from_event(event, provider_type=event.enrichment.provider_type)
-                    self.facts.upsert_fact(fact)
-                    event.enrichment.cache_status = "refreshed"
-                    event.enrichment.valid_until = self.freshness.macro_valid_until(event)
-                    event.enrichment.next_refresh_at = self.freshness.next_refresh_at(
-                        event.enrichment.valid_until.isoformat() if hasattr(event.enrichment.valid_until, "isoformat") else event.enrichment.valid_until
-                    )
-                    enriched_by_id[event.event_id] = event
-                    metrics["provider_hits"] += 1
-                    metrics["facts_written"] += 1
-                else:
-                    provider_missing.append(event)
-            metrics["provider_misses"] += len(provider_missing)
-        else:
-            provider_missing = missing
-            if missing:
-                metrics["warnings_json"].append("event_enrichment_service_unavailable")
-
-        ai_used = False
-        ai_called = False
-        ai_succeeded = False
-        ai_failure_reason = None
-        if provider_missing and self.settings.enable_ai_researcher:
-            all_ai_candidates = self._ai_candidates(provider_missing, limit=False)
-            ai_candidates = all_ai_candidates[: self.settings.ai_researcher_max_events]
-            deferred_ai_candidates = all_ai_candidates[self.settings.ai_researcher_max_events :]
-            metrics["ai_events_requested"] = len(ai_candidates)
-            facts: list[dict[str, Any]] = []
-            ai_status: dict[str, Any] = {"status": "skipped", "warning": "no_ai_candidates"}
-            if ai_candidates:
-                metrics["ai_research_requests"] = 1
-                ai_called = True
-                facts, ai_status = await self.ai_researcher_service.research_and_save(
-                    [self._event_payload(event) for event in ai_candidates]
+        try:
+            for event in events:
+                metrics["events_checked"] += 1
+                self.facts.upsert_economic_event(
+                    event,
+                    event_key=f"{event.country}:{event.date}:{event.event_id}",
+                    valid_until=self.freshness.macro_valid_until(event),
                 )
-                ai_succeeded = ai_status.get("status") == "success"
-                ai_failure_reason = ai_status.get("failure_reason") or ai_status.get("error")
-                metrics["ai_results_valid"] = int(ai_status.get("results_valid") or len(facts))
-                metrics["ai_results_rejected"] = int(ai_status.get("results_rejected") or 0)
+                if not self._should_enrich(event):
+                    updated = event.model_copy(deep=True)
+                    updated.enrichment.warnings.append("no_data_available: enrichment skipped by high-impact filter")
+                    enriched_by_id[event.event_id] = updated
+                    continue
+                fact_key = self.fact_key(event)
+                fact = self.facts.get_fact(fact_key)
+                if fact:
+                    freshness = self.freshness.evaluate(fact)
+                    if freshness.usable:
+                        updated = event.model_copy(deep=True)
+                        updated.enrichment = self._enrichment_from_fact(fact, freshness.cache_status, freshness.warnings)
+                        enriched_by_id[event.event_id] = updated
+                        metrics["db_hits"] += 1
+                        self.observations.record(
+                            run_id=run_id,
+                            provider_name="market_facts",
+                            provider_type="DB",
+                            status="cache_hit",
+                            country=event.country,
+                            category=event.category,
+                            query=fact_key,
+                            item_count=1,
+                        )
+                        continue
+                metrics["db_misses"] += 1
                 self.observations.record(
                     run_id=run_id,
-                    provider_name="ai_researcher",
-                    provider_type="AI_RESEARCHER_CODEX_CLI",
-                    status="ai_research_used" if facts else ai_status.get("status", "no_data_available"),
-                    country=country,
-                    item_count=len(facts),
-                    warning=";".join(ai_status.get("warnings", [])) if isinstance(ai_status.get("warnings"), list) else ai_status.get("warning"),
-                    error=ai_status.get("error") or ai_status.get("failure_reason"),
-                    raw_payload_json=ai_status,
+                    provider_name="market_facts",
+                    provider_type="DB",
+                    status="cache_miss",
+                    country=event.country,
+                    category=event.category,
+                    query=fact_key,
                 )
-                metrics["facts_written"] += len(facts)
-                if not facts:
-                    negative_reason = ai_status.get("failure_reason") or ai_status.get("status") or "no_data_available"
-                    for event in ai_candidates:
-                        negative = self._negative_ai_fact(event, reason=str(negative_reason))
-                        self.facts.upsert_fact(negative)
-                        facts.append(negative)
-                    metrics["facts_written"] += len(ai_candidates)
-                for event in deferred_ai_candidates:
-                    self.facts.upsert_fact(self._negative_ai_fact(event, reason="ai_batch_deferred"))
-                    metrics["facts_written"] += 1
-            facts_by_key = {fact["fact_key"]: fact for fact in facts}
-            for event in provider_missing:
-                fact = facts_by_key.get(self.fact_key(event))
-                updated = event.model_copy(deep=True)
-                if fact:
-                    self.facts.upsert_fact(fact)
-                    updated.enrichment = self._enrichment_from_fact(fact, "refreshed", [])
-                    if _has_values(updated.enrichment):
-                        ai_used = True
-                else:
-                    updated.enrichment.warnings.append("missing_enrichment_data")
-                enriched_by_id[event.event_id] = updated
-        else:
-            if provider_missing:
-                metrics["warnings_json"].append("ai_researcher_disabled")
-            for event in provider_missing:
-                updated = event.model_copy(deep=True)
-                if not updated.enrichment.warnings:
-                    updated.enrichment.warnings.append("missing_enrichment_data")
-                enriched_by_id[event.event_id] = updated
+                missing.append(event)
 
-        result = [enriched_by_id.get(event.event_id, event) for event in events]
-        data_quality = {
-            "db_hits": metrics["db_hits"],
-            "db_misses": metrics["db_misses"],
-            "provider_hits": metrics["provider_hits"],
-            "provider_failures": metrics["provider_misses"],
-            "ai_research_used": ai_used,
-            "ai_research_called": ai_called,
-            "ai_research_succeeded": ai_succeeded,
-            "ai_research_requests": metrics["ai_research_requests"],
-            "ai_events_requested": metrics["ai_events_requested"],
-            "ai_results_valid": metrics["ai_results_valid"],
-            "ai_results_rejected": metrics["ai_results_rejected"],
-            "ai_failure_reason": ai_failure_reason,
-            "missing_critical_fields": [
-                self.fact_key(event) for event in result if self._is_ai_researchable(event) and not _has_values(event.enrichment)
-            ],
-            "stale_fields": [
-                self.fact_key(event) for event in result if "stale_fact" in event.enrichment.warnings
-            ],
-            "warnings": metrics["warnings_json"],
-            "errors": metrics["errors_json"],
-        }
-        metadata = {
-            "run_id": run_id,
-            "service_role": "data provider only",
-            "data_quality": data_quality,
-            "provider_metadata": provider_metadata,
-            "decisions_delegated_to": "AI-TRADER",
-            "trading_logic": "not implemented; data service only",
-        }
-        self.runs.finish(run_id=run_id, status="completed", metrics=metrics)
-        return result, metadata
+            provider_missing: list[EconomicEvent] = []
+            if missing and self.event_enrichment_service:
+                provider_events, provider_metadata = await self.event_enrichment_service.enrich_events(
+                    events=missing,
+                    country=country,
+                    start=start,
+                    end=end,
+                )
+                self.observations.record(
+                    run_id=run_id,
+                    provider_name="event_enrichment_service",
+                    provider_type="SCRAPER",
+                    status="success" if any(_has_values(event.enrichment) for event in provider_events) else "no_data_available",
+                    country=country,
+                    item_count=sum(1 for event in provider_events if _has_values(event.enrichment)),
+                    raw_payload_json=provider_metadata,
+                )
+                for event in provider_events:
+                    if _has_values(event.enrichment):
+                        fact = self._fact_from_event(event, provider_type=event.enrichment.provider_type)
+                        self.facts.upsert_fact(fact)
+                        event.enrichment.cache_status = "refreshed"
+                        event.enrichment.valid_until = self.freshness.macro_valid_until(event)
+                        event.enrichment.next_refresh_at = self.freshness.next_refresh_at(
+                            event.enrichment.valid_until.isoformat() if hasattr(event.enrichment.valid_until, "isoformat") else event.enrichment.valid_until
+                        )
+                        enriched_by_id[event.event_id] = event
+                        metrics["provider_hits"] += 1
+                        metrics["facts_written"] += 1
+                    else:
+                        provider_missing.append(event)
+                metrics["provider_misses"] += len(provider_missing)
+            else:
+                provider_missing = missing
+                if missing:
+                    metrics["warnings_json"].append("event_enrichment_service_unavailable")
+
+            ai_used = False
+            ai_called = False
+            ai_succeeded = False
+            ai_failure_reason = None
+            if provider_missing and self.settings.enable_ai_researcher:
+                all_ai_candidates = self._ai_candidates(provider_missing, limit=False)
+                ai_candidates = all_ai_candidates[: self.settings.ai_researcher_max_events]
+                deferred_ai_candidates = all_ai_candidates[self.settings.ai_researcher_max_events :]
+                metrics["ai_events_requested"] = len(ai_candidates)
+                facts: list[dict[str, Any]] = []
+                ai_status: dict[str, Any] = {"status": "skipped", "warning": "no_ai_candidates"}
+                if ai_candidates:
+                    metrics["ai_research_requests"] = 1
+                    ai_called = True
+                    facts, ai_status = await self.ai_researcher_service.research_and_save(
+                        [self._event_payload(event) for event in ai_candidates]
+                    )
+                    ai_succeeded = ai_status.get("status") == "success"
+                    ai_failure_reason = ai_status.get("failure_reason") or ai_status.get("error")
+                    metrics["ai_results_valid"] = int(ai_status.get("results_valid") or len(facts))
+                    metrics["ai_results_rejected"] = int(ai_status.get("results_rejected") or 0)
+                    self.observations.record(
+                        run_id=run_id,
+                        provider_name="ai_researcher",
+                        provider_type="AI_RESEARCHER_CODEX_CLI",
+                        status="ai_research_used" if facts else ai_status.get("status", "no_data_available"),
+                        country=country,
+                        item_count=len(facts),
+                        warning=";".join(ai_status.get("warnings", [])) if isinstance(ai_status.get("warnings"), list) else ai_status.get("warning"),
+                        error=ai_status.get("error") or ai_status.get("failure_reason"),
+                        raw_payload_json=ai_status,
+                    )
+                    metrics["facts_written"] += len(facts)
+                    if not facts:
+                        negative_reason = ai_status.get("failure_reason") or ai_status.get("status") or "no_data_available"
+                        for event in ai_candidates:
+                            negative = self._negative_ai_fact(event, reason=str(negative_reason))
+                            self.facts.upsert_fact(negative)
+                            facts.append(negative)
+                        metrics["facts_written"] += len(ai_candidates)
+                    for event in deferred_ai_candidates:
+                        self.facts.upsert_fact(self._negative_ai_fact(event, reason="ai_batch_deferred"))
+                        metrics["facts_written"] += 1
+                facts_by_key = {fact["fact_key"]: fact for fact in facts}
+                for event in provider_missing:
+                    fact = facts_by_key.get(self.fact_key(event))
+                    updated = event.model_copy(deep=True)
+                    if fact:
+                        self.facts.upsert_fact(fact)
+                        updated.enrichment = self._enrichment_from_fact(fact, "refreshed", [])
+                        if _has_values(updated.enrichment):
+                            ai_used = True
+                    else:
+                        updated.enrichment.warnings.append("missing_enrichment_data")
+                    enriched_by_id[event.event_id] = updated
+            else:
+                if provider_missing:
+                    metrics["warnings_json"].append("ai_researcher_disabled")
+                for event in provider_missing:
+                    updated = event.model_copy(deep=True)
+                    if not updated.enrichment.warnings:
+                        updated.enrichment.warnings.append("missing_enrichment_data")
+                    enriched_by_id[event.event_id] = updated
+
+            result = [enriched_by_id.get(event.event_id, event) for event in events]
+            data_quality = {
+                "events_found": len(events),
+                "enrichment_complete": metrics["provider_misses"] == 0,
+                "enrichment_partial": metrics["provider_hits"] > 0 and metrics["provider_misses"] > 0,
+                "enrichment_timeout": False,
+                "enrichment_status": "enrichment_complete" if metrics["provider_misses"] == 0 else ("enrichment_partial" if metrics["provider_hits"] else "enrichment_missing"),
+                "db_hits": metrics["db_hits"],
+                "db_misses": metrics["db_misses"],
+                "provider_hits": metrics["provider_hits"],
+                "provider_failures": metrics["provider_misses"],
+                "ai_research_used": ai_used,
+                "ai_research_called": ai_called,
+                "ai_research_succeeded": ai_succeeded,
+                "ai_research_requests": metrics["ai_research_requests"],
+                "ai_events_requested": metrics["ai_events_requested"],
+                "ai_results_valid": metrics["ai_results_valid"],
+                "ai_results_rejected": metrics["ai_results_rejected"],
+                "ai_failure_reason": ai_failure_reason,
+                "missing_critical_fields": [
+                    self.fact_key(event) for event in result if self._is_ai_researchable(event) and not _has_values(event.enrichment)
+                ],
+                "stale_fields": [
+                    self.fact_key(event) for event in result if "stale_fact" in event.enrichment.warnings
+                ],
+                "warnings": metrics["warnings_json"],
+                "errors": metrics["errors_json"],
+            }
+            metadata = {
+                "run_id": run_id,
+                "service_role": "data provider only",
+                "data_quality": data_quality,
+                "provider_metadata": provider_metadata,
+                "decisions_delegated_to": "AI-TRADER",
+                "trading_logic": "not implemented; data service only",
+            }
+            return result, metadata
+        except BaseException as exc:
+            status = "failed"
+            metrics["errors_json"].append(str(exc) or exc.__class__.__name__)
+            raise
+        finally:
+            self.runs.finish(run_id=run_id, status=status, metrics=metrics)
 
     def fact_key(self, event: EconomicEvent) -> str:
         return self.keys.macro_event_key(

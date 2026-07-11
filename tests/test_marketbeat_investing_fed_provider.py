@@ -95,9 +95,11 @@ def test_investing_fed_rate_monitor_parser_reads_meeting_probabilities() -> None
 
     assert parsed["cards_seen"] == 1
     assert meeting["meeting_date"] == "2026-07-29"
-    assert meeting["meeting_at"] == "2026-07-29"
+    assert meeting["meeting_at"] == "2026-07-29T14:00:00-04:00"
+    assert meeting["meeting_time_local_text"] == "Jul 29, 2026 02:00PM ET"
     assert meeting["future_price"] == 96.373
-    assert meeting["updated_at"] == "Jul 10, 2026 01:05PM EDT"
+    assert meeting["updated_at"] == "2026-07-10T13:05:00-04:00"
+    assert meeting["updated_at_text"] == "Jul 10, 2026 01:05PM EDT"
     assert meeting["event_id"] == "516971"
     assert meeting["probability_sum_pct"] == 100.0
     assert meeting["target_rate_probabilities"][1]["previous_day_probability_pct"] is None
@@ -165,7 +167,7 @@ async def test_investing_fed_monitor_provider_fetches_secondary_probabilities(tm
     assert result["official_fed_data"] is False
     assert result["official_cme_data"] is False
     assert result["current_meeting"]["event_id"] == "516971"
-    assert result["current_meeting"]["meeting_at"] == "2026-07-29"
+    assert result["current_meeting"]["meeting_at"] == "2026-07-29T14:00:00-04:00"
     assert result["history_endpoint"]["status"] == "not_integrated"
     assert result["history_endpoint_status"] == "not_integrated"
     assert result["official_fed_source"] is False

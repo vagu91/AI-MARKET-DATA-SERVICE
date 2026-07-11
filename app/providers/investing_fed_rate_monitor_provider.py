@@ -5,11 +5,16 @@ import html
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from app.core.config import Settings
+from app.core.text_normalization import normalize_text
 from app.providers.calendar_utils import REQUEST_HEADERS
+
+
+NY_TZ = ZoneInfo("America/New_York")
 
 
 class InvestingFedRateMonitorProvider:
@@ -136,15 +141,18 @@ def _parse_card(block: str) -> dict[str, Any] | None:
         )
     if not meeting_date or not probabilities:
         return None
+    meeting_time_text = _clean(meeting_time)
+    updated_at_text = updated_at
     total = round(sum(float(item["current_probability_pct"] or 0) for item in probabilities), 4)
     return {
         "meeting_date": meeting_date,
-        "meeting_at": meeting_date,
-        "meeting_time_local": _clean(meeting_time),
+        "meeting_at": parse_local_datetime(meeting_time_text, fallback_date=meeting_date),
+        "meeting_time_local_text": meeting_time_text,
+        "meeting_time_local": meeting_time_text,
         "timezone": "America/New_York",
         "future_price": future_price,
-        "updated_at": updated_at,
-        "updated_at_text": updated_at,
+        "updated_at": parse_local_datetime(updated_at_text),
+        "updated_at_text": updated_at_text,
         "event_ids": sorted(event_ids),
         "event_id": sorted(event_ids)[0] if event_ids else None,
         "target_rate_probabilities": probabilities,
@@ -165,6 +173,36 @@ def parse_meeting_date(value: str) -> str | None:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
             continue
+    return None
+
+
+def parse_local_datetime(value: str | None, *, fallback_date: str | None = None) -> str | None:
+    text = _clean(value)
+    if not text:
+        if fallback_date:
+            return datetime.fromisoformat(f"{fallback_date}T14:00:00").replace(tzinfo=NY_TZ).isoformat()
+        return None
+    normalized = re.sub(r"\b(ET|EST|EDT)\b", "", text, flags=re.I).strip()
+    formats = ("%b %d, %Y %I:%M%p", "%B %d, %Y %I:%M%p", "%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p")
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt).replace(tzinfo=NY_TZ).isoformat()
+        except ValueError:
+            continue
+    if fallback_date:
+        time_match = re.search(r"(\d{1,2}):(\d{2})\s*([AP]M)", normalized, flags=re.I)
+        if time_match:
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+            if time_match.group(3).upper() == "PM" and hour != 12:
+                hour += 12
+            if time_match.group(3).upper() == "AM" and hour == 12:
+                hour = 0
+            try:
+                return datetime.fromisoformat(f"{fallback_date}T{hour:02d}:{minute:02d}:00").replace(tzinfo=NY_TZ).isoformat()
+            except ValueError:
+                return None
+        return datetime.fromisoformat(f"{fallback_date}T14:00:00").replace(tzinfo=NY_TZ).isoformat()
     return None
 
 
@@ -217,7 +255,7 @@ def _float(value: Any) -> float | None:
 
 
 def _clean(value: Any) -> str:
-    return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
+    return normalize_text(re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip())
 
 
 def _iso(value: datetime) -> str:
