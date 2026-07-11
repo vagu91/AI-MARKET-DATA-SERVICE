@@ -18,7 +18,7 @@ from app.providers.investing_fed_rate_monitor_provider import parse_investing_fe
 from app.providers.nasdaq_100_constituents_provider import _normalize
 from app.services.ai_trader_contract_service import build_ai_trader_market_context
 from app.services.data_integrity_service import sector_exposure
-from app.services.diagnostics_service import DiagnosticsService
+from app.services.diagnostics_service import DiagnosticsService, _event_enrichment_metadata
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.enrichment_run_repository import EnrichmentRunRepository
 
@@ -199,12 +199,12 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_event_enrichment_timeout_keeps_base_events_and_closes_run(tmp_path: Path) -> None:
+async def test_event_enrichment_deadline_skips_ai_without_claiming_timeout(tmp_path: Path) -> None:
     cfg = Settings(
         _env_file=None,
         database_path=tmp_path / "market.sqlite",
         timeout_events_seconds=1,
-        enable_ai_researcher=False,
+        enable_ai_researcher=True,
     )
 
     class Macro:
@@ -242,11 +242,109 @@ async def test_event_enrichment_timeout_keeps_base_events_and_closes_run(tmp_pat
     model = await service.full_model(refresh="force", fetch_missing_nasdaq=False)
     quality = model["data_quality"]
     assert "event_enrichment_timeout" not in quality.get("missing_critical_fields", [])
-    assert quality["enrichment_timeout"] is True
+    assert quality["enrichment_timeout"] is False
+    enrichment = model["metadata"]["event_enrichment"]
+    assert enrichment["status"] == "not_required"
+    assert enrichment["AI_called"] is False
+    assert enrichment["attempted_event_count"] == 0
+    assert enrichment["timeout_event_count"] == 0
+    assert all(row["attempted"] is False and row["timeout"] is False for row in enrichment["events"])
     assert model["event_calendar"]["critical_macro_events"]
     latest_run = EnrichmentRunRepository(cfg).latest()
     assert latest_run["finished_at"] is not None
     assert latest_run["status"] in {"failed", "completed"}
+
+
+@pytest.mark.asyncio
+async def test_event_enrichment_deadline_marks_started_ai_as_cancelled(tmp_path: Path) -> None:
+    cfg = Settings(
+        _env_file=None,
+        database_path=tmp_path / "market.sqlite",
+        timeout_events_seconds=1,
+        enable_ai_researcher=True,
+    )
+
+    class Macro:
+        async def latest(self):
+            from app.models.macro import MacroLatestResponse
+
+            return MacroLatestResponse()
+
+    class Events:
+        async def list_events(self, country, start, end, enrich=False):
+            return [_event()]
+
+    class Windows:
+        async def event_windows(self, symbol):
+            return {}
+
+    class Nasdaq:
+        async def context(self, *args, **kwargs):
+            return {}
+
+    class EmptyEnrichment:
+        async def enrich_events(self, **kwargs):
+            return kwargs["events"], {}
+
+    class SlowAI:
+        async def research_and_save(self, events):
+            await asyncio.sleep(2)
+            return [], {"status": "success"}
+
+    orchestrator = EnrichmentOrchestrator(
+        cfg,
+        event_enrichment_service=EmptyEnrichment(),
+        ai_researcher_service=SlowAI(),
+    )
+    service = DiagnosticsService(
+        cfg,
+        macro_service=Macro(),
+        event_service=Events(),
+        event_window_service=Windows(),
+        nasdaq_data_service=Nasdaq(),
+        enrichment_orchestrator=orchestrator,
+    )
+
+    model = await service.full_model(refresh="force", fetch_missing_nasdaq=False)
+    enrichment = model["metadata"]["event_enrichment"]
+    row = enrichment["events"][0]
+
+    assert enrichment["status"] == "cancelled"
+    assert enrichment["AI_called"] is True
+    assert enrichment["attempted_event_count"] == 1
+    assert enrichment["timeout_event_count"] == 0
+    assert row["AI_called"] is True
+    assert row["attempted"] is True
+    assert row["timeout"] is False
+
+
+@pytest.mark.parametrize(
+    ("quality", "expected_status", "expected_called"),
+    [
+        ({"ai_research_enabled": False}, "disabled", False),
+        ({"ai_research_enabled": True, "ai_research_configured": False}, "not_configured", False),
+        ({"ai_research_enabled": True, "ai_research_configured": True}, "not_required", False),
+        ({"ai_research_enabled": True, "ai_research_configured": True, "ai_not_available": True}, "not_available", False),
+        ({"ai_research_enabled": True, "ai_research_configured": True, "ai_research_called": True, "ai_candidate_event_ids": ["evt-cpi"], "ai_research_status": "success"}, "completed", True),
+        ({"ai_research_enabled": True, "ai_research_configured": True, "ai_research_called": True, "ai_candidate_event_ids": ["evt-cpi"], "ai_research_status": "provider_failed", "ai_failure_reason": "codex_cli_non_zero_exit"}, "failed", True),
+        ({"ai_research_enabled": True, "ai_research_configured": True, "ai_research_called": True, "ai_candidate_event_ids": ["evt-cpi"], "ai_research_status": "provider_failed", "ai_failure_reason": "ai_research_timeout"}, "timeout", True),
+        ({"ai_research_enabled": True, "ai_research_configured": True, "ai_research_called": True, "ai_candidate_event_ids": ["evt-cpi"], "ai_research_status": "cancelled"}, "cancelled", True),
+        ({"ai_research_enabled": True, "ai_research_configured": True, "ai_research_called": True, "ai_candidate_event_ids": ["evt-cpi"], "ai_research_status": "rejected", "ai_results_rejected": 1}, "rejected", True),
+    ],
+)
+def test_ai_enrichment_state_machine_has_only_coherent_states(quality, expected_status, expected_called) -> None:
+    metadata = _event_enrichment_metadata({"data_quality": quality}, [_event()])
+    row = metadata["events"][0]
+
+    assert metadata["status"] == expected_status
+    assert metadata["AI_called"] is expected_called
+    assert row["status"] == expected_status
+    assert row["AI_called"] is expected_called
+    assert row["attempted"] is expected_called
+    assert row["timeout"] is (expected_status == "timeout")
+    assert not (row["attempted"] is False and row["timeout"] is True)
+    assert not (metadata["attempted_event_count"] == 0 and metadata["timeout_event_count"] > 0)
+    assert not (metadata["AI_called"] is False and metadata["completed_event_count"] > 0)
 
 
 def _event() -> EconomicEvent:

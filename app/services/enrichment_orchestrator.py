@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any
 
 from app.core.config import Settings
@@ -57,6 +58,10 @@ class EnrichmentOrchestrator:
             "ai_events_requested": 0,
             "ai_results_valid": 0,
             "ai_results_rejected": 0,
+            "ai_candidate_event_ids": [],
+            "ai_research_status": "not_required",
+            "ai_duration_ms": None,
+            "ai_not_available": False,
             "facts_written": 0,
             "news_written": 0,
             "warnings_json": [],
@@ -158,14 +163,18 @@ class EnrichmentOrchestrator:
                 ai_candidates = all_ai_candidates[: self.settings.ai_researcher_max_events]
                 deferred_ai_candidates = all_ai_candidates[self.settings.ai_researcher_max_events :]
                 metrics["ai_events_requested"] = len(ai_candidates)
+                metrics["ai_candidate_event_ids"] = [event.event_id for event in ai_candidates]
                 facts: list[dict[str, Any]] = []
-                ai_status: dict[str, Any] = {"status": "skipped", "warning": "no_ai_candidates"}
+                ai_status: dict[str, Any] = {"status": "not_required", "warning": "no_ai_candidates"}
                 if ai_candidates:
                     metrics["ai_research_requests"] = 1
                     ai_called = True
+                    started = perf_counter()
                     facts, ai_status = await self.ai_researcher_service.research_and_save(
                         [self._event_payload(event) for event in ai_candidates]
                     )
+                    metrics["ai_duration_ms"] = int((perf_counter() - started) * 1000)
+                    metrics["ai_research_status"] = ai_status.get("status") or "failed"
                     ai_succeeded = ai_status.get("status") == "success"
                     ai_failure_reason = ai_status.get("failure_reason") or ai_status.get("error")
                     metrics["ai_results_valid"] = int(ai_status.get("results_valid") or len(facts))
@@ -192,6 +201,8 @@ class EnrichmentOrchestrator:
                     for event in deferred_ai_candidates:
                         self.facts.upsert_fact(self._negative_ai_fact(event, reason="ai_batch_deferred"))
                         metrics["facts_written"] += 1
+                else:
+                    metrics["ai_research_status"] = "not_required"
                 facts_by_key = {fact["fact_key"]: fact for fact in facts}
                 for event in provider_missing:
                     fact = facts_by_key.get(self.fact_key(event))
@@ -205,6 +216,7 @@ class EnrichmentOrchestrator:
                         updated.enrichment.warnings.append("missing_enrichment_data")
                     enriched_by_id[event.event_id] = updated
             else:
+                metrics["ai_research_status"] = "disabled" if not self.settings.enable_ai_researcher else "not_required"
                 if provider_missing:
                     metrics["warnings_json"].append("ai_researcher_disabled")
                 for event in provider_missing:
@@ -225,10 +237,17 @@ class EnrichmentOrchestrator:
                 "provider_hits": metrics["provider_hits"],
                 "provider_failures": metrics["provider_misses"],
                 "ai_research_used": ai_used,
+                "ai_research_enabled": bool(self.settings.enable_ai_researcher),
+                "ai_research_configured": bool(self.settings.enable_ai_researcher and self.settings.ai_researcher_mode in {"codex_cli", "openai_api"}),
+                "ai_research_mode": self.settings.ai_researcher_mode,
                 "ai_research_called": ai_called,
                 "ai_research_succeeded": ai_succeeded,
                 "ai_research_requests": metrics["ai_research_requests"],
                 "ai_events_requested": metrics["ai_events_requested"],
+                "ai_candidate_event_ids": metrics["ai_candidate_event_ids"],
+                "ai_research_status": metrics["ai_research_status"],
+                "ai_duration_ms": metrics["ai_duration_ms"],
+                "ai_not_available": metrics["ai_not_available"],
                 "ai_results_valid": metrics["ai_results_valid"],
                 "ai_results_rejected": metrics["ai_results_rejected"],
                 "ai_failure_reason": ai_failure_reason,

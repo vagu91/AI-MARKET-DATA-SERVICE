@@ -166,19 +166,40 @@ class DiagnosticsService:
                     timeout=enrichment_timeout,
                 )
             except TimeoutError:
-                for event in events:
-                    if hasattr(event, "enrichment"):
-                        event.enrichment.warnings.append("optional_enrichment_timeout")
+                # The orchestrator persists this counter in its finally block.  It
+                # lets the outer deadline distinguish a skipped pipeline from an
+                # AI dispatch that was cancelled by the diagnostics deadline.
+                latest_run = self.enrichment_orchestrator.runs.latest() or {}
+                ai_started = bool(latest_run.get("ai_research_requests"))
+                ai_candidates = (
+                    self.enrichment_orchestrator._ai_candidates(events)
+                    if ai_started
+                    else []
+                )
                 return events, {
                     "data_quality": {
                         "refresh_mode": refresh,
                         "events_found": len(events),
                         "enrichment_complete": False,
                         "enrichment_partial": bool(events),
-                        "enrichment_timeout": True,
-                        "enrichment_status": "enrichment_timeout",
+                        # The outer enrichment deadline does not prove that the AI
+                        # dispatcher ran.  Keep this as an optional skip, never as
+                        # an AI timeout.
+                        "enrichment_timeout": False,
+                        "enrichment_status": "not_required",
+                        "enrichment_not_attempted": not ai_started,
+                        "ai_research_enabled": bool(self.settings.enable_ai_researcher),
+                        "ai_research_configured": bool(
+                            self.settings.enable_ai_researcher
+                            and self.settings.ai_researcher_mode in {"codex_cli", "openai_api"}
+                        ),
+                        "ai_research_mode": self.settings.ai_researcher_mode,
+                        "ai_research_called": ai_started,
+                        "ai_candidate_event_ids": [event.event_id for event in ai_candidates],
+                        "ai_research_status": "cancelled" if ai_started else "not_required",
+                        "ai_failure_reason": "diagnostics_enrichment_deadline" if ai_started else None,
                         "missing_critical_fields": [],
-                        "warnings": [f"optional_event_enrichment_timeout_after_{enrichment_timeout}s"],
+                        "warnings": [f"optional_event_enrichment_skipped_after_{enrichment_timeout}s"],
                     }
                 }
 
@@ -256,7 +277,7 @@ class DiagnosticsService:
             data_quality=quality,
             db_summary=self.facts.db_summary(),
             event_facts=event_facts,
-            metadata={"event_enrichment": _event_enrichment_metadata(enrichment_metadata, enriched)},
+            metadata={"event_enrichment": _event_enrichment_metadata(enrichment_metadata, enriched, settings=self.settings)},
             positioning_context=positioning_context,
             sentiment_context=sentiment_context,
         )
@@ -717,60 +738,91 @@ class DiagnosticsService:
         return {"by_provider_status": [dict(row) for row in rows]}
 
 
-def _event_enrichment_metadata(metadata: dict[str, Any], events: list[Any]) -> dict[str, Any]:
+def _event_enrichment_metadata(
+    metadata: dict[str, Any],
+    events: list[Any],
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Materialize the AI enrichment state machine from actual dispatcher telemetry."""
     quality = metadata.get("data_quality") or {}
     warnings = quality.get("warnings") or metadata.get("warnings") or []
-    timeout = bool(quality.get("enrichment_timeout")) or any("timeout" in str(warning) for warning in warnings)
-    ai_called = bool(quality.get("ai_research_called") or quality.get("ai_research_requests"))
-    accepted_events = [
-        event for event in events
-        if getattr(getattr(event, "enrichment", None), "source_url", None)
-        and any(getattr(getattr(event, "enrichment", None), field, None) not in (None, "") for field in ("forecast", "previous", "consensus", "actual"))
-    ]
-    event_rows = []
+    enabled = bool(quality.get("ai_research_enabled", getattr(settings, "enable_ai_researcher", False)))
+    mode = str(quality.get("ai_research_mode") or getattr(settings, "ai_researcher_mode", "codex_cli"))
+    configured = bool(quality.get("ai_research_configured", enabled and mode in {"codex_cli", "openai_api"}))
+    ai_called = bool(quality.get("ai_research_called"))
+    candidate_ids = {str(value) for value in quality.get("ai_candidate_event_ids") or []}
+    raw_status = str(quality.get("ai_research_status") or "").lower()
+    failure_reason = quality.get("ai_failure_reason")
+    duration_ms = quality.get("ai_duration_ms")
+
+    if not enabled:
+        overall_status, reason = "disabled", "AI enrichment is disabled"
+    elif not configured:
+        overall_status, reason = "not_configured", "AI enrichment is not configured"
+    elif quality.get("ai_not_available"):
+        overall_status, reason = "not_available", str(failure_reason or "AI enrichment is unavailable")
+    elif not ai_called:
+        overall_status = "not_required"
+        reason = "optional enrichment skipped" if quality.get("enrichment_not_attempted") else "no AI-eligible event required enrichment"
+    elif raw_status in {"timeout"} or "timeout" in str(failure_reason or "").lower():
+        overall_status, reason = "timeout", str(failure_reason or "AI enrichment timed out")
+    elif raw_status in {"cancelled", "canceled"}:
+        overall_status, reason = "cancelled", str(failure_reason or "AI enrichment was cancelled")
+    elif raw_status in {"rejected"} or int(quality.get("ai_results_rejected") or 0) and not int(quality.get("ai_results_valid") or 0):
+        overall_status, reason = "rejected", str(failure_reason or "AI enrichment results were rejected")
+    elif raw_status in {"success", "no_data_available"}:
+        overall_status, reason = "completed", None
+    else:
+        overall_status, reason = "failed", str(failure_reason or raw_status or "AI enrichment failed")
+
+    event_rows: list[dict[str, Any]] = []
     for event in events:
         enrichment = getattr(event, "enrichment", None)
-        summary = getattr(enrichment, "summary", {}) or {}
+        attempted = ai_called and str(getattr(event, "event_id", "")) in candidate_ids
+        status = overall_status if attempted else (overall_status if overall_status in {"disabled", "not_configured", "not_available"} else "not_required")
+        source_url = getattr(enrichment, "source_url", None)
+        values = [field for field in ("forecast", "previous", "consensus", "actual") if getattr(enrichment, field, None) not in (None, "")]
+        accepted_fields = values if attempted and status == "completed" and source_url else []
+        rejected_fields = values if attempted and status == "rejected" else []
         event_rows.append(
             {
                 "event_id": getattr(event, "event_id", None),
                 "event_name": getattr(event, "name", None),
-                "AI_called": ai_called,
-                "attempted": ai_called and summary.get("research_priority", 99) <= 6,
-                "status": summary.get("temporal_status") or quality.get("enrichment_status"),
-                "failure_type": "timeout" if timeout else None,
-                "timeout": timeout,
-                "source_url": getattr(enrichment, "source_url", None),
-                "accepted_fields": [
-                    field for field in ("forecast", "previous", "consensus", "actual")
-                    if getattr(enrichment, field, None) not in (None, "") and getattr(enrichment, "source_url", None)
-                ],
-                "rejected_fields": [
-                    field for field in ("forecast", "previous", "consensus", "actual")
-                    if getattr(enrichment, field, None) not in (None, "") and not getattr(enrichment, "source_url", None)
-                ],
-                "confidence": getattr(enrichment, "confidence", None),
-                "reliability": getattr(enrichment, "reliability", None),
+                "AI_called": attempted,
+                "attempted": attempted,
+                "status": status,
+                "failure_type": status if status in {"failed", "timeout", "cancelled", "rejected"} else None,
+                "timeout": status == "timeout",
+                "duration_ms": duration_ms if attempted else None,
                 "persisted": getattr(enrichment, "cache_status", None) == "refreshed",
                 "read_back": getattr(enrichment, "cache_status", None) == "hit",
-                "rejection_reason": ";".join(getattr(enrichment, "warnings", []) or []) or None,
+                "accepted_fields": accepted_fields,
+                "rejected_fields": rejected_fields,
+                "source_urls": [source_url] if source_url else [],
+                "source_url": source_url,
+                "confidence": getattr(enrichment, "confidence", None),
+                "reliability": getattr(enrichment, "reliability", None),
+                "reason": reason if attempted or status != "not_required" else None,
             }
         )
+
     return {
-        "enabled": bool(getattr(metadata, "enabled", False)) if not isinstance(metadata, dict) else quality.get("ai_research_enabled", ai_called or "ai_researcher_disabled" not in warnings),
-        "configured": "ai_researcher_disabled" not in warnings,
-        "mode": quality.get("ai_research_mode") or metadata.get("ai_mode") or "codex_cli",
+        "enabled": enabled,
+        "configured": configured,
+        "mode": mode,
         "AI_called": ai_called,
-        "attempted_event_count": int(quality.get("ai_candidate_count") or sum(1 for row in event_rows if row["attempted"])),
-        "completed_event_count": int(quality.get("provider_hits") or 0),
-        "timeout_event_count": len(event_rows) if timeout else 0,
-        "failed_event_count": int(quality.get("provider_misses") or 0) if not timeout else 0,
-        "rejected_event_count": int(quality.get("ai_rejected_count") or 0),
-        "accepted_event_count": len(accepted_events),
-        "persisted_event_count": int(quality.get("facts_written") or len([row for row in event_rows if row["persisted"]])),
-        "read_back_event_count": int(quality.get("db_hits") or len([row for row in event_rows if row["read_back"]])),
-        "duration_ms": quality.get("duration_ms"),
-        "status": quality.get("enrichment_status") or ("ai_timeout" if timeout else "not_available"),
+        "attempted_event_count": sum(1 for row in event_rows if row["attempted"]),
+        "completed_event_count": sum(1 for row in event_rows if row["status"] == "completed"),
+        "timeout_event_count": sum(1 for row in event_rows if row["timeout"]),
+        "failed_event_count": sum(1 for row in event_rows if row["status"] == "failed"),
+        "rejected_event_count": sum(len(row["rejected_fields"]) for row in event_rows),
+        "accepted_event_count": sum(len(row["accepted_fields"]) for row in event_rows),
+        "persisted_event_count": sum(1 for row in event_rows if row["persisted"]),
+        "read_back_event_count": sum(1 for row in event_rows if row["read_back"]),
+        "duration_ms": duration_ms if ai_called else None,
+        "status": overall_status,
+        "reason": reason,
         "warnings": warnings,
         "events": event_rows[:25],
     }

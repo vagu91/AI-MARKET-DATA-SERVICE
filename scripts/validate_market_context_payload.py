@@ -74,6 +74,7 @@ def main() -> int:
     event_enrichment = (debug_force.get("metadata") or {}).get("event_enrichment") or {}
     if "AI_called" not in event_enrichment:
         errors.append("ai_called_missing_from_debug_event_enrichment")
+    errors.extend(_ai_enrichment_state_errors(event_enrichment))
     if _enrichment_value_without_source(debug_force):
         errors.append("enrichment_value_without_source")
 
@@ -109,8 +110,11 @@ def main() -> int:
         "ai_attempted_count": event_enrichment.get("attempted_event_count"),
         "ai_completed_count": event_enrichment.get("completed_event_count"),
         "ai_timeout_count": event_enrichment.get("timeout_event_count"),
+        "ai_failed_count": event_enrichment.get("failed_event_count"),
+        "ai_rejected_field_count": event_enrichment.get("rejected_event_count"),
         "ai_accepted_field_count": sum(len(item.get("accepted_fields") or []) for item in event_enrichment.get("events") or []),
-        "ai_rejected_field_count": sum(len(item.get("rejected_fields") or []) for item in event_enrichment.get("events") or []),
+        "ai_persisted_event_count": event_enrichment.get("persisted_event_count"),
+        "ai_read_back_event_count": event_enrichment.get("read_back_event_count"),
         "event_false_duplicates": 0 if "distinct_events_marked_duplicate" not in errors else 1,
         "qqq_unknown_weights_preserved": "zero_used_for_unknown_weight" not in errors,
         "social_sentiment_semantically_valid": "social_neutral_ratio_masks_absence_of_signal" not in errors,
@@ -161,6 +165,63 @@ def _walk(value: Any):
     elif isinstance(value, list):
         for item in value:
             yield from _walk(item)
+
+
+def _ai_enrichment_state_errors(enrichment: dict[str, Any]) -> list[str]:
+    """Validate that aggregate AI telemetry is a lossless summary of event rows."""
+    errors: list[str] = []
+    rows = enrichment.get("events") or []
+    allowed = {"disabled", "not_configured", "not_required", "not_available", "completed", "failed", "timeout", "cancelled", "rejected"}
+    global_status = enrichment.get("status")
+    if global_status not in allowed:
+        errors.append("ai_enrichment_unknown_global_status")
+    if global_status in {"completed", "failed", "timeout", "cancelled", "rejected"} and not enrichment.get("AI_called"):
+        errors.append("ai_enrichment_terminal_status_without_ai_call")
+    if global_status in {"disabled", "not_configured", "not_required", "not_available"} and enrichment.get("AI_called"):
+        errors.append("ai_enrichment_passive_status_with_ai_call")
+    for row in rows:
+        status = row.get("status")
+        attempted = bool(row.get("attempted"))
+        called = bool(row.get("AI_called"))
+        timeout = bool(row.get("timeout"))
+        if status not in allowed:
+            errors.append("ai_enrichment_unknown_event_status")
+        if not attempted and timeout:
+            errors.append("ai_enrichment_timeout_without_attempt")
+        if not called and status == "timeout":
+            errors.append("ai_enrichment_timeout_without_ai_call")
+        if attempted != called:
+            errors.append("ai_enrichment_attempt_call_mismatch")
+
+    attempted_count = sum(1 for row in rows if row.get("attempted"))
+    completed_count = sum(1 for row in rows if row.get("status") == "completed")
+    timeout_count = sum(1 for row in rows if row.get("timeout"))
+    failed_count = sum(1 for row in rows if row.get("status") == "failed")
+    accepted_count = sum(len(row.get("accepted_fields") or []) for row in rows)
+    rejected_count = sum(len(row.get("rejected_fields") or []) for row in rows)
+    persisted_count = sum(1 for row in rows if row.get("persisted"))
+    read_back_count = sum(1 for row in rows if row.get("read_back"))
+    if int(enrichment.get("attempted_event_count") or 0) != attempted_count:
+        errors.append("ai_enrichment_attempted_count_mismatch")
+    if int(enrichment.get("completed_event_count") or 0) != completed_count:
+        errors.append("ai_enrichment_completed_count_mismatch")
+    if int(enrichment.get("timeout_event_count") or 0) != timeout_count:
+        errors.append("ai_enrichment_timeout_count_mismatch")
+    if int(enrichment.get("failed_event_count") or 0) != failed_count:
+        errors.append("ai_enrichment_failed_count_mismatch")
+    if int(enrichment.get("accepted_event_count") or 0) != accepted_count:
+        errors.append("ai_enrichment_accepted_field_count_mismatch")
+    if int(enrichment.get("rejected_event_count") or 0) != rejected_count:
+        errors.append("ai_enrichment_rejected_field_count_mismatch")
+    if int(enrichment.get("persisted_event_count") or 0) != persisted_count:
+        errors.append("ai_enrichment_persisted_count_mismatch")
+    if int(enrichment.get("read_back_event_count") or 0) != read_back_count:
+        errors.append("ai_enrichment_read_back_count_mismatch")
+    if not enrichment.get("AI_called") and (attempted_count or completed_count or timeout_count):
+        errors.append("ai_enrichment_aggregate_call_mismatch")
+    if not attempted_count and timeout_count:
+        errors.append("ai_enrichment_timeout_count_without_attempt")
+    return list(dict.fromkeys(errors))
 
 
 def _contains_zero_unknown_weight(payload: dict[str, Any]) -> bool:
