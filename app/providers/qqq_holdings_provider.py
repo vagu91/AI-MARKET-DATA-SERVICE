@@ -1,9 +1,7 @@
-import csv
 import json
 import re
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
-from io import StringIO
 from typing import Any
 
 import httpx
@@ -15,7 +13,18 @@ from app.models.nasdaq import QQQHolding
 from app.providers.alpha_vantage import ensure_alpha_payload_ok, parse_percent
 from app.providers.base import BaseProvider, ProviderError, metadata
 from app.providers.calendar_utils import REQUEST_HEADERS
-
+from app.services.qqq_weight_intelligence_service import (
+    EQUAL_WEIGHT_PROXY,
+    OFFICIAL_QQQ_WEIGHT,
+    RECONSTRUCTED_MARKET_CAP_WEIGHT,
+    VENDOR_QQQ_WEIGHT,
+    WEIGHT_METHOD_RANK,
+    apply_weight_provenance,
+    log_weight_event,
+    parse_csv_holdings,
+    reconstruct_market_cap_weights,
+    validate_weight_set,
+)
 
 class QQQHoldingsProvider(BaseProvider):
     source = "QQQ Holdings"
@@ -28,9 +37,9 @@ class QQQHoldingsProvider(BaseProvider):
         super().__init__(cache)
         self.settings = settings
 
-    async def fetch_safe(self) -> ProviderResult:
+    async def fetch_safe(self, *, force: bool = False) -> ProviderResult:
         valid_cached = self._cached_result(max_age_hours=self.settings.qqq_holdings_ttl_hours)
-        if valid_cached:
+        if valid_cached and not force:
             return _with_quality_updates(
                 valid_cached,
                 cache_used=True,
@@ -58,8 +67,20 @@ class QQQHoldingsProvider(BaseProvider):
 
         data = result.data if isinstance(result.data, dict) else {}
         quality = data.get("data_quality") if isinstance(data.get("data_quality"), dict) else {}
+        if valid_cached and _result_rank(valid_cached) > _result_rank(result):
+            result = _preserve_better_cached_result(valid_cached, result)
+            data = result.data if isinstance(result.data, dict) else {}
+            quality = data.get("data_quality") if isinstance(data.get("data_quality"), dict) else {}
         if data.get("holdings") and not quality.get("provider_failed"):
-            self.cache.set(self.cache_key, result.model_dump(mode="json"))
+            if data.get("weight_method") != EQUAL_WEIGHT_PROXY:
+                self.cache.set(self.cache_key, result.model_dump(mode="json"))
+                log_weight_event(
+                    "qqq_weight_persisted",
+                    source=data.get("source"),
+                    method=data.get("weight_method"),
+                    constituent_count=len(data.get("holdings") or []),
+                    total_weight_pct=quality.get("total_weight_pct"),
+                )
             return result
         stale = self._cached_result(
             max_age_hours=self.settings.qqq_holdings_ttl_hours + self.settings.qqq_holdings_stale_tolerance_hours
@@ -83,52 +104,83 @@ class QQQHoldingsProvider(BaseProvider):
 
     async def fetch(self) -> ProviderResult:
         diagnostics = _diagnostics()
+        log_weight_event("qqq_weight_lookup_started", method="ranked_source_cascade")
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
             try:
                 diagnostics["provider_attempts"].append("invesco")
                 diagnostics["actual_network_calls"] += 1
+                diagnostics["source_attempt_count"] += 1
+                log_weight_event(
+                    "qqq_weight_source_attempted",
+                    source="Invesco QQQ Holdings",
+                    source_url=self.settings.invesco_qqq_holdings_url,
+                    method=OFFICIAL_QQQ_WEIGHT,
+                )
                 response = await client.get(
                     self.settings.invesco_qqq_holdings_url,
                     headers=REQUEST_HEADERS,
                     timeout=min(float(self.settings.http_timeout_seconds), 8.0),
                 )
                 diagnostics["invesco_http_status"] = response.status_code
-                if response.status_code == 403:
+                if response.status_code in {401, 403, 406}:
                     diagnostics["invesco_status"] = "access_restricted"
                     diagnostics["invesco_retryable"] = False
-                    raise ProviderError("Invesco holdings access_restricted http_status=403")
+                    diagnostics["failure_breakdown"]["access_restricted"] += 1
+                    raise ProviderError(
+                        f"Invesco holdings access_restricted http_status={response.status_code}"
+                    )
                 response.raise_for_status()
                 holdings, as_of, parse_errors = parse_invesco_holdings_csv(response.text)
                 diagnostics["errors"].extend(parse_errors)
                 if holdings:
-                    diagnostics["invesco_status"] = "found"
-                    return ProviderResult(
-                        metadata=metadata(
+                    candidate = _weighted_candidate(
+                        holdings=[item.model_dump(mode="json") for item in holdings],
+                        source="Invesco QQQ Holdings",
+                        source_url=self.settings.invesco_qqq_holdings_url,
+                        method=OFFICIAL_QQQ_WEIGHT,
+                        as_of=as_of,
+                        official=True,
+                        reconstructed=False,
+                        confidence=0.98,
+                        ttl_hours=self.settings.qqq_holdings_ttl_hours,
+                        total_tolerance_pct=self.settings.qqq_weight_total_tolerance_pct,
+                        minimum_coverage_pct=self.settings.qqq_weight_min_coverage_pct,
+                        maximum_constituent_pct=self.settings.qqq_weight_max_constituent_pct,
+                        diagnostics=diagnostics,
+                    )
+                    if candidate["validation"]["valid"]:
+                        diagnostics["invesco_status"] = "found"
+                        diagnostics["source_success_count"] += 1
+                        diagnostics["official_source_success"] = True
+                        log_weight_event(
+                            "qqq_weight_source_succeeded",
                             source="Invesco QQQ Holdings",
-                            provider_type=ProviderType.CSV,
-                            reliability=0.88,
-                            data_as_of=_parse_as_of(as_of),
-                            freshness=Freshness.RECENT,
-                            errors=diagnostics["errors"],
-                        ),
-                        data={
-                            "as_of": as_of,
-                            "holdings": [item.model_dump(mode="json") for item in holdings],
-                            "data_quality": _quality(
-                                holdings,
-                                diagnostics,
-                                final_source="Invesco QQQ Holdings",
-                                final_status="found",
-                                official_etf_holdings=True,
-                            ),
-                        },
+                            method=OFFICIAL_QQQ_WEIGHT,
+                            constituent_count=len(candidate["holdings"]),
+                            total_weight_pct=candidate["validation"].get("total_weight_pct"),
+                        )
+                        return _candidate_result(candidate, diagnostics, ProviderType.CSV, 0.98)
+                    diagnostics["failure_breakdown"][_validation_failure(candidate)] += 1
+                    log_weight_event(
+                        "qqq_weight_set_rejected",
+                        source="Invesco QQQ Holdings",
+                        method=OFFICIAL_QQQ_WEIGHT,
+                        fallback_reason=_validation_failure(candidate),
                     )
                 diagnostics["invesco_status"] = "not_found"
                 diagnostics["errors"].append("Invesco holdings returned no normalized holdings")
             except Exception as exc:
+                diagnostics["source_failure_count"] += 1
                 if diagnostics.get("invesco_status") is None:
                     diagnostics["invesco_status"] = "provider_failed"
+                    diagnostics["failure_breakdown"]["official_unavailable"] += 1
                 diagnostics["errors"].append(f"Invesco holdings request failed: {exc or 'empty error detail'}")
+                log_weight_event(
+                    "qqq_weight_source_failed",
+                    source="Invesco QQQ Holdings",
+                    method=OFFICIAL_QQQ_WEIGHT,
+                    fallback_reason=str(exc),
+                )
 
             if self.settings.alpha_vantage_api_key:
                 negative = self._alpha_negative_cache()
@@ -137,10 +189,18 @@ class QQQHoldingsProvider(BaseProvider):
                     diagnostics["alpha_vantage_status"] = str(negative.get("status") or "rate_limited")
                     diagnostics["alpha_vantage_rate_limited"] = True
                     diagnostics["alpha_vantage_next_retry_at"] = negative.get("next_retry_at")
+                    diagnostics["failure_breakdown"]["rate_limited"] += 1
                 else:
                     try:
                         diagnostics["provider_attempts"].append("alpha_vantage")
                         diagnostics["actual_network_calls"] += 1
+                        diagnostics["source_attempt_count"] += 1
+                        log_weight_event(
+                            "qqq_weight_source_attempted",
+                            source="Alpha Vantage ETF_PROFILE",
+                            source_url=self.settings.alpha_vantage_base_url,
+                            method=VENDOR_QQQ_WEIGHT,
+                        )
                         response = await client.get(
                             self.settings.alpha_vantage_base_url,
                             params={
@@ -157,6 +217,8 @@ class QQQHoldingsProvider(BaseProvider):
                             diagnostics["alpha_vantage_status"] = "rate_limited"
                             diagnostics["alpha_vantage_rate_limited"] = True
                             diagnostics["alpha_vantage_next_retry_at"] = next_retry_at
+                            diagnostics["source_failure_count"] += 1
+                            diagnostics["failure_breakdown"]["rate_limited"] += 1
                             self.cache.set(
                                 self.alpha_negative_cache_key,
                                 {
@@ -171,30 +233,31 @@ class QQQHoldingsProvider(BaseProvider):
                             holdings, parse_errors = parse_alpha_vantage_etf_profile(payload)
                             diagnostics["errors"].extend(parse_errors)
                             if holdings:
-                                diagnostics["alpha_vantage_status"] = "found"
-                                return ProviderResult(
-                                    metadata=metadata(
-                                        source="Alpha Vantage ETF_PROFILE",
-                                        provider_type=ProviderType.API,
-                                        reliability=0.9,
-                                        freshness=Freshness.RECENT,
-                                        errors=diagnostics["errors"],
-                                    ),
-                                    data={
-                                        "as_of": datetime.now(UTC).date().isoformat(),
-                                        "holdings": [item.model_dump(mode="json") for item in holdings],
-                                        "data_quality": _quality(
-                                            holdings,
-                                            diagnostics,
-                                            final_source="Alpha Vantage ETF_PROFILE",
-                                            final_status="found",
-                                            official_etf_holdings=True,
-                                        ),
-                                    },
+                                candidate = _weighted_candidate(
+                                    holdings=[item.model_dump(mode="json") for item in holdings],
+                                    source="Alpha Vantage ETF_PROFILE",
+                                    source_url=self.settings.alpha_vantage_base_url,
+                                    method=VENDOR_QQQ_WEIGHT,
+                                    as_of=datetime.now(UTC).date().isoformat(),
+                                    official=False,
+                                    reconstructed=False,
+                                    confidence=0.88,
+                                    ttl_hours=self.settings.qqq_holdings_ttl_hours,
+                                    total_tolerance_pct=self.settings.qqq_weight_total_tolerance_pct,
+                                    minimum_coverage_pct=self.settings.qqq_weight_min_coverage_pct,
+                                    maximum_constituent_pct=self.settings.qqq_weight_max_constituent_pct,
+                                    diagnostics=diagnostics,
                                 )
+                                if candidate["validation"]["valid"]:
+                                    diagnostics["alpha_vantage_status"] = "found"
+                                    diagnostics["source_success_count"] += 1
+                                    diagnostics["vendor_source_success"] = True
+                                    return _candidate_result(candidate, diagnostics, ProviderType.API, 0.88)
+                                diagnostics["failure_breakdown"][_validation_failure(candidate)] += 1
                             diagnostics["alpha_vantage_status"] = "not_found"
                             diagnostics["errors"].append("Alpha Vantage ETF_PROFILE returned no holdings")
                     except Exception as exc:
+                        diagnostics["source_failure_count"] += 1
                         if diagnostics.get("alpha_vantage_status") is None:
                             diagnostics["alpha_vantage_status"] = "provider_failed"
                         diagnostics["errors"].append(str(exc) or "Alpha Vantage ETF_PROFILE failed")
@@ -202,51 +265,61 @@ class QQQHoldingsProvider(BaseProvider):
                 diagnostics["alpha_vantage_status"] = "not_configured"
 
             try:
-                diagnostics["provider_attempts"].append("nasdaq_100_proxy")
+                diagnostics["provider_attempts"].append("nasdaq_100_market_cap")
                 diagnostics["actual_network_calls"] += 1
+                diagnostics["source_attempt_count"] += 1
+                log_weight_event(
+                    "qqq_weight_source_attempted",
+                    source="Nasdaq-100 Constituents",
+                    source_url=self.settings.nasdaq_100_constituents_url,
+                    method=RECONSTRUCTED_MARKET_CAP_WEIGHT,
+                )
                 response = await client.get(
                     self.settings.nasdaq_100_constituents_url,
                     headers=_nasdaq_headers(),
                     timeout=min(float(self.settings.http_timeout_seconds), 8.0),
                 )
                 response.raise_for_status()
-                holdings = parse_nasdaq_constituents(response.text)
-                if not holdings:
+                payload = response.json()
+                rows, as_of = _nasdaq_rows(payload)
+                if not rows:
                     raise ProviderError("Nasdaq-100 fallback returned no holdings")
-                diagnostics["nasdaq_proxy_used"] = True
-                return ProviderResult(
-                    metadata=metadata(
-                        source="Nasdaq-100 Constituents",
-                        provider_type=ProviderType.API,
-                        reliability=0.72,
-                        freshness=Freshness.RECENT,
-                        is_fallback=True,
-                        errors=[],
-                    ),
-                    data={
-                        "status": "proxy",
-                        "as_of": datetime.now(UTC).date().isoformat(),
-                        "holdings": [item.model_dump(mode="json") for item in holdings],
-                        "source": "Nasdaq-100 constituents",
-                        "proxy_for": "QQQ holdings",
-                        "is_proxy": True,
-                        "holdings_count": len(holdings),
-                        "weight_data_available": False,
-                        "official_etf_holdings": False,
-                        "data_quality": _quality(
-                            holdings,
-                            diagnostics,
-                            fallback_used=True,
-                            final_source="Nasdaq-100 constituents",
-                            final_status="proxy",
-                            is_proxy=True,
-                            proxy_for="QQQ holdings",
-                            official_etf_holdings=False,
-                            weight_data_available=False,
-                        ),
-                    },
+                candidate = reconstruct_market_cap_weights(
+                    rows,
+                    source="Nasdaq official constituent market-cap snapshot",
+                    source_url=self.settings.nasdaq_100_constituents_url,
+                    as_of=as_of,
+                    ttl_hours=self.settings.qqq_reconstructed_weight_ttl_hours,
+                    total_tolerance_pct=self.settings.qqq_weight_total_tolerance_pct,
+                    minimum_coverage_pct=self.settings.qqq_weight_min_coverage_pct,
+                    maximum_constituent_pct=self.settings.qqq_weight_max_constituent_pct,
                 )
+                candidate["proxy_for"] = "QQQ holdings / Nasdaq-100 modified weights"
+                if candidate["validation"]["valid"]:
+                    diagnostics["source_success_count"] += 1
+                    diagnostics["reconstruction_used"] = True
+                    diagnostics["nasdaq_proxy_used"] = True
+                    log_weight_event(
+                        "qqq_weight_fallback_selected",
+                        source=candidate["source"],
+                        method=RECONSTRUCTED_MARKET_CAP_WEIGHT,
+                        constituent_count=len(candidate["holdings"]),
+                        total_weight_pct=candidate["validation"].get("total_weight_pct"),
+                        fallback_reason="official_and_vendor_weights_unavailable",
+                    )
+                    return _candidate_result(candidate, diagnostics, ProviderType.API, 0.76)
+                diagnostics["failure_breakdown"][_validation_failure(candidate)] += 1
+                equal_candidate = _equal_weight_candidate(
+                    rows,
+                    source="Nasdaq-100 constituents",
+                    source_url=self.settings.nasdaq_100_constituents_url,
+                    as_of=as_of,
+                    diagnostics=diagnostics,
+                )
+                return _candidate_result(equal_candidate, diagnostics, ProviderType.API, 0.35)
             except Exception as exc:
+                diagnostics["source_failure_count"] += 1
+                diagnostics["failure_breakdown"]["official_unavailable"] += 1
                 diagnostics["errors"].append(f"Nasdaq-100 fallback request failed: {exc or 'empty error detail'}")
                 return ProviderResult(
                     metadata=metadata(
@@ -267,6 +340,7 @@ class QQQHoldingsProvider(BaseProvider):
                             final_status="not_found",
                             provider_failed=True,
                             final_data_available=False,
+                            weight_method=None,
                         ),
                     },
                 )
@@ -288,6 +362,12 @@ class QQQHoldingsProvider(BaseProvider):
         result.metadata.provider_type = ProviderType.CACHE
         result.metadata.is_fallback = True
         result.metadata.retrieved_at = datetime.now(UTC)
+        log_weight_event(
+            "qqq_weight_read_back",
+            source=data.get("source") or result.metadata.source,
+            method=data.get("weight_method"),
+            constituent_count=len(data.get("holdings") or []),
+        )
         return result
 
     def _alpha_negative_cache(self) -> dict[str, Any] | None:
@@ -301,41 +381,8 @@ class QQQHoldingsProvider(BaseProvider):
 
 
 def parse_invesco_holdings_csv(text: str) -> tuple[list[QQQHolding], str | None, list[str]]:
-    lines = [line for line in text.splitlines() if line.strip()]
-    as_of = None
-    for line in lines[:10]:
-        lower = line.lower()
-        if "as of" in lower:
-            as_of = line.split(",", maxsplit=1)[-1].strip().strip('"')
-            break
-
-    header_idx = 0
-    for idx, line in enumerate(lines):
-        lowered = line.lower()
-        if ("ticker" in lowered or "symbol" in lowered) and "weight" in lowered:
-            header_idx = idx
-            break
-
-    reader = csv.DictReader(StringIO("\n".join(lines[header_idx:])))
-    holdings: list[QQQHolding] = []
-    errors: list[str] = []
-    for row in reader:
-        symbol = _first(row, "Ticker", "Holding Ticker", "Symbol", "Identifier")
-        if not symbol:
-            continue
-        weight_raw = _first(row, "Weight", "Weight (%)", "% Weight", "Weighting")
-        weight = _parse_float(weight_raw)
-        if weight_raw and weight is None:
-            errors.append(f"Unable to parse weight for {symbol}")
-        holdings.append(
-            QQQHolding(
-                symbol=normalize_symbol(symbol),
-                name=_first(row, "Name", "Holding Name", "Security Name", "Company"),
-                weight=weight,
-                sector=_first(row, "Sector", "GICS Sector"),
-            )
-        )
-    return holdings, as_of, errors
+    rows, as_of, errors = parse_csv_holdings(text)
+    return [QQQHolding.model_validate(item) for item in rows], as_of, errors
 
 
 def parse_alpha_vantage_etf_profile(payload: dict[str, Any]) -> tuple[list[QQQHolding], list[str]]:
@@ -408,6 +455,10 @@ def parse_nasdaq_constituents(text: str) -> list[QQQHolding]:
                 name=row.get("companyName") or row.get("name"),
                 weight=None,
                 sector=row.get("sector"),
+                market_cap=_parse_float(row.get("marketCap")),
+                price=_parse_float(row.get("lastSalePrice")),
+                change_pct=_parse_float(row.get("percentageChange")),
+                price_source="Nasdaq",
             )
         )
     if holdings:
@@ -484,15 +535,6 @@ def normalize_symbol(symbol: str) -> str:
     return value
 
 
-def _first(row: dict[str, str], *keys: str) -> str | None:
-    lowered = {key.lower().strip(): value for key, value in row.items() if key}
-    for key in keys:
-        value = lowered.get(key.lower())
-        if value not in (None, ""):
-            return value.strip()
-    return None
-
-
 def _parse_float(value: str | None) -> float | None:
     if not value:
         return None
@@ -506,7 +548,7 @@ def _parse_float(value: str | None) -> float | None:
 def _parse_as_of(value: str | None) -> datetime | None:
     if not value:
         return None
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d-%b-%Y"):
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d-%b-%Y", "%b %d, %Y"):
         try:
             parsed = datetime.strptime(value, fmt)
             return parsed.replace(tzinfo=UTC)
@@ -541,6 +583,239 @@ def _nasdaq_headers() -> dict[str, str]:
     }
 
 
+def _nasdaq_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    table = data.get("data") if isinstance(data.get("data"), dict) else data
+    rows = table.get("rows") or data.get("rows") or []
+    as_of = table.get("date") or data.get("date") or table.get("asOf") or data.get("asOf")
+    return [row for row in rows if isinstance(row, dict)], str(as_of) if as_of else None
+
+
+def _weighted_candidate(
+    *,
+    holdings: list[dict[str, Any]],
+    source: str,
+    source_url: str,
+    method: str,
+    as_of: str | None,
+    official: bool,
+    reconstructed: bool,
+    confidence: float,
+    ttl_hours: float,
+    total_tolerance_pct: float,
+    minimum_coverage_pct: float,
+    maximum_constituent_pct: float,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    apply_weight_provenance(
+        holdings,
+        method=method,
+        source=source,
+        source_url=source_url,
+        as_of=as_of,
+        retrieved_at=now,
+        valid_until=now + timedelta(hours=float(ttl_hours)),
+        official=official,
+        reconstructed=reconstructed,
+        confidence=confidence,
+    )
+    validation = validate_weight_set(
+        holdings,
+        total_tolerance_pct=total_tolerance_pct,
+        minimum_coverage_pct=minimum_coverage_pct,
+        maximum_constituent_pct=maximum_constituent_pct,
+    )
+    if not validation["valid"]:
+        diagnostics["errors"].append(
+            f"{source} weight set rejected: {','.join(validation['rejection_reasons']) or 'invalid'}"
+        )
+    return {
+        "status": "found" if validation["valid"] else "partial",
+        "as_of": as_of,
+        "source": source,
+        "source_url": source_url,
+        "weight_method": method,
+        "weight_is_official": official,
+        "weight_is_reconstructed": reconstructed,
+        "weight_verified": validation["valid"],
+        "weight_confidence": confidence if validation["valid"] else min(confidence, 0.5),
+        "weight_valid_until": (now + timedelta(hours=float(ttl_hours))).isoformat(),
+        "holdings": sorted(holdings, key=lambda item: float(item.get("weight") or -1), reverse=True),
+        "validation": validation,
+    }
+
+
+def _equal_weight_candidate(
+    rows: list[dict[str, Any]],
+    *,
+    source: str,
+    source_url: str,
+    as_of: str | None,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    base = parse_nasdaq_constituents(json.dumps({"data": {"rows": rows}}))
+    weight = 100.0 / len(base) if base else None
+    holdings = [item.model_dump(mode="json") for item in base]
+    apply_weight_provenance(
+        holdings,
+        method=EQUAL_WEIGHT_PROXY,
+        source=source,
+        source_url=source_url,
+        as_of=as_of,
+        retrieved_at=now,
+        valid_until=now + timedelta(hours=1),
+        official=False,
+        reconstructed=False,
+        confidence=0.35,
+    )
+    for holding in holdings:
+        holding["weight"] = weight
+        holding["weight_pct"] = weight
+        holding["weight_verified"] = False
+    diagnostics["equal_weight_used"] = True
+    diagnostics["nasdaq_proxy_used"] = True
+    return {
+        "status": "proxy",
+        "as_of": as_of,
+        "source": source,
+        "source_url": source_url,
+        "weight_method": EQUAL_WEIGHT_PROXY,
+        "weight_is_official": False,
+        "weight_is_reconstructed": False,
+        "weight_verified": False,
+        "weight_confidence": 0.35,
+        "weight_valid_until": (now + timedelta(hours=1)).isoformat(),
+        "holdings": holdings,
+        "validation": validate_weight_set(holdings),
+        "proxy_for": "QQQ holdings / Nasdaq-100 weights",
+    }
+
+
+def _candidate_result(
+    candidate: dict[str, Any],
+    diagnostics: dict[str, Any],
+    provider_type: ProviderType,
+    reliability: float,
+) -> ProviderResult:
+    method = str(candidate.get("weight_method") or "")
+    is_proxy = method in {RECONSTRUCTED_MARKET_CAP_WEIGHT, EQUAL_WEIGHT_PROXY}
+    official_qqq = method == OFFICIAL_QQQ_WEIGHT
+    holding_models = [QQQHolding.model_validate(item) for item in candidate.get("holdings") or []]
+    validation = candidate.get("validation") or {}
+    final_status = "proxy" if method == EQUAL_WEIGHT_PROXY else "found"
+    quality = _quality(
+        holding_models,
+        diagnostics,
+        fallback_used=is_proxy,
+        final_source=candidate.get("source"),
+        final_status=final_status,
+        is_proxy=is_proxy,
+        proxy_for=candidate.get("proxy_for"),
+        official_etf_holdings=official_qqq,
+        weight_data_available=bool(validation.get("non_null_weight_count")),
+        weight_method=method,
+        validation=validation,
+    )
+    quality["next_weight_refresh_at"] = candidate.get("weight_valid_until")
+    weight_as_of = _parse_as_of(candidate.get("as_of"))
+    quality["weight_age_hours"] = (
+        round((datetime.now(UTC) - weight_as_of).total_seconds() / 3600.0, 3)
+        if weight_as_of
+        else None
+    )
+    quality["stale_weight_count"] = len(holding_models) if quality.get("stale") else 0
+    quality["weight_quality_score"] = round(
+        reliability * (1.0 if candidate.get("weight_verified") else 0.75), 3
+    )
+    quality["alternative_sources"] = quality.get("fallback_chain") or []
+    log_weight_event(
+        "qqq_weight_set_validated",
+        source=candidate.get("source"),
+        method=method,
+        constituent_count=len(holding_models),
+        total_weight_pct=validation.get("total_weight_pct"),
+        coverage_pct=validation.get("coverage_pct"),
+    )
+    return ProviderResult(
+        metadata=metadata(
+            source=str(candidate.get("source") or "QQQ Holdings"),
+            provider_type=provider_type,
+            reliability=reliability,
+            data_as_of=_parse_as_of(candidate.get("as_of")),
+            freshness=Freshness.RECENT,
+            is_fallback=is_proxy,
+            errors=[],
+        ),
+        data={
+            **candidate,
+            "is_proxy": is_proxy,
+            "proxy_for": candidate.get("proxy_for"),
+            "holdings_count": len(holding_models),
+            "weight_data_available": bool(validation.get("non_null_weight_count")),
+            "official_etf_holdings": official_qqq,
+            "data_quality": quality,
+        },
+    )
+
+
+def _validation_failure(candidate: dict[str, Any]) -> str:
+    reasons = list((candidate.get("validation") or {}).get("rejection_reasons") or [])
+    return reasons[0] if reasons else "partial_response"
+
+
+def _result_rank(result: ProviderResult) -> int:
+    data = result.data if isinstance(result.data, dict) else {}
+    return WEIGHT_METHOD_RANK.get(str(data.get("weight_method") or ""), 0)
+
+
+def _preserve_better_cached_result(cached: ProviderResult, attempted: ProviderResult) -> ProviderResult:
+    attempted_data = attempted.data if isinstance(attempted.data, dict) else {}
+    attempted_quality = attempted_data.get("data_quality") or {}
+    cached_data = cached.data if isinstance(cached.data, dict) else {}
+    quality = cached_data.setdefault("data_quality", {})
+    quality.update(
+        {
+            "provider_attempts": attempted_quality.get("provider_attempts") or [],
+            "actual_network_calls": int(attempted_quality.get("actual_network_calls") or 0),
+            "source_attempt_count": int(attempted_quality.get("source_attempt_count") or 0),
+            "source_success_count": int(attempted_quality.get("source_success_count") or 0),
+            "source_failure_count": int(attempted_quality.get("source_failure_count") or 0),
+            "failure_breakdown": attempted_quality.get("failure_breakdown") or {},
+            "last_known_good_used": True,
+            "fallback_used": True,
+            "final_status": "found",
+            "final_source": cached_data.get("source") or cached.metadata.source,
+            "warnings": [
+                _aggregate_warning(
+                    "valid_last_known_good_preserved",
+                    f"attempted_method={attempted_data.get('weight_method')}",
+                )
+            ],
+        }
+    )
+    cached.data = cached_data
+    log_weight_event(
+        "qqq_weight_fallback_selected",
+        source=cached_data.get("source"),
+        method=cached_data.get("weight_method"),
+        fallback_reason="new_candidate_rank_lower_than_valid_last_known_good",
+    )
+    return cached
+
+
+def _attempt_status(attempt: str, diagnostics: dict[str, Any]) -> str:
+    if attempt == "invesco":
+        return str(diagnostics.get("invesco_status") or "attempted")
+    if attempt.startswith("alpha_vantage"):
+        return str(diagnostics.get("alpha_vantage_status") or "attempted")
+    if attempt.startswith("nasdaq_100"):
+        return "reconstructed" if diagnostics.get("reconstruction_used") else "proxy"
+    return "cache_hit" if "cache" in attempt else "attempted"
+
+
 def _diagnostics() -> dict[str, Any]:
     return {
         "provider_attempts": [],
@@ -555,6 +830,25 @@ def _diagnostics() -> dict[str, Any]:
         "invesco_retryable": None,
         "nasdaq_proxy_used": False,
         "last_known_good_used": False,
+        "source_attempt_count": 0,
+        "source_success_count": 0,
+        "source_failure_count": 0,
+        "official_source_success": False,
+        "vendor_source_success": False,
+        "reconstruction_used": False,
+        "equal_weight_used": False,
+        "failure_breakdown": {
+            "official_unavailable": 0,
+            "access_restricted": 0,
+            "rate_limited": 0,
+            "schema_changed": 0,
+            "partial_response": 0,
+            "invalid_total_weight": 0,
+            "missing_constituents": 0,
+            "stale_source": 0,
+            "market_cap_missing": 0,
+            "price_missing": 0,
+        },
         "errors": [],
     }
 
@@ -571,12 +865,17 @@ def _quality(
     proxy_for: str | None = None,
     official_etf_holdings: bool = True,
     weight_data_available: bool | None = None,
+    weight_method: str | None = None,
+    validation: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     if isinstance(diagnostics, list):
         diagnostics = {**_diagnostics(), "errors": diagnostics}
     weights_available = all(item.weight is not None for item in holdings) if holdings else False
     if weight_data_available is None:
         weight_data_available = weights_available
+    validation = validation or validate_weight_set(
+        [item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) for item in holdings]
+    )
     warning = _aggregate_warning(
         f"invesco={diagnostics.get('invesco_status')}",
         f"alpha_vantage={diagnostics.get('alpha_vantage_status')}",
@@ -613,6 +912,32 @@ def _quality(
         "proxy_for": proxy_for,
         "official_etf_holdings": official_etf_holdings,
         "weight_data_available": bool(weight_data_available),
+        "source_attempt_count": int(diagnostics.get("source_attempt_count") or 0),
+        "source_success_count": int(diagnostics.get("source_success_count") or 0),
+        "source_failure_count": int(diagnostics.get("source_failure_count") or 0),
+        "official_source_success": bool(diagnostics.get("official_source_success")),
+        "vendor_source_success": bool(diagnostics.get("vendor_source_success")),
+        "reconstruction_used": bool(diagnostics.get("reconstruction_used")),
+        "equal_weight_used": bool(diagnostics.get("equal_weight_used")),
+        "weighted_constituent_count": int(validation.get("weighted_constituent_count") or 0),
+        "missing_weight_count": int(validation.get("missing_weight_count") or 0),
+        "duplicate_symbol_count": int(validation.get("duplicate_symbol_count") or 0),
+        "negative_weight_count": int(validation.get("negative_weight_count") or 0),
+        "zero_weight_count": int(validation.get("zero_weight_count") or 0),
+        "total_weight_pct": validation.get("total_weight_pct"),
+        "top_10_weight_pct": validation.get("top_10_weight_pct"),
+        "largest_weight_pct": validation.get("largest_weight_pct"),
+        "weight_coverage_pct": float(validation.get("coverage_pct") or 0.0),
+        "official_weight_coverage_pct": float(validation.get("coverage_pct") or 0.0) if official_etf_holdings else 0.0,
+        "normalization_applied": bool(validation.get("normalization_applied")),
+        "weight_method": weight_method,
+        "weight_freshness": "FRESH" if final_status in {"found", "reconstructed"} else "STALE" if final_status == "stale_acceptable" else "UNKNOWN",
+        "last_successful_weight_refresh_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z") if holdings else None,
+        "failure_breakdown": dict(diagnostics.get("failure_breakdown") or {}),
+        "fallback_chain": [
+            {"source": item, "status": _attempt_status(item, diagnostics)}
+            for item in diagnostics.get("provider_attempts") or []
+        ],
     }
 
 

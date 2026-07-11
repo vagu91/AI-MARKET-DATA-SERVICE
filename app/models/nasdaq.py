@@ -39,8 +39,35 @@ class DataQuality(BaseModel):
 class QQQHolding(BaseModel):
     symbol: str
     name: str | None = None
+    company_name: str | None = None
+    share_class: str | None = None
     weight: float | None = None
+    weight_pct: float | None = None
     sector: str | None = None
+    weight_source: str | None = None
+    weight_source_url: str | None = None
+    weight_method: str | None = None
+    weight_as_of: str | None = None
+    weight_retrieved_at: datetime | None = None
+    weight_valid_until: datetime | None = None
+    weight_verified: bool = False
+    weight_is_official: bool = False
+    weight_is_reconstructed: bool = False
+    weight_confidence: float = 0.0
+    market_cap: float | None = None
+    price: float | None = None
+    change_pct: float | None = None
+    price_source: str | None = None
+    shares_outstanding: float | None = None
+    source: str | None = None
+    source_url: str | None = None
+    as_of: str | None = None
+    retrieved_at: datetime | None = None
+    valid_until: datetime | None = None
+    is_official: bool = False
+    is_reconstructed: bool = False
+    confidence: float = 0.0
+    warnings: list[str] = Field(default_factory=list)
 
 
 class QQQHoldingsQuality(DataQuality):
@@ -66,6 +93,39 @@ class QQQHoldingsQuality(DataQuality):
     proxy_for: str | None = None
     official_etf_holdings: bool = True
     weight_data_available: bool = True
+    source_attempt_count: int = 0
+    source_success_count: int = 0
+    source_failure_count: int = 0
+    official_source_success: bool = False
+    vendor_source_success: bool = False
+    reconstruction_used: bool = False
+    equal_weight_used: bool = False
+    weighted_constituent_count: int = 0
+    missing_weight_count: int = 0
+    missing_price_count: int = 0
+    duplicate_symbol_count: int = 0
+    negative_weight_count: int = 0
+    zero_weight_count: int = 0
+    total_weight_pct: float | None = None
+    top_10_weight_pct: float | None = None
+    largest_weight_pct: float | None = None
+    weight_coverage_pct: float = 0.0
+    official_weight_coverage_pct: float = 0.0
+    price_coverage_pct: float = 0.0
+    weighted_contribution_coverage_pct: float = 0.0
+    sector_weight_coverage_pct: float = 0.0
+    stale_weight_count: int = 0
+    proxy_penalty: float = 0.0
+    weight_quality_score: float = 0.0
+    weight_method: str | None = None
+    weight_freshness: str = "UNKNOWN"
+    weight_age_hours: float | None = None
+    last_successful_weight_refresh_at: str | None = None
+    next_weight_refresh_at: str | None = None
+    normalization_applied: bool = False
+    fallback_chain: list[dict[str, Any]] = Field(default_factory=list)
+    alternative_sources: list[dict[str, Any]] = Field(default_factory=list)
+    failure_breakdown: dict[str, int] = Field(default_factory=dict)
 
 
 class QQQHoldingsResponse(BaseModel):
@@ -81,6 +141,15 @@ class QQQHoldingsResponse(BaseModel):
     holdings_count: int = 0
     weight_data_available: bool = True
     official_etf_holdings: bool = True
+    weight_method: str | None = None
+    weight_source: str | None = None
+    weight_source_url: str | None = None
+    weight_as_of: str | None = None
+    weight_valid_until: datetime | None = None
+    weight_verified: bool = False
+    weight_is_official: bool = False
+    weight_is_reconstructed: bool = False
+    weight_confidence: float = 0.0
     holdings: list[QQQHolding] = Field(default_factory=list)
     data_quality: QQQHoldingsQuality
 
@@ -89,6 +158,8 @@ class MegaCapStock(BaseModel):
     symbol: str
     name: str | None = None
     weight: float | None = None
+    weight_method: str | None = None
+    weight_source: str | None = None
     last_price: float | None = None
     change: float | None = None
     change_pct: float | None = None
@@ -117,14 +188,24 @@ class MegaCapSnapshotResponse(BaseModel):
 class BreadthContributor(BaseModel):
     symbol: str
     weight: float
+    weight_pct: float | None = None
     change_pct: float
     weighted_contribution: float
+    weighted_contribution_pct_points: float | None = None
+    contribution_rank: int | None = None
+    direction: str | None = None
+    price_source: str | None = None
+    weight_source: str | None = None
 
 
 class MegaCapBreadthQuality(BaseModel):
     missing_weights: list[str] = Field(default_factory=list)
     missing_prices: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    covered_weight_pct: float = 0.0
+    uncovered_weight_pct: float = 100.0
+    price_coverage_pct: float = 0.0
+    weight_coverage_pct: float = 0.0
 
 
 class MegaCapBreadthResponse(BaseModel):
@@ -138,6 +219,19 @@ class MegaCapBreadthResponse(BaseModel):
     weighted_neutral_pct: float
     average_change_pct: float
     weighted_average_change_pct: float
+    coverage_adjusted_weighted_change_pct: float | None = None
+    weighted_positive_contribution: float = 0.0
+    weighted_negative_contribution: float = 0.0
+    weighted_net_contribution: float = 0.0
+    covered_weight_pct: float = 0.0
+    uncovered_weight_pct: float = 100.0
+    calculation_method: str = "unavailable"
+    weight_method: str | None = None
+    covered_symbols: list[str] = Field(default_factory=list)
+    missing_price_symbols: list[str] = Field(default_factory=list)
+    missing_weight_symbols: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    is_proxy: bool = False
     top_positive_contributors: list[BreadthContributor] = Field(default_factory=list)
     top_negative_contributors: list[BreadthContributor] = Field(default_factory=list)
     source: str = "MEGA_CAP_SNAPSHOT+QQQ_HOLDINGS"

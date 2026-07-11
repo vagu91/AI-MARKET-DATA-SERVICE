@@ -6,6 +6,12 @@ from typing import Any
 
 from app.services.data_freshness_service import parse_datetime
 from app.services.news_intelligence_service import build_news_digest as build_intelligence_news_digest
+from app.services.qqq_weight_intelligence_service import (
+    concentration_metrics,
+    sector_weight_exposure,
+    weight_quality_score,
+    weighted_contributions,
+)
 
 
 SEMICONDUCTOR_SYMBOLS = {"NVDA", "AVGO", "AMD", "MU", "INTC", "AMAT", "QCOM", "ARM", "ASML", "LRCX", "KLAC", "MRVL"}
@@ -242,12 +248,50 @@ def build_news_digest(news_context: dict[str, Any], *, coverage_window_hours: in
 
 def enrich_nasdaq_context(nasdaq_context: dict[str, Any], news_context: dict[str, Any]) -> dict[str, Any]:
     output = dict(nasdaq_context)
-    holdings = list((output.get("qqq_holdings") or {}).get("top_holdings") or [])
+    qqq = output.get("qqq_holdings") or {}
+    holdings = list(qqq.get("holdings") or qqq.get("top_holdings") or [])
     stocks = list((output.get("mega_cap_snapshot") or {}).get("stocks") or [])
     breadth = output.get("mega_cap_breadth") or {}
     output["breadth_summary"] = _breadth_summary(breadth)
-    output["concentration"] = _concentration(holdings)
-    output["semiconductor_context"] = _semiconductor_context(holdings, stocks)
+    output["concentration"] = {
+        **_concentration(holdings),
+        "weight_method": qqq.get("weight_method"),
+        "source": qqq.get("weight_source") or qqq.get("source"),
+    }
+    output["semiconductor_context"] = {
+        **_semiconductor_context(holdings, stocks),
+        "weight_method": qqq.get("weight_method"),
+        "source": qqq.get("weight_source") or qqq.get("source"),
+    }
+    exposure = sector_weight_exposure(holdings)
+    exposure["source"] = qqq.get("weight_source") or qqq.get("source")
+    exposure["weight_method"] = qqq.get("weight_method")
+    for sector in exposure.get("sectors") or []:
+        sector["source"] = exposure["source"]
+        sector["coverage_pct"] = exposure.get("sector_weight_coverage_pct")
+    output["sector_exposure"] = {**(output.get("sector_exposure") or {}), **exposure}
+    weight_coverage = float((qqq.get("data_quality") or {}).get("weight_coverage_pct") or 0.0)
+    price_coverage = float((breadth.get("data_quality") or {}).get("price_coverage_pct") or 0.0)
+    sector_coverage = float(exposure.get("sector_weight_coverage_pct") or 0.0)
+    quality = weight_quality_score(
+        method=qqq.get("weight_method"),
+        weight_coverage_pct=weight_coverage,
+        price_coverage_pct=price_coverage,
+        sector_coverage_pct=sector_coverage,
+        stale=bool((qqq.get("data_quality") or {}).get("stale")),
+    )
+    output["weight_quality"] = {
+        **quality,
+        "weight_coverage_pct": weight_coverage,
+        "official_weight_coverage_pct": float((qqq.get("data_quality") or {}).get("official_weight_coverage_pct") or 0.0),
+        "price_coverage_pct": price_coverage,
+        "weighted_contribution_coverage_pct": float(breadth.get("covered_weight_pct") or 0.0),
+        "sector_weight_coverage_pct": sector_coverage,
+        "stale_weight_count": int((qqq.get("data_quality") or {}).get("stale_weight_count") or 0),
+        "missing_weight_count": int((qqq.get("data_quality") or {}).get("missing_weight_count") or 0),
+        "missing_price_count": len(breadth.get("missing_price_symbols") or []),
+        "calculation_method": breadth.get("calculation_method"),
+    }
     output["driver_context"] = _driver_context(holdings, stocks, output.get("earnings") or {}, news_context)
     output["status"] = "available" if output else "no_data_available"
     return output
@@ -349,7 +393,7 @@ def _breadth_summary(breadth: dict[str, Any]) -> dict[str, Any]:
     value = weighted_avg if weighted_avg is not None else avg_change
     avg = float(value) if value is not None else None
     classification = "UNKNOWN" if avg is None else "POSITIVE" if avg > 0.05 else "NEGATIVE" if avg < -0.05 else "MIXED"
-    weight_available = weighted_avg is not None
+    weight_available = weighted_avg is not None and bool(breadth.get("weight_method"))
     return {
         "positive_count": int(breadth.get("positive_count") or 0),
         "negative_count": int(breadth.get("negative_count") or 0),
@@ -358,55 +402,48 @@ def _breadth_summary(breadth: dict[str, Any]) -> dict[str, Any]:
         "weighted_negative_pct": breadth.get("weighted_negative_pct"),
         "weighted_average_change_pct": weighted_avg,
         "average_change_pct": avg_change,
-        "calculation_method": "provider_weighted" if weight_available else ("equal_weight_proxy" if avg_change is not None else "unavailable"),
-        "is_proxy": not weight_available and avg_change is not None,
+        "calculation_method": breadth.get("calculation_method") or ("partial_weighted" if weight_available else "equal_weight_proxy" if avg_change is not None else "unavailable"),
+        "weight_method": breadth.get("weight_method"),
+        "covered_symbols": breadth.get("covered_symbols") or [],
+        "missing_price_symbols": breadth.get("missing_price_symbols") or [],
+        "missing_weight_symbols": breadth.get("missing_weight_symbols") or [],
+        "covered_weight_pct": breadth.get("covered_weight_pct"),
+        "uncovered_weight_pct": breadth.get("uncovered_weight_pct"),
+        "coverage_adjusted_weighted_change_pct": breadth.get("coverage_adjusted_weighted_change_pct"),
+        "weighted_positive_contribution": breadth.get("weighted_positive_contribution"),
+        "weighted_negative_contribution": breadth.get("weighted_negative_contribution"),
+        "weighted_net_contribution": breadth.get("weighted_net_contribution"),
+        "is_proxy": bool(breadth.get("is_proxy")),
         "proxy_reason": None if weight_available else "QQQ constituent weights unavailable",
-        "reliability": 0.75 if weight_available else (0.45 if avg_change is not None else 0.0),
+        "reliability": breadth.get("confidence") or (0.75 if weight_available else (0.45 if avg_change is not None else 0.0)),
         "classification": classification,
     }
 
 
 def _concentration(holdings: list[dict[str, Any]]) -> dict[str, Any]:
-    weights = [_float_or_none(item.get("weight")) for item in holdings]
-    if holdings and not any(weight is not None for weight in weights):
-        largest = holdings[0]
-        return {
-            "top_5_weight_pct": None,
-            "top_10_weight_pct": None,
-            "largest_constituent_symbol": largest.get("symbol"),
-            "largest_constituent_weight_pct": None,
-            "classification": "UNKNOWN",
-            "weight_data_available": False,
-        }
-    numeric_weights = [weight or 0.0 for weight in weights]
-    top5 = round(sum(numeric_weights[:5]), 4)
-    top10 = round(sum(numeric_weights[:10]), 4)
-    largest = holdings[0] if holdings else {}
-    classification = "HIGH" if top10 >= 45 else "MEDIUM" if top10 >= 30 else "LOW"
-    return {
-        "top_5_weight_pct": top5,
-        "top_10_weight_pct": top10,
-        "largest_constituent_symbol": largest.get("symbol"),
-        "largest_constituent_weight_pct": largest.get("weight"),
-        "classification": classification,
-        "weight_data_available": True,
-    }
+    return concentration_metrics(holdings)
 
 
 def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str, Any]]) -> dict[str, Any]:
     by_symbol = {str(item.get("symbol")).upper(): item for item in stocks}
     weight_by_symbol = {str(item.get("symbol")).upper(): _float_or_none(item.get("weight")) for item in holdings}
     holding_symbols = {str(item.get("symbol")).upper() for item in holdings}
+    holding_by_symbol = {str(item.get("symbol")).upper(): item for item in holdings}
     relevant = [symbol for symbol in SEMICONDUCTOR_SYMBOLS if symbol in holding_symbols or symbol in by_symbol]
-    resolved = [symbol for symbol in relevant if symbol in by_symbol]
-    unresolved = [symbol for symbol in relevant if symbol not in by_symbol]
+    resolved = [
+        symbol
+        for symbol in relevant
+        if symbol in by_symbol
+        or _float_or_none((holding_by_symbol.get(symbol) or {}).get("change_pct")) is not None
+    ]
+    unresolved = [symbol for symbol in relevant if symbol not in resolved]
     excluded = [symbol for symbol in SEMICONDUCTOR_SYMBOLS if symbol not in relevant]
-    positive = sum(1 for symbol in resolved if float(by_symbol[symbol].get("change_pct") or 0.0) > 0)
-    negative = sum(1 for symbol in resolved if float(by_symbol[symbol].get("change_pct") or 0.0) < 0)
-    total_weight = sum(weight for symbol in resolved if (weight := weight_by_symbol.get(symbol)) is not None)
-    weighted = None
-    if total_weight:
-        weighted = round(sum((weight_by_symbol.get(symbol) or 0.0) * float(by_symbol[symbol].get("change_pct") or 0.0) for symbol in resolved) / total_weight, 4)
+    semi_holdings = [holding_by_symbol[symbol] for symbol in relevant if symbol in holding_by_symbol]
+    contribution = weighted_contributions(semi_holdings, stocks)
+    rows = contribution["contributors"]
+    positive = sum(1 for item in rows if item["change_pct"] > 0)
+    negative = sum(1 for item in rows if item["change_pct"] < 0)
+    total_weight = sum(weight for symbol in relevant if (weight := weight_by_symbol.get(symbol)) is not None)
     classification = "INSUFFICIENT_DATA" if not resolved else "POSITIVE" if positive > negative else "NEGATIVE" if negative > positive else "MIXED"
     return {
         "symbols": sorted(SEMICONDUCTOR_SYMBOLS),
@@ -419,7 +456,14 @@ def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str
         "exclusion_reason": {symbol: "not_present_in_current_qqq_holdings_or_snapshot" for symbol in excluded},
         "positive_count": positive,
         "negative_count": negative,
-        "weighted_change_pct": weighted,
+        "semiconductor_weight_pct": round(total_weight, 4),
+        "weighted_change_pct": contribution["coverage_adjusted_weighted_change_pct"],
+        "semiconductor_weighted_change_pct": contribution["coverage_adjusted_weighted_change_pct"],
+        "semiconductor_positive_contribution": contribution["weighted_positive_contribution"],
+        "semiconductor_negative_contribution": contribution["weighted_negative_contribution"],
+        "semiconductor_net_contribution": contribution["weighted_net_contribution"],
+        "top_semiconductor_contributors": rows[:5],
+        "coverage_pct": round(contribution["covered_weight_pct"] / total_weight * 100.0, 4) if total_weight else 0.0,
         "classification": classification,
         "recent_news_count": 0,
         "upcoming_earnings_count": 0,
@@ -427,6 +471,8 @@ def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str
             "resolution_pct": _pct(len(resolved), len(SEMICONDUCTOR_SYMBOLS)),
             "unresolved_reason": {symbol: "missing_from_mega_cap_snapshot_provider_output" for symbol in unresolved},
             "weight_data_available": any(weight is not None for weight in weight_by_symbol.values()),
+            "missing_price_symbols": contribution["missing_price_symbols"],
+            "covered_weight_pct": contribution["covered_weight_pct"],
         },
     }
 

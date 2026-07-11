@@ -80,7 +80,7 @@ def test_alpha_vantage_daily_rate_limit_payload_detected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_qqq_holdings_invesco_403_alpha_rate_limit_then_nasdaq_proxy(tmp_path) -> None:
+async def test_qqq_equal_weight_proxy_is_runtime_only_after_upstream_failures(tmp_path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("ALPHA_VANTAGE_API_KEY=test-key\n", encoding="utf-8")
     settings = Settings(
@@ -110,16 +110,17 @@ async def test_qqq_holdings_invesco_403_alpha_rate_limit_then_nasdaq_proxy(tmp_p
         second = await provider.fetch_safe()
 
     quality = result.data["data_quality"]
-    assert invesco.call_count == 1
+    assert invesco.call_count == 2
     assert alpha.call_count == 1
-    assert nasdaq.call_count == 1
-    assert second.metadata.provider_type == "CACHE"
-    assert second.data["data_quality"]["actual_network_calls"] == 0
+    assert nasdaq.call_count == 2
+    assert second.metadata.provider_type == "API"
+    assert second.data["data_quality"]["actual_network_calls"] == 2
     assert result.data["status"] == "proxy"
     assert result.data["is_proxy"] is True
     assert result.data["official_etf_holdings"] is False
-    assert result.data["weight_data_available"] is False
-    assert result.data["holdings"][0]["weight"] is None
+    assert result.data["weight_data_available"] is True
+    assert result.data["weight_method"] == "equal_weight_proxy"
+    assert result.data["holdings"][0]["weight"] == 100.0
     assert quality["invesco_status"] == "access_restricted"
     assert quality["invesco_http_status"] == 403
     assert quality["alpha_vantage_status"] == "rate_limited"

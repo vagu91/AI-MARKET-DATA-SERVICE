@@ -23,6 +23,7 @@ from app.services.data_integrity_service import (
 from app.services.bls_required_series import normalize_bls_series_id
 from app.services.context_extensions_service import apply_context_extensions
 from app.services.news_intelligence_service import build_news_context as build_intelligence_news_context
+from app.services.qqq_weight_intelligence_service import weight_quality_score
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +369,24 @@ def build_section_quality(
     unknown_weight = (nasdaq_context.get("sector_exposure") or {}).get("unknown_weight_pct") if nasdaq_context else None
     if unknown_weight is not None and unknown_weight >= 10:
         nasdaq_missing.append("sector_exposure_unknown_weight_above_threshold")
+    qqq = (nasdaq_context or {}).get("qqq_holdings") or {}
+    qqq_quality = qqq.get("data_quality") or {}
+    breadth = (nasdaq_context or {}).get("mega_cap_breadth") or {}
+    breadth_quality = breadth.get("data_quality") or {}
+    weight_coverage = float(qqq_quality.get("weight_coverage_pct") or 0.0)
+    price_coverage = float(breadth_quality.get("price_coverage_pct") or 0.0)
+    sector_coverage = max(0.0, 100.0 - float(unknown_weight or 0.0)) if unknown_weight is not None else 0.0
+    nasdaq_score = weight_quality_score(
+        method=qqq.get("weight_method"),
+        weight_coverage_pct=weight_coverage,
+        price_coverage_pct=price_coverage,
+        sector_coverage_pct=sector_coverage,
+        stale=bool(qqq_quality.get("stale")),
+    )
+    if qqq.get("weight_method") == "equal_weight_proxy":
+        nasdaq_missing.append("qqq_weights_equal_weight_proxy")
+    if qqq_quality.get("missing_weight_count"):
+        nasdaq_missing.append("qqq_weights_missing")
     news_quality = dict(news_context.get("quality") or {})
     news_missing = [] if news_context.get("latest") else ["latest"]
     if news_context.get("latest") and float(news_quality.get("news_quality_score") or 0) < 0.4:
@@ -381,7 +400,18 @@ def build_section_quality(
         },
         "critical_macro_events": event_quality,
         "nasdaq_context": {
-            "completeness_score": 1.0 if nasdaq_context else 0.0,
+            "completeness_score": nasdaq_score["weight_quality_score"] if nasdaq_context else 0.0,
+            "freshness_score": 0.65 if qqq_quality.get("stale") else nasdaq_score["weight_quality_score"],
+            "reliability_score": float(qqq.get("weight_confidence") or qqq.get("reliability") or 0.0),
+            **nasdaq_score,
+            "weight_coverage_pct": weight_coverage,
+            "official_weight_coverage_pct": float(qqq_quality.get("official_weight_coverage_pct") or 0.0),
+            "price_coverage_pct": price_coverage,
+            "weighted_contribution_coverage_pct": float(breadth.get("covered_weight_pct") or 0.0),
+            "sector_weight_coverage_pct": sector_coverage,
+            "stale_weight_count": int(qqq_quality.get("stale_weight_count") or 0),
+            "missing_weight_count": int(qqq_quality.get("missing_weight_count") or 0),
+            "missing_price_count": len(breadth.get("missing_price_symbols") or []),
             "missing_fields": nasdaq_missing,
         },
         "news_context": {
@@ -409,8 +439,8 @@ def build_overall_quality(section_quality: dict[str, Any]) -> dict[str, Any]:
     blocking = []
     if section_quality["macro_snapshot"]["completeness_score"] < 0.7:
         blocking.append("macro_snapshot_incomplete")
-    if section_quality["nasdaq_context"]["completeness_score"] < 1.0:
-        blocking.append("nasdaq_context_missing")
+    if section_quality["nasdaq_context"]["completeness_score"] < 0.5:
+        blocking.append("nasdaq_context_insufficient")
     if section_quality["news_context"]["completeness_score"] < 1.0:
         blocking.append("news_context_missing")
     if section_quality["critical_macro_events"].get("missing_fields"):
@@ -549,7 +579,9 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
     data = context.model_dump(mode="json") if hasattr(context, "model_dump") else dict(context)
     holdings = data.get("qqq_holdings") or data.get("qqq_holdings_summary") or {}
     summary = data.get("qqq_holdings_summary") or holdings or {}
-    top_holdings = [classify_holding_sector(item) for item in (summary.get("top_holdings") or holdings.get("holdings") or [])]
+    all_holdings = [classify_holding_sector(item) for item in (holdings.get("holdings") or summary.get("top_holdings") or [])]
+    all_holdings.sort(key=lambda item: float(item.get("weight_pct") or item.get("weight") or -1), reverse=True)
+    top_holdings = all_holdings[:15]
     snapshot = data.get("mega_cap_snapshot") or {}
     breadth = data.get("mega_cap_breadth") or {}
     earnings = data.get("upcoming_earnings") or data.get("earnings") or {}
@@ -559,13 +591,24 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
             "status": holdings.get("status") or ("found" if holdings.get("holdings") or top_holdings else "not_found"),
             "as_of": holdings.get("as_of") or summary.get("as_of"),
             "holdings_count": holdings_count,
-            "top_holdings": (top_holdings or [])[:15],
+            "holdings": all_holdings,
+            "top_holdings": top_holdings,
             "source": holdings.get("source") or summary.get("source"),
+            "source_url": holdings.get("weight_source_url") or holdings.get("source_url"),
             "reliability": holdings.get("reliability") or summary.get("reliability"),
             "is_proxy": bool(holdings.get("is_proxy")),
             "proxy_for": holdings.get("proxy_for"),
             "weight_data_available": holdings.get("weight_data_available"),
             "official_etf_holdings": holdings.get("official_etf_holdings", True),
+            "weight_method": holdings.get("weight_method"),
+            "weight_source": holdings.get("weight_source") or holdings.get("source"),
+            "weight_source_url": holdings.get("weight_source_url") or holdings.get("source_url"),
+            "weight_as_of": holdings.get("weight_as_of") or holdings.get("as_of"),
+            "weight_valid_until": holdings.get("weight_valid_until"),
+            "weight_verified": bool(holdings.get("weight_verified")),
+            "weight_is_official": bool(holdings.get("weight_is_official")),
+            "weight_is_reconstructed": bool(holdings.get("weight_is_reconstructed")),
+            "weight_confidence": float(holdings.get("weight_confidence") or 0.0),
             "data_quality": holdings.get("data_quality") or {},
         },
         "mega_cap_snapshot": {
@@ -579,9 +622,9 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
         "mega_cap_breadth": breadth,
         "earnings": {"upcoming": earnings.get("events") or [], "data_quality": earnings.get("data_quality", {})},
         "sector_exposure": sector_exposure(
-            top_holdings or holdings.get("holdings") or [],
+            all_holdings,
             total_holdings_count=holdings_count,
-            coverage_scope="complete_portfolio" if holdings.get("weight_data_available") and holdings_count == len(holdings.get("holdings") or top_holdings or []) else None,
+            coverage_scope="complete_portfolio" if holdings.get("weight_data_available") and holdings_count == len(all_holdings) else None,
         ),
         "data_quality": data.get("metadata") or {},
     }

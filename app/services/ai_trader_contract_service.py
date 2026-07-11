@@ -95,7 +95,11 @@ def _compact_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
         "nasdaq_100_official_snapshot": _compact_nasdaq_100(nasdaq.get("nasdaq_100_official_snapshot") or {}),
     }
     if isinstance(output["qqq_holdings"], dict) and output["qqq_holdings"].get("top_holdings"):
-        output["qqq_holdings"] = {**output["qqq_holdings"], "top_holdings": output["qqq_holdings"]["top_holdings"][:15]}
+        output["qqq_holdings"] = {
+            **output["qqq_holdings"],
+            "holdings": (output["qqq_holdings"].get("holdings") or [])[:15],
+            "top_holdings": output["qqq_holdings"]["top_holdings"][:15],
+        }
     return output
 
 
@@ -108,7 +112,7 @@ def _compact_breadth(breadth: dict[str, Any]) -> dict[str, Any]:
         return {}
     missing_weights = ((breadth.get("data_quality") or {}).get("missing_weights") or [])
     output = dict(breadth)
-    if missing_weights:
+    if missing_weights and not breadth.get("weight_method"):
         output["calculation_method"] = "equal_weight_proxy"
         output["is_proxy"] = True
         output["proxy_reason"] = "QQQ constituent weights unavailable; equal-weight mega-cap proxy only"

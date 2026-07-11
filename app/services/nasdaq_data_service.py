@@ -24,6 +24,12 @@ from app.providers.earnings_provider import EarningsProvider
 from app.providers.mega_cap_snapshot_provider import MEGA_CAP_TICKERS, MegaCapSnapshotProvider
 from app.providers.news_provider import NewsProvider
 from app.providers.qqq_holdings_provider import QQQHoldingsProvider
+from app.services.qqq_weight_intelligence_service import (
+    EQUAL_WEIGHT_PROXY,
+    RECONSTRUCTED_MARKET_CAP_WEIGHT,
+    log_weight_event,
+    weighted_contributions,
+)
 
 
 class NasdaqDataService:
@@ -39,14 +45,22 @@ class NasdaqDataService:
         self.earnings_provider = earnings_provider
         self.news_provider = news_provider
 
-    async def qqq_holdings(self, *, run_cache: dict[str, Any] | None = None) -> QQQHoldingsResponse:
-        cache_key = "qqq_holdings:QQQ"
+    async def qqq_holdings(
+        self,
+        *,
+        run_cache: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> QQQHoldingsResponse:
+        cache_key = f"qqq_holdings:QQQ:force={force}"
         if run_cache is not None and cache_key in run_cache:
             cached = run_cache[cache_key]
             cached.data_quality.run_cache_used = True
             cached.data_quality.run_deduplicated_calls += 1
             return cached
-        result = await self.qqq_holdings_provider.fetch_safe()
+        try:
+            result = await self.qqq_holdings_provider.fetch_safe(force=force)
+        except TypeError:
+            result = await self.qqq_holdings_provider.fetch_safe()
         data = result.data if isinstance(result.data, dict) else {}
         holdings = [QQQHolding.model_validate(item) for item in data.get("holdings", [])]
         quality_data = data.get("data_quality", {})
@@ -73,6 +87,15 @@ class NasdaqDataService:
             holdings_count=len(holdings),
             weight_data_available=bool(data.get("weight_data_available", quality.weight_data_available)),
             official_etf_holdings=bool(data.get("official_etf_holdings", quality.official_etf_holdings)),
+            weight_method=data.get("weight_method") or quality.weight_method,
+            weight_source=data.get("source") or result.metadata.source,
+            weight_source_url=data.get("source_url"),
+            weight_as_of=data.get("as_of"),
+            weight_valid_until=data.get("weight_valid_until"),
+            weight_verified=bool(data.get("weight_verified")),
+            weight_is_official=bool(data.get("weight_is_official")),
+            weight_is_reconstructed=bool(data.get("weight_is_reconstructed")),
+            weight_confidence=float(data.get("weight_confidence") or 0.0),
             holdings=holdings,
             data_quality=quality,
         )
@@ -80,15 +103,23 @@ class NasdaqDataService:
             run_cache[cache_key] = response
         return response
 
-    async def mega_cap_snapshot(self, *, run_cache: dict[str, Any] | None = None) -> MegaCapSnapshotResponse:
-        holdings = await self.qqq_holdings(run_cache=run_cache)
-        weights = {item.symbol: item.weight for item in holdings.holdings}
+    async def mega_cap_snapshot(
+        self,
+        *,
+        run_cache: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> MegaCapSnapshotResponse:
+        holdings = await self.qqq_holdings(run_cache=run_cache, force=force)
+        weights = {item.symbol: item for item in holdings.holdings}
         result = await self.mega_cap_snapshot_provider.fetch_safe()
         data = result.data if isinstance(result.data, dict) else {}
         stocks = []
         for item in data.get("stocks", []):
             item = dict(item)
-            item["weight"] = weights.get(item.get("symbol"))
+            holding = weights.get(item.get("symbol"))
+            item["weight"] = holding.weight if holding else None
+            item["weight_method"] = holding.weight_method if holding else None
+            item["weight_source"] = holding.weight_source if holding else None
             stocks.append(MegaCapStock.model_validate(item))
         quality_data = data.get("data_quality", {})
         quality_data["fallback_used"] = bool(quality_data.get("fallback_used") or result.metadata.is_fallback)
@@ -110,38 +141,46 @@ class NasdaqDataService:
             data_quality=MegaCapSnapshotQuality.model_validate(quality_data),
         )
 
-    async def mega_cap_breadth(self, *, run_cache: dict[str, Any] | None = None) -> MegaCapBreadthResponse:
-        snapshot = await self.mega_cap_snapshot(run_cache=run_cache)
+    async def mega_cap_breadth(
+        self,
+        *,
+        run_cache: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> MegaCapBreadthResponse:
+        holdings = await self.qqq_holdings(run_cache=run_cache, force=force)
+        snapshot = await self.mega_cap_snapshot(run_cache=run_cache, force=force)
         stocks = snapshot.stocks
         missing_weights = [stock.symbol for stock in stocks if stock.weight is None]
         missing_prices = [stock.symbol for stock in stocks if stock.change_pct is None]
         usable = [stock for stock in stocks if stock.change_pct is not None]
-        equal_weight = 100.0 / len(usable) if usable else 0.0
-        total_weight = sum(stock.weight if stock.weight is not None else equal_weight for stock in usable)
-        total_weight = total_weight or 1.0
-
-        contributors: list[BreadthContributor] = []
-        positive_weight = negative_weight = neutral_weight = 0.0
-        weighted_average = 0.0
-        for stock in usable:
-            weight = stock.weight if stock.weight is not None else equal_weight
-            normalized_weight = weight / total_weight * 100.0
-            change_pct = stock.change_pct or 0.0
-            contribution = normalized_weight * change_pct / 100.0
-            weighted_average += contribution
-            contributor = BreadthContributor(
-                symbol=stock.symbol,
-                weight=weight,
-                change_pct=change_pct,
-                weighted_contribution=contribution,
-            )
-            contributors.append(contributor)
-            if change_pct > 0:
-                positive_weight += normalized_weight
-            elif change_pct < 0:
-                negative_weight += normalized_weight
-            else:
-                neutral_weight += normalized_weight
+        contribution_data = weighted_contributions(
+            [item.model_dump(mode="json") for item in holdings.holdings],
+            [item.model_dump(mode="json") for item in stocks],
+        )
+        mega_symbols = {stock.symbol for stock in stocks}
+        contributor_rows = [
+            item for item in contribution_data["contributors"] if item["symbol"] in mega_symbols
+        ]
+        contributors = [BreadthContributor.model_validate(item) for item in contributor_rows]
+        positive_weight = sum(
+            float(item.weight_pct or item.weight)
+            for item in contributors
+            if item.change_pct > 0
+        )
+        negative_weight = sum(
+            float(item.weight_pct or item.weight)
+            for item in contributors
+            if item.change_pct < 0
+        )
+        neutral_weight = sum(
+            float(item.weight_pct or item.weight)
+            for item in contributors
+            if item.change_pct == 0
+        )
+        covered_weight = positive_weight + negative_weight + neutral_weight
+        weighted_positive = sum(item.weighted_contribution for item in contributors if item.weighted_contribution > 0)
+        weighted_negative = sum(item.weighted_contribution for item in contributors if item.weighted_contribution < 0)
+        weighted_net = weighted_positive + weighted_negative
 
         top_positive = sorted(
             [item for item in contributors if item.weighted_contribution > 0],
@@ -153,6 +192,34 @@ class NasdaqDataService:
             key=lambda item: item.weighted_contribution,
         )[:5]
         changes = [stock.change_pct for stock in usable if stock.change_pct is not None]
+        method = holdings.weight_method
+        calculation_method = (
+            "official_weighted"
+            if holdings.weight_is_official
+            else "vendor_weighted"
+            if method == "vendor_qqq_weight"
+            else "reconstructed_weighted"
+            if method == RECONSTRUCTED_MARKET_CAP_WEIGHT
+            else "equal_weight_proxy"
+            if method == EQUAL_WEIGHT_PROXY
+            else "partial_weighted"
+            if contributors
+            else "unavailable"
+        )
+        confidence = min(snapshot.reliability, holdings.weight_confidence or holdings.reliability)
+        log_weight_event(
+            "qqq_weight_contribution_calculated",
+            method=method,
+            constituent_count=len(contributors),
+            coverage_pct=covered_weight,
+        )
+        if covered_weight < 99.0:
+            log_weight_event(
+                "qqq_weight_coverage_degraded",
+                method=method,
+                coverage_pct=covered_weight,
+                constituent_count=len(contributors),
+            )
         return MegaCapBreadthResponse(
             retrieved_at=datetime.now(UTC),
             tracked_count=len(stocks),
@@ -163,7 +230,20 @@ class NasdaqDataService:
             weighted_negative_pct=negative_weight,
             weighted_neutral_pct=neutral_weight,
             average_change_pct=sum(changes) / len(changes) if changes else 0.0,
-            weighted_average_change_pct=weighted_average,
+            weighted_average_change_pct=weighted_net,
+            coverage_adjusted_weighted_change_pct=(weighted_net / covered_weight * 100.0 if covered_weight else None),
+            weighted_positive_contribution=weighted_positive,
+            weighted_negative_contribution=weighted_negative,
+            weighted_net_contribution=weighted_net,
+            covered_weight_pct=covered_weight,
+            uncovered_weight_pct=max(0.0, 100.0 - covered_weight),
+            calculation_method=calculation_method,
+            weight_method=method,
+            covered_symbols=[item.symbol for item in contributors],
+            missing_price_symbols=missing_prices,
+            missing_weight_symbols=missing_weights,
+            confidence=confidence,
+            is_proxy=calculation_method == "equal_weight_proxy",
             top_positive_contributors=top_positive,
             top_negative_contributors=top_negative,
             reliability=snapshot.reliability,
@@ -171,6 +251,10 @@ class NasdaqDataService:
                 missing_weights=missing_weights,
                 missing_prices=missing_prices,
                 errors=snapshot.data_quality.errors,
+                covered_weight_pct=covered_weight,
+                uncovered_weight_pct=max(0.0, 100.0 - covered_weight),
+                price_coverage_pct=len(usable) / max(len(stocks), 1) * 100.0,
+                weight_coverage_pct=len(contributors) / max(len(stocks), 1) * 100.0,
             ),
         )
 
@@ -227,7 +311,7 @@ class NasdaqDataService:
             data_quality=NewsQuality.model_validate(quality_data),
         )
 
-    async def context(self) -> NasdaqContextResponse:
+    async def context(self, *, force: bool = False) -> NasdaqContextResponse:
         critical_errors: list[str] = []
         warnings: list[str] = []
         fallback_notes: list[str] = []
@@ -235,21 +319,21 @@ class NasdaqDataService:
         run_cache: dict[str, Any] = {}
         holdings = await _timed_section(
             "qqq_holdings",
-            self.qqq_holdings(run_cache=run_cache),
+            self.qqq_holdings(run_cache=run_cache, force=force),
             timeout=_provider_timeout(self.qqq_holdings_provider, "timeout_nasdaq_seconds", 45.0),
             fallback=lambda error: _empty_holdings(error),
             warnings=warnings,
         )
         snapshot = await _timed_section(
             "mega_cap_snapshot",
-            self.mega_cap_snapshot(run_cache=run_cache),
+            self.mega_cap_snapshot(run_cache=run_cache, force=force),
             timeout=_provider_timeout(self.mega_cap_snapshot_provider, "timeout_nasdaq_seconds", 45.0),
             fallback=lambda error: _empty_snapshot(error),
             warnings=warnings,
         )
         breadth = await _timed_section(
             "mega_cap_breadth",
-            self.mega_cap_breadth(run_cache=run_cache),
+            self.mega_cap_breadth(run_cache=run_cache, force=force),
             timeout=_provider_timeout(self.mega_cap_snapshot_provider, "timeout_nasdaq_seconds", 45.0),
             fallback=lambda error: _empty_breadth(error),
             warnings=warnings,

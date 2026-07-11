@@ -24,6 +24,7 @@ from app.services.market_context_builder import (
     materialize_nasdaq_context_from_facts,
     normalize_nasdaq_context,
 )
+from app.services.qqq_weight_intelligence_service import log_weight_event
 from app.services.bls_required_series import (
     bls_required_series_status_from_macro_series,
     bls_required_series_status_from_macro_snapshot,
@@ -666,21 +667,42 @@ class DiagnosticsService:
         return events
 
     async def _nasdaq_db_first(self, *, symbol: str, fetch_missing: bool = True, force: bool = False) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        allow_stale = not fetch_missing and not force
         facts_by_type = {
-            "qqq_holdings": [] if force else self.facts.get_valid_facts_by_type("qqq_holdings"),
-            "mega_cap_snapshot": [] if force else self.facts.get_valid_facts_by_type("mega_cap_snapshot"),
-            "mega_cap_breadth": [] if force else self.facts.get_valid_facts_by_type("mega_cap_breadth"),
-            "earnings_event": [] if force else self.facts.get_valid_facts_by_type("earnings_event"),
-            "nasdaq_context": [] if force else self.facts.get_valid_facts_by_type("nasdaq_context"),
+            "qqq_holdings": [] if force else self.facts.get_valid_facts_by_type("qqq_holdings", allow_stale=allow_stale),
+            "mega_cap_snapshot": [] if force else self.facts.get_valid_facts_by_type("mega_cap_snapshot", allow_stale=allow_stale),
+            "mega_cap_breadth": [] if force else self.facts.get_valid_facts_by_type("mega_cap_breadth", allow_stale=allow_stale),
+            "earnings_event": [] if force else self.facts.get_valid_facts_by_type("earnings_event", allow_stale=allow_stale),
+            "nasdaq_context": [] if force else self.facts.get_valid_facts_by_type("nasdaq_context", allow_stale=allow_stale),
         }
         cached_count = sum(len(items) for items in facts_by_type.values())
         if cached_count:
-            return materialize_nasdaq_context_from_facts(facts_by_type), {
+            materialized = materialize_nasdaq_context_from_facts(facts_by_type)
+            stale_used = allow_stale and any(
+                self.freshness.evaluate(fact).usable is False
+                for facts in facts_by_type.values()
+                for fact in facts
+            )
+            if stale_used and materialized:
+                qqq_quality = (materialized.get("qqq_holdings") or {}).setdefault("data_quality", {})
+                qqq_quality["stale"] = True
+                qqq_quality["last_known_good_used"] = True
+                qqq_quality["weight_freshness"] = "STALE"
+            if materialized:
+                qqq = materialized.get("qqq_holdings") or {}
+                log_weight_event(
+                    "qqq_weight_materialized",
+                    source=qqq.get("weight_source") or qqq.get("source"),
+                    method=qqq.get("weight_method"),
+                    constituent_count=qqq.get("holdings_count"),
+                    stale=stale_used,
+                )
+            return materialized, {
                 "db_hits": cached_count,
                 "db_misses": 0,
                 "provider_hits": 0,
                 "provider_failures": 0,
-                "warnings": [],
+                "warnings": ["nasdaq_last_known_good_stale"] if stale_used else [],
                 "errors": [],
             }
         if not fetch_missing:
@@ -693,7 +715,7 @@ class DiagnosticsService:
                 "errors": [],
             }
         try:
-            context = await self.nasdaq_data_service.context()
+            context = await self.nasdaq_data_service.context(force=force)
         except Exception as exc:
             return None, {
                 "db_hits": 0,
@@ -726,6 +748,11 @@ class DiagnosticsService:
         for fact_key, fact_type, raw in facts:
             if not raw:
                 continue
+            fact_valid_until = (
+                raw.get("weight_valid_until")
+                if fact_type == "qqq_holdings" and isinstance(raw, dict)
+                else valid_until
+            ) or valid_until
             self.facts.upsert_fact(
                 {
                     "fact_key": fact_key,
@@ -737,11 +764,19 @@ class DiagnosticsService:
                     "reliability": raw.get("reliability", 0) if isinstance(raw, dict) else 0,
                     "confidence": raw.get("reliability", 0) if isinstance(raw, dict) else 0,
                     "retrieved_at": raw.get("retrieved_at", now_iso()) if isinstance(raw, dict) else now_iso(),
-                    "valid_until": valid_until,
-                    "next_refresh_at": valid_until,
+                    "valid_until": fact_valid_until,
+                    "next_refresh_at": fact_valid_until,
                     "raw_payload_json": raw,
                 }
             )
+            if fact_type == "qqq_holdings" and isinstance(raw, dict):
+                log_weight_event(
+                    "qqq_weight_persisted",
+                    source=raw.get("weight_source") or raw.get("source"),
+                    method=raw.get("weight_method"),
+                    constituent_count=raw.get("holdings_count") or len(raw.get("holdings") or []),
+                    total_weight_pct=(raw.get("data_quality") or {}).get("total_weight_pct"),
+                )
             written += 1
         for article in (payload.get("latest_news") or {}).get("articles", []):
             try:
