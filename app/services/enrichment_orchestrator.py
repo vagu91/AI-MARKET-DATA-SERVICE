@@ -14,7 +14,7 @@ from app.services.ai_research_diagnostics import AIResearchDiagnostics
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.enrichment_run_repository import EnrichmentRunRepository
 from app.services.event_enrichment_service import EventEnrichmentService
-from app.services.fact_key_service import FactKeyService
+from app.services.economic_event_materialization_service import EconomicEventMaterializationService
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.provider_observation_repository import ProviderObservationRepository
 
@@ -36,8 +36,8 @@ class EnrichmentOrchestrator:
         self.event_enrichment_service = event_enrichment_service
         self.ai_researcher_service = ai_researcher_service or AIResearcherService(settings)
         self.facts = MarketFactRepository(settings)
+        self.event_materializer = EconomicEventMaterializationService(settings, facts=self.facts)
         self.freshness = DataFreshnessService(settings)
-        self.keys = FactKeyService()
         self.observations = ProviderObservationRepository(settings)
         self.runs = EnrichmentRunRepository(settings)
 
@@ -71,6 +71,7 @@ class EnrichmentOrchestrator:
             "news_written": 0,
             "warnings_json": [],
             "errors_json": [],
+            **self.event_materializer.empty_metrics(),
         }
         self.runs.start(run_id=run_id, trigger=trigger)
         enriched_by_id: dict[str, EconomicEvent] = {}
@@ -91,9 +92,12 @@ class EnrichmentOrchestrator:
                     enriched_by_id[event.event_id] = updated
                     continue
                 fact_key = self.fact_key(event)
-                fact = self.facts.get_fact(fact_key)
+                fact, freshness = self.event_materializer.lookup_fact(
+                    event,
+                    refresh_mode="force" if force else "auto",
+                    metrics=metrics,
+                )
                 if fact:
-                    freshness = self.freshness.evaluate(fact)
                     if freshness.usable and force:
                         metrics["db_bypassed_force"] += 1
                         logger.info(
@@ -111,8 +115,14 @@ class EnrichmentOrchestrator:
                             item_count=1,
                         )
                     elif freshness.usable:
-                        updated = event.model_copy(deep=True)
-                        updated.enrichment = self._enrichment_from_fact(fact, freshness.cache_status, freshness.warnings)
+                        updated = self.event_materializer.apply_fact(
+                            event,
+                            fact,
+                            cache_status=freshness.cache_status,
+                            warnings=freshness.warnings,
+                            refresh_mode="auto",
+                            metrics=metrics,
+                        )
                         enriched_by_id[event.event_id] = updated
                         metrics["db_hits"] += 1
                         self.observations.record(
@@ -159,10 +169,14 @@ class EnrichmentOrchestrator:
                     if _has_values(event.enrichment):
                         fact = self._fact_from_event(event, provider_type=event.enrichment.provider_type)
                         self.facts.upsert_fact(fact)
-                        event.enrichment.cache_status = "refreshed"
-                        event.enrichment.valid_until = self.freshness.macro_valid_until(event)
-                        event.enrichment.next_refresh_at = self.freshness.next_refresh_at(
-                            event.enrichment.valid_until.isoformat() if hasattr(event.enrichment.valid_until, "isoformat") else event.enrichment.valid_until
+                        read_back = self.facts.get_event_enrichment_fact(self.fact_key(event))
+                        event = self.event_materializer.apply_fact(
+                            event,
+                            read_back or fact,
+                            cache_status="refreshed",
+                            warnings=[] if read_back else ["provider_fact_read_back_failed"],
+                            refresh_mode="force" if force else "auto",
+                            metrics=metrics,
                         )
                         enriched_by_id[event.event_id] = event
                         metrics["provider_hits"] += 1
@@ -233,13 +247,27 @@ class EnrichmentOrchestrator:
                     updated = event.model_copy(deep=True)
                     if fact:
                         persisted = self.facts.upsert_fact(fact)
-                        read_back = self.facts.get_fact(self.fact_key(event))
+                        read_back = self.facts.get_event_enrichment_fact(self.fact_key(event))
                         diagnostics.event_json(event.event_id, "persistence_payload.json", persisted)
                         diagnostics.event_json(event.event_id, "read_back.json", read_back)
                         if read_back:
-                            updated.enrichment = self._enrichment_from_fact(read_back, "refreshed", [])
+                            updated = self.event_materializer.apply_fact(
+                                event,
+                                read_back,
+                                cache_status="refreshed",
+                                warnings=[],
+                                refresh_mode="force" if force else "auto",
+                                metrics=metrics,
+                            )
                         else:
-                            updated.enrichment = self._enrichment_from_fact(fact, "refreshed", ["ai_fact_read_back_failed"])
+                            updated = self.event_materializer.apply_fact(
+                                event,
+                                fact,
+                                cache_status="refreshed",
+                                warnings=["ai_fact_read_back_failed"],
+                                refresh_mode="force" if force else "auto",
+                                metrics=metrics,
+                            )
                         updated.enrichment.summary["persistence"] = {
                             "persisted": True,
                             "read_back": read_back is not None,
@@ -296,6 +324,7 @@ class EnrichmentOrchestrator:
                 ],
                 "warnings": metrics["warnings_json"],
                 "errors": metrics["errors_json"],
+                **{name: metrics[name] for name in self.event_materializer.empty_metrics()},
             }
             metadata = {
                 "run_id": run_id,
@@ -314,12 +343,7 @@ class EnrichmentOrchestrator:
             self.runs.finish(run_id=run_id, status=status, metrics=metrics)
 
     def fact_key(self, event: EconomicEvent) -> str:
-        return self.keys.macro_event_key(
-            country=event.country,
-            category=event.category,
-            event_date=event.date,
-            event_name=event.name,
-        )
+        return self.event_materializer.fact_key(event)
 
     def _should_enrich(self, event: EconomicEvent) -> bool:
         if self.settings.ai_researcher_only_high_impact and event.impact != Impact.HIGH:
@@ -351,36 +375,6 @@ class EnrichmentOrchestrator:
             "errors_json": event.enrichment.errors,
             "raw_payload_json": event.model_dump(mode="json"),
         }
-
-    def _enrichment_from_fact(self, fact: dict[str, Any], cache_status: str, warnings: list[str]) -> EventEnrichment:
-        provider_type = fact.get("provider_type") or "DB"
-        raw_payload = fact.get("raw_payload") if isinstance(fact.get("raw_payload"), dict) else {}
-        if provider_type not in ProviderType.__members__.values():
-            provider_type = str(provider_type).split(".")[-1]
-        try:
-            parsed_provider_type = ProviderType(provider_type)
-        except ValueError:
-            parsed_provider_type = ProviderType.DB
-        return EventEnrichment(
-            forecast=fact.get("forecast"),
-            previous=fact.get("previous"),
-            consensus=fact.get("consensus"),
-            actual=fact.get("actual"),
-            metrics=list(raw_payload.get("metrics") or []),
-            summary=dict(raw_payload.get("summary") or {}),
-            fomc_context=raw_payload.get("fomc_context"),
-            source=fact.get("source"),
-            source_url=fact.get("source_url"),
-            provider_type=parsed_provider_type,
-            retrieved_at=fact.get("retrieved_at"),
-            valid_until=fact.get("valid_until"),
-            next_refresh_at=fact.get("next_refresh_at"),
-            reliability=fact.get("reliability") or 0,
-            confidence=fact.get("confidence") or 0,
-            cache_status=cache_status,
-            warnings=warnings + list(fact.get("warnings") or []),
-            errors=list(fact.get("errors") or []),
-        )
 
     def _event_payload(self, event: EconomicEvent) -> dict[str, Any]:
         payload = event.model_dump(mode="json")

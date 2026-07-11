@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 from app.providers.aaii_sentiment_provider import parse_aaii_sentiment
 from app.providers.cftc_cot_provider import find_nasdaq_row, parse_cftc_financial_row
 from app.services.credential_audit_service import credential_audit
@@ -56,13 +58,14 @@ def test_acquisition_routes_registered():
 
 def test_acquisition_status_counts_official_news_from_market_news(tmp_path):
     cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
+    retrieved_at = datetime.now(UTC).replace(microsecond=0)
     MarketNewsRepository(cfg).upsert_news(
         {
             "title": "Federal Reserve official release",
             "source": "Federal Reserve",
             "source_url": "https://www.federalreserve.gov/newsevents/pressreleases/test.htm",
-            "published_at": "2026-07-10T12:00:00Z",
-            "retrieved_at": "2026-07-10T12:01:00Z",
+            "published_at": (retrieved_at - timedelta(minutes=1)).isoformat(),
+            "retrieved_at": retrieved_at.isoformat(),
             "provider_type": "RSS",
             "is_official": True,
             "reliability": 0.9,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -21,6 +22,8 @@ from app.services.data_integrity_service import (
 )
 from app.services.bls_required_series import normalize_bls_series_id
 from app.services.context_extensions_service import apply_context_extensions
+
+logger = logging.getLogger(__name__)
 
 
 MACRO_BUCKETS = {
@@ -392,8 +395,10 @@ def build_section_quality(
     macro_present = sum(
         1 for bucket in MACRO_BUCKETS if isinstance(macro_snapshot.get(bucket), dict) for _ in macro_snapshot[bucket]
     )
-    missing_events = list(existing_quality.get("missing_critical_fields", []))
-    event_count = len(event_calendar.get("critical_macro_events", []))
+    event_quality = _critical_event_quality(
+        event_calendar.get("critical_macro_events", []),
+        refresh_mode=str(existing_quality.get("refresh_mode") or "auto"),
+    )
     nasdaq_missing = [] if nasdaq_context else ["nasdaq_context"]
     unknown_weight = (nasdaq_context.get("sector_exposure") or {}).get("unknown_weight_pct") if nasdaq_context else None
     if unknown_weight is not None and unknown_weight >= 10:
@@ -406,10 +411,7 @@ def build_section_quality(
             "reliability_score": _average_reliability(macro_snapshot),
             "missing_fields": _missing_macro_fields(macro_snapshot),
         },
-        "critical_macro_events": {
-            "completeness_score": 1.0 if event_count and not missing_events else (0.75 if event_count else 0.0),
-            "missing_fields": missing_events,
-        },
+        "critical_macro_events": event_quality,
         "nasdaq_context": {
             "completeness_score": 1.0 if nasdaq_context else 0.0,
             "missing_fields": nasdaq_missing,
@@ -436,6 +438,8 @@ def build_overall_quality(section_quality: dict[str, Any]) -> dict[str, Any]:
         blocking.append("nasdaq_context_missing")
     if section_quality["news_context"]["completeness_score"] < 1.0:
         blocking.append("news_context_missing")
+    if section_quality["critical_macro_events"].get("missing_fields"):
+        blocking.append("critical_event_enrichment_missing")
     if "sector_exposure_unknown_weight_above_threshold" in section_quality["nasdaq_context"].get("missing_fields", []):
         blocking.append("sector_exposure_insufficient")
     invalid_future_actual_count = int(section_quality.get("_integrity", {}).get("invalid_future_actual_count", 0))
@@ -456,6 +460,77 @@ def build_overall_quality(section_quality: dict[str, Any]) -> dict[str, Any]:
         "stale_as_recent_count": stale_as_recent_count,
         "is_ready_for_market_analysis": not blocking,
         "blocking_reasons": blocking,
+    }
+
+
+def _critical_event_quality(events: list[EconomicEvent], *, refresh_mode: str) -> dict[str, Any]:
+    if not events:
+        return {
+            "completeness_score": 0.0,
+            "missing_fields": ["critical_macro_events"],
+            "event_count": 0,
+            "quantitative_event_count": 0,
+            "complete_event_count": 0,
+            "partial_event_count": 0,
+            "missing_event_count": 0,
+            "not_applicable_event_count": 0,
+        }
+
+    scores: list[float] = []
+    missing: list[str] = []
+    complete = 0
+    partial = 0
+    not_applicable = 0
+    quantitative = 0
+    for event in events:
+        if not _quantitative_applicable(event):
+            not_applicable += 1
+            continue
+        quantitative += 1
+        applicable_fields = ["forecast", "consensus", "previous"]
+        release_at = parse_datetime(event.time_utc or event.date)
+        if release_at is not None and datetime.now(UTC) >= release_at:
+            applicable_fields.append("actual")
+        present = {
+            field
+            for field in applicable_fields
+            if getattr(event.enrichment, field, None) not in (None, "")
+            or any(
+                isinstance(metric, dict) and metric.get(field) not in (None, "")
+                for metric in event.enrichment.metrics
+            )
+        }
+        score = len(present) / len(applicable_fields) if applicable_fields else 1.0
+        scores.append(score)
+        if not present:
+            missing_key = f"event_enrichment:{event.event_id}"
+            missing.append(missing_key)
+            logger.warning(
+                "event_quality_invariant_failed",
+                extra={
+                    "event_id": event.event_id,
+                    "fact_key": missing_key,
+                    "fact_type": "macro_event_enrichment",
+                    "refresh_mode": refresh_mode,
+                    "cache_status": event.enrichment.cache_status,
+                    "provider_type": str(event.enrichment.provider_type or ""),
+                    "valid_until": str(event.enrichment.valid_until or ""),
+                },
+            )
+        elif score >= 1.0:
+            complete += 1
+        else:
+            partial += 1
+
+    return {
+        "completeness_score": round(sum(scores) / len(scores), 3) if scores else 1.0,
+        "missing_fields": missing,
+        "event_count": len(events),
+        "quantitative_event_count": quantitative,
+        "complete_event_count": complete,
+        "partial_event_count": partial,
+        "missing_event_count": len(missing),
+        "not_applicable_event_count": not_applicable,
     }
 
 

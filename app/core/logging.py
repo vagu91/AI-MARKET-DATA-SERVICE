@@ -7,6 +7,8 @@ from typing import Any
 
 from app.core.config import Settings
 
+_LOG_RECORD_FIELDS = set(logging.makeLogRecord({}).__dict__)
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -19,8 +21,11 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         for key, value in record.__dict__.items():
-            if key.startswith("_") and key not in payload:
-                payload[key[1:]] = value
+            if key in _LOG_RECORD_FIELDS or key in {"message", "asctime"}:
+                continue
+            output_key = key[1:] if key.startswith("_") else key
+            if output_key not in payload:
+                payload[output_key] = value
         return json.dumps(payload, default=str)
 
 

@@ -205,6 +205,7 @@ def test_orchestrator_force_bypasses_valid_negative_cache_and_calls_ai(tmp_path)
         )
     )
     assert forced["data_quality"]["db_hits"] == 0
+    assert forced["data_quality"]["history_event_count"] == 0
     assert forced["data_quality"]["db_bypassed_force"] == 1
     assert forced["data_quality"]["ai_research_requests"] == 1
     assert ai.calls == 1

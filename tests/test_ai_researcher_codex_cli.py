@@ -276,6 +276,7 @@ def test_metric_only_ai_result_counts_as_valid_fact(tmp_path):
     facts, status = provider.load_payload(data)
     assert status["results_used"] == 1
     assert facts[0]["status"] == "active"
+    assert facts[0]["fact_type"] == "macro_event_enrichment"
     assert facts[0]["previous"] == 0.5
     assert facts[0]["source"] == "BLS"
     assert facts[0]["source_url"] == "https://www.bls.gov/news.release/cpi.nr0.htm"
@@ -339,6 +340,48 @@ def test_metric_zero_value_is_preserved_in_top_level_fact(tmp_path):
     facts, _ = provider.load_payload(data)
 
     assert facts[0]["previous"] == 0.0
+
+
+def test_cpi_primary_mom_metric_is_promoted_with_matching_provenance(tmp_path):
+    provider = AIResearcherProvider(settings(tmp_path))
+    data = payload()
+    item = data["results"][0]
+    item.update(
+        {
+            "previous": 4.2,
+            "source": "YoY source",
+            "source_url": "https://research.test/yoy",
+            "metrics": [
+                {
+                    "metric_id": "headline_cpi_yoy",
+                    "previous": 4.2,
+                    "unit": "percent",
+                    "source": "YoY source",
+                    "source_url": "https://research.test/yoy",
+                    "evidence_text": "Headline CPI was 4.2 percent year over year.",
+                    "reliability": 0.8,
+                    "confidence": 0.8,
+                },
+                {
+                    "metric_id": "headline_cpi_mom",
+                    "previous": 0.5,
+                    "unit": "percent",
+                    "source": "MoM source",
+                    "source_url": "https://research.test/mom",
+                    "evidence_text": "Headline CPI was 0.5 percent month over month.",
+                    "reliability": 0.9,
+                    "confidence": 0.9,
+                },
+            ],
+        }
+    )
+
+    facts, status = provider.load_payload(data)
+
+    assert status["results_used"] == 1
+    assert facts[0]["previous"] == 0.5
+    assert facts[0]["source"] == "MoM source"
+    assert facts[0]["source_url"] == "https://research.test/mom"
 
 
 def test_source_name_containing_trading_substring_is_not_rejected(tmp_path):

@@ -10,8 +10,12 @@ class EventWindowService:
         self.event_service = event_service
 
     async def event_windows(self, symbol: str) -> EventWindowsResponse:
-        now = datetime.now(UTC)
         events = await self.event_service.upcoming(country="US", days=1)
+        return self.from_events(symbol=symbol, events=events)
+
+    @staticmethod
+    def from_events(*, symbol: str, events: list) -> EventWindowsResponse:
+        now = datetime.now(UTC)
         active_windows: list[EventWindow] = []
         upcoming_windows: list[EventWindow] = []
         for event in events:
@@ -44,4 +48,3 @@ class EventWindowService:
             active_event_windows=active_windows,
             upcoming_event_windows=upcoming_windows,
         )
-

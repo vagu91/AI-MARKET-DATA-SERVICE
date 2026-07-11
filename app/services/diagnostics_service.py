@@ -13,6 +13,7 @@ from app.models.macro import MacroSeries
 from app.models.nasdaq import NasdaqContextResponse
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
+from app.services.economic_event_materialization_service import EconomicEventMaterializationService
 from app.services.event_service import EventService
 from app.services.event_window_service import EventWindowService
 from app.services.macro_service import MacroService
@@ -61,6 +62,7 @@ class DiagnosticsService:
         self.nasdaq_data_service = nasdaq_data_service
         self.enrichment_orchestrator = enrichment_orchestrator
         self.facts = MarketFactRepository(settings)
+        self.event_materializer = EconomicEventMaterializationService(settings, facts=self.facts)
         self.news = MarketNewsRepository(settings)
         self.freshness = DataFreshnessService(settings)
         self.positioning_runtime = PositioningRuntimeService(settings)
@@ -135,15 +137,37 @@ class DiagnosticsService:
 
         async def load_events() -> tuple[list[Any], dict[str, Any]]:
             if refresh == "false":
-                events = self._events_from_history(country=country, start=now, end=now + timedelta(days=days))
-                return events, {"data_quality": {"refresh_mode": "false", "missing_critical_fields": [], "events_found": len(events), "enrichment_status": "cache_only"}}
+                events, materialization = self.event_materializer.load_from_history(
+                    country=country,
+                    start=now,
+                    end=now + timedelta(days=days),
+                    refresh_mode="false",
+                )
+                return events, {
+                    "data_quality": {
+                        "refresh_mode": "false",
+                        "events_found": len(events),
+                        "enrichment_status": "cache_only",
+                        "db_hits": materialization["enrichment_fact_hit_count"],
+                        "db_misses": materialization["enrichment_fact_miss_count"],
+                        "cache_used": True,
+                        "ai_research_called": False,
+                        "ai_research_requests": 0,
+                        **materialization,
+                    }
+                }
             try:
                 events = await asyncio.wait_for(
                     self._official_events(country=country, start=now, end=now + timedelta(days=days)),
                     timeout=max(float(self.settings.timeout_events_seconds), 1.0),
                 )
             except TimeoutError:
-                events = self._events_from_history(country=country, start=now, end=now + timedelta(days=days))
+                events, materialization = self.event_materializer.load_from_history(
+                    country=country,
+                    start=now,
+                    end=now + timedelta(days=days),
+                    refresh_mode=refresh,
+                )
                 return events, {
                     "data_quality": {
                         "refresh_mode": refresh,
@@ -151,6 +175,7 @@ class DiagnosticsService:
                         "enrichment_status": "events_timeout_fallback_to_history" if events else "events_timeout",
                         "missing_critical_fields": [] if events else ["events_not_available"],
                         "warnings": [f"events_fetch_timeout_after_{self.settings.timeout_events_seconds}s"],
+                        **materialization,
                     }
                 }
             enrichment_timeout = max(float(self.settings.timeout_events_seconds), 1.0)
@@ -225,6 +250,8 @@ class DiagnosticsService:
                 }
 
         async def load_event_windows():
+            if refresh == "false":
+                return None
             try:
                 return await asyncio.wait_for(
                     self.event_window_service.event_windows(symbol=symbol),
@@ -239,6 +266,13 @@ class DiagnosticsService:
             load_nasdaq(),
             load_event_windows(),
         )
+        if refresh == "false":
+            if hasattr(self.event_window_service, "from_events"):
+                event_windows = self.event_window_service.from_events(symbol=symbol, events=enriched)
+            else:
+                from app.models.macro import EventWindowsResponse
+
+                event_windows = EventWindowsResponse(symbol=symbol, checked_at_utc=datetime.now(UTC).isoformat())
         news_items = self.news.stored(days=days, limit=100)
         news_pipeline = _news_pipeline_status(news_items)
         macro_pipeline = _macro_pipeline_status(macro)
@@ -589,28 +623,13 @@ class DiagnosticsService:
         return events
 
     def _events_from_history(self, *, country: str, start: datetime, end: datetime) -> list:
-        from app.models.events import EconomicEvent
-
-        with connect_market_db(self.settings) as conn:
-            rows = conn.execute(
-                """
-                SELECT raw_payload_json
-                FROM economic_events_history
-                WHERE country = ? AND date >= ? AND date <= ?
-                ORDER BY time_utc ASC
-                """,
-                (country.upper(), start.date().isoformat(), end.date().isoformat()),
-            ).fetchall()
-        output = []
-        import json
-
-        for row in rows:
-            try:
-                payload = json.loads(row["raw_payload_json"])
-                output.append(EconomicEvent.model_validate(payload))
-            except Exception:
-                continue
-        return output
+        events, _ = self.event_materializer.load_from_history(
+            country=country,
+            start=start,
+            end=end,
+            refresh_mode="false",
+        )
+        return events
 
     async def _nasdaq_db_first(self, *, symbol: str, fetch_missing: bool = True, force: bool = False) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         facts_by_type = {

@@ -43,8 +43,14 @@ def migrate_database(path: Path) -> dict[str, object]:
                 conn.rollback()
                 raise
         _migrate_legacy_cache_entries(conn)
+        legacy_event_enrichment_facts_migrated = _migrate_legacy_event_enrichment_facts(conn)
         conn.commit()
-    return {"path": str(path), "applied": applied, "schema_version": len(MIGRATIONS)}
+    return {
+        "path": str(path),
+        "applied": applied,
+        "schema_version": len(MIGRATIONS),
+        "legacy_event_enrichment_facts_migrated": legacy_event_enrichment_facts_migrated,
+    }
 
 
 def _split_sql(sql: str) -> list[str]:
@@ -72,3 +78,21 @@ def _migrate_legacy_cache_entries(conn: sqlite3.Connection) -> None:
             """,
             (row["cache_key"], row["payload"], row["created_at"], row["updated_at"], checksum),
         )
+
+
+def _migrate_legacy_event_enrichment_facts(conn: sqlite3.Connection) -> int:
+    tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "market_facts" not in tables:
+        return 0
+    cursor = conn.execute(
+        """
+        UPDATE market_facts
+        SET fact_type = 'macro_event_enrichment'
+        WHERE fact_type = 'ai_research_result'
+          AND fact_key LIKE '%:macro_event_enrichment'
+        """
+    )
+    return max(int(cursor.rowcount or 0), 0)

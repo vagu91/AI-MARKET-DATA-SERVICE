@@ -17,6 +17,9 @@ FACT_COLUMNS = [
     "confidence", "retrieved_at", "release_at", "valid_from", "valid_until", "next_refresh_at", "status",
     "raw_payload_json", "notes", "warnings_json", "errors_json", "created_at", "updated_at",
 ]
+CANONICAL_EVENT_ENRICHMENT_TYPE = "macro_event_enrichment"
+LEGACY_EVENT_ENRICHMENT_TYPE = "ai_research_result"
+EVENT_ENRICHMENT_TYPES = (CANONICAL_EVENT_ENRICHMENT_TYPE, LEGACY_EVENT_ENRICHMENT_TYPE)
 
 
 def now_iso() -> str:
@@ -54,6 +57,8 @@ class MarketFactRepository:
 
     def upsert_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
         payload = normalize_payload_text(dict(fact))
+        if payload.get("fact_type") == LEGACY_EVENT_ENRICHMENT_TYPE:
+            payload["fact_type"] = CANONICAL_EVENT_ENRICHMENT_TYPE
         timestamp = now_iso()
         payload.setdefault("retrieved_at", timestamp)
         payload.setdefault("created_at", timestamp)
@@ -80,6 +85,21 @@ class MarketFactRepository:
         with connect_market_db(self.settings) as conn:
             row = conn.execute("SELECT * FROM market_facts WHERE fact_key = ?", (fact_key,)).fetchone()
         return self._row(row)
+
+    def get_event_enrichment_fact(self, fact_key: str) -> dict[str, Any] | None:
+        canonical_key = fact_key.replace(f":{LEGACY_EVENT_ENRICHMENT_TYPE}", f":{CANONICAL_EVENT_ENRICHMENT_TYPE}")
+        legacy_key = canonical_key.replace(f":{CANONICAL_EVENT_ENRICHMENT_TYPE}", f":{LEGACY_EVENT_ENRICHMENT_TYPE}")
+        with connect_market_db(self.settings) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM market_facts
+                WHERE fact_key IN (?, ?)
+                  AND fact_type IN (?, ?)
+                """,
+                (canonical_key, legacy_key, *EVENT_ENRICHMENT_TYPES),
+            ).fetchall()
+        facts = [self._row(row) for row in rows if row]
+        return max((fact for fact in facts if fact), key=_event_fact_rank, default=None)
 
     def search_facts(self, country: str | None = None, category: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         where: list[str] = []
@@ -131,8 +151,12 @@ class MarketFactRepository:
         }
 
     def count(self, *, fact_type: str | None = None) -> int:
-        clause = "WHERE fact_type = ?" if fact_type else ""
-        params = (fact_type,) if fact_type else ()
+        if fact_type == CANONICAL_EVENT_ENRICHMENT_TYPE:
+            clause = "WHERE fact_type IN (?, ?)"
+            params = EVENT_ENRICHMENT_TYPES
+        else:
+            clause = "WHERE fact_type = ?" if fact_type else ""
+            params = (fact_type,) if fact_type else ()
         with connect_market_db(self.settings) as conn:
             return int(conn.execute(f"SELECT COUNT(*) c FROM market_facts {clause}", params).fetchone()["c"])
 
@@ -141,12 +165,24 @@ class MarketFactRepository:
             return int(conn.execute("SELECT COUNT(*) c FROM market_facts WHERE status = 'active'").fetchone()["c"])
 
     def get_valid_facts_by_type(self, fact_type: str, *, allow_stale: bool = False) -> list[dict[str, Any]]:
+        fact_types = EVENT_ENRICHMENT_TYPES if fact_type == CANONICAL_EVENT_ENRICHMENT_TYPE else (fact_type,)
+        placeholders = ", ".join("?" for _ in fact_types)
         with connect_market_db(self.settings) as conn:
             rows = conn.execute(
-                "SELECT * FROM market_facts WHERE fact_type = ? AND status = 'active' ORDER BY updated_at DESC",
-                (fact_type,),
+                f"SELECT * FROM market_facts WHERE fact_type IN ({placeholders}) AND status = 'active' ORDER BY updated_at DESC",
+                fact_types,
             ).fetchall()
         facts = [self._row(row) for row in rows if row]
+        if fact_type == CANONICAL_EVENT_ENRICHMENT_TYPE:
+            selected: dict[str, dict[str, Any]] = {}
+            for fact in facts:
+                if not fact:
+                    continue
+                identity = _canonical_event_fact_key(str(fact.get("fact_key") or ""))
+                current = selected.get(identity)
+                if current is None or _event_fact_rank(fact) > _event_fact_rank(current):
+                    selected[identity] = fact
+            facts = list(selected.values())
         now = datetime.now(UTC)
         if allow_stale:
             return [fact for fact in facts if fact]
@@ -227,6 +263,19 @@ class MarketFactRepository:
             )
             conn.commit()
 
+    def economic_event_payloads(self, *, country: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        with connect_market_db(self.settings) as conn:
+            rows = conn.execute(
+                """
+                SELECT raw_payload_json
+                FROM economic_events_history
+                WHERE country = ? AND date >= ? AND date <= ?
+                ORDER BY time_utc ASC
+                """,
+                (country.upper(), start_date, end_date),
+            ).fetchall()
+        return [payload for row in rows if isinstance((payload := decode(row["raw_payload_json"], None)), dict)]
+
     def db_summary(self) -> dict[str, Any]:
         with connect_market_db(self.settings) as conn:
             facts_total = conn.execute("SELECT COUNT(*) c FROM market_facts").fetchone()["c"]
@@ -249,13 +298,17 @@ class MarketFactRepository:
                 LIMIT 10
                 """
             ).fetchall()
+        facts_by_type = {row["fact_type"] or "unknown": row["c"] for row in by_type}
+        legacy_count = int(facts_by_type.pop(LEGACY_EVENT_ENRICHMENT_TYPE, 0))
+        if legacy_count:
+            facts_by_type[CANONICAL_EVENT_ENRICHMENT_TYPE] = int(facts_by_type.get(CANONICAL_EVENT_ENRICHMENT_TYPE, 0)) + legacy_count
         return {
             "market_facts": {"total": facts_total, "active": facts_active, "stale": facts_stale},
             "economic_events_history": {"total": events_total},
             "market_news": {"total": news_total},
             "provider_observations": {"total": observations_total},
             "enrichment_runs": {"total": runs_total},
-            "facts_by_type": {row["fact_type"] or "unknown": row["c"] for row in by_type},
+            "facts_by_type": facts_by_type,
             "next_expirations": [dict(row) for row in expirations],
             "service_role": "data provider only",
         }
@@ -280,3 +333,29 @@ class MarketFactRepository:
         data["errors"] = decode(data.pop("errors_json", None), [])
         data["raw_payload"] = decode(data.pop("raw_payload_json", None), None)
         return data
+
+
+def _canonical_event_fact_key(fact_key: str) -> str:
+    return fact_key.replace(f":{LEGACY_EVENT_ENRICHMENT_TYPE}", f":{CANONICAL_EVENT_ENRICHMENT_TYPE}")
+
+
+def _event_fact_rank(fact: dict[str, Any]) -> tuple[int, int, str, int]:
+    valid_until = _parse_datetime(fact.get("valid_until"))
+    usable = valid_until is None or valid_until > datetime.now(UTC)
+    active = str(fact.get("status") or "").lower() in {"active", "no_data_available"}
+    return (
+        int(usable),
+        int(active),
+        str(fact.get("updated_at") or fact.get("retrieved_at") or ""),
+        int(fact.get("fact_type") == CANONICAL_EVENT_ENRICHMENT_TYPE),
+    )
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)

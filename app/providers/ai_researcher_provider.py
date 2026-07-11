@@ -20,6 +20,13 @@ from app.services.ai_research_validation_service import ValidationRequest, valid
 from app.services.ai_research_diagnostics import AIResearchDiagnostics
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
+PRIMARY_METRIC_IDS = {
+    "CPI": ("headline_cpi_mom",),
+    "PPI": ("headline_ppi_mom", "ppi_final_demand_mom", "final_demand_ppi_mom"),
+    "PCE": ("headline_pce_mom",),
+    "GDP": ("real_gdp_annualized_qoq", "real_gdp_qoq_saar"),
+    "NFP": ("nonfarm_payrolls_change",),
+}
 FORBIDDEN_TRADING_TERMS = {
     "buy", "sell", "long", "short", "no_trade", "entry", "target", "stop", "recommendation",
 }
@@ -284,8 +291,8 @@ class AIResearcherProvider:
             if reject_item:
                 rejected += 1
                 continue
-            reliability = item.get("reliability") or _first_metric_field(item, "reliability") or 0
-            confidence = item.get("confidence") or _first_metric_field(item, "confidence") or 0
+            reliability = _primary_or_top(item, "reliability") or 0
+            confidence = _primary_or_top(item, "confidence") or 0
             if has_value and (reliability <= 0 or confidence <= 0):
                 warnings.append(f"rejected_low_reliability_or_confidence:{item.get('fact_key')}")
                 rejected += 1
@@ -294,18 +301,18 @@ class AIResearcherProvider:
             facts.append(
                 {
                     "fact_key": item.get("fact_key"),
-                    "fact_type": "ai_research_result",
+                    "fact_type": "macro_event_enrichment",
                     "country": item.get("country"),
                     "category": item.get("category"),
                     "event_name": item.get("event_name"),
                     "period": item.get("period"),
-                    "unit": _top_or_metric(item, "unit"),
+                    "unit": _primary_or_top(item, "unit"),
                     "forecast": _top_or_metric(item, "forecast"),
                     "previous": _top_or_metric(item, "previous"),
                     "consensus": _top_or_metric(item, "consensus"),
                     "actual": _top_or_metric(item, "actual"),
-                    "source": item.get("source") or _first_metric_field(item, "source"),
-                    "source_url": item.get("source_url") or _first_metric_field(item, "source_url"),
+                    "source": _primary_or_top(item, "source"),
+                    "source_url": _primary_or_top(item, "source_url"),
                     "provider_type": "AI_RESEARCHER_CODEX_CLI",
                     "reliability": reliability,
                     "confidence": confidence,
@@ -464,8 +471,28 @@ def _first_metric_field(item: dict[str, Any], field: str) -> Any:
 
 
 def _top_or_metric(item: dict[str, Any], field: str) -> Any:
+    primary = _primary_metric(item)
+    if primary is not None:
+        return primary.get(field)
     value = item.get(field)
     return value if value not in (None, "") else _first_metric_field(item, field)
+
+
+def _primary_or_top(item: dict[str, Any], field: str) -> Any:
+    primary = _primary_metric(item)
+    if primary is not None and primary.get(field) not in (None, ""):
+        return primary.get(field)
+    value = item.get(field)
+    return value if value not in (None, "") else _first_metric_field(item, field)
+
+
+def _primary_metric(item: dict[str, Any]) -> dict[str, Any] | None:
+    category = str(item.get("category") or "").upper()
+    if "NONFARM" in category or "PAYROLL" in category:
+        category = "NFP"
+    expected = PRIMARY_METRIC_IDS.get(category, ())
+    metrics = [metric for metric in item.get("metrics") or [] if isinstance(metric, dict)]
+    return next((metric for metric_id in expected for metric in metrics if metric.get("metric_id") == metric_id), None)
 
 
 def _contains_forbidden_terms(payload: Any) -> bool:
