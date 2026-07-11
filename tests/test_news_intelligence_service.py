@@ -148,9 +148,12 @@ def test_markup_time_canonical_link_and_article_text_are_fallbacks():
     assert metadata["summary_source_type"] == "page_text_excerpt"
 
 
-def test_retrieved_at_is_never_promoted_to_published_at():
+def test_retrieved_at_is_last_resort_inferred_published_at():
     normalized = normalize_news_article(article("Apple earnings", published_at=None), now=NOW)
-    assert normalized["published_at"] is None
+    assert normalized["published_at"] == NOW.isoformat()
+    assert normalized["published_at_source"] == "retrieved_at_fallback"
+    assert normalized["published_at_verified"] is False
+    assert normalized["timestamp_inferred"] is True
     assert normalized["retrieved_at"] == NOW.isoformat()
 
 
@@ -205,7 +208,7 @@ def test_entity_symbol_extraction_matrix(title, symbols):
         (article("Best CD rates today", source="Yahoo Personal Finance"), 0.0, "deposit_rates"),
         (article("Mortgage refinancing offers", source="Yahoo Personal Finance"), 0.0, "mortgage"),
         (article("Analyst reiterates Nvidia price target"), 0.0, "analyst_rating_only"),
-        (article("Apple earnings update", summary=None, published_at=None), 0.0, "missing_timestamp"),
+        (article("Apple earnings update", summary=None, published_at=None), 0.0, "irrelevant_company"),
         (article("Major US bank failure raises systemic risk concerns"), 0.52, None),
     ],
 )

@@ -445,8 +445,6 @@ def build_overall_quality(section_quality: dict[str, Any]) -> dict[str, Any]:
         blocking.append("macro_snapshot_incomplete")
     if section_quality["nasdaq_context"]["completeness_score"] < 0.5:
         blocking.append("nasdaq_context_insufficient")
-    if section_quality["news_context"]["completeness_score"] < 1.0:
-        blocking.append("news_context_missing")
     if section_quality["critical_macro_events"].get("missing_fields"):
         blocking.append("critical_event_enrichment_missing")
     if "sector_exposure_unknown_weight_above_threshold" in section_quality["nasdaq_context"].get("missing_fields", []):
@@ -612,6 +610,17 @@ def normalize_nasdaq_context(context: Any) -> dict[str, Any] | None:
             "weight_verified": bool(holdings.get("weight_verified")),
             "weight_is_official": bool(holdings.get("weight_is_official")),
             "weight_is_reconstructed": bool(holdings.get("weight_is_reconstructed")),
+            "weight_calculation_validated": bool(holdings.get("weight_verified")),
+            "official_weight_verified": bool(holdings.get("weight_verified") and holdings.get("weight_is_official")),
+            "weight_method_classification": (
+                "official_etf_weight"
+                if holdings.get("weight_verified") and holdings.get("weight_is_official")
+                else "reconstructed_market_cap_proxy"
+                if "reconstruct" in str(holdings.get("weight_method") or "")
+                else "equal_weight_proxy"
+                if "equal" in str(holdings.get("weight_method") or "")
+                else "unavailable"
+            ),
             "weight_confidence": float(holdings.get("weight_confidence") or 0.0),
             "data_quality": holdings.get("data_quality") or {},
         },
@@ -671,6 +680,18 @@ def _annotate_event(event: EconomicEvent, seen: dict[str, dict[str, Any]]) -> Ec
             "possible_duplicate": False,
         }
     )
+    if category == "NFP":
+        named_period = _period_key(payload.name)
+        month_name, _, year = named_period.partition(":")
+        payload.enrichment.summary.update(
+            {
+                "release_period": f"{month_name.title()} {year}" if month_name and year else None,
+                "release_month": month_name.title() if month_name else None,
+                "release_date": payload.date,
+                "period_date_consistent": not invalid,
+                "calendar_verified": not invalid,
+            }
+        )
     if category == "FOMC":
         payload.enrichment.fomc_context = _fomc_context(payload)
     return payload

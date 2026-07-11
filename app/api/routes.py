@@ -33,6 +33,8 @@ from app.services.macro_service import MacroService
 from app.services.market_fact_repository import MarketFactRepository, init_market_db
 from app.services.market_context_builder import build_market_context_contract
 from app.services.ai_trader_contract_service import build_ai_trader_market_context
+from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
+from app.services.market_context_hardening_service import harden_market_context
 from app.services.ai_research_diagnostics import record_final_consumer_events
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.nasdaq_data_service import NasdaqDataService
@@ -125,9 +127,10 @@ async def market_context_mnq(
             fetch_missing_nasdaq=refresh == "force",
             refresh=refresh,
         )
+        contract = harden_market_context(contract, settings=enrichment_orchestrator.settings)
         if view == "debug":
             return contract
-        consumer = build_ai_trader_market_context(contract)
+        consumer = build_ai_trader_market_context(contract, settings=enrichment_orchestrator.settings)
         record_final_consumer_events(
             enrichment_orchestrator.settings,
             (contract.get("data_quality") or {}).get("ai_diagnostic_artifact_dir"),
@@ -184,8 +187,8 @@ async def market_context_mnq(
         "critical_fetch_completed": True,
         "critical_persistence_completed": True,
         "critical_commits_completed": True,
-        "critical_read_back_completed": bool(macro.series) and bool(nasdaq_context) and news_pipeline["read_back_count"] > 0,
-        "snapshot_materialization_completed": news_pipeline["materialized_count"] > 0 and bool(macro.series) and bool(nasdaq_context),
+        "critical_read_back_completed": bool(macro.series) and bool(nasdaq_context) and news_pipeline["committed"],
+        "snapshot_materialization_completed": news_pipeline["search_completed"] and bool(macro.series) and bool(nasdaq_context),
         "snapshot_built_from_db": True,
         "partial_response": False,
     }
@@ -248,7 +251,8 @@ async def market_context_mnq(
     contract["risk_context"] = risk_context
     contract["risk_sentiment"] = risk_sentiment
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
-    return contract if view == "debug" else build_ai_trader_market_context(contract)
+    contract = harden_market_context(contract, settings=enrichment_orchestrator.settings)
+    return contract if view == "debug" else build_ai_trader_market_context(contract, settings=enrichment_orchestrator.settings)
 
 
 @router.get("/market-context/mnq/debug")
@@ -269,6 +273,27 @@ async def market_context_mnq_debug(
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
     )
+
+
+@router.get("/market-context/mnq/consumer")
+async def market_context_mnq_consumer(
+    refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
+    macro_service: MacroService = Depends(get_macro_service),
+    event_service: EventService = Depends(get_event_service),
+    event_window_service: EventWindowService = Depends(get_event_window_service),
+    nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    full = await market_context_mnq(
+        refresh=refresh,
+        view="debug",
+        macro_service=macro_service,
+        event_service=event_service,
+        event_window_service=event_window_service,
+        nasdaq_service=nasdaq_service,
+        enrichment_orchestrator=enrichment_orchestrator,
+    )
+    return build_ai_trader_consumer_v2(full, settings=enrichment_orchestrator.settings)
 
 
 @router.get("/db/health")

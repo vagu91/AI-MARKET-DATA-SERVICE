@@ -27,6 +27,10 @@ def settings(tmp_path) -> Settings:
     return Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
 
 
+def polymarket_settings(tmp_path) -> Settings:
+    return Settings(_env_file=None, database_path=tmp_path / "market.sqlite", enable_polymarket=True)
+
+
 def test_economic_value_parser_handles_units_missing_and_parentheses():
     assert parse_economic_value("--")["parse_status"] == "missing"
     assert parse_economic_value("—")["parse_status"] == "missing"
@@ -367,7 +371,7 @@ async def test_polymarket_tls_failure_is_not_not_found(monkeypatch, tmp_path):
 
     monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
 
-    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+    result = await PolymarketPredictionProvider(polymarket_settings(tmp_path)).fetch()
 
     assert result["status"] == "ssl_error"
     assert result["failure_type"] == "ssl_error"
@@ -396,7 +400,7 @@ async def test_polymarket_http_404_is_not_found(monkeypatch, tmp_path):
 
     monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
 
-    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+    result = await PolymarketPredictionProvider(polymarket_settings(tmp_path)).fetch()
 
     assert result["status"] == "not_found"
     assert result["http_status"] == 404
@@ -424,7 +428,7 @@ async def test_polymarket_rate_limit_classification(monkeypatch, tmp_path):
 
     monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
 
-    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+    result = await PolymarketPredictionProvider(polymarket_settings(tmp_path)).fetch()
 
     assert result["status"] == "rate_limited"
     assert result["http_status"] == 429
@@ -472,7 +476,7 @@ async def test_polymarket_zero_relevant_markets_is_not_found(monkeypatch, tmp_pa
 
     monkeypatch.setattr(poly_module.httpx, "AsyncClient", lambda timeout: FakeClient())
 
-    result = await PolymarketPredictionProvider(settings(tmp_path)).fetch()
+    result = await PolymarketPredictionProvider(polymarket_settings(tmp_path)).fetch()
 
     assert result["status"] == "not_found"
     assert result["failure_type"] is None

@@ -182,7 +182,7 @@ def canonicalize_investing_monitor(
             "history_insufficient": int(not repricing["history_available"]),
         },
     }
-    return {
+    result = {
         "status": "available" if available else "not_found",
         "current_fed_state": current_state,
         "next_meeting": _next_meeting_summary(next_meeting),
@@ -229,6 +229,123 @@ def canonicalize_investing_monitor(
         "fed_funds_futures": _legacy_fed_funds_block(payload, legacy_block),
         "service_role": "data provider only",
     }
+    result["sanity_check"] = build_fed_sanity_check(result, macro_snapshot=macro_snapshot)
+    return result
+
+
+def build_fed_sanity_check(
+    snapshot: dict[str, Any],
+    *,
+    macro_snapshot: dict[str, Any],
+    tolerance: float = 0.015,
+) -> dict[str, Any]:
+    meetings = [item for item in snapshot.get("meetings") or [] if isinstance(item, dict)]
+    current = snapshot.get("current_fed_state") or {}
+    lower = _number(current.get("current_target_lower_bound"))
+    upper = _number(current.get("current_target_upper_bound"))
+    midpoint = _number(current.get("current_target_midpoint"))
+    target_range_consistent = (
+        True if lower is None or upper is None or midpoint is None else math.isclose((lower + upper) / 2, midpoint, abs_tol=tolerance)
+    )
+    expected_midpoint_consistent = True
+    expected_change_consistent = True
+    future_price_consistent = True
+    probability_distribution_consistent = True
+    for meeting in meetings:
+        outcomes = [item for item in meeting.get("outcomes") or [] if isinstance(item, dict)]
+        probability_sum = sum(_number(item.get("probability")) or 0.0 for item in outcomes)
+        if outcomes and not math.isclose(probability_sum, 1.0, abs_tol=tolerance):
+            probability_distribution_consistent = False
+        calculated_midpoint = sum(
+            (_number(item.get("target_midpoint")) or 0.0) * (_number(item.get("probability")) or 0.0)
+            for item in outcomes
+        )
+        reported_midpoint = _number(meeting.get("expected_target_midpoint"))
+        if outcomes and reported_midpoint is not None and not math.isclose(calculated_midpoint, reported_midpoint, abs_tol=tolerance):
+            expected_midpoint_consistent = False
+        reported_change = _number(meeting.get("expected_change_bps"))
+        if reported_midpoint is not None and midpoint is not None and reported_change is not None:
+            calculated_change = (reported_midpoint - midpoint) * 100
+            if not math.isclose(calculated_change, reported_change, abs_tol=0.5):
+                expected_change_consistent = False
+        future_price = _number(meeting.get("future_price"))
+        if future_price is not None and reported_midpoint is not None:
+            implied_rate = 100.0 - future_price
+            if abs(implied_rate - reported_midpoint) > 1.25:
+                future_price_consistent = False
+        meeting["probability_semantics"] = "probability_target_range_after_meeting_relative_to_current_range"
+        meeting["is_single_meeting_action_probability"] = False
+
+    meeting_dates = [str(item.get("meeting_date") or "") for item in meetings]
+    meeting_sequence_consistent = meeting_dates == sorted(meeting_dates) and len(meeting_dates) == len(set(meeting_dates))
+    calendar_mapping_consistent = all(
+        (item.get("validation") or {}).get("meeting_date_match") is not False for item in meetings
+    )
+    ranking = str((snapshot.get("source_summary") or {}).get("ranking_class") or "")
+    crosscheck_available = ranking.startswith("official_") or bool((snapshot.get("source_summary") or {}).get("crosscheck_source"))
+    core = all(
+        (
+            target_range_consistent,
+            expected_midpoint_consistent,
+            expected_change_consistent,
+            future_price_consistent,
+            meeting_sequence_consistent,
+            probability_distribution_consistent,
+            calendar_mapping_consistent,
+        )
+    )
+    warnings: list[str] = []
+    if not crosscheck_available:
+        warnings.append("official_source_crosscheck_unavailable")
+    if not core:
+        warnings.append("fed_expectations_internal_consistency_failed")
+    status = "FAIL" if not core else "PASS" if crosscheck_available else "WARN"
+    yields = _yields_context(macro_snapshot, meetings)
+    result = {
+        "status": status,
+        "target_range_consistent": target_range_consistent,
+        "expected_midpoint_consistent": expected_midpoint_consistent,
+        "expected_change_consistent": expected_change_consistent,
+        "future_price_consistent": future_price_consistent,
+        "meeting_sequence_consistent": meeting_sequence_consistent,
+        "probability_distribution_consistent": probability_distribution_consistent,
+        "calendar_mapping_consistent": calendar_mapping_consistent,
+        "source_crosscheck_available": crosscheck_available,
+        "requires_crosscheck": not crosscheck_available,
+        "probability_semantics": "probability_target_range_after_meeting_relative_to_current_range",
+        "is_single_meeting_action_probability": False,
+        "yields_context": yields,
+        "warnings": warnings,
+    }
+    logger.info(
+        "fed_expectations_sanity_checked",
+        extra={"status": status, "meeting_count": len(meetings), "source_crosscheck_available": crosscheck_available},
+    )
+    return result
+
+
+def _yields_context(macro_snapshot: dict[str, Any], meetings: list[dict[str, Any]]) -> dict[str, Any]:
+    rates = macro_snapshot.get("rates_and_yields") or {}
+    dgs2 = _number((rates.get("DGS2") or {}).get("value"))
+    dgs10 = _number((rates.get("DGS10") or {}).get("value"))
+    curve = round(dgs10 - dgs2, 4) if dgs2 is not None and dgs10 is not None else None
+    expected_change = _number((meetings[0] if meetings else {}).get("expected_change_bps"))
+    if curve is None or expected_change is None:
+        direction = "UNKNOWN"
+    elif abs(expected_change) < 5 or abs(curve) < 0.05:
+        direction = "NEUTRAL"
+    elif (expected_change < 0 and curve >= 0) or (expected_change > 0 and curve <= 0):
+        direction = "SUPPORTIVE"
+    else:
+        direction = "DIVERGENT"
+    return {"dgs2": dgs2, "dgs10": dgs10, "curve_2s10s": curve, "directional_consistency": direction}
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def canonicalize_meeting(

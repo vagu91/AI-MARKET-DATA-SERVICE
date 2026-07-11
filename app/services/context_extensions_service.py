@@ -445,7 +445,16 @@ def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str
     positive = sum(1 for item in rows if item["change_pct"] > 0)
     negative = sum(1 for item in rows if item["change_pct"] < 0)
     total_weight = sum(weight for symbol in relevant if (weight := weight_by_symbol.get(symbol)) is not None)
-    classification = "INSUFFICIENT_DATA" if not resolved else "POSITIVE" if positive > negative else "NEGATIVE" if negative > positive else "MIXED"
+    net = contribution["weighted_net_contribution"]
+    positive_contribution = abs(float(contribution["weighted_positive_contribution"] or 0.0))
+    negative_contribution = abs(float(contribution["weighted_negative_contribution"] or 0.0))
+    tolerance = 0.0001
+    if not resolved or net is None:
+        classification = "UNKNOWN"
+    elif abs(float(net)) <= tolerance:
+        classification = "MIXED" if positive_contribution > tolerance and negative_contribution > tolerance else "FLAT"
+    else:
+        classification = "POSITIVE_CONTRIBUTION" if float(net) > tolerance else "NEGATIVE_CONTRIBUTION"
     return {
         "symbols": sorted(SEMICONDUCTOR_SYMBOLS),
         "requested_count": len(SEMICONDUCTOR_SYMBOLS),
@@ -466,6 +475,7 @@ def _semiconductor_context(holdings: list[dict[str, Any]], stocks: list[dict[str
         "top_semiconductor_contributors": rows[:5],
         "coverage_pct": round(contribution["covered_weight_pct"] / total_weight * 100.0, 4) if total_weight else 0.0,
         "classification": classification,
+        "classification_tolerance": tolerance,
         "recent_news_count": 0,
         "upcoming_earnings_count": 0,
         "data_quality": {

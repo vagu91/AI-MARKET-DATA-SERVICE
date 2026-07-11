@@ -3,14 +3,22 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.core.config import Settings
+from app.services.market_context_hardening_service import harden_market_context
 
 CONTRACT_NAME = "ai_trader_market_context"
 SCHEMA_VERSION = "1.0"
 
 
-def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
+def build_ai_trader_market_context(
+    full: dict[str, Any],
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    full = harden_market_context(full, settings=settings)
     nasdaq = full.get("nasdaq_context") or {}
     data_quality = full.get("data_quality") or {}
+    readiness = _legacy_readiness(full.get("readiness") or _readiness(data_quality))
     consumer = {
         "contract": CONTRACT_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -18,7 +26,7 @@ def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
         "generated_at": full.get("generated_at_utc") or full.get("generated_at"),
         "snapshot_summary": _snapshot_summary(full),
         "service_role": "data provider only",
-        "readiness": _readiness(data_quality),
+        "readiness": readiness,
         "data_quality": _compact_quality(data_quality),
         "macro_snapshot": full.get("macro_snapshot") or {},
         "event_calendar": _compact_events(full.get("event_calendar") or {}),
@@ -32,7 +40,7 @@ def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
         "market_schedule": _compact_market_schedule(full.get("market_schedule") or {}),
         "corporate_events": full.get("corporate_events") or {},
         "nasdaq_context": _compact_nasdaq(nasdaq),
-        "news_digest": full.get("news_digest") or {},
+        "news_digest": _legacy_news_digest(full.get("news_digest") or {}),
         "news_context": {"latest": (full.get("news_context") or {}).get("latest") or []},
         "warnings": _consumer_warnings(full),
         "decisions_delegated_to": "AI-TRADER",
@@ -43,6 +51,7 @@ def build_ai_trader_market_context(full: dict[str, Any]) -> dict[str, Any]:
         "metadata": {
             "event_enrichment": (full.get("metadata") or {}).get("event_enrichment") or {},
             "refresh_mode": ((full.get("metadata") or {}).get("multi_source_runtime") or {}).get("refresh_mode"),
+            "runtime_io": (full.get("metadata") or {}).get("runtime_io") or {},
         },
     }
     consumer["payload_size_bytes"] = len(json.dumps(consumer, default=str, separators=(",", ":")).encode("utf-8"))
@@ -316,7 +325,7 @@ def _warning_code(value: str) -> str:
 
 def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
     data_quality = full.get("data_quality") or {}
-    readiness = _readiness(data_quality)
+    readiness = _legacy_readiness(full.get("readiness") or _readiness(data_quality))
     overall = data_quality.get("overall_data_quality") or {}
     event_calendar = full.get("event_calendar") or {}
     critical_events = event_calendar.get("critical_macro_events") or []
@@ -329,7 +338,10 @@ def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
         "generated_at": full.get("generated_at_utc") or full.get("generated_at"),
         "symbol": full.get("symbol"),
         "ready": readiness["ready"],
-        "critical_errors": readiness["critical_errors"],
+        "readiness_status": readiness.get("status"),
+        "critical_errors": readiness.get("critical_errors", 0),
+        "critical_error_details": readiness.get("critical_error_details") or [],
+        "critical_error_count": readiness.get("critical_error_count", 0),
         "provider_success_count": sum(1 for status in statuses if status == "found"),
         "provider_partial_count": sum(1 for status in statuses if status in {"partial", "stale_acceptable"}),
         "provider_failure_count": sum(1 for status in statuses if status in {"provider_failed", "ssl_error", "rate_limited", "access_restricted"}),
@@ -345,6 +357,11 @@ def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
         "market_status": (((full.get("market_schedule") or {}).get("nasdaq_cash_session") or {}).get("status")),
         "data_freshness_score": overall.get("freshness_score"),
         "data_reliability_score": overall.get("reliability_score"),
+        "materialization": {
+            **((full.get("metadata") or {}).get("materialization") or {}),
+            "consumer_materialization_completed": True,
+        },
+        "runtime_io": (full.get("metadata") or {}).get("runtime_io") or {},
     }
 
 
@@ -396,6 +413,26 @@ def _block_status(block: dict[str, Any]) -> str | None:
 
 def _empty_social() -> dict[str, Any]:
     return {"status": "not_found", "source_count": 0, "mention_count": 0, "warnings": ["social_sentiment_not_available"]}
+
+
+def _legacy_readiness(readiness: dict[str, Any]) -> dict[str, Any]:
+    output = dict(readiness)
+    details = readiness.get("critical_errors")
+    details = list(details) if isinstance(details, list) else []
+    blocking = list(readiness.get("blocking_reasons") or [])
+    output["critical_error_details"] = details
+    output["critical_error_count"] = len(details)
+    output["critical_errors"] = len(details) + len(blocking)
+    return output
+
+
+def _legacy_news_digest(digest: dict[str, Any]) -> dict[str, Any]:
+    output = dict(digest)
+    semantic = str(output.get("status") or "")
+    if semantic:
+        output["semantic_status"] = semantic
+        output["status"] = "available" if semantic in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"} else "no_data_available"
+    return output
 
 
 def _float(value: Any) -> float | None:

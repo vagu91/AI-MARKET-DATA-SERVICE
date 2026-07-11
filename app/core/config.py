@@ -162,6 +162,44 @@ class Settings(BaseSettings):
     )
     default_news_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_DEFAULT_NEWS_TTL_HOURS")
     default_fact_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_DEFAULT_FACT_TTL_HOURS")
+    readiness_require_news: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_READINESS_REQUIRE_NEWS", "READINESS_REQUIRE_NEWS"),
+    )
+    readiness_require_rates: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_READINESS_REQUIRE_RATES", "READINESS_REQUIRE_RATES"),
+    )
+    readiness_require_positioning: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_READINESS_REQUIRE_POSITIONING", "READINESS_REQUIRE_POSITIONING"),
+    )
+    readiness_require_sentiment: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MARKET_READINESS_REQUIRE_SENTIMENT", "READINESS_REQUIRE_SENTIMENT"),
+    )
+    readiness_require_prediction_markets: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "AI_MARKET_READINESS_REQUIRE_PREDICTION_MARKETS",
+            "READINESS_REQUIRE_PREDICTION_MARKETS",
+        ),
+    )
+    news_weekend_lookback_hours: int = Field(
+        default=72,
+        validation_alias=AliasChoices("AI_MARKET_NEWS_WEEKEND_LOOKBACK_HOURS", "NEWS_WEEKEND_LOOKBACK_HOURS"),
+    )
+    news_market_open_lookback_hours: int = Field(
+        default=24,
+        validation_alias=AliasChoices(
+            "AI_MARKET_NEWS_MARKET_OPEN_LOOKBACK_HOURS",
+            "NEWS_MARKET_OPEN_LOOKBACK_HOURS",
+        ),
+    )
+    news_holiday_lookback_hours: int = Field(
+        default=72,
+        validation_alias=AliasChoices("AI_MARKET_NEWS_HOLIDAY_LOOKBACK_HOURS", "NEWS_HOLIDAY_LOOKBACK_HOURS"),
+    )
     qqq_holdings_ttl_hours: int = Field(default=24, validation_alias="AI_MARKET_QQQ_HOLDINGS_TTL_HOURS")
     qqq_holdings_stale_tolerance_hours: int = Field(default=72, validation_alias="AI_MARKET_QQQ_HOLDINGS_STALE_TOLERANCE_HOURS")
     qqq_reconstructed_weight_ttl_hours: int = Field(default=12, validation_alias="AI_MARKET_QQQ_RECONSTRUCTED_WEIGHT_TTL_HOURS")
@@ -246,7 +284,7 @@ class Settings(BaseSettings):
     social_sentiment_timeout_seconds: float = Field(default=6.0, validation_alias="AI_MARKET_SOCIAL_SENTIMENT_TIMEOUT_SECONDS")
     social_sentiment_max_items: int = Field(default=40, validation_alias="AI_MARKET_SOCIAL_SENTIMENT_MAX_ITEMS")
     enable_macromicro_aaii_crosscheck: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_MACROMICRO_AAII_CROSSCHECK")
-    enable_polymarket: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_POLYMARKET")
+    enable_polymarket: bool = Field(default=False, validation_alias="AI_MARKET_ENABLE_POLYMARKET")
     provider_failure_cache_minutes: int = Field(default=30, validation_alias="AI_MARKET_PROVIDER_FAILURE_CACHE_MINUTES")
     provider_negative_cache_minutes: int = Field(default=60, validation_alias="AI_MARKET_PROVIDER_NEGATIVE_CACHE_MINUTES")
     provider_max_retries: int = Field(default=1, validation_alias="AI_MARKET_PROVIDER_MAX_RETRIES")

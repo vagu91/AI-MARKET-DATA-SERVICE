@@ -94,9 +94,11 @@ def test_macro_save_read_back_materializes_from_db(tmp_path) -> None:
 
 def test_readiness_false_when_blocking_reasons_present() -> None:
     consumer = build_ai_trader_market_context(
-        {
-            "symbol": "MNQ",
-            "data_quality": {
+            {
+                "symbol": "MNQ",
+                "risk_context": {"status": "COMPLETE", "vix": {"status": "found", "value": 16.0}},
+                "nasdaq_context": {"status": "available", "qqq_holdings": {"holdings_count": 104}},
+                "data_quality": {
                 "critical_errors": [],
                 "overall_data_quality": {
                     "blocking_reasons": ["macro_snapshot_incomplete"],
@@ -109,6 +111,9 @@ def test_readiness_false_when_blocking_reasons_present() -> None:
 
     assert consumer["readiness"]["ready"] is False
     assert consumer["readiness"]["critical_errors"] == 1
+    assert consumer["readiness"]["critical_error_details"] == []
+    assert consumer["readiness"]["critical_error_count"] == 0
+    assert "macro_snapshot_missing" in consumer["readiness"]["blocking_reasons"]
     assert consumer["data_quality"]["missing_critical_fields"] == ["DGS10"]
 
 

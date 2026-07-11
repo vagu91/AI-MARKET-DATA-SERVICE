@@ -129,6 +129,7 @@ def test_consumer_aggregates_optional_enrichment_warnings_and_keeps_debug_detail
     full = {
         "symbol": "MNQ",
         "generated_at_utc": "2099-01-01T00:00:00Z",
+        "macro_snapshot": {"rates_and_yields": {"DGS2": {"value": 3.5, "source": "FRED"}}},
         "data_quality": {
             "overall_data_quality": {"freshness_score": 0.9, "reliability_score": 0.8},
             "warnings": ["optional_event_enrichment_timeout_after_1s"],
@@ -168,6 +169,7 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
     full = {
         "symbol": "MNQ",
         "generated_at_utc": "2099-01-01T00:00:00Z",
+        "macro_snapshot": {"rates_and_yields": {"DGS2": {"value": 3.5, "source": "FRED"}}},
         "data_quality": {
             "overall_data_quality": {"freshness_score": 0.91, "reliability_score": 0.88},
             "critical_errors": [],
@@ -177,10 +179,10 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
             "fed_communications": [{"category": "FOMC", "impact": "HIGH", "time_utc": "2099-01-29T19:00:00Z"}],
             "other_economic_events": [],
         },
-        "nasdaq_context": {"earnings": {"events": [{"symbol": "NVDA"}]}},
+        "nasdaq_context": {"qqq_holdings": {"holdings_count": 104}, "earnings": {"events": [{"symbol": "NVDA"}]}},
         "news_context": {"latest": [{"title": "A"}, {"title": "B"}]},
         "social_sentiment": {"status": "found"},
-        "risk_context": {"vvix": {"status": "found"}},
+        "risk_context": {"status": "COMPLETE", "vvix": {"status": "found"}},
         "market_schedule": {"nasdaq_cash_session": {"status": "closed"}},
     }
 
@@ -189,6 +191,8 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
     assert summary["symbol"] == "MNQ"
     assert summary["ready"] is True
     assert summary["critical_errors"] == 0
+    assert summary["critical_error_details"] == []
+    assert summary["critical_error_count"] == 0
     assert summary["critical_event_count"] == 1
     assert summary["high_impact_event_count_next_7d"] == 2
     assert summary["next_critical_event_at"] == "2099-01-02T12:30:00Z"

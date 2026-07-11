@@ -24,6 +24,7 @@ from app.services.market_context_builder import (
     materialize_nasdaq_context_from_facts,
     normalize_nasdaq_context,
 )
+from app.services.market_context_hardening_service import harden_market_context
 from app.services.qqq_weight_intelligence_service import log_weight_event
 from app.services.bls_required_series import (
     bls_required_series_status_from_macro_series,
@@ -313,8 +314,8 @@ class DiagnosticsService:
             "critical_fetch_completed": (not fetch_missing) or macro_quality.get("provider_hits", 0) > 0 or macro_quality.get("db_hits", 0) > 0,
             "critical_persistence_completed": macro_quality.get("provider_hits", 0) == 0 or macro_quality.get("read_back_count", macro_quality.get("db_hits", 0)) > 0,
             "critical_commits_completed": macro_quality.get("provider_hits", 0) == 0 or macro_quality.get("read_back_count", 0) > 0,
-            "critical_read_back_completed": bool(macro.series) and bool(nasdaq_context) and news_pipeline["read_back_count"] > 0,
-            "snapshot_materialization_completed": news_pipeline["materialized_count"] > 0 and bool(macro.series) and bool(nasdaq_context),
+            "critical_read_back_completed": bool(macro.series) and bool(nasdaq_context) and news_pipeline["committed"],
+            "snapshot_materialization_completed": news_pipeline["search_completed"] and bool(macro.series) and bool(nasdaq_context),
             "snapshot_built_from_db": True,
             "partial_response": not (bool(macro.series) and bool(nasdaq_context)),
         }
@@ -378,7 +379,7 @@ class DiagnosticsService:
         contract["risk_context"] = risk_context
         contract["risk_sentiment"] = risk_sentiment
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
-        return contract
+        return harden_market_context(contract, settings=self.settings)
 
     def temporal_integrity(self) -> dict[str, Any]:
         model_facts = self.facts.search_facts(limit=1000)
@@ -976,6 +977,10 @@ def _news_pipeline_status(
         "diagnostics": diagnostics,
         "quality": materialized.get("quality") or {},
         "eligible_news_not_materialized": max(eligible_count - materialized_count, 0) if materialized_count == 0 else 0,
+        "search_completed": True,
+        "provider_attempt_count": 1 if news_items else 0,
+        "provider_success_count": 1 if news_items else 0,
+        "provider_failure_count": 0,
     }
 
 

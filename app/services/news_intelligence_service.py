@@ -43,7 +43,7 @@ ENTITY_ALIASES: dict[str, tuple[str, ...]] = {
 SEMICONDUCTOR_SYMBOLS = {"NVDA", "AVGO", "AMD", "MU", "INTC", "QCOM", "AMAT", "ASML", "ARM"}
 
 OFFICIAL_DOMAINS = {
-    "federalreserve.gov", "bls.gov", "bea.gov", "treasury.gov", "sec.gov", "cftc.gov",
+    "federalreserve.gov", "bls.gov", "bea.gov", "treasury.gov", "sec.gov", "cftc.gov", "cboe.com", "nasdaq.com",
 }
 OFFICIAL_NAMES = {
     "federal reserve", "federal reserve rss", "board of governors of the federal reserve system",
@@ -230,6 +230,17 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         "is_official_source": is_official,
         "is_primary_source": is_primary,
         "is_official": is_official,
+        "source_tier": (
+            1
+            if classification in {"official_source", "primary_market_source", "major_news_agency"}
+            else 2
+            if classification == "major_financial_media"
+            else 3
+        ),
+        "data_origin_is_official": is_official,
+        "distribution_source_is_official": is_official,
+        "source_is_primary_originator": is_primary,
+        "source_is_official_redistributor": False,
         "source_reliability_base": SOURCE_BASE_RELIABILITY[classification],
     }
 
@@ -333,7 +344,69 @@ def classify_news_topics(article: dict[str, Any]) -> list[dict[str, Any]]:
         if not any(row["topic"] == "semiconductors" for row in rows):
             rows.append({"topic": "semiconductors", "topic_score": 0.82, "topic_reason": "semiconductor_watchlist_entity", "matched_entities": sorted(symbols), "matched_terms": sorted(symbols.intersection(SEMICONDUCTOR_SYMBOLS))})
     add("geopolitics", 0.82, "policy_or_geopolitical_channel_with_mnq_impact", ("export control", "export restriction", "us china", "taiwan", "antitrust", "trade restriction", "sanctions"))
+    add("energy", 0.78, "energy_price_or_supply_channel_with_macro_impact", ("oil price", "crude oil", "opec", "strait of hormuz", "energy supply disruption"))
     return _dedupe_topic_rows(rows)
+
+
+def _recover_timestamp(article: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    json_ld = article.get("json_ld") if isinstance(article.get("json_ld"), dict) else {}
+    opengraph = article.get("opengraph") if isinstance(article.get("opengraph"), dict) else {}
+    metadata = article.get("article_metadata") if isinstance(article.get("article_metadata"), dict) else {}
+    candidates = (
+        (json_ld.get("datePublished"), "json_ld", True, False, 0.98),
+        (opengraph.get("article:published_time") or opengraph.get("published_time"), "opengraph", True, False, 0.95),
+        (metadata.get("datePublished") or metadata.get("published_at"), "article_metadata", True, False, 0.94),
+        (article.get("rss_published_at") or article.get("pub_date"), "rss", True, False, 0.92),
+        (article.get("api_published_at") or article.get("structured_timestamp"), "structured_api", True, False, 0.92),
+        (article.get("published_at"), str(article.get("published_at_source") or "provider_timestamp"), bool(article.get("published_at_verified", True)), bool(article.get("timestamp_inferred")), float(article.get("timestamp_confidence") or 0.9)),
+    )
+    for value, source, verified, inferred, confidence in candidates:
+        if parsed := _iso_datetime(value):
+            if source != "provider_timestamp" or article.get("published_at_source"):
+                logger.info("news_timestamp_recovered", extra={"published_at_source": source, "published_at": parsed})
+            return {
+                "published_at": parsed,
+                "published_at_source": source,
+                "published_at_verified": verified,
+                "timestamp_inferred": inferred,
+                "timestamp_confidence": round(confidence, 3),
+                "timestamp_status": "INFERRED" if inferred else "VERIFIED" if verified else "UNVERIFIED",
+            }
+    source_url = str(article.get("canonical_url") or article.get("source_url") or article.get("url") or "")
+    if url_date := _date_from_url(source_url):
+        parsed = _iso_datetime(url_date)
+        logger.info("news_timestamp_recovered", extra={"published_at_source": "url_date", "published_at": parsed})
+        return {
+            "published_at": parsed,
+            "published_at_source": "url_date",
+            "published_at_verified": False,
+            "timestamp_inferred": True,
+            "timestamp_confidence": 0.62,
+            "timestamp_status": "INFERRED",
+        }
+    for value, source, confidence in (
+        (article.get("aggregator_published_at"), "aggregator_timestamp", 0.72),
+        (article.get("source_page_published_at"), "source_page", 0.82),
+        (article.get("retrieved_at"), "retrieved_at_fallback", 0.35),
+    ):
+        if parsed := _iso_datetime(value):
+            logger.info("news_timestamp_recovered", extra={"published_at_source": source, "published_at": parsed})
+            return {
+                "published_at": parsed,
+                "published_at_source": source,
+                "published_at_verified": False,
+                "timestamp_inferred": True,
+                "timestamp_confidence": confidence,
+                "timestamp_status": "INFERRED",
+            }
+    return {
+        "published_at": None,
+        "published_at_source": None,
+        "published_at_verified": False,
+        "timestamp_inferred": False,
+        "timestamp_confidence": 0.0,
+        "timestamp_status": "MISSING",
+    }
 
 
 def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
@@ -342,7 +415,7 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     article["title"] = clean_text(article.get("title")) or ""
     article["summary"] = _clean_summary(article.get("summary") or article.get("content_snippet"))
     article["retrieved_at"] = _iso_datetime(article.get("retrieved_at")) or now.replace(microsecond=0).isoformat()
-    article["published_at"] = _iso_datetime(article.get("published_at"))
+    article.update(_recover_timestamp(article, now=now))
     article["provider_type"] = str(article.get("provider_type") or "RSS").split(".")[-1]
     logger.info("news_article_received", extra=_log_fields(article))
 
@@ -380,7 +453,7 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     article["independent_source_count"] = 1
     article["pipeline_version"] = PIPELINE_VERSION
     article["warnings"] = _article_warnings(article)
-    logger.info("news_article_accepted" if article["accepted"] else "news_article_excluded", extra=_log_fields(article))
+    logger.info("news_article_accepted" if article["accepted"] else "news_article_rejected", extra=_log_fields(article))
     return article
 
 
@@ -495,7 +568,7 @@ def _score_article(article: dict[str, Any], *, now: datetime) -> dict[str, Any]:
     topics = set(article.get("topics") or [])
     symbols = set(article.get("symbols") or [])
     source_quality = float(article.get("source_reliability_base") or 0)
-    direct = 1.0 if topics.intersection({"macro", "fed", "yields"}) or symbols.intersection(ENTITY_ALIASES) else 0.0
+    direct = 1.0 if topics.intersection({"macro", "fed", "yields"}) or symbols.intersection(ENTITY_ALIASES) else 0.75 if topics.intersection({"geopolitics", "energy"}) else 0.0
     macro = 1.0 if "macro" in topics or "inflation" in topics else 0.0
     mega = 1.0 if symbols.intersection(ENTITY_ALIASES) else 0.0
     semi = 1.0 if "semiconductors" in topics else 0.0
@@ -520,6 +593,8 @@ def _score_article(article: dict[str, Any], *, now: datetime) -> dict[str, Any]:
         score = min(score, 0.3)
     if not article.get("published_at"):
         score = max(0.0, score - 0.22)
+    elif article.get("timestamp_inferred"):
+        score = max(0.0, score - (1.0 - float(article.get("timestamp_confidence") or 0.0)) * 0.16)
     if not article.get("summary"):
         score = max(0.0, score - 0.12)
     reliability_factors = {
@@ -544,6 +619,9 @@ def _score_article(article: dict[str, Any], *, now: datetime) -> dict[str, Any]:
             "content_completeness": completeness,
         }.items() if value >= 0.5
     ]
+    market_impact = max(macro, mega, semi, rates, 0.75 if topics.intersection({"geopolitics", "energy"}) else 0.0)
+    topic_score = max((float(row.get("topic_score") or 0) for row in article.get("topic_classifications") or []), default=0.0)
+    noise_penalty = 1.0 if personal_reason else 0.7 if _promotional_or_listicle(article) else 0.5 if _analyst_rating_only(article) else 0.0
     return {
         "direct_mnq_relevance": direct,
         "macro_impact": macro,
@@ -560,6 +638,14 @@ def _score_article(article: dict[str, Any], *, now: datetime) -> dict[str, Any]:
         "reliability": round(reliability, 3),
         "confidence": round(min(score, reliability), 3),
         "reliability_factors": reliability_factors,
+        "mnq_relevance_score": round(direct, 3),
+        "market_impact_score": round(market_impact, 3),
+        "source_quality_score": round(source_quality, 3),
+        "recency_score": round(freshness, 3),
+        "topic_score": round(topic_score, 3),
+        "duplicate_penalty": 0.0,
+        "noise_penalty": noise_penalty,
+        "final_acceptance_score": round(score, 3),
     }
 
 
@@ -575,11 +661,21 @@ def _exclusion_reason(article: dict[str, Any], *, now: datetime) -> str | None:
         return "low_relevance"
     if not article.get("published_at"):
         return "missing_timestamp"
+    if (
+        article.get("published_at_source") == "retrieved_at_fallback"
+        and article.get("source_classification") in {"aggregator", "secondary_financial_media", "low_quality_or_unknown"}
+    ):
+        return "timestamp_unverified"
     published = parse_datetime(article.get("published_at"))
     if published and published > now + timedelta(minutes=5):
         return "invalid_timestamp"
     valid_until = parse_datetime(article.get("valid_until"))
-    if valid_until and valid_until < now:
+    weekend_last_session = bool(
+        now.weekday() >= 5
+        and published
+        and now - published <= timedelta(hours=72)
+    )
+    if valid_until and valid_until < now and not weekend_last_session:
         return "stale_or_expired"
     if published and now - published > timedelta(days=14):
         return "stale_or_expired"
@@ -714,6 +810,11 @@ def _news_quality(
     total = len(accepted)
     summary_pct = _pct(sum(bool(item.get("summary")) for item in accepted), total)
     published_pct = _pct(sum(bool(item.get("published_at")) for item in accepted), total)
+    verified_published_pct = _pct(sum(bool(item.get("published_at_verified")) for item in accepted), total)
+    timestamp_quality_pct = round(
+        sum(float(item.get("timestamp_confidence") or 0.0) for item in accepted) / max(total, 1) * 100,
+        2,
+    )
     canonical_pct = _pct(sum(bool(item.get("canonical_url")) for item in accepted), total)
     high_pct = _pct(sum(float(item.get("reliability") or 0) >= 0.8 for item in accepted), total)
     official_count = len({item.get("original_publisher") for item in accepted if item.get("is_official_source")})
@@ -726,7 +827,7 @@ def _news_quality(
     cluster_strength = min(1.0, independent_clusters / max(len(clusters), 1))
     score = (
         summary_pct / 100 * 0.2
-        + published_pct / 100 * 0.2
+        + timestamp_quality_pct / 100 * 0.2
         + canonical_pct / 100 * 0.15
         + high_pct / 100 * 0.2
         + source_strength * 0.15
@@ -739,6 +840,8 @@ def _news_quality(
         "completeness_score": score,
         "summary_coverage_pct": summary_pct,
         "published_at_coverage_pct": published_pct,
+        "published_at_verified_coverage_pct": verified_published_pct,
+        "timestamp_quality_pct": timestamp_quality_pct,
         "canonical_url_coverage_pct": canonical_pct,
         "high_quality_article_pct": high_pct,
         "high_reliability_source_count": high_count,
@@ -869,7 +972,7 @@ def _promotional_or_listicle(article: dict[str, Any]) -> bool:
         term in text
         for term in (
             "top stock pick", "stocks to buy", "best stocks", "millionaire maker", "buy this stock",
-            "could make you rich", "protect your riches", "must own stocks",
+            "could make you rich", "protect your riches", "must own stocks", "best growth stocks",
         )
     )
 
