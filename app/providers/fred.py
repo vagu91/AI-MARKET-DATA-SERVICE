@@ -19,6 +19,7 @@ FRED_SERIES = {
     "NFCI": "Chicago Fed National Financial Conditions Index",
     "SOFR": "Secured Overnight Financing Rate",
     "T10Y2Y": "10-Year Treasury Minus 2-Year Treasury",
+    "ICSA": "Initial Claims",
 }
 
 
@@ -60,7 +61,7 @@ class FredProvider(BaseProvider):
                     "series_id": series_id,
                     "name": name,
                     "value": value,
-                    "units": "index" if series_id in {"VIXCLS", "NFCI"} else "percent",
+                    "units": "index" if series_id in {"VIXCLS", "NFCI"} else "thousands of claims" if series_id == "ICSA" else "percent",
                     "data_as_of": item.get("date"),
                     "source": self.source,
                 }

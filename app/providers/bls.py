@@ -13,6 +13,7 @@ BLS_SERIES = {
     "WPUFD4": "Producer Price Index: Final Demand",
     "CES0000000001": "Total Nonfarm Payrolls",
     "LNS14000000": "Unemployment Rate",
+    "CES0500000003": "Average Hourly Earnings of All Employees: Total Private",
 }
 
 BLS_FRED_FALLBACK_SERIES = {
@@ -20,6 +21,7 @@ BLS_FRED_FALLBACK_SERIES = {
     "WPUFD4": "PPIFIS",
     "CES0000000001": "PAYEMS",
     "LNS14000000": "UNRATE",
+    "CES0500000003": "CES0500000003",
 }
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import Settings
@@ -48,7 +49,8 @@ def build_ai_trader_consumer_v2(
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    hardened = harden_market_context(full, settings=settings)
+    generated_at = parse_datetime(full.get("generated_at_utc") or full.get("generated_at"))
+    hardened = harden_market_context(full, settings=settings, now=generated_at)
     readiness = dict(hardened.get("readiness") or {})
     consumer = {
         "contract": CONTRACT_NAME,
@@ -58,7 +60,7 @@ def build_ai_trader_consumer_v2(
         "context_date": (hardened.get("market_schedule") or {}).get("context_date"),
         "readiness": readiness,
         "snapshot_summary": _snapshot_summary(hardened),
-        "macro": _macro(hardened.get("macro_snapshot") or {}),
+        "macro": _macro(hardened.get("macro_snapshot") or {}, now=generated_at),
         "event_risk": _event_risk(hardened),
         "rates": _rates(hardened.get("rates_expectations") or {}),
         "risk": _risk(hardened.get("risk_context") or {}),
@@ -79,7 +81,7 @@ def build_ai_trader_consumer_v2(
     logger.info("consumer_payload_materialized", extra={"payload_size_bytes": size})
     logger.info(
         "consumer_payload_size_validated",
-        extra={"payload_size_bytes": size, "under_100kb": size < 100_000},
+        extra={"payload_size_bytes": size, "under_90kb": size < 90_000},
     )
     logger.info("consumer_contract_validated", extra={"contract": CONTRACT_NAME, "schema_version": SCHEMA_VERSION})
     return consumer
@@ -108,7 +110,7 @@ def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _macro(snapshot: dict[str, Any]) -> dict[str, Any]:
+def _macro(snapshot: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     rates = snapshot.get("rates_and_yields") or {}
     financial = snapshot.get("financial_conditions") or {}
     growth = snapshot.get("growth") or {}
@@ -129,11 +131,13 @@ def _macro(snapshot: dict[str, Any]) -> dict[str, Any]:
         "CPI": inflation.get("CUSR0000SA0"),
         "PPI": inflation.get("WPUFD4"),
         "NFP": labor.get("CES0000000001"),
+        "Average Hourly Earnings": labor.get("CES0500000003"),
         "unemployment": labor.get("LNS14000000"),
+        "Initial Jobless Claims": labor.get("ICSA"),
     }
     projected = {key: _metric(value or {}) for key, value in rows.items()}
     series_lifecycle = {
-        key: _series_lifecycle(key, value or {})
+        key: _series_lifecycle(key, value or {}, now=now)
         for key, value in rows.items()
         if value
     }
@@ -271,10 +275,7 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
             "net_contribution": breadth.get("weighted_net_contribution"),
         },
         "semiconductor_context": nasdaq.get("semiconductor_context") or {},
-        "alphabet_aggregate": next(
-            (item for item in ((nasdaq.get("earnings") or {}).get("upcoming") or []) if item.get("issuer_name") == "Alphabet Inc."),
-            None,
-        ),
+        "alphabet_aggregate": _alphabet_aggregate(holdings),
         "proxy_status": {"is_proxy": qqq.get("is_proxy"), "proxy_for": qqq.get("proxy_for")},
         "weight_method": {
             "method": qqq.get("weight_method"),
@@ -289,6 +290,7 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
 def _earnings(full: dict[str, Any]) -> dict[str, Any]:
     earnings = (full.get("nasdaq_context") or {}).get("earnings") or {}
     events = earnings.get("upcoming") or earnings.get("events") or []
+    upcoming = [_earnings_event(item) for item in events[:20]]
     return {
         "lifecycle": earnings.get("lifecycle") or {},
         "status": earnings.get("status") or (
@@ -300,7 +302,7 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
             else "NO_RELEVANT_DATA_FOUND"
         ),
         "issuer_event_count": earnings.get("issuer_event_count", len(events)),
-        "events": [_earnings_event(item) for item in events[:20]],
+        "upcoming_mega_cap_earnings_14d": upcoming,
         "quality": earnings.get("data_quality") or {},
     }
 
@@ -491,6 +493,22 @@ def _earnings_event(item: dict[str, Any]) -> dict[str, Any]:
     return _select(item, "issuer_event_id", "issuer_name", "symbols", "symbol", "earnings_date", "date", "time", "is_primary_event", "duplicate_security_event", "eps_estimate", "revenue_estimate", "source", "reliability")
 
 
+def _alphabet_aggregate(holdings: list[dict[str, Any]]) -> dict[str, Any]:
+    classes = [item for item in holdings if str(item.get("symbol") or "").upper() in {"GOOG", "GOOGL"}]
+    if not classes:
+        return {}
+    aggregate = next((item.get("issuer_aggregate_weight_pct") for item in classes if item.get("issuer_aggregate_weight_pct") is not None), None)
+    if aggregate is None:
+        weights = [item.get("weight_pct", item.get("weight")) for item in classes]
+        aggregate = round(sum(float(value) for value in weights if value is not None), 6)
+    return {
+        "issuer_name": "Alphabet Inc.",
+        "symbols": sorted(str(item.get("symbol")).upper() for item in classes),
+        "aggregate_weight_pct": aggregate,
+        "share_classes": [_holding(item) for item in classes],
+    }
+
+
 def _article(item: dict[str, Any]) -> dict[str, Any]:
     return _select(item, "article_id", "title", "summary", "source", "source_tier", "source_classification", "canonical_url", "published_at", "published_at_source", "published_at_verified", "timestamp_inferred", "timestamp_confidence", "symbols", "topics", "mnq_relevance_score", "market_impact_score", "source_quality_score", "recency_score", "final_acceptance_score", "reliability", "confidence", "cluster_id")
 
@@ -539,7 +557,7 @@ def _compact_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
-def _series_lifecycle(series_name: str, item: dict[str, Any]) -> dict[str, Any]:
+def _series_lifecycle(series_name: str, item: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     frequency = str(item.get("frequency") or "unknown").lower()
     if series_name in {"Fed target lower", "Fed target upper"}:
         policy_ref = "fed_target"
@@ -553,9 +571,23 @@ def _series_lifecycle(series_name: str, item: dict[str, Any]) -> dict[str, Any]:
         policy_ref = "quarterly_release"
     else:
         policy_ref = "unknown_frequency"
+    next_refresh = parse_datetime(item.get("next_refresh_at"))
+    valid_until = parse_datetime(item.get("valid_until"))
+    data_as_of = parse_datetime(item.get("data_as_of") or item.get("latest_release_at"))
+    now = now or datetime.now(UTC)
+    if next_refresh and next_refresh > now:
+        lifecycle_status = "NEXT_RELEASE_SCHEDULED"
+    elif valid_until and valid_until > now:
+        lifecycle_status = "KNOWN_NEXT_RELEASE"
+    elif frequency == "daily" and data_as_of and data_as_of.date() < now.date():
+        lifecycle_status = "LAST_SESSION"
+    elif data_as_of:
+        lifecycle_status = "CURRENT_RELEASE"
+    else:
+        lifecycle_status = "UNKNOWN"
     lifecycle = {
         "frequency": frequency,
-        "lifecycle_status": "KNOWN" if item.get("valid_until") and item.get("next_refresh_at") else "POLICY_DEFINED_DATE_UNKNOWN",
+        "lifecycle_status": lifecycle_status,
         "policy_ref": policy_ref,
     }
     if item.get("valid_until"):

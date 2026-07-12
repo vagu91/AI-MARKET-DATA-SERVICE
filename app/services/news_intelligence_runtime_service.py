@@ -7,8 +7,6 @@ from typing import Any
 from app.core.config import Settings
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.market_fact_repository import MarketFactRepository
-from app.services.market_context_hardening_service import apply_news_semantics
-from app.services.market_session_service import build_session_aware_schedule
 from app.services.news_intelligence_service import build_news_context, news_snapshot_valid_until
 
 logger = logging.getLogger(__name__)
@@ -37,18 +35,17 @@ class NewsIntelligenceRuntimeService:
                 raw = cached.get("raw_payload") if isinstance(cached.get("raw_payload"), dict) else {}
                 context = raw.get("news_context") if isinstance(raw.get("news_context"), dict) else None
                 if context is not None:
-                    context = _session_aware(context, self.settings)
                     output = _with_runtime(context, refresh_mode=refresh_mode, cache_status=freshness.cache_status)
                     logger.info("news_digest_materialized", extra=_runtime_log(output, cache_status=freshness.cache_status))
                     return output, _runtime_metrics(output, cache_status=freshness.cache_status, persisted=0, read_back=1)
 
         if refresh_mode == "false":
-            context = _session_aware(build_news_context(news_items, limit=limit), self.settings)
+            context = build_news_context(news_items, limit=limit)
             output = _with_runtime(context, refresh_mode="false", cache_status="legacy_db_materialized")
             logger.info("news_digest_materialized", extra=_runtime_log(output, cache_status="legacy_db_materialized"))
             return output, _runtime_metrics(output, cache_status="legacy_db_materialized", persisted=0, read_back=0)
 
-        context = _session_aware(build_news_context(news_items, limit=limit), self.settings)
+        context = build_news_context(news_items, limit=limit)
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         valid_until = news_snapshot_valid_until(context)
         payload = {
@@ -129,13 +126,3 @@ def _runtime_log(context: dict[str, Any], *, cache_status: str) -> dict[str, Any
         "official_source_count": diagnostics.get("official_source_count"),
         "high_reliability_source_count": diagnostics.get("high_reliability_source_count"),
     }
-
-
-def _session_aware(context: dict[str, Any], settings: Settings) -> dict[str, Any]:
-    schedule = build_session_aware_schedule({})
-    return apply_news_semantics(
-        context,
-        pipeline={},
-        market_schedule=schedule,
-        settings=settings,
-    )

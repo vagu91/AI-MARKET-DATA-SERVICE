@@ -98,6 +98,7 @@ def occurrence(
         ("NFP", "Employment Situation (June 2099)", "Nonfarm Payrolls", "Jun", "K", "nonfarm_payrolls_change"),
         ("NFP", "Employment Situation (June 2099)", "Unemployment Rate", "Jun", "%", "unemployment_rate"),
         ("NFP", "Employment Situation (June 2099)", "Average Hourly Earnings (MoM)", "Jun", "%", "average_hourly_earnings_mom"),
+        ("Initial Jobless Claims", "Initial Jobless Claims (July 2099)", "Initial Jobless Claims", "Jul", "K", "initial_jobless_claims"),
     ],
 )
 def test_semantic_temporal_matching_for_critical_metrics(category, official_name, candidate_name, period, unit, metric_id):

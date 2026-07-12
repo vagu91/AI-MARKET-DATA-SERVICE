@@ -30,6 +30,7 @@ PRIMARY_METRIC = {
     "PCE": "headline_pce_mom",
     "GDP": "real_gdp_annualized_qoq",
     "NFP": "nonfarm_payrolls_change",
+    "CLAIMS": "initial_jobless_claims",
 }
 
 METRIC_META = {
@@ -50,6 +51,7 @@ METRIC_META = {
     "unemployment_rate": ("NFP", "Unemployment Rate", "monthly", "percent"),
     "average_hourly_earnings_mom": ("NFP", "Average Hourly Earnings MoM", "MoM", "percent"),
     "average_hourly_earnings_yoy": ("NFP", "Average Hourly Earnings YoY", "YoY", "percent"),
+    "initial_jobless_claims": ("CLAIMS", "Initial Jobless Claims", "weekly", "thousands of claims"),
 }
 
 DIAGNOSTIC_FIELDS = (
@@ -286,6 +288,8 @@ def event_family(event: EconomicEvent) -> str | None:
         return "GDP"
     if "employment situation" in text or "nonfarm payroll" in text or "non farm payroll" in text:
         return "NFP"
+    if "initial jobless claims" in text or "initial unemployment claims" in text:
+        return "CLAIMS"
     return None
 
 
@@ -304,6 +308,8 @@ def candidate_metric_id(candidate: dict[str, Any]) -> str | None:
         return f"average_hourly_earnings_{frequency}" if frequency in {"mom", "yoy"} else None
     if "unemployment rate" in text:
         return "unemployment_rate"
+    if "initial jobless claims" in text or "initial unemployment claims" in text:
+        return "initial_jobless_claims"
     if ("nonfarm payroll" in text or "non farm payroll" in text) and "adp" not in text:
         return "nonfarm_payrolls_change"
     if (
@@ -352,7 +358,7 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
     incoming = {
         "metric_id": metric_id,
         "label": label,
-        "value_type": "thousands" if metric_id == "nonfarm_payrolls_change" else "percent",
+        "value_type": "thousands" if metric_id in {"nonfarm_payrolls_change", "initial_jobless_claims"} else "percent",
         "frequency": frequency,
         "forecast": None,
         "consensus": candidate.get("consensus"),
@@ -599,8 +605,8 @@ def _consensus_valid_until(event: EconomicEvent, *, now: datetime | None = None)
 
 def _unit_compatible(metric_id: str, unit: Any) -> bool:
     normalized = str(unit or "").strip().lower()
-    if metric_id == "nonfarm_payrolls_change":
-        return normalized in {"k", "thousand", "thousands", "thousands of jobs"}
+    if metric_id in {"nonfarm_payrolls_change", "initial_jobless_claims"}:
+        return normalized in {"k", "thousand", "thousands", "thousands of jobs", "thousands of claims"}
     return normalized in {"%", "percent", "percentage", "pct"}
 
 

@@ -33,7 +33,7 @@ MACRO_BUCKETS = {
     "financial_conditions": {"VIXCLS", "NFCI"},
     "growth": {"BEA:GDP", "BEA:REAL_GDP"},
     "inflation": {"CUSR0000SA0", "WPUFD4", "BEA:PCE", "BEA:CORE_PCE"},
-    "labor": {"CES0000000001", "LNS14000000"},
+    "labor": {"CES0000000001", "CES0500000003", "LNS14000000", "ICSA"},
     "consumer": {"BEA:PERSONAL_INCOME", "BEA:PERSONAL_SPENDING"},
 }
 
@@ -104,6 +104,8 @@ SERIES_META = {
     "BEA:CORE_PCE": ("core_pce_price_index", "BEA reported units", "monthly"),
     "CES0000000001": ("nonfarm_payrolls_level", "thousands of persons", "monthly"),
     "LNS14000000": ("unemployment_rate", "percent", "monthly"),
+    "CES0500000003": ("average_hourly_earnings", "US dollars per hour", "monthly"),
+    "ICSA": ("initial_jobless_claims", "thousands of claims", "weekly"),
     "BEA:PERSONAL_INCOME": ("personal_income", "BEA reported units", "monthly"),
     "BEA:PERSONAL_SPENDING": ("personal_spending", "BEA reported units", "monthly"),
 }
@@ -262,6 +264,9 @@ def augment_macro_snapshot_from_event_facts(snapshot: dict[str, Any], facts: lis
         "ppi_final_demand_mom": ("inflation", "WPUFD4", "PPI Final Demand MoM"),
         "nonfarm_payrolls_change": ("labor", "CES0000000001", "Nonfarm Payrolls Change"),
         "unemployment_rate": ("labor", "LNS14000000", "Unemployment Rate"),
+        "average_hourly_earnings_mom": ("labor", "CES0500000003", "Average Hourly Earnings"),
+        "average_hourly_earnings_yoy": ("labor", "CES0500000003", "Average Hourly Earnings"),
+        "initial_jobless_claims": ("labor", "ICSA", "Initial Jobless Claims"),
     }
     provider_sources = {item.get("source") for item in snapshot.get("provider_results", [])}
     for fact in facts:

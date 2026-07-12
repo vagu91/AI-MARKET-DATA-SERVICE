@@ -9,6 +9,7 @@ import pytest
 from app.core.config import Settings
 from app.services.ai_trader_consumer_v2_service import (
     _macro,
+    _news,
     build_ai_trader_consumer_v2,
 )
 from app.services.market_context_hardening_service import harden_market_context
@@ -291,6 +292,20 @@ def test_historical_news_driver_is_excluded() -> None:
     assert news["previous_session_drivers"] == []
 
 
+def test_rth_news_materializes_three_to_five_current_drivers() -> None:
+    drivers = [
+        {"driver_id": f"driver-{index}", "headline": f"Driver {index}", "published_at_latest": f"2026-07-13T{14 + index}:00:00Z"}
+        for index in range(5)
+    ]
+    news = _news(
+        {"status": "AVAILABLE", "context_date": "2026-07-13", "accepted_article_count": 5},
+        {"drivers": drivers},
+        {"context_date": "2026-07-13", "last_market_session_date": "2026-07-10", "market_session_status": "open"},
+    )
+    assert len(news["current_drivers"]) == 5
+    assert news["accepted_article_count"] == 5
+
+
 @pytest.mark.parametrize(
     ("series", "frequency", "policy_ref"),
     [
@@ -315,20 +330,20 @@ def test_macro_series_lifecycle_uses_compact_policy_reference(series: str, frequ
     lifecycle = macro["series_lifecycle"][series]
     assert lifecycle["frequency"] == frequency
     assert lifecycle["policy_ref"] == policy_ref
-    assert lifecycle["lifecycle_status"] == "POLICY_DEFINED_DATE_UNKNOWN"
+    assert lifecycle["lifecycle_status"] == "UNKNOWN"
     assert macro["series_lifecycle_policies"][policy_ref]["refresh_policy"]
 
 
 def test_known_macro_dates_are_exposed_without_duplication() -> None:
-    macro = _macro({"rates_and_yields": {"DGS2": {"value": 4.1, "frequency": "daily", "valid_until": "2026-07-12T00:00:00Z", "next_refresh_at": "2026-07-12T00:00:00Z"}}})
+    macro = _macro({"rates_and_yields": {"DGS2": {"value": 4.1, "frequency": "daily", "valid_until": "2099-07-12T00:00:00Z", "next_refresh_at": "2099-07-12T00:00:00Z"}}})
     lifecycle = macro["series_lifecycle"]["2Y"]
-    assert lifecycle["lifecycle_status"] == "KNOWN"
+    assert lifecycle["lifecycle_status"] == "NEXT_RELEASE_SCHEDULED"
     assert lifecycle["valid_until"] == lifecycle["next_refresh_at"]
 
 
-def test_consumer_payload_stays_below_preferred_95kb() -> None:
+def test_consumer_payload_stays_below_preferred_90kb() -> None:
     payload = consumer(base_full())
-    assert len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")) <= 95_000
+    assert len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")) <= 90_000
 
 
 def test_cache_only_materialization_is_stable_across_restart_equivalent_rebuild() -> None:

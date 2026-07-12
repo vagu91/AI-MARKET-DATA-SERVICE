@@ -375,7 +375,7 @@ def fed_snapshot(*, ranking: str = "secondary_monitor") -> dict:
         (("expected_target_midpoint", 4.0), "official_futures_derived_complete", "FAIL"),
         (("expected_change_bps", 25.0), "official_futures_derived_complete", "FAIL"),
         (("future_price", 90.0), "official_futures_derived_complete", "FAIL"),
-        (("validation", {"meeting_date_match": False}), "official_futures_derived_complete", "FAIL"),
+        (("validation", {"meeting_date_match": False}), "official_futures_derived_complete", "WARN"),
     ],
 )
 def test_fed_sanity_matrix(mutation: tuple[str, object] | None, ranking: str, expected: str) -> None:
@@ -386,6 +386,37 @@ def test_fed_sanity_matrix(mutation: tuple[str, object] | None, ranking: str, ex
     assert sanity["status"] == expected
     assert sanity["probability_semantics"] == "probability_target_range_after_meeting_relative_to_current_range"
     assert sanity["is_single_meeting_action_probability"] is False
+    assert sanity["source_crosscheck_status"] in {"AVAILABLE", "UNAVAILABLE"}
+    if expected == "FAIL":
+        assert sanity["sanity_failure_reason"] != "NONE"
+    else:
+        assert sanity["sanity_failure_reason"] == "NONE"
+
+
+def test_fed_calendar_mapping_is_warning_not_mathematical_failure() -> None:
+    snapshot = fed_snapshot(ranking="secondary_monitor")
+    snapshot["meetings"][0]["validation"] = {"meeting_date_match": False}
+    sanity = build_fed_sanity_check(snapshot, macro_snapshot=minimal_full()["macro_snapshot"])
+    assert sanity["status"] == "WARN"
+    assert sanity["sanity_failure_reason"] == "NONE"
+    assert "calendar_mapping_not_crosschecked" in sanity["sanity_warning_reason"]
+
+
+def test_consumer_exposes_empty_earnings_14d_context() -> None:
+    consumer = build_ai_trader_consumer_v2(minimal_full(), settings=Settings(_env_file=None))
+    assert "upcoming_mega_cap_earnings_14d" in consumer["earnings"]
+    assert "events" not in consumer["earnings"]
+
+
+def test_consumer_exposes_alphabet_aggregate_from_holdings() -> None:
+    full = minimal_full()
+    full["nasdaq_context"]["qqq_holdings"]["holdings"] = [
+        {"symbol": "GOOGL", "weight_pct": 2.8, "issuer_aggregate_weight_pct": 5.2},
+        {"symbol": "GOOG", "weight_pct": 2.4, "issuer_aggregate_weight_pct": 5.2},
+    ]
+    aggregate = build_ai_trader_consumer_v2(full, settings=Settings(_env_file=None))["nasdaq"]["alphabet_aggregate"]
+    assert aggregate["symbols"] == ["GOOG", "GOOGL"]
+    assert aggregate["aggregate_weight_pct"] == 5.2
 
 
 @pytest.mark.parametrize("section", INCLUDED_SECTIONS)
@@ -404,7 +435,7 @@ def test_consumer_v2_contract_name_schema_and_payload_size() -> None:
     consumer = build_ai_trader_consumer_v2(minimal_full(), settings=Settings(_env_file=None))
     assert consumer["contract"] == "ai_trader_market_context_consumer"
     assert consumer["schema_version"] == "2.1"
-    assert len(json.dumps(consumer, default=str).encode()) < 100_000
+    assert len(json.dumps(consumer, default=str).encode()) < 90_000
     assert not {
         "payload_view",
         "payload_size_bytes",

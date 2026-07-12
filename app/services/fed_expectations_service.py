@@ -283,6 +283,14 @@ def build_fed_sanity_check(
     )
     ranking = str((snapshot.get("source_summary") or {}).get("ranking_class") or "")
     crosscheck_available = ranking.startswith("official_") or bool((snapshot.get("source_summary") or {}).get("crosscheck_source"))
+    mathematical_checks = {
+        "target_range_inconsistent": target_range_consistent,
+        "expected_midpoint_inconsistent": expected_midpoint_consistent,
+        "expected_change_inconsistent": expected_change_consistent,
+        "future_price_inconsistent": future_price_consistent,
+        "meeting_sequence_inconsistent": meeting_sequence_consistent,
+        "probability_distribution_inconsistent": probability_distribution_consistent,
+    }
     core = all(
         (
             target_range_consistent,
@@ -291,15 +299,19 @@ def build_fed_sanity_check(
             future_price_consistent,
             meeting_sequence_consistent,
             probability_distribution_consistent,
-            calendar_mapping_consistent,
         )
     )
+    failure_reasons = [reason for reason, passed in mathematical_checks.items() if not passed]
+    warning_reasons: list[str] = []
+    if not calendar_mapping_consistent:
+        warning_reasons.append("calendar_mapping_not_crosschecked")
     warnings: list[str] = []
     if not crosscheck_available:
-        warnings.append("official_source_crosscheck_unavailable")
+        warning_reasons.append("official_source_crosscheck_unavailable")
     if not core:
         warnings.append("fed_expectations_internal_consistency_failed")
-    status = "FAIL" if not core else "PASS" if crosscheck_available else "WARN"
+    warnings.extend(warning_reasons)
+    status = "FAIL" if not core else "WARN" if warning_reasons else "PASS"
     yields = _yields_context(macro_snapshot, meetings)
     result = {
         "status": status,
@@ -311,7 +323,10 @@ def build_fed_sanity_check(
         "probability_distribution_consistent": probability_distribution_consistent,
         "calendar_mapping_consistent": calendar_mapping_consistent,
         "source_crosscheck_available": crosscheck_available,
+        "source_crosscheck_status": "AVAILABLE" if crosscheck_available else "UNAVAILABLE",
         "requires_crosscheck": not crosscheck_available,
+        "sanity_failure_reason": ",".join(failure_reasons) if failure_reasons else "NONE",
+        "sanity_warning_reason": ",".join(warning_reasons) if warning_reasons else "NONE",
         "probability_semantics": "probability_target_range_after_meeting_relative_to_current_range",
         "is_single_meeting_action_probability": False,
         "yields_context": yields,
