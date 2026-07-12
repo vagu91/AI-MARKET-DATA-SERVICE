@@ -15,6 +15,7 @@ from app.services.macro_consensus_service import (
     _log_context,
     candidate_metric_id,
     match_consensus_candidate,
+    merge_consensus_provider_payloads,
 )
 from app.services.market_context_builder import _critical_event_quality, _enrichment_summary, _normalize_metric
 from app.services.market_fact_repository import MarketFactRepository
@@ -222,6 +223,54 @@ def test_range_and_distribution_are_preserved_without_averaging(tmp_path):
     assert metric["estimate_high"] == 0.5
     assert metric["median_estimate"] == 0.3
     assert metric["average_estimate"] == 0.31
+
+
+def test_xtb_candidate_uses_explicit_metric_and_persists_lineage(tmp_path):
+    candidate = {
+        **occurrence("Titolo localizzato", period="Jun"),
+        "metric_id": "headline_cpi_mom",
+        "source": "XTB Economic Calendar",
+        "consensus_source": "XTB Economic Calendar",
+        "source_url": "https://www.xtb.com/it/calendario-economico",
+        "consensus_source_url": "https://www.xtb.com/it/calendario-economico",
+        "reliability": 0.80,
+        "actual": 0.4,
+    }
+    enriched, metrics, _ = MacroConsensusService(settings(tmp_path)).enrich_and_persist(
+        [official_event()],
+        {"status": "found", "items": [candidate]},
+        refresh_mode="force",
+    )
+    metric = enriched[0].enrichment.metrics[0]
+    assert metrics["consensus_persisted_count"] == 1
+    assert metrics["consensus_read_back_count"] == 1
+    assert metric["consensus_source"] == "XTB Economic Calendar"
+    assert metric["actual"] == 0.4
+    assert metric["field_lineage"]["actual"]["source"] == "XTB Economic Calendar"
+
+
+def test_ranked_consensus_preserves_higher_rank_and_uses_xtb_actual(tmp_path):
+    investing = {"status": "found", "source": "Investing Economic Calendar", "items": [occurrence(consensus=0.3)]}
+    xtb_candidate = {
+        **occurrence("Titolo localizzato", consensus=0.4, occurrence_id="xtb-1"),
+        "metric_id": "headline_cpi_mom",
+        "source": "XTB Economic Calendar",
+        "consensus_source": "XTB Economic Calendar",
+        "source_url": "https://www.xtb.com/it/calendario-economico",
+        "consensus_source_url": "https://www.xtb.com/it/calendario-economico",
+        "reliability": 0.80,
+        "actual": 0.5,
+    }
+    merged = merge_consensus_provider_payloads(investing, {"status": "found", "source": "XTB Economic Calendar", "items": [xtb_candidate]})
+    enriched, _, _ = MacroConsensusService(settings(tmp_path)).enrich_and_persist(
+        [official_event()], merged, refresh_mode="force"
+    )
+    metric = enriched[0].enrichment.metrics[0]
+    assert metric["consensus"] == 0.3
+    assert metric["consensus_source"] == "Investing Economic Calendar"
+    assert metric["actual"] == 0.5
+    assert metric["field_lineage"]["actual"]["source"] == "XTB Economic Calendar"
+    assert any("consensus_conflict" in warning for warning in enriched[0].enrichment.warnings)
 
 
 def test_lower_precedence_consensus_does_not_erase_actual_forecast_or_stronger_consensus(tmp_path):

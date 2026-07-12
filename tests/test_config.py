@@ -42,6 +42,24 @@ def test_settings_reads_prefixed_alpha_vantage_env_name(tmp_path) -> None:
     assert settings.alpha_vantage_api_key == "alpha-prefixed"
 
 
+def test_settings_reads_fmp_key_aliases_and_xtb_controls(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join([
+            "FMP_API_KEY=fmp-secret",
+            "AI_MARKET_ENABLE_XTB_CALENDAR=true",
+            "AI_MARKET_XTB_CALENDAR_MIN_IMPACT=2",
+            "AI_MARKET_XTB_CALENDAR_LOOKAHEAD_DAYS=7",
+        ]),
+        encoding="utf-8",
+    )
+    settings = Settings(_env_file=env_file)
+    assert settings.fmp_api_key == "fmp-secret"
+    assert settings.enable_xtb_calendar is True
+    assert settings.xtb_calendar_min_impact == 2
+    assert settings.xtb_calendar_lookahead_days == 7
+
+
 def test_settings_reads_openai_event_enrichment_config(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("AI_MARKET_OPENAI_API_KEY", raising=False)

@@ -508,8 +508,10 @@ def test_quality_penalties_and_composite_degrade_for_missing_components(missing)
     target = {"vix": vix, "vvix": vvix, "skew": skew, "curve": curve, "put_call": put_call}.get(missing)
     if target is not None:
         target["status"] = "not_found"
-        if missing == "curve": target["coverage_pct"] = 0
-        if missing == "put_call": target["scope_coverage_pct"] = 0
+        if missing == "curve":
+            target["coverage_pct"] = 0
+        if missing == "put_call":
+            target["scope_coverage_pct"] = 0
     else:
         alignment["aligned"] = False
         alignment["session_consistent"] = False
@@ -592,7 +594,8 @@ async def test_restart_refresh_false_is_zero_network_browser_ai_and_same_data(tm
     restarted.put_call_provider.fetch = _fail_network
     cached, _ = await restarted.snapshot(refresh="false", macro_snapshot={})
     assert cached["vvix"]["value"] == forced["vvix"]["value"]
-    stable = lambda rows: [{key: value for key, value in row.items() if key != "cache_status"} for row in rows]
+    def stable(rows):
+        return [{key: value for key, value in row.items() if key != "cache_status"} for row in rows]
     assert stable(cached["vix_term_structure"]["contracts"]) == stable(forced["vix_term_structure"]["contracts"])
     assert cached["diagnostics"]["provider_calls"] == 0
     assert cached["diagnostics"]["actual_network_calls"] == 0

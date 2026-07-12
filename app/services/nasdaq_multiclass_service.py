@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import re
 from copy import deepcopy
-from datetime import UTC, datetime
 from typing import Any
 
 from app.services.qqq_weight_intelligence_service import parse_market_value, parse_weight_value

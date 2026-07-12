@@ -163,17 +163,26 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
     upcoming = [item for item in (windows.get("upcoming") or windows.get("upcoming_event_windows") or []) if str(item.get("impact") or "").upper() == "HIGH" and _event_release_at(item)]
     unscheduled = [item for item in (windows.get("upcoming_unscheduled") or []) if str(item.get("impact") or "").upper() == "HIGH"]
     scheduled_critical = [item for item in critical if _event_release_at(item)]
+    xtb = ((full.get("economic_calendar_enrichment") or {}).get("xtb") or {})
     return {
         "consensus_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_consensus") or {},
         "actual_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_actual") or {},
         "events_today": _events_today(full.get("events_today_context") or {}),
         "event_risk_window_status": windows.get("event_risk_window_status"),
         "active_windows": [_event(item) for item in active[:6]],
-        "upcoming_high_impact_windows": [_event(item) for item in upcoming[:8]],
-        "upcoming_high_impact_events_unscheduled": [_unscheduled_event(item) for item in unscheduled[:8]],
+        "upcoming_high_impact_windows": [_event(item) for item in upcoming[:6]],
+        "upcoming_high_impact_events_unscheduled": [_unscheduled_event(item) for item in unscheduled[:6]],
         "next_critical_event": _event(scheduled_critical[0]) if scheduled_critical else None,
         "next_fomc": _event(next((item for item in [*critical, *fed] if "FOMC" in _event_text(item)), {})) or None,
-        "critical_events": [_event(item) for item in critical[:8]],
+        "critical_events": [_event(item) for item in critical[:6]],
+        "xtb_us_macro_calendar": {
+            "status": xtb.get("status"),
+            "provider_status": xtb.get("status"),
+            "retrieved_at": xtb.get("retrieved_at"),
+            "valid_until": xtb.get("valid_until"),
+            "source": xtb.get("source"),
+            "events": [_xtb_event(item) for item in (xtb.get("events") or xtb.get("items") or [])[:12]],
+        },
         "warnings": windows.get("warnings") or [],
     }
 
@@ -490,7 +499,73 @@ def _compact_sector(exposure: dict[str, Any]) -> dict[str, Any]:
 
 
 def _earnings_event(item: dict[str, Any]) -> dict[str, Any]:
-    return _select(item, "issuer_event_id", "issuer_name", "symbols", "symbol", "earnings_date", "date", "time", "is_primary_event", "duplicate_security_event", "eps_estimate", "revenue_estimate", "source", "reliability")
+    output = _select(
+        item,
+        "issuer_event_id",
+        "issuer_name",
+        "symbols",
+        "symbol",
+        "earnings_date",
+        "date",
+        "time",
+        "is_primary_event",
+        "duplicate_security_event",
+        "eps_estimate",
+        "eps_actual",
+        "revenue_estimate",
+        "revenue_actual",
+        "provider_last_updated",
+        "retrieved_at_utc",
+        "source",
+        "source_url",
+        "reliability",
+        "lineage",
+    )
+    output["lineage"] = _compact_source_field_lineage(output.get("lineage"))
+    return output
+
+
+def _xtb_event(item: dict[str, Any]) -> dict[str, Any]:
+    output = _drop_empty(_select(
+        item,
+        "source_event_id",
+        "indicator_id",
+        "event_name",
+        "normalized_event_type",
+        "date",
+        "time_local",
+        "release_at",
+        "all_day",
+        "impact",
+        "importance",
+        "consensus",
+        "consensus_verified",
+        "forecast_display",
+        "previous",
+        "previous_display",
+        "actual",
+        "actual_display",
+        "unit",
+        "currency",
+        "source",
+        "retrieved_at",
+        "lineage",
+    ))
+    output["lineage"] = _compact_source_field_lineage(output.get("lineage"))
+    return output
+
+
+def _compact_source_field_lineage(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    output: dict[str, dict[str, Any]] = {}
+    for field, details in raw.items():
+        if not isinstance(details, dict):
+            continue
+        compact = _drop_empty(_select(details, "source_field", "source_fields"))
+        if compact:
+            output[str(field)] = compact
+    return output
 
 
 def _alphabet_aggregate(holdings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -714,9 +789,7 @@ def _event_metric(metric: dict[str, Any]) -> dict[str, Any]:
     for key in ("source", "source_url", "provider_type", "confidence", "reliability", "evidence", "validation", "field_lineage"):
         if output.get(key) in (None, "", {}, []):
             output.pop(key, None)
-    if output.get("provider_type") not in {"AI_RESEARCHER_CODEX_CLI", "MIXED"}:
-        output.pop("field_lineage", None)
-    elif output.get("field_lineage"):
+    if output.get("field_lineage"):
         output["field_lineage"] = _compact_field_lineage(
             output["field_lineage"],
             shared_evidence=output.get("evidence"),

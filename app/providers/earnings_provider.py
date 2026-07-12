@@ -10,6 +10,7 @@ from app.models.nasdaq import EarningsTiming
 from app.providers.alpha_vantage import csv_rows
 from app.providers.base import BaseProvider, metadata
 from app.providers.calendar_utils import REQUEST_HEADERS
+from app.providers.fmp_earnings_calendar_provider import FmpEarningsCalendarProvider
 from app.providers.mega_cap_snapshot_provider import MEGA_CAP_TICKERS
 
 
@@ -27,6 +28,13 @@ class EarningsProvider(BaseProvider):
         events = []
         errors = []
         now = datetime.now(UTC)
+        fmp_result = await FmpEarningsCalendarProvider(self.cache, self.settings).fetch()
+        fmp_data = fmp_result.data if isinstance(fmp_result.data, dict) else {}
+        if fmp_data.get("events"):
+            return fmp_result
+        fmp_quality = fmp_data.get("data_quality") or {}
+        fmp_messages = _dedupe_errors([*(fmp_quality.get("warnings") or []), *(fmp_quality.get("errors") or [])])
+        fmp_attempted = int(fmp_quality.get("provider_calls") or 0) > 0
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
             if self.settings.alpha_vantage_api_key:
                 try:
@@ -53,8 +61,8 @@ class EarningsProvider(BaseProvider):
                                 "events": events,
                                 "data_quality": {
                                     "errors": [],
-                                    "warnings": [],
-                                    "fallback_used": False,
+                                    "warnings": fmp_messages,
+                                    "fallback_used": fmp_attempted,
                                     "final_data_available": True,
                                     "no_data_found": False,
                                     "provider_failed": False,
@@ -73,8 +81,8 @@ class EarningsProvider(BaseProvider):
                             "events": [],
                             "data_quality": {
                                 "errors": ["No watchlist earnings found in requested window"],
-                                "warnings": [],
-                                "fallback_used": False,
+                                    "warnings": fmp_messages,
+                                    "fallback_used": fmp_attempted,
                                 "final_data_available": True,
                                 "no_data_found": True,
                                 "provider_failed": False,
@@ -86,6 +94,8 @@ class EarningsProvider(BaseProvider):
                     message = str(exc) or "Alpha Vantage EARNINGS_CALENDAR provider_failed"
                     errors.append(f"Alpha Vantage EARNINGS_CALENDAR {_category(message)}: {message}")
 
+        if not self.settings.alpha_vantage_api_key:
+            return fmp_result
         return ProviderResult(
             metadata=metadata(
                 source="Alpha Vantage EARNINGS_CALENDAR" if self.settings.alpha_vantage_api_key else self.source,

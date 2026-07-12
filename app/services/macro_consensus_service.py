@@ -76,6 +76,25 @@ class ConsensusMatch:
     candidate_period: str | None = None
 
 
+def merge_consensus_provider_payloads(*payloads: dict[str, Any]) -> dict[str, Any]:
+    available = [payload for payload in payloads if isinstance(payload, dict)]
+    items = [dict(item) for payload in available for item in payload.get("items") or [] if isinstance(item, dict)]
+    items.sort(key=lambda item: (-float(item.get("reliability") or _source_reliability(item.get("source"))), str(item.get("release_at") or ""), str(item.get("event_name") or "")))
+    sources = [str(payload.get("source") or payload.get("provider")) for payload in available if payload.get("source") or payload.get("provider")]
+    return {
+        "status": "found" if items else "not_found",
+        "provider": "ranked_macro_consensus_sources",
+        "source": "+".join(dict.fromkeys(sources)),
+        "source_url": next((payload.get("source_url") for payload in available if payload.get("source_url")), None),
+        "retrieved_at": max((str(payload.get("retrieved_at") or "") for payload in available), default=None),
+        "valid_until": min((str(payload.get("valid_until")) for payload in available if payload.get("valid_until")), default=None),
+        "items": items,
+        "diagnostics": {"provider_count": len(available), "candidate_count": len(items), "source_ranking": ["official_existing_fields", "Investing Economic Calendar", "XTB Economic Calendar", "AI fallback"]},
+        "warnings": [warning for payload in available for warning in payload.get("warnings") or []],
+        "errors": [error for payload in available for error in payload.get("errors") or []],
+    }
+
+
 class MacroConsensusService:
     def __init__(self, settings: Settings, *, facts: MarketFactRepository | None = None) -> None:
         self.settings = settings
@@ -299,6 +318,9 @@ def candidate_family(candidate: dict[str, Any]) -> str | None:
 
 
 def candidate_metric_id(candidate: dict[str, Any]) -> str | None:
+    explicit = str(candidate.get("metric_id") or "")
+    if explicit in METRIC_META:
+        return explicit
     text = _normalized(candidate.get("event_name"))
     compact = text.replace(" ", "")
     frequency = "mom" if "mom" in compact else "yoy" if "yoy" in compact else "qoq" if "qoq" in compact else None
@@ -355,6 +377,9 @@ def reference_period(value: Any, *, release_at: datetime | None) -> tuple[str, i
 def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id: str) -> None:
     _family, label, frequency, unit = METRIC_META[metric_id]
     valid_until = _consensus_valid_until(event)
+    source = str(candidate.get("consensus_source") or candidate.get("source") or "Secondary Economic Calendar")
+    source_url = candidate.get("consensus_source_url") or candidate.get("source_url")
+    reliability = float(candidate.get("reliability") or _source_reliability(source))
     incoming = {
         "metric_id": metric_id,
         "label": label,
@@ -363,7 +388,7 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
         "forecast": None,
         "consensus": candidate.get("consensus"),
         "previous": candidate.get("previous"),
-        "actual": None,
+        "actual": candidate.get("actual"),
         "estimate_count": candidate.get("estimate_count"),
         "estimate_low": candidate.get("estimate_low"),
         "estimate_high": candidate.get("estimate_high"),
@@ -371,10 +396,10 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
         "average_estimate": candidate.get("average_estimate"),
         "forecast_origin": None,
         "consensus_verified": True,
-        "consensus_source": "Investing Economic Calendar",
-        "consensus_source_url": candidate.get("consensus_source_url") or candidate.get("source_url"),
-        "source": "Investing Economic Calendar",
-        "source_url": candidate.get("consensus_source_url") or candidate.get("source_url"),
+        "consensus_source": source,
+        "consensus_source_url": source_url,
+        "source": source,
+        "source_url": source_url,
         "provider_type": ProviderType.API.value,
         "validation": {
             "status": "deterministic_verified",
@@ -384,22 +409,34 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
         "valid_until": valid_until,
         "period": candidate.get("reference_period"),
         "unit": unit,
-        "reliability": 0.84,
-        "confidence": 0.84,
+        "reliability": reliability,
+        "confidence": reliability,
         "field_semantics": {
             "forecast_is_consensus": False,
             "forecast_origin": None,
             "consensus_verified": True,
-            "consensus_origin": "aggregated_economic_calendar",
+            "consensus_origin": candidate.get("consensus_origin") or "aggregated_economic_calendar",
             "source_scope": "aggregated_market_expectation",
             "period_match": True,
             "release_time_match": True,
             "actual_is_official": False,
         },
         "warnings": [],
+        "field_lineage": {
+            field: {
+                "source": source,
+                "source_url": source_url,
+                "provider_type": ProviderType.API.value,
+                "confidence": reliability,
+                "reliability": reliability,
+                "validation": {"status": "deterministic_verified"},
+            }
+            for field in ("consensus", "previous", "actual")
+            if candidate.get(field) not in (None, "")
+        },
         "provenance": [{
-            "source": "Investing Economic Calendar",
-            "source_url": candidate.get("consensus_source_url") or candidate.get("source_url"),
+            "source": source,
+            "source_url": source_url,
             "value": candidate.get("consensus"),
             "retrieved_at": candidate.get("consensus_retrieved_at"),
         }],
@@ -467,16 +504,18 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
     field_lineage = dict(existing.get("field_lineage") or {})
     for field in ("actual", "forecast", "previous"):
         if existing.get(field) in (None, ""):
-            continue
-        field_lineage[field] = {
-            "source": existing.get(f"{field}_source") or existing.get("source"),
-            "source_url": existing.get(f"{field}_source_url") or existing.get("source_url"),
-            "provider_type": existing.get("provider_type"),
-            "confidence": existing.get("confidence"),
-            "reliability": existing.get("reliability"),
-            "evidence": existing.get("evidence") or existing.get("evidence_text"),
-            "validation": existing.get("validation") or {},
-        }
+            if incoming.get(field) not in (None, ""):
+                field_lineage[field] = dict((incoming.get("field_lineage") or {}).get(field) or {})
+        else:
+            field_lineage[field] = {
+                "source": existing.get(f"{field}_source") or existing.get("source"),
+                "source_url": existing.get(f"{field}_source_url") or existing.get("source_url"),
+                "provider_type": existing.get("provider_type"),
+                "confidence": existing.get("confidence"),
+                "reliability": existing.get("reliability"),
+                "evidence": existing.get("evidence") or existing.get("evidence_text"),
+                "validation": existing.get("validation") or {},
+            }
     if preserve_existing_consensus:
         field_lineage["consensus"] = {
             "source": existing.get("consensus_source") or existing.get("source"),
@@ -630,6 +669,15 @@ def _period_label(period: tuple[str, int, int] | None) -> str | None:
 
 def _normalized(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _source_reliability(source: Any) -> float:
+    text = str(source or "")
+    if "Investing" in text:
+        return 0.84
+    if "XTB" in text:
+        return 0.80
+    return 0.75
 
 
 def _log_context(

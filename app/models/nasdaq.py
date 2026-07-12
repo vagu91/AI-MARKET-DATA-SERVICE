@@ -295,6 +295,9 @@ class EarningsEvent(BaseModel):
     eps_actual: float | None = None
     revenue_estimate: float | None = None
     revenue_actual: float | None = None
+    provider_last_updated: str | None = None
+    retrieved_at_utc: datetime | None = None
+    lineage: dict[str, Any] = Field(default_factory=dict)
     source: str
     source_url: str
     event_risk_level: Impact = Impact.MEDIUM

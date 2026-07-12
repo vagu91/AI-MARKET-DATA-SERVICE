@@ -42,6 +42,7 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /news/latest?symbols=NVDA,AAPL,MSFT,QQQ&limit=20&recency_days=14`
 - `GET /nasdaq/context`
 - `GET /providers/investing/economic-calendar?refresh=false|auto|force`
+- `GET /providers/xtb/economic-calendar?refresh=false|auto|force`
 - `GET /providers/investing/holidays?refresh=false|auto|force`
 - `GET /providers/marketbeat/holidays?refresh=false|auto|force`
 - `GET /providers/investing/fed-rate-monitor?refresh=false|auto|force`
@@ -110,6 +111,8 @@ Initial providers:
 - Federal Reserve official RSS/pages: FOMC, speeches, minutes, press releases
 - Invesco/Nasdaq public data: QQQ holdings and Nasdaq-100 constituents
 - Alpha Vantage API: QQQ ETF holdings, earnings calendar, news metadata, controlled quote fallback
+- Financial Modeling Prep stable earnings calendar: primary upcoming mega-cap earnings source when `FMP_API_KEY` is configured
+- XTB JSON economic calendar: secondary US macro calendar, consensus/previous/actual cross-check, impact 2-3
 - Yahoo public chart endpoint: primary mega-cap quote snapshot source
 - Stooq public CSV: quote fallback only when primary quote sources do not produce data
 - GDELT public API and RSS feeds: macro and mega-cap news fallback
@@ -173,6 +176,7 @@ AI_MARKET_FRED_API_KEY=...
 AI_MARKET_BEA_API_KEY=...
 AI_MARKET_BLS_API_KEY=...
 AI_MARKET_ALPHA_VANTAGE_API_KEY=...
+AI_MARKET_FMP_API_KEY=...
 ```
 
 For local compatibility, unprefixed names are also accepted:
@@ -182,9 +186,10 @@ FRED_API_KEY=...
 BEA_API_KEY=...
 BLS_API_KEY=...
 ALPHA_VANTAGE_API_KEY=...
+FMP_API_KEY=...
 ```
 
-API keys are never written to structured logs. If FRED, BEA, or Alpha Vantage is not configured, endpoints still return other providers and include clear provider errors when a source is unavailable.
+API keys are never written to structured logs. If FMP is not configured, its request is skipped and the existing earnings fallback/cache remains available. XTB requires no key and can be disabled with `AI_MARKET_ENABLE_XTB_CALENDAR=false`.
 
 Official event schedules currently used by `/events/today` and `/events/upcoming`:
 
@@ -302,7 +307,7 @@ Invoke-RestMethod "http://127.0.0.1:8010/events/upcoming?country=US&days=30" | C
 Invoke-RestMethod "http://127.0.0.1:8010/market-context/mnq" | ConvertTo-Json -Depth 40
 ```
 
-When `ALPHA_VANTAGE_API_KEY` or `AI_MARKET_ALPHA_VANTAGE_API_KEY` is configured, Alpha Vantage is used as the primary source for QQQ holdings, earnings calendar metadata, and latest news. Mega-cap quote snapshots use Yahoo Finance Chart first to avoid consuming Alpha Vantage free-tier quote limits; Alpha Vantage `GLOBAL_QUOTE` is used only as a controlled fallback.
+When `FMP_API_KEY` or `AI_MARKET_FMP_API_KEY` is configured, Financial Modeling Prep stable earnings calendar is the primary source for the 14-day mega-cap earnings block; Alpha Vantage remains the controlled earnings fallback. Alpha Vantage can also supply QQQ holdings and news metadata. Mega-cap quote snapshots use Yahoo Finance Chart first to avoid consuming Alpha Vantage free-tier quote limits; Alpha Vantage `GLOBAL_QUOTE` is used only as a controlled fallback.
 
 These endpoints do not compute chart levels, generate signals, or decide actions.
 News responses accept `recency_days` and filter articles by `published_at` when the upstream source provides a timestamp. If Alpha Vantage and GDELT are rate-limited, `/news/latest` falls back to RSS feeds and deduplicates articles by URL/title.

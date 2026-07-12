@@ -12,6 +12,8 @@ def credential_audit(settings: Settings) -> dict[str, Any]:
         _row("BLS macro/calendar", "BLS", False, bool(settings.bls_api_key), "free public limited", False, "public API", True),
         _row("BEA macro", "BEA", True, bool(settings.bea_api_key), "free", False, "DB cache", True),
         _row("QQQ holdings/news/earnings", "Alpha Vantage", True, bool(settings.alpha_vantage_api_key), "free limited", False, "Invesco/Yahoo/RSS", True),
+        _row("Upcoming mega-cap earnings", "Financial Modeling Prep", True, bool(settings.fmp_api_key), "configured plan", False, "existing earnings fallback/cache", False),
+        _row("US economic calendar", "XTB Economic Calendar", False, True, "public JSON", False, "official calendars/cache", False),
         _row("Yahoo quote/news", "Yahoo Finance", False, True, "public unofficial", False, "Stooq/RSS/cache", False),
         _row("COT", "CFTC", False, True, "public official", False, "CFTC public text", True),
         _row("Fed official news", "Federal Reserve RSS", False, True, "public official", False, "RSS cache", False),

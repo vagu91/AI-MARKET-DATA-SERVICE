@@ -6,7 +6,6 @@ from app.core.config import Settings
 from app.services.data_integrity_service import (
     classify_source,
     fact_temporal_status,
-    freshness_label,
     next_release_refresh_at,
     reject_future_actual,
     sector_exposure,

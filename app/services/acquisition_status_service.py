@@ -27,6 +27,7 @@ BLOCKS = {
     "risk_sentiment": tuple(),
     "earnings": ("earnings_event",),
     "investing_economic_calendar": ("investing_economic_calendar",),
+    "xtb_economic_calendar": ("xtb_economic_calendar",),
     "investing_holidays": ("investing_holidays",),
     "cme_market_schedule": ("cme_market_schedule",),
     "cboe_risk_indices": ("cboe_risk_indices",),
@@ -363,6 +364,7 @@ def _brief_observation(item: dict[str, Any]) -> dict[str, Any]:
 def _enabled(settings: Settings, name: str) -> bool:
     mapping = {
         "investing_economic_calendar": settings.enable_investing_calendar,
+        "xtb_economic_calendar": settings.enable_xtb_calendar,
         "investing_holidays": settings.enable_investing_holidays,
         "cme_market_schedule": settings.enable_cme_market_schedule,
         "cboe_risk_indices": settings.enable_cboe_risk_indices,

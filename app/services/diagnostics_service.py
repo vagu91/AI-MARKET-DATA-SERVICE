@@ -40,7 +40,7 @@ from app.services.data_integrity_service import (
     parse_retry_seconds,
 )
 from app.services.market_news_repository import MarketNewsRepository
-from app.services.macro_consensus_service import MacroConsensusService
+from app.services.macro_consensus_service import MacroConsensusService, merge_consensus_provider_payloads
 from app.services.news_intelligence_runtime_service import NewsIntelligenceRuntimeService
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
@@ -281,16 +281,20 @@ class DiagnosticsService:
         )
         multi_runtime = MultiSourceRuntimeService(self.settings)
         investing_refresh = refresh if force or (refresh == "auto" and self.macro_consensus.needs_refresh(enriched)) else "false"
-        investing_payload = await multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh)
+        investing_payload, xtb_payload = await asyncio.gather(
+            multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh),
+            multi_runtime.provider("xtb_economic_calendar", refresh=refresh if refresh in {"false", "force"} else "auto"),
+        )
         consensus_quality = {field: 0 for field in (
             "consensus_lookup_count", "consensus_candidate_count", "consensus_match_count",
             "consensus_rejected_count", "consensus_persisted_count", "consensus_read_back_count",
             "consensus_materialized_count", "consensus_missing_count",
         )}
         if refresh != "false":
-            enriched, consensus_quality, investing_payload = self.macro_consensus.enrich_and_persist(
+            ranked_consensus = merge_consensus_provider_payloads(investing_payload, xtb_payload)
+            enriched, consensus_quality, _ = self.macro_consensus.enrich_and_persist(
                 enriched,
-                investing_payload,
+                ranked_consensus,
                 refresh_mode=refresh,
             )
             if investing_payload.get("status") == "found":
@@ -298,6 +302,12 @@ class DiagnosticsService:
                     "investing_economic_calendar",
                     investing_payload,
                     source="Investing Economic Calendar",
+                )
+            if xtb_payload.get("status") == "found":
+                multi_runtime.persist_provider_result(
+                    "xtb_economic_calendar",
+                    xtb_payload,
+                    source="XTB Economic Calendar",
                 )
         if refresh == "false":
             if hasattr(self.event_window_service, "from_events"):
@@ -366,7 +376,10 @@ class DiagnosticsService:
         multi_refresh = "force" if refresh == "force" else "false"
         multi_source = await multi_runtime.snapshot(
             refresh=multi_refresh,
-            preloaded_blocks={"investing_economic_calendar": investing_payload},
+            preloaded_blocks={
+                "investing_economic_calendar": investing_payload,
+                "xtb_economic_calendar": xtb_payload,
+            },
         )
         apply_multi_source_context(contract, multi_source)
         contract["rates_expectations"] = self.fed_expectations.snapshot(

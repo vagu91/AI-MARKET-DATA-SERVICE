@@ -195,7 +195,6 @@ def test_codex_non_zero_exit_reports_failure_reason(tmp_path, monkeypatch):
 
 async def test_batch_of_five_events_is_one_codex_call_and_next_run_db_hit(tmp_path, monkeypatch):
     cfg = settings(tmp_path)
-    provider = AIResearcherProvider(cfg)
     calls = 0
 
     def fake_run(command, **kwargs):

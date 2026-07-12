@@ -10,12 +10,11 @@ from app.api.deps import (
     get_nasdaq_data_service,
 )
 from app.models.events import EconomicEvent
-from app.models.macro import EventWindowsResponse, MacroLatestResponse, MarketContextResponse
+from app.models.macro import EventWindowsResponse, MacroLatestResponse
 from app.models.nasdaq import (
     EarningsResponse,
     MegaCapBreadthResponse,
     MegaCapSnapshotResponse,
-    NasdaqContextResponse,
     NewsResponse,
     QQQHoldingsResponse,
 )
@@ -30,6 +29,7 @@ from app.services.diagnostics_service import (
 )
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.macro_service import MacroService
+from app.services.macro_consensus_service import merge_consensus_provider_payloads
 from app.services.market_fact_repository import MarketFactRepository, init_market_db
 from app.services.market_context_builder import build_market_context_contract
 from app.services.ai_trader_contract_service import build_ai_trader_market_context
@@ -163,9 +163,11 @@ async def market_context_mnq(
     multi_runtime = MultiSourceRuntimeService(enrichment_orchestrator.settings)
     investing_refresh = "auto" if diagnostics.macro_consensus.needs_refresh(upcoming) else "false"
     investing_payload = await multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh)
-    upcoming, consensus_quality, investing_payload = diagnostics.macro_consensus.enrich_and_persist(
+    xtb_payload = await multi_runtime.provider("xtb_economic_calendar", refresh="auto")
+    ranked_consensus = merge_consensus_provider_payloads(investing_payload, xtb_payload)
+    upcoming, consensus_quality, _ = diagnostics.macro_consensus.enrich_and_persist(
         upcoming,
-        investing_payload,
+        ranked_consensus,
         refresh_mode="auto",
     )
     if investing_payload.get("status") == "found":
@@ -173,6 +175,12 @@ async def market_context_mnq(
             "investing_economic_calendar",
             investing_payload,
             source="Investing Economic Calendar",
+        )
+    if xtb_payload.get("status") == "found":
+        multi_runtime.persist_provider_result(
+            "xtb_economic_calendar",
+            xtb_payload,
+            source="XTB Economic Calendar",
         )
     event_windows = await event_window_service.event_windows(symbol="MNQ")
     nasdaq_context, nasdaq_quality = await diagnostics._nasdaq_db_first(symbol="MNQ", fetch_missing=False)
@@ -231,6 +239,7 @@ async def market_context_mnq(
         refresh="false",
         preloaded_blocks={
             "investing_economic_calendar": investing_payload,
+            "xtb_economic_calendar": xtb_payload,
             "investing_fed_rate_monitor": fed_expectations_payload,
         },
     )
@@ -587,6 +596,14 @@ async def provider_investing_holidays(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
     return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("investing_holidays", refresh=refresh)
+
+
+@router.get("/providers/xtb/economic-calendar")
+async def provider_xtb_economic_calendar(
+    refresh: str = Query(default="auto", pattern="^(false|auto|force)$"),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return await MultiSourceRuntimeService(enrichment_orchestrator.settings).provider("xtb_economic_calendar", refresh=refresh)
 
 
 @router.get("/providers/marketbeat/holidays")

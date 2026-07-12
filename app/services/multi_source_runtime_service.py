@@ -18,6 +18,7 @@ from app.providers.nasdaq_earnings_provider import NasdaqEarningsProvider
 from app.providers.nasdaq_market_info_provider import NasdaqMarketInfoProvider
 from app.providers.nasdaq_qqq_option_chain_provider import NasdaqQQQOptionChainProvider
 from app.providers.polymarket_prediction_provider import PolymarketPredictionProvider
+from app.providers.xtb_economic_calendar_provider import XtbEconomicCalendarProvider
 from app.services.market_fact_repository import MarketFactRepository, now_iso
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.provider_observation_repository import ProviderObservationRepository
@@ -28,6 +29,7 @@ FetchCallable = Callable[[], Awaitable[dict[str, Any]]]
 
 FACT_TYPES = {
     "investing_economic_calendar": "investing_economic_calendar",
+    "xtb_economic_calendar": "xtb_economic_calendar",
     "investing_holidays": "investing_holidays",
     "marketbeat_holidays": "marketbeat_holidays",
     "cme_market_schedule": "cme_market_schedule",
@@ -50,6 +52,7 @@ class MultiSourceRuntimeService:
         self.facts = MarketFactRepository(settings)
         self.observations = ProviderObservationRepository(settings)
         self.investing_calendar = InvestingEconomicCalendarProvider(settings)
+        self.xtb_calendar = XtbEconomicCalendarProvider(settings)
         self.investing_holidays = InvestingHolidayCalendarProvider(settings)
         self.marketbeat_holidays = MarketBeatHolidaysProvider(settings)
         self.cme_market_schedule = CmeMarketScheduleProvider(settings)
@@ -98,6 +101,15 @@ class MultiSourceRuntimeService:
                 source="MarketBeat Stock Market Holidays",
                 refresh=refresh,
                 persist_unmaterialized=False,
+            ),
+            "xtb_economic_calendar": preloaded_blocks.get("xtb_economic_calendar") or await self._run_provider(
+                "xtb_economic_calendar",
+                FACT_TYPES["xtb_economic_calendar"],
+                self.xtb_calendar.fetch,
+                item_count=_count_investing_calendar,
+                enabled=self.settings.enable_xtb_calendar,
+                source="XTB Economic Calendar",
+                refresh=refresh,
             ),
             "cme_market_schedule": await self._run_provider(
                 "cme_market_schedule",
@@ -229,6 +241,16 @@ class MultiSourceRuntimeService:
                 source="MarketBeat Stock Market Holidays",
                 refresh=refresh,
                 persist_unmaterialized=False,
+            )
+        if name == "xtb_economic_calendar":
+            return await self._run_provider(
+                name,
+                FACT_TYPES[name],
+                self.xtb_calendar.fetch,
+                item_count=_count_investing_calendar,
+                enabled=self.settings.enable_xtb_calendar,
+                source="XTB Economic Calendar",
+                refresh=refresh,
             )
         if name == "cme_market_schedule":
             return await self._run_provider(
@@ -488,6 +510,7 @@ class MultiSourceRuntimeService:
 
 def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict[str, Any]:
     investing = blocks.get("investing_economic_calendar") or {}
+    xtb = blocks.get("xtb_economic_calendar") or {}
     holidays = blocks.get("investing_holidays") or {}
     marketbeat_holidays = blocks.get("marketbeat_holidays") or {}
     cme_market_schedule = blocks.get("cme_market_schedule") or {}
@@ -507,16 +530,24 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
     return {
         "economic_calendar_enrichment": {
             "investing": {**investing, "events": investing.get("items") or []},
+            "xtb": {**xtb, "events": xtb.get("items") or []},
+            "source_ranking": {
+                "official_release_calendars": "primary_for_schedule_and_official_actuals",
+                "investing_economic_calendar": "primary_aggregated_consensus_when_verified",
+                "xtb_economic_calendar": "secondary_consensus_crosscheck_and_calendar_fallback",
+                "conflict_policy": "preserve_higher_reliability_verified_field_and_retain_lineage",
+                "stale_policy": "never_promote_expired_secondary_values",
+            },
             "consensus_coverage": {
-                "events_with_consensus": sum(1 for item in investing.get("items") or [] if item.get("consensus") is not None),
-                "events_total": len(investing.get("items") or []),
+                "events_with_consensus": sum(1 for source in (investing, xtb) for item in source.get("items") or [] if item.get("consensus") is not None),
+                "events_total": sum(len(source.get("items") or []) for source in (investing, xtb)),
             },
             "previous_coverage": {
-                "events_with_previous": sum(1 for item in investing.get("items") or [] if item.get("previous") is not None),
-                "events_total": len(investing.get("items") or []),
+                "events_with_previous": sum(1 for source in (investing, xtb) for item in source.get("items") or [] if item.get("previous") is not None),
+                "events_total": sum(len(source.get("items") or []) for source in (investing, xtb)),
             },
             "secondary_actuals": {
-                "count": sum(1 for item in investing.get("items") or [] if item.get("actual") is not None),
+                "count": sum(1 for source in (investing, xtb) for item in source.get("items") or [] if item.get("actual") is not None),
                 "actual_is_official": False,
             },
         },

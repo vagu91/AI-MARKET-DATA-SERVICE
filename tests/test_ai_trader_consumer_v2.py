@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -445,6 +444,50 @@ def test_consumer_v2_contract_name_schema_and_payload_size() -> None:
         "trading_logic",
         "decisions_delegated_to",
     }.intersection(consumer)
+
+
+def test_consumer_with_fmp_earnings_and_xtb_calendar_stays_under_90kb() -> None:
+    full = minimal_full()
+    full["nasdaq_context"]["earnings"] = {
+        "upcoming": [
+            {
+                "symbol": symbol,
+                "date": date,
+                "source": "Financial Modeling Prep Earnings Calendar",
+                "retrieved_at_utc": "2026-07-12T06:00:00Z",
+                "lineage": {"date": {"source": "Financial Modeling Prep Earnings Calendar", "source_field": "date"}},
+            }
+            for symbol, date in (("NFLX", "2026-07-16"), ("TSLA", "2026-07-22"), ("GOOGL", "2026-07-23"))
+        ]
+    }
+    full["economic_calendar_enrichment"] = {
+        "xtb": {
+            "status": "found",
+            "source": "XTB Economic Calendar",
+            "retrieved_at": "2026-07-12T06:00:00Z",
+            "valid_until": "2026-07-12T06:30:00Z",
+            "items": [
+                {
+                    "source_event_id": str(index),
+                    "event_name": f"US macro event {index}",
+                    "normalized_event_type": "CPI_MOM",
+                    "date": "2026-07-13",
+                    "release_at": f"2026-07-13T{12 + index % 8:02d}:30:00Z",
+                    "importance": 2 if index % 2 else 3,
+                    "consensus": 0.3,
+                    "previous": 0.2,
+                    "source": "XTB Economic Calendar",
+                    "retrieved_at": "2026-07-12T06:00:00Z",
+                    "lineage": {"consensus": {"source": "XTB Economic Calendar", "source_field": "forecast"}},
+                }
+                for index in range(12)
+            ],
+        }
+    }
+    consumer = build_ai_trader_consumer_v2(full, settings=Settings(_env_file=None))
+    assert len(consumer["earnings"]["upcoming_mega_cap_earnings_14d"]) == 3
+    assert len(consumer["event_risk"]["xtb_us_macro_calendar"]["events"]) == 12
+    assert len(json.dumps(consumer, separators=(",", ":"), default=str).encode()) < 90_000
 
 
 def test_consumer_v2_limits_holdings_to_twenty() -> None:

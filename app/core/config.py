@@ -169,6 +169,10 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("AI_MARKET_READINESS_REQUIRE_NEWS", "READINESS_REQUIRE_NEWS"),
     )
+    fmp_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MARKET_FMP_API_KEY", "FMP_API_KEY"),
+    )
     readiness_require_rates: bool = Field(
         default=False,
         validation_alias=AliasChoices("AI_MARKET_READINESS_REQUIRE_RATES", "READINESS_REQUIRE_RATES"),
@@ -278,6 +282,12 @@ class Settings(BaseSettings):
     risk_curve_flat_tolerance_pct: float = Field(default=0.25, validation_alias="AI_MARKET_RISK_CURVE_FLAT_TOLERANCE_PCT")
     risk_alignment_max_gap_minutes: int = Field(default=1440, validation_alias="AI_MARKET_RISK_ALIGNMENT_MAX_GAP_MINUTES")
     enable_nasdaq_earnings: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_EARNINGS")
+    enable_fmp_earnings: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_FMP_EARNINGS")
+    enable_xtb_calendar: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_XTB_CALENDAR")
+    xtb_calendar_timeout_seconds: float = Field(default=10.0, validation_alias="AI_MARKET_XTB_CALENDAR_TIMEOUT_SECONDS")
+    xtb_calendar_min_impact: int = Field(default=2, ge=0, le=3, validation_alias="AI_MARKET_XTB_CALENDAR_MIN_IMPACT")
+    xtb_calendar_lookahead_days: int = Field(default=7, ge=1, le=14, validation_alias="AI_MARKET_XTB_CALENDAR_LOOKAHEAD_DAYS")
+    xtb_calendar_ttl_minutes: int = Field(default=30, ge=1, validation_alias="AI_MARKET_XTB_CALENDAR_TTL_MINUTES")
     enable_nasdaq_100: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_100")
     enable_nasdaq_market_info: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_NASDAQ_MARKET_INFO")
     enable_cme_market_schedule: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_CME_MARKET_SCHEDULE")
@@ -372,6 +382,8 @@ class Settings(BaseSettings):
     cboe_vix_futures_delayed_url: str = "https://cdn.cboe.com/api/global/delayed_quotes/futures/_VIX.json"
     cboe_put_call_url: str = "https://www.cboe.com/markets/us/options/market-statistics/daily"
     nasdaq_earnings_calendar_url: str = "https://api.nasdaq.com/api/calendar/earnings"
+    fmp_earnings_calendar_url: str = "https://financialmodelingprep.com/stable/earnings-calendar"
+    xtb_economic_calendar_url: str = "https://www.xtb.com/web-api/v3/languages/it/market-calendars?showForWeek=true&cache=false"
     nasdaq_market_info_url: str = "https://api.nasdaq.com/api/market-info"
     cme_market_schedule_url: str = "https://www.cmegroup.com/trading-hours.html"
     nasdaq_qqq_option_chain_url: str = "https://api.nasdaq.com/api/quote/QQQ/option-chain"
