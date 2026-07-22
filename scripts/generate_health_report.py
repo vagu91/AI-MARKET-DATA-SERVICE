@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services.health_report_service import HealthReportService
+from app.services.health_report_service import HealthReportService  # noqa: E402
 
 
 def main() -> int:

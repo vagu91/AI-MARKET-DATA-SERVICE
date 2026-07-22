@@ -89,6 +89,17 @@ def _with_runtime(context: dict[str, Any], *, refresh_mode: str, cache_status: s
     output = dict(context)
     if cache_status in {"expired", "stale", "stale_acceptable"} and output.get("latest"):
         output["last_known_good_used"] = True
+        output["historical_articles"] = list(output.get("latest") or [])
+        output["latest"] = []
+        output["articles"] = []
+        output["current_drivers"] = []
+        output["usable_for_analysis"] = False
+        output["status"] = "STALE_LAST_KNOWN_GOOD"
+        output["freshness"] = "STALE"
+        warnings = list(output.get("warnings") or [])
+        if "expired_news_snapshot_not_current" not in warnings:
+            warnings.append("expired_news_snapshot_not_current")
+        output["warnings"] = warnings
     metadata = dict(output.get("metadata") or {})
     metadata.update(
         {

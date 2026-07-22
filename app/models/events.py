@@ -48,6 +48,10 @@ class EconomicEvent(BaseModel):
     name: str
     country: str = "US"
     category: str
+    metric_id: str | None = None
+    normalized_event_family: str | None = None
+    reference_period: str | None = None
+    frequency: str | None = None
     date: str
     time_utc: datetime | None = None
     time_local: datetime | None = None

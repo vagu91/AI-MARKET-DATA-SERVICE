@@ -39,6 +39,10 @@ from app.services.macro_service import MacroService
 from app.services.market_fact_repository import init_market_db
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.nasdaq_data_service import NasdaqDataService
+from app.services.ai_research_worker import AIResearchWorker
+from app.services.ai_research_job_repository import AIResearchJobRepository
+from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
+from app.services.research_scheduler_service import ResearchSchedulerService
 
 
 def build_application_state(settings: Settings) -> dict[str, Any]:
@@ -91,6 +95,14 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         settings,
         event_enrichment_service=event_enrichment_service,
     )
+    ai_job_repository = AIResearchJobRepository(settings)
+    market_context_snapshots = MarketContextSnapshotRepository(settings)
+    ai_research_worker = AIResearchWorker(
+        settings,
+        repository=ai_job_repository,
+        snapshots=market_context_snapshots,
+    )
+    research_scheduler = ResearchSchedulerService(settings)
 
     return {
         "settings": settings,
@@ -102,4 +114,8 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         "nasdaq_data_service": nasdaq_data_service,
         "enrichment_orchestrator": enrichment_orchestrator,
         "market_news_repository": market_news_repository,
+        "ai_job_repository": ai_job_repository,
+        "market_context_snapshots": market_context_snapshots,
+        "ai_research_worker": ai_research_worker,
+        "research_scheduler": research_scheduler,
     }

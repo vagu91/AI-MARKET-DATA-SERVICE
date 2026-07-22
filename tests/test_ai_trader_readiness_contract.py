@@ -268,14 +268,14 @@ async def test_deterministic_enrichment_timeout_falls_through_to_ai(tmp_path: Pa
     assert "event_enrichment_timeout" not in quality.get("missing_critical_fields", [])
     assert quality["enrichment_timeout"] is False
     enrichment = model["metadata"]["event_enrichment"]
-    assert enrichment["status"] == "completed"
-    assert enrichment["AI_called"] is True
-    assert enrichment["attempted_event_count"] == 1
+    assert enrichment["status"] == "pending"
+    assert enrichment["AI_called"] is False
+    assert enrichment["attempted_event_count"] == 0
     assert enrichment["timeout_event_count"] == 0
-    assert all(row["attempted"] is True and row["timeout"] is False for row in enrichment["events"])
-    assert enrichment["persisted_event_count"] == 1
-    assert enrichment["read_back_event_count"] == 1
-    assert ai.calls == 1
+    assert all(row["attempted"] is False and row["timeout"] is False for row in enrichment["events"])
+    assert enrichment["persisted_event_count"] == 0
+    assert enrichment["read_back_event_count"] == 0
+    assert ai.calls == 0
     assert model["event_calendar"]["critical_macro_events"]
     latest_run = EnrichmentRunRepository(cfg).latest()
     assert latest_run["finished_at"] is not None
@@ -337,15 +337,15 @@ async def test_ai_stage_timeout_is_reported_without_outer_cancellation(tmp_path:
     enrichment = model["metadata"]["event_enrichment"]
     row = enrichment["events"][0]
 
-    assert enrichment["status"] == "timeout"
-    assert enrichment["AI_called"] is True
-    assert enrichment["attempted_event_count"] == 1
-    assert enrichment["timeout_event_count"] == 1
-    assert row["AI_called"] is True
-    assert row["attempted"] is True
-    assert row["timeout"] is True
-    assert enrichment["persisted_event_count"] == 1
-    assert enrichment["read_back_event_count"] == 1
+    assert enrichment["status"] == "pending"
+    assert enrichment["AI_called"] is False
+    assert enrichment["attempted_event_count"] == 0
+    assert enrichment["timeout_event_count"] == 0
+    assert row["AI_called"] is False
+    assert row["attempted"] is False
+    assert row["timeout"] is False
+    assert enrichment["persisted_event_count"] == 0
+    assert enrichment["read_back_event_count"] == 0
 
 
 @pytest.mark.parametrize(

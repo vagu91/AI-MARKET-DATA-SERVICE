@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -23,7 +22,6 @@ def main() -> int:
     consumer_force = _load(artifact_dir / "consumer_force.json")
     debug_force = _load(artifact_dir / "debug_force.json")
     consumer_cache = _load(artifact_dir / "consumer_cache.json")
-    debug_cache = _load(artifact_dir / "debug_cache.json")
     errors: list[str] = []
     warnings: list[str] = []
 

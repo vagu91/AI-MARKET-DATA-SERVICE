@@ -208,10 +208,9 @@ def test_orchestrator_force_bypasses_valid_negative_cache_and_calls_ai(tmp_path)
     assert forced["data_quality"]["history_event_count"] == 0
     assert forced["data_quality"]["db_bypassed_force"] == 1
     assert forced["data_quality"]["ai_research_requests"] == 1
-    assert ai.calls == 1
-    assert float(enriched[0].enrichment.previous) == 0.5
-    assert float(enriched[0].enrichment.metrics[0]["previous"]) == 0.5
-    assert enriched[0].enrichment.summary["persistence"] == {"persisted": True, "read_back": True}
+    assert ai.calls == 0
+    assert enriched[0].enrichment.previous is None
+    assert "ai_enrichment_pending" in enriched[0].enrichment.warnings
 
 
 def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
@@ -232,8 +231,8 @@ def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
     assert metadata["data_quality"]["db_hits"] == 0
     assert metadata["data_quality"]["db_bypassed_force"] == 1
     assert metadata["data_quality"]["ai_research_requests"] == 1
-    assert ai.calls == 1
-    assert float(enriched[0].enrichment.previous) == 0.7
+    assert ai.calls == 0
+    assert enriched[0].enrichment.previous is None
 
 
 def test_orchestrator_force_batches_five_valid_negative_caches(tmp_path):
@@ -261,13 +260,11 @@ def test_orchestrator_force_batches_five_valid_negative_caches(tmp_path):
     quality = metadata["data_quality"]
     assert quality["db_hits"] == 0
     assert quality["db_bypassed_force"] == 5
-    assert quality["ai_research_requests"] == 1
+    assert quality["ai_research_requests"] == 5
     assert quality["ai_events_requested"] == 5
-    assert ai.calls == 1
-    assert all(item.enrichment.previous is not None for item in enriched)
-    for event in events:
-        stored = repo.get_fact(orchestrator.fact_key(event))
-        assert stored["previous"] is not None
+    assert ai.calls == 0
+    assert all("ai_enrichment_pending" in item.enrichment.warnings for item in enriched)
+    assert all(repo.get_fact(orchestrator.fact_key(event))["status"] == "no_data_available" for event in events)
 
 
 def test_orchestrator_provider_success_saves_db(tmp_path):
@@ -351,9 +348,9 @@ def test_orchestrator_ai_disabled_and_enabled_paths(tmp_path):
             trigger="test",
         )
     )
-    assert ai.calls == 1
-    assert enriched[0].enrichment.forecast == "0.4%"
-    assert metadata["data_quality"]["ai_research_used"] is True
+    assert ai.calls == 0
+    assert enriched[0].enrichment.forecast is None
+    assert metadata["data_quality"]["ai_research_status"] == "PENDING"
 
 
 def test_ai_researcher_output_validation(tmp_path):

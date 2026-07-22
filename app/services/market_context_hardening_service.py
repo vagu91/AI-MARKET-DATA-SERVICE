@@ -273,6 +273,25 @@ def events_today_context(
 ) -> dict[str, Any]:
     now = _aware(now or datetime.now(UTC))
     events = list(full.get("events_today") or [])
+    calendar = full.get("event_calendar") or {}
+    candidates = [
+        *(calendar.get("critical_macro_events") or []),
+        *(calendar.get("fed_communications") or []),
+        *(calendar.get("other_economic_events") or []),
+        *(((full.get("economic_calendar_enrichment") or {}).get("xtb") or {}).get("items") or []),
+        *(((full.get("economic_calendar_enrichment") or {}).get("xtb") or {}).get("events") or []),
+    ]
+    seen = {
+        str(item.get("canonical_event_key") or item.get("event_id") or f"{item.get('time_utc')}|{item.get('name') or item.get('event_name')}")
+        for item in events if isinstance(item, dict)
+    }
+    for item in candidates:
+        if not isinstance(item, dict) or not _event_is_today(item, now):
+            continue
+        identity = str(item.get("canonical_event_key") or item.get("event_id") or f"{item.get('time_utc')}|{item.get('name') or item.get('event_name')}")
+        if identity not in seen:
+            events.append(item)
+            seen.add(identity)
     quality = full.get("data_quality") or {}
     event_errors = list((quality.get("event_pipeline") or {}).get("errors") or [])
     if events:
@@ -292,6 +311,13 @@ def events_today_context(
         "blocking": False,
         "errors": event_errors,
     }
+
+
+def _event_is_today(item: dict[str, Any], now: datetime) -> bool:
+    release = parse_datetime(item.get("release_at") or item.get("time_utc"))
+    if release is not None:
+        return _aware(release).date() == now.date()
+    return str(item.get("date") or "") == now.date().isoformat()
 
 
 def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str, Any]:

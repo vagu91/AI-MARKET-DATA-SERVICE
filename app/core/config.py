@@ -270,6 +270,80 @@ class Settings(BaseSettings):
         default=6,
         validation_alias="AI_MARKET_MAX_RELEASE_REFRESH_ATTEMPTS",
     )
+    official_feed_delay_hours: int = Field(
+        default=24, ge=1, validation_alias="AI_MARKET_OFFICIAL_FEED_DELAY_HOURS",
+    )
+    official_actual_retry_seconds: str = Field(
+        default="30,120,300,900,1800,3600,3600,3600,3600,3600,3600,3600",
+        validation_alias="AI_MARKET_OFFICIAL_ACTUAL_RETRY_SECONDS",
+    )
+    official_actual_max_attempts: int = Field(
+        default=48, ge=2, validation_alias="AI_MARKET_OFFICIAL_ACTUAL_MAX_ATTEMPTS",
+    )
+    source_policy_path: Path = Field(
+        default=Path("./config/source_policy.json"),
+        validation_alias="AI_MARKET_SOURCE_POLICY_PATH",
+    )
+    ai_worker_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_AI_WORKER_ENABLED",
+    )
+    ai_worker_poll_seconds: float = Field(
+        default=1.0,
+        ge=0.05,
+        validation_alias="AI_MARKET_AI_WORKER_POLL_SECONDS",
+    )
+    ai_job_lease_seconds: int = Field(
+        default=60,
+        ge=5,
+        validation_alias="AI_MARKET_AI_JOB_LEASE_SECONDS",
+    )
+    ai_job_max_runtime_seconds: int = Field(
+        default=600,
+        ge=1,
+        validation_alias="AI_MARKET_AI_JOB_MAX_RUNTIME_SECONDS",
+    )
+    ai_job_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        validation_alias="AI_MARKET_AI_JOB_MAX_ATTEMPTS",
+    )
+    ai_research_web_access_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_AI_RESEARCH_WEB_ACCESS_ENABLED",
+    )
+    ai_job_workspace_root: Path = Field(
+        default=Path("./data/ai_research_jobs"),
+        validation_alias="AI_MARKET_AI_JOB_WORKSPACE_ROOT",
+    )
+    ai_worker_shutdown_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        validation_alias="AI_MARKET_AI_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+    )
+    ai_run_window_news_minutes: int = Field(default=15, ge=1, validation_alias="AI_MARKET_AI_RUN_WINDOW_NEWS_MINUTES")
+    ai_run_window_missing_event_minutes: int = Field(default=60, ge=1, validation_alias="AI_MARKET_AI_RUN_WINDOW_MISSING_EVENT_MINUTES")
+    ai_run_window_speech_minutes: int = Field(default=30, ge=1, validation_alias="AI_MARKET_AI_RUN_WINDOW_SPEECH_MINUTES")
+    ai_run_window_earnings_minutes: int = Field(default=60, ge=1, validation_alias="AI_MARKET_AI_RUN_WINDOW_EARNINGS_MINUTES")
+    ai_run_window_general_market_minutes: int = Field(default=30, ge=1, validation_alias="AI_MARKET_AI_RUN_WINDOW_GENERAL_MARKET_MINUTES")
+    ai_run_window_actual_refresh_minutes: int = Field(default=15, ge=1, validation_alias="AI_MARKET_AI_RUN_WINDOW_ACTUAL_REFRESH_MINUTES")
+    research_scheduler_enabled: bool = Field(default=False, validation_alias="AI_MARKET_RESEARCH_SCHEDULER_ENABLED")
+    research_premarket_enabled: bool = Field(default=True, validation_alias="AI_MARKET_RESEARCH_PREMARKET_ENABLED")
+    research_session_enabled: bool = Field(default=True, validation_alias="AI_MARKET_RESEARCH_SESSION_ENABLED")
+    research_postmarket_enabled: bool = Field(default=True, validation_alias="AI_MARKET_RESEARCH_POSTMARKET_ENABLED")
+    research_event_triggers_enabled: bool = Field(default=True, validation_alias="AI_MARKET_RESEARCH_EVENT_TRIGGERS_ENABLED")
+    research_news_enabled: bool = Field(default=True, validation_alias="AI_MARKET_RESEARCH_NEWS_ENABLED")
+    research_premarket_time: str = Field(default="08:00", validation_alias="AI_MARKET_RESEARCH_PREMARKET_TIME")
+    research_postmarket_time: str = Field(default="17:00", validation_alias="AI_MARKET_RESEARCH_POSTMARKET_TIME")
+    research_session_interval_minutes: int = Field(default=30, ge=1, validation_alias="AI_MARKET_RESEARCH_SESSION_INTERVAL_MINUTES")
+    research_max_concurrent_jobs: int = Field(default=1, ge=1, validation_alias="AI_MARKET_RESEARCH_MAX_CONCURRENT_JOBS")
+    research_max_searches: int = Field(default=8, ge=1, validation_alias="AI_MARKET_RESEARCH_MAX_SEARCHES")
+    research_max_opened_sources: int = Field(default=12, ge=1, validation_alias="AI_MARKET_RESEARCH_MAX_OPENED_SOURCES")
+    research_daily_budget_runs: int = Field(default=8, ge=0, validation_alias="AI_MARKET_RESEARCH_DAILY_BUDGET_RUNS")
+    research_minimum_freshness_minutes: int = Field(default=15, ge=1, validation_alias="AI_MARKET_RESEARCH_MINIMUM_FRESHNESS_MINUTES")
+    research_pre_event_window_minutes: int = Field(default=120, ge=1, validation_alias="AI_MARKET_RESEARCH_PRE_EVENT_WINDOW_MINUTES")
+    research_daily_budget_searches: int = Field(default=64, ge=0, validation_alias="AI_MARKET_RESEARCH_DAILY_BUDGET_SEARCHES")
+    research_daily_budget_opened_sources: int = Field(default=96, ge=0, validation_alias="AI_MARKET_RESEARCH_DAILY_BUDGET_OPENED_SOURCES")
     enable_investing_calendar: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_CALENDAR")
     enable_investing_holidays: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_INVESTING_HOLIDAYS")
     enable_marketbeat_holidays: bool = Field(default=True, validation_alias="AI_MARKET_ENABLE_MARKETBEAT_HOLIDAYS")

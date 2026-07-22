@@ -14,6 +14,7 @@ from app.providers.base import BaseProvider, ProviderError, metadata, redact_sen
 # T10101 line 1 is the existing GDP growth series used by the service.
 # T10106 line 1 adds Real GDP in chained dollars.
 # T20805 line 1 adds monthly PCE current-dollar level.
+# T20804 line 1 is the headline PCE chain-type price index.
 # T20804 line 25 is BEA's monthly PCE price index excluding food and energy (Core PCE).
 # T20600 line 1 adds monthly Personal Income.
 # T20600 line 28 adds Personal Spending via BEA's "Personal outlays" line.
@@ -36,6 +37,13 @@ BEA_SERIES = [
         "series_id": "BEA:PCE",
         "name": "Personal Consumption Expenditures",
         "table": "T20805",
+        "frequency": "M",
+        "line_number": "1",
+    },
+    {
+        "series_id": "BEA:PCE_PRICE_INDEX",
+        "name": "PCE Price Index",
+        "table": "T20804",
         "frequency": "M",
         "line_number": "1",
     },
@@ -118,7 +126,8 @@ class BeaProvider(BaseProvider):
                     continue
 
                 for spec in table_specs:
-                    item = self._latest_row_for_line(rows, str(spec["line_number"]))
+                    matching_rows = self._rows_for_line(rows, str(spec["line_number"]))
+                    item = max(matching_rows, key=lambda row: str(row.get("TimePeriod") or ""), default=None)
                     if item is None:
                         errors.append(
                             f"BEA {table} line {spec['line_number']} unavailable for {spec['name']}"
@@ -139,8 +148,29 @@ class BeaProvider(BaseProvider):
                         "value": float(value),
                         "units": item.get("CL_UNIT"),
                         "data_as_of": period,
+                        "frequency": "quarterly" if frequency == "Q" else "monthly",
+                        "seasonal_adjustment": "SAAR" if frequency == "Q" or spec["series_id"] in {
+                            "BEA:PERSONAL_INCOME", "BEA:PERSONAL_SPENDING", "BEA:PCE",
+                        } else "SA",
+                        "observations": [
+                            {
+                                "period": row.get("TimePeriod"),
+                                "value": str(row.get("DataValue") or "").replace(",", ""),
+                                "release_vintage": row.get("NoteRef") or row.get("CL_UNIT") or "published",
+                            }
+                            for row in matching_rows
+                            if row.get("DataValue") not in (None, "", "---")
+                        ],
                         "source": self.source,
+                        "source_url": self.settings.bea_base_url,
+                        "canonical_url": "https://www.bea.gov/data",
+                        "source_domain": "bea.gov",
+                        "provider_adapter": "BEA_OFFICIAL_API",
+                        "official_adapter": True,
                     }
+                    series[str(spec["series_id"])]["observations"].sort(
+                        key=lambda row: str(row.get("period") or "")
+                    )
 
         return ProviderResult(
             metadata=metadata(
@@ -155,14 +185,11 @@ class BeaProvider(BaseProvider):
         )
 
     @staticmethod
-    def _latest_row_for_line(
+    def _rows_for_line(
         rows: list[dict[str, object]],
         line_number: str,
-    ) -> dict[str, object] | None:
-        for row in reversed(rows):
-            if str(row.get("LineNumber")) == line_number:
-                return row
-        return None
+    ) -> list[dict[str, object]]:
+        return [row for row in rows if str(row.get("LineNumber")) == line_number]
 
     @staticmethod
     def _period_to_datetime(period: str) -> datetime:

@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_event_service, get_event_window_service, get_macro_service
+from app.api.deps import get_event_service, get_event_window_service, get_macro_service, get_nasdaq_data_service
 from app.main import app
 from app.models.events import EconomicEvent
 from app.models.macro import EventWindowsResponse, MacroLatestResponse
@@ -117,7 +117,7 @@ def test_nasdaq_data_endpoints_are_registered() -> None:
         assert path in paths
 
 
-def test_events_and_market_context_include_enrichment() -> None:
+def test_events_and_market_context_include_enrichment(monkeypatch) -> None:
     class FakeEventService:
         last_enrichment_metadata = {"enriched_count": 1, "missing_enrichment_count": 0}
 
@@ -138,9 +138,40 @@ def test_events_and_market_context_include_enrichment() -> None:
                 checked_at_utc="2099-07-14T12:00:00+00:00",
             )
 
+    class FakeNasdaqService:
+        async def context(self, *args, **kwargs):
+            return {}
+
+    async def no_external_provider(self, name, *, refresh="auto"):
+        return {"status": "not_configured", "items": [], "provider_calls": 0, "actual_network_calls": 0}
+
+    async def no_external_snapshot(self, *, refresh="auto", preloaded_blocks=None):
+        from app.services.multi_source_runtime_service import build_multi_source_context_blocks
+
+        blocks = preloaded_blocks or {}
+        return {
+            "status": "available", "refresh_mode": refresh, "blocks": blocks,
+            "context_blocks": build_multi_source_context_blocks(blocks),
+            "data_quality": {"provider_calls": 0, "actual_network_calls": 0, "cache_used": True},
+        }
+
+    async def no_positioning(self, *, refresh="auto"):
+        return {"status": "not_configured"}
+
+    async def no_risk(self, **kwargs):
+        return {}, {}
+
+    monkeypatch.setattr("app.services.multi_source_runtime_service.MultiSourceRuntimeService.provider", no_external_provider)
+    monkeypatch.setattr("app.services.multi_source_runtime_service.MultiSourceRuntimeService.snapshot", no_external_snapshot)
+    monkeypatch.setattr("app.services.positioning_runtime_service.PositioningRuntimeService.cot", no_positioning)
+    monkeypatch.setattr("app.services.positioning_runtime_service.PositioningRuntimeService.aaii", no_positioning)
+    monkeypatch.setattr("app.services.risk_context_runtime_service.RiskContextRuntimeService.snapshot", no_risk)
+    monkeypatch.setattr("app.services.social_sentiment_service.SocialSentimentService.snapshot", no_positioning)
+
     app.dependency_overrides[get_event_service] = lambda: FakeEventService()
     app.dependency_overrides[get_macro_service] = lambda: FakeMacroService()
     app.dependency_overrides[get_event_window_service] = lambda: FakeEventWindowService()
+    app.dependency_overrides[get_nasdaq_data_service] = lambda: FakeNasdaqService()
     try:
         with TestClient(app) as client:
             upcoming = client.get("/events/upcoming?country=US&days=7")
@@ -151,8 +182,10 @@ def test_events_and_market_context_include_enrichment() -> None:
     assert upcoming.status_code == 200
     assert upcoming.json()[0]["enrichment"]["forecast"] == "0.3%"
     assert context.status_code == 200
-    assert context.json()["events_today"][0]["enrichment"]["previous"] == "0.2%"
-    assert context.json()["metadata"]["event_enrichment"]["enriched_count"] == 1
+    payload = context.json()
+    assert payload["contract"] == "ai_trader_market_context_consumer"
+    assert payload["schema_version"] == "2.1"
+    assert payload["event_risk"]["events_today"]["events"][0]["previous"] == "0.2%"
 
 
 def event_payload() -> dict:

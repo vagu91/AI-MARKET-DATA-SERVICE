@@ -48,6 +48,8 @@ from app.services.multi_source_runtime_service import MultiSourceRuntimeService,
 from app.services.fed_expectations_service import FedExpectationsService
 from app.services.risk_context_runtime_service import RiskContextRuntimeService
 from app.services.social_sentiment_service import SocialSentimentService
+from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
+from app.services.event_value_candidate_repository import EventValueCandidateRepository
 
 
 class DiagnosticsService:
@@ -189,8 +191,6 @@ class DiagnosticsService:
                     }
                 }
             enrichment_timeout = max(float(self.settings.timeout_events_seconds), 1.0)
-            if self.settings.enable_ai_researcher:
-                enrichment_timeout += max(float(self.settings.timeout_ai_research_seconds), 1.0)
             enrichment_timeout += 5.0
             try:
                 return await asyncio.wait_for(
@@ -285,6 +285,21 @@ class DiagnosticsService:
             multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh),
             multi_runtime.provider("xtb_economic_calendar", refresh=refresh if refresh in {"false", "force"} else "auto"),
         )
+        if refresh != "false":
+            candidates = EventValueCandidateRepository(self.settings)
+            candidates.persist_provider_payload(investing_payload)
+            candidates.persist_provider_payload(xtb_payload)
+        enriched = reconcile_calendar_events(
+            enriched,
+            [investing_payload, xtb_payload],
+            now=now,
+        )
+        for event in enriched:
+            self.facts.upsert_economic_event(
+                event,
+                event_key=canonical_event_key(event),
+                valid_until=self.freshness.macro_valid_until(event),
+            )
         consensus_quality = {field: 0 for field in (
             "consensus_lookup_count", "consensus_candidate_count", "consensus_match_count",
             "consensus_rejected_count", "consensus_persisted_count", "consensus_read_back_count",
@@ -896,6 +911,7 @@ def _event_enrichment_metadata(
     mode = str(quality.get("ai_research_mode") or getattr(settings, "ai_researcher_mode", "codex_cli"))
     configured = bool(quality.get("ai_research_configured", enabled and mode in {"codex_cli", "openai_api"}))
     ai_called = bool(quality.get("ai_research_called"))
+    ai_queued = int(quality.get("ai_research_requests") or 0) > 0 or str(quality.get("ai_research_status") or "").upper() == "PENDING"
     candidate_ids = {str(value) for value in quality.get("ai_candidate_event_ids") or []}
     raw_status = str(quality.get("ai_research_status") or "").lower()
     failure_reason = quality.get("ai_failure_reason")
@@ -907,6 +923,8 @@ def _event_enrichment_metadata(
         overall_status, reason = "not_configured", "AI enrichment is not configured"
     elif quality.get("ai_not_available"):
         overall_status, reason = "not_available", str(failure_reason or "AI enrichment is unavailable")
+    elif ai_queued and not ai_called:
+        overall_status, reason = "pending", "AI enrichment is queued for the persistent worker"
     elif not ai_called:
         overall_status = "not_required"
         reason = "optional enrichment skipped" if quality.get("enrichment_not_attempted") else "no AI-eligible event required enrichment"
@@ -925,7 +943,8 @@ def _event_enrichment_metadata(
     for event in events:
         enrichment = getattr(event, "enrichment", None)
         attempted = ai_called and str(getattr(event, "event_id", "")) in candidate_ids
-        status = overall_status if attempted else (overall_status if overall_status in {"disabled", "not_configured", "not_available"} else "not_required")
+        queued_for_event = ai_queued and str(getattr(event, "event_id", "")) in candidate_ids
+        status = overall_status if attempted or queued_for_event else (overall_status if overall_status in {"disabled", "not_configured", "not_available"} else "not_required")
         source_url = getattr(enrichment, "source_url", None)
         values = [field for field in ("forecast", "previous", "consensus", "actual") if getattr(enrichment, field, None) not in (None, "")]
         accepted_fields = values if attempted and status == "completed" and source_url else []
