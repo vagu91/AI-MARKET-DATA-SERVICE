@@ -485,7 +485,8 @@ def test_consumer_with_fmp_earnings_and_xtb_calendar_stays_under_90kb() -> None:
         }
     }
     consumer = build_ai_trader_consumer_v2(full, settings=Settings(_env_file=None))
-    assert len(consumer["earnings"]["upcoming_mega_cap_earnings_14d"]) == 3
+    assert len(consumer["earnings"]["upcoming_mega_cap_earnings_14d"]) == 2
+    assert [item["symbol"] for item in consumer["earnings"]["released_earnings"]] == ["NFLX"]
     assert len(consumer["event_risk"]["xtb_us_macro_calendar"]["events"]) == 12
     assert len(json.dumps(consumer, separators=(",", ":"), default=str).encode()) < 90_000
 

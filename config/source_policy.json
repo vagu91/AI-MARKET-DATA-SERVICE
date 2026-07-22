@@ -1,0 +1,48 @@
+{
+  "policy_version": "source-policy-v1",
+  "default_unknown_tier": 5,
+  "forbidden_domains": [],
+  "issuer_official_domains": ["apple.com", "microsoft.com", "nvidia.com", "amazon.com", "abc.xyz", "meta.com", "tesla.com"],
+  "issuer_domain_allowlist": {
+    "Apple": ["apple.com"], "Microsoft": ["microsoft.com"], "NVIDIA": ["nvidia.com"],
+    "Amazon": ["amazon.com"], "Alphabet": ["abc.xyz"], "Meta": ["meta.com"], "Tesla": ["tesla.com"]
+  },
+  "semantic_policies": {
+    "actual": {"allowed_tiers": [1], "required_confirmations": 1, "ttl_minutes": 10080, "max_reliability": 0.99},
+    "forecast": {"allowed_tiers": [3, 4], "required_confirmations": 2, "ttl_minutes": 1440, "max_reliability": 0.92},
+    "consensus": {"allowed_tiers": [3, 4], "required_confirmations": 2, "ttl_minutes": 1440, "max_reliability": 0.92},
+    "previous": {"allowed_tiers": [1, 3, 4], "required_confirmations": 2, "ttl_minutes": 10080, "max_reliability": 0.92},
+    "news": {"allowed_tiers": [1, 2, 3], "required_confirmations": 2, "ttl_minutes": 360, "max_reliability": 0.98},
+    "outcome": {"allowed_tiers": [1, 3], "required_confirmations": 1, "ttl_minutes": 10080, "max_reliability": 0.99},
+    "transcript_url": {"allowed_tiers": [1], "required_confirmations": 1, "ttl_minutes": 43200, "max_reliability": 0.99},
+    "earnings": {"allowed_tiers": [1, 2], "required_confirmations": 1, "ttl_minutes": 43200, "max_reliability": 0.99},
+    "guidance": {"allowed_tiers": [1, 2], "required_confirmations": 1, "ttl_minutes": 43200, "max_reliability": 0.99},
+    "exploratory_context": {"allowed_tiers": [1, 2, 3, 4, 5], "required_confirmations": 1, "ttl_minutes": 60, "max_reliability": 0.70}
+  },
+  "rules": [
+    {"domain": "bls.gov", "publisher": "U.S. Bureau of Labor Statistics", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "bea.gov", "publisher": "U.S. Bureau of Economic Analysis", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "federalreserve.gov", "publisher": "Federal Reserve", "tier": 1, "data_types": ["actual", "event", "speech", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "treasury.gov", "publisher": "U.S. Treasury", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "census.gov", "publisher": "U.S. Census Bureau", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "eia.gov", "publisher": "U.S. Energy Information Administration", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "sec.gov", "publisher": "U.S. SEC", "tier": 1, "data_types": ["actual", "event", "earnings", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "cftc.gov", "publisher": "U.S. CFTC", "tier": 1, "data_types": ["actual", "positioning", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "cmegroup.com", "publisher": "CME Group", "tier": 1, "data_types": ["actual", "event", "market", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "cboe.com", "publisher": "Cboe", "tier": 1, "data_types": ["actual", "market", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "nasdaq.com", "publisher": "Nasdaq", "tier": 1, "data_types": ["actual", "event", "market", "earnings", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "whitehouse.gov", "publisher": "The White House", "tier": 1, "data_types": ["event", "speech", "news"], "official_actual": false, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "invesco.com", "publisher": "Invesco", "tier": 2, "data_types": ["market", "holdings", "news"], "official_actual": false, "consensus": false, "news": true, "base_reliability": 0.96, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "reuters.com", "publisher": "Reuters", "tier": 3, "data_types": ["event", "speech", "news"], "official_actual": false, "consensus": false, "news": true, "base_reliability": 0.92, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "apnews.com", "publisher": "Associated Press", "tier": 3, "data_types": ["event", "speech", "news"], "official_actual": false, "consensus": false, "news": true, "base_reliability": 0.91, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "bloomberg.com", "publisher": "Bloomberg", "tier": 3, "data_types": ["event", "news", "consensus"], "official_actual": false, "consensus": true, "news": true, "base_reliability": 0.92, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "cnbc.com", "publisher": "CNBC", "tier": 3, "data_types": ["event", "speech", "news"], "official_actual": false, "consensus": false, "news": true, "base_reliability": 0.88, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "ft.com", "publisher": "Financial Times", "tier": 3, "data_types": ["event", "news", "consensus"], "official_actual": false, "consensus": true, "news": true, "base_reliability": 0.91, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "wsj.com", "publisher": "Wall Street Journal", "tier": 3, "data_types": ["event", "news", "consensus"], "official_actual": false, "consensus": true, "news": true, "base_reliability": 0.91, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "marketwatch.com", "publisher": "MarketWatch", "tier": 3, "data_types": ["event", "news", "consensus"], "official_actual": false, "consensus": true, "news": true, "base_reliability": 0.86, "multiple_confirmation": true, "aggregator": false},
+    {"domain": "investing.com", "publisher": "Investing", "tier": 4, "data_types": ["event", "forecast", "consensus", "previous"], "official_actual": false, "consensus": true, "news": false, "base_reliability": 0.84, "multiple_confirmation": true, "aggregator": true},
+    {"domain": "xtb.com", "publisher": "XTB", "tier": 4, "data_types": ["event", "forecast", "consensus", "previous"], "official_actual": false, "consensus": true, "news": false, "base_reliability": 0.80, "multiple_confirmation": true, "aggregator": true},
+    {"domain": "tradingeconomics.com", "publisher": "Trading Economics", "tier": 4, "data_types": ["event", "forecast", "consensus", "previous"], "official_actual": false, "consensus": true, "news": false, "base_reliability": 0.82, "multiple_confirmation": true, "aggregator": true},
+    {"domain": "fxstreet.com", "publisher": "FXStreet", "tier": 4, "data_types": ["event", "forecast", "consensus", "previous"], "official_actual": false, "consensus": true, "news": false, "base_reliability": 0.80, "multiple_confirmation": true, "aggregator": true}
+  ]
+}

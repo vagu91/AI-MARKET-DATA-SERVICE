@@ -4,20 +4,20 @@ import asyncio
 import uuid
 import logging
 from datetime import UTC, datetime, timedelta
-from time import perf_counter
 from typing import Any
 
 from app.core.config import Settings
 from app.models.common import Impact, ProviderType
 from app.models.events import EconomicEvent, EventEnrichment
 from app.services.ai_researcher_service import AIResearcherService
-from app.services.ai_research_diagnostics import AIResearchDiagnostics
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.enrichment_run_repository import EnrichmentRunRepository
 from app.services.event_enrichment_service import EventEnrichmentService
 from app.services.economic_event_materialization_service import EconomicEventMaterializationService
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.provider_observation_repository import ProviderObservationRepository
+from app.services.ai_research_job_service import AIResearchJobService
+from app.services.temporal_domain_service import canonical_event_key
 
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
@@ -41,6 +41,7 @@ class EnrichmentOrchestrator:
         self.freshness = DataFreshnessService(settings)
         self.observations = ProviderObservationRepository(settings)
         self.runs = EnrichmentRunRepository(settings)
+        self.ai_jobs = AIResearchJobService(settings)
 
     async def enrich_events(
         self,
@@ -84,7 +85,7 @@ class EnrichmentOrchestrator:
                 metrics["events_checked"] += 1
                 self.facts.upsert_economic_event(
                     event,
-                    event_key=f"{event.country}:{event.date}:{event.event_id}",
+                    event_key=canonical_event_key(event),
                     valid_until=self.freshness.macro_valid_until(event),
                 )
                 if not self._should_enrich(event):
@@ -219,111 +220,51 @@ class EnrichmentOrchestrator:
             ai_succeeded = False
             ai_failure_reason = None
             ai_diagnostic_artifact_dir: str | None = None
+            ai_jobs: list[dict[str, Any]] = []
             if provider_missing and self.settings.enable_ai_researcher:
-                all_ai_candidates = self._ai_candidates(provider_missing, limit=False)
-                ai_candidates = all_ai_candidates[: self.settings.ai_researcher_max_events]
-                deferred_ai_candidates = all_ai_candidates[self.settings.ai_researcher_max_events :]
+                ai_candidates = self._ai_candidates(provider_missing, limit=False)[: self.settings.ai_researcher_max_events]
                 metrics["ai_events_requested"] = len(ai_candidates)
                 metrics["ai_candidate_event_ids"] = [event.event_id for event in ai_candidates]
-                facts: list[dict[str, Any]] = []
-                ai_status: dict[str, Any] = {"status": "not_required", "warning": "no_ai_candidates"}
-                if ai_candidates:
-                    metrics["ai_research_requests"] = 1
-                    ai_called = True
-                    started = perf_counter()
-                    try:
-                        facts, ai_status = await asyncio.wait_for(
-                            self.ai_researcher_service.research_and_save(
-                                [self._event_payload(event) for event in ai_candidates]
-                            ),
-                            timeout=max(float(self.settings.timeout_ai_research_seconds), 1.0),
-                        )
-                    except TimeoutError:
-                        facts = []
-                        ai_status = {
-                            "status": "provider_failed",
-                            "failure_reason": "ai_research_timeout",
-                            "timeout_seconds": self.settings.timeout_ai_research_seconds,
-                        }
-                    metrics["ai_duration_ms"] = int((perf_counter() - started) * 1000)
-                    metrics["ai_research_status"] = ai_status.get("status") or "failed"
-                    ai_diagnostic_artifact_dir = ai_status.get("diagnostic_artifact_dir")
-                    ai_succeeded = ai_status.get("status") == "success"
-                    ai_failure_reason = ai_status.get("failure_reason") or ai_status.get("error")
-                    metrics["ai_results_valid"] = int(ai_status.get("results_valid") or len(facts))
-                    metrics["ai_results_rejected"] = int(ai_status.get("results_rejected") or 0)
-                    self.observations.record(
-                        run_id=run_id,
-                        provider_name="ai_researcher",
-                        provider_type="AI_RESEARCHER_CODEX_CLI",
-                        status="ai_research_used" if facts else ai_status.get("status", "no_data_available"),
-                        country=country,
-                        item_count=len(facts),
-                        warning=";".join(ai_status.get("warnings", [])) if isinstance(ai_status.get("warnings"), list) else ai_status.get("warning"),
-                        error=ai_status.get("error") or ai_status.get("failure_reason"),
-                        raw_payload_json=ai_status,
-                    )
-                    metrics["facts_written"] += len(facts)
-                    if not facts:
-                        negative_reason = ai_status.get("failure_reason") or ai_status.get("status") or "no_data_available"
-                        for event in ai_candidates:
-                            negative = self._negative_ai_fact(event, reason=str(negative_reason))
-                            self.facts.upsert_fact(negative)
-                            facts.append(negative)
-                        metrics["facts_written"] += len(ai_candidates)
-                    for event in deferred_ai_candidates:
-                        self.facts.upsert_fact(self._negative_ai_fact(event, reason="ai_batch_deferred"))
-                        metrics["facts_written"] += 1
-                else:
-                    metrics["ai_research_status"] = "not_required"
-                facts_by_key = {fact["fact_key"]: fact for fact in facts}
-                diagnostics = AIResearchDiagnostics(self.settings, artifact_dir=ai_diagnostic_artifact_dir)
-                for event in provider_missing:
-                    fact = facts_by_key.get(self.fact_key(event))
-                    updated = event.model_copy(deep=True)
-                    if fact:
-                        persisted = self.facts.upsert_fact(fact)
-                        read_back = self.facts.get_event_enrichment_fact(self.fact_key(event))
-                        diagnostics.event_json(event.event_id, "persistence_payload.json", persisted)
-                        diagnostics.event_json(event.event_id, "read_back.json", read_back)
-                        if read_back:
-                            updated = self.event_materializer.apply_fact(
-                                event,
-                                read_back,
-                                cache_status="refreshed",
-                                warnings=[],
-                                refresh_mode="force" if force else "auto",
-                                metrics=metrics,
-                            )
-                        else:
-                            updated = self.event_materializer.apply_fact(
-                                event,
-                                fact,
-                                cache_status="refreshed",
-                                warnings=["ai_fact_read_back_failed"],
-                                refresh_mode="force" if force else "auto",
-                                metrics=metrics,
-                            )
-                        updated.enrichment.summary["persistence"] = {
-                            "persisted": True,
-                            "read_back": read_back is not None,
-                        }
-                        if _has_values(updated.enrichment):
-                            ai_used = True
-                    else:
-                        updated.enrichment.warnings.append("missing_enrichment_data")
-                    enriched_by_id[event.event_id] = updated
+                ai_jobs = self.ai_jobs.enqueue_missing_events(
+                    ai_candidates,
+                    correlation_id=run_id,
+                    force=force,
+                )
+                metrics["ai_research_requests"] = len(ai_jobs)
+                metrics["ai_research_status"] = "PENDING" if ai_jobs else "not_required"
+                self.observations.record(
+                    run_id=run_id,
+                    provider_name="ai_research_job_queue",
+                    provider_type="DB",
+                    status="queued" if ai_jobs else "not_required",
+                    country=country,
+                    item_count=len(ai_jobs),
+                    raw_payload_json={"job_ids": [job["job_id"] for job in ai_jobs]},
+                )
             else:
                 metrics["ai_research_status"] = "disabled" if not self.settings.enable_ai_researcher else "not_required"
-                if provider_missing:
+                if provider_missing and not self.settings.enable_ai_researcher:
                     metrics["warnings_json"].append("ai_researcher_disabled")
-                for event in provider_missing:
-                    updated = event.model_copy(deep=True)
-                    if not updated.enrichment.warnings:
-                        updated.enrichment.warnings.append("missing_enrichment_data")
-                    enriched_by_id[event.event_id] = updated
+            for event in provider_missing:
+                updated = event.model_copy(deep=True)
+                if ai_jobs:
+                    updated.enrichment.warnings.append("ai_enrichment_pending")
+                    updated.enrichment.summary["ai_enrichment"] = {
+                        "status": "PENDING",
+                        "job_ids": [job["job_id"] for job in ai_jobs if job.get("event_key")],
+                    }
+                elif not updated.enrichment.warnings:
+                    updated.enrichment.warnings.append("missing_enrichment_data")
+                enriched_by_id[event.event_id] = updated
 
             result = [enriched_by_id.get(event.event_id, event) for event in events]
+            release_jobs = self.ai_jobs.enqueue_temporal_refreshes(
+                result,
+                correlation_id=run_id,
+            )
+            if release_jobs:
+                metrics["ai_research_requests"] += len(release_jobs)
+                metrics["ai_research_status"] = "PENDING"
             data_quality = {
                 "events_found": len(events),
                 "enrichment_complete": metrics["provider_misses"] == 0,
@@ -346,6 +287,7 @@ class EnrichmentOrchestrator:
                 "ai_events_requested": metrics["ai_events_requested"],
                 "ai_candidate_event_ids": metrics["ai_candidate_event_ids"],
                 "ai_research_status": metrics["ai_research_status"],
+                "ai_job_ids": [job["job_id"] for job in [*ai_jobs, *release_jobs]],
                 "ai_duration_ms": metrics["ai_duration_ms"],
                 "ai_not_available": metrics["ai_not_available"],
                 "ai_diagnostic_artifact_dir": ai_diagnostic_artifact_dir,

@@ -9,6 +9,7 @@ from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_hardening_service import harden_market_context
 from app.services.market_session_service import NEW_YORK
+from app.services.temporal_domain_service import temporal_event_state
 
 
 logger = logging.getLogger(__name__)
@@ -52,12 +53,58 @@ def build_ai_trader_consumer_v2(
     generated_at = parse_datetime(full.get("generated_at_utc") or full.get("generated_at"))
     hardened = harden_market_context(full, settings=settings, now=generated_at)
     readiness = dict(hardened.get("readiness") or {})
+    ai_enrichment = _ai_enrichment(hardened.get("ai_enrichment") or {})
+    research = _research(hardened.get("research") or {})
+    temporal_pending = _has_temporal_status(
+        hardened,
+        {"AWAITING_ACTUAL", "AWAITING_OUTCOME", "ACTUAL_UNAVAILABLE"},
+    )
+    ai_pending = ai_enrichment["status"] in {"PENDING", "RUNNING", "PARTIAL", "FAILED"}
+    research_pending = research["status"] in {"PENDING", "RUNNING", "PARTIAL", "FAILED"}
+    research_blocking = bool(research["blocking_gaps"])
+    semantic_incompatible = _has_semantic_actual_mismatch(hardened)
+    if temporal_pending or ai_pending or research_pending or research_blocking or semantic_incompatible:
+        readiness["ready_for_full_analysis"] = False
+        readiness["full_analysis_confidence"] = min(
+            float(readiness.get("full_analysis_confidence") or 0.0),
+            0.5,
+        )
+        reasons = list(readiness.get("degrading_reasons") or [])
+        if temporal_pending:
+            reasons.append("temporal_data_pending")
+        if ai_pending:
+            reasons.append("ai_enrichment_pending")
+        if research_pending:
+            reasons.append("research_pending_or_incomplete")
+        if research_blocking:
+            reasons.append("research_blocking_gaps")
+        if semantic_incompatible:
+            reasons.append("critical_actual_semantic_mismatch")
+        readiness["degrading_reasons"] = sorted(set(reasons))
+    section_status = readiness.get("section_status") or {}
+    sections_available = sorted(
+        key for key, value in section_status.items()
+        if value in {"AVAILABLE", "LAST_KNOWN_GOOD", "NO_DATA_EXPECTED", "NO_RELEVANT_DATA", "NO_RELEVANT_MARKETS"}
+    )
+    sections_missing = sorted(key for key in section_status if key not in sections_available)
+    generated = hardened.get("generated_at_utc") or hardened.get("generated_at")
     consumer = {
         "contract": CONTRACT_NAME,
         "schema_version": SCHEMA_VERSION,
+        "snapshot_id": hardened.get("snapshot_id"),
+        "snapshot_revision": hardened.get("snapshot_revision"),
         "symbol": hardened.get("symbol") or "MNQ",
-        "generated_at": hardened.get("generated_at_utc") or hardened.get("generated_at"),
+        "generated_at": generated,
+        "data_as_of": hardened.get("data_as_of") or generated,
         "context_date": (hardened.get("market_schedule") or {}).get("context_date"),
+        "market_session_status": (hardened.get("market_schedule") or {}).get("market_session_status"),
+        "readiness_status": readiness.get("status"),
+        "ready_for_trading_context": readiness.get("ready_for_trading_context", False),
+        "ready_for_full_analysis": readiness.get("ready_for_full_analysis", False),
+        "available_data_confidence": readiness.get("available_data_confidence", 0.0),
+        "full_analysis_confidence": readiness.get("full_analysis_confidence", 0.0),
+        "sections_available": sections_available,
+        "sections_missing": sections_missing,
         "readiness": readiness,
         "snapshot_summary": _snapshot_summary(hardened),
         "macro": _macro(hardened.get("macro_snapshot") or {}, now=generated_at),
@@ -75,8 +122,12 @@ def build_ai_trader_consumer_v2(
         "sentiment": _sentiment(hardened.get("sentiment_context") or {}),
         "market_schedule": _schedule(hardened.get("market_schedule") or {}),
         "quality": hardened.get("quality") or {},
+        "lifecycle": ((hardened.get("metadata") or {}).get("data_lifecycle") or hardened.get("lifecycle") or {}),
+        "ai_enrichment": ai_enrichment,
+        "research": research,
         "warnings": _warnings(hardened),
     }
+    _enforce_payload_limit(consumer)
     size = _payload_size(consumer)
     logger.info("consumer_payload_materialized", extra={"payload_size_bytes": size})
     logger.info(
@@ -85,6 +136,102 @@ def build_ai_trader_consumer_v2(
     )
     logger.info("consumer_contract_validated", extra={"contract": CONTRACT_NAME, "schema_version": SCHEMA_VERSION})
     return consumer
+
+
+def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> None:
+    if _payload_size(consumer) < limit:
+        return
+    news = consumer.get("news") or {}
+    event_risk = consumer.get("event_risk") or {}
+    earnings = consumer.get("earnings") or {}
+    for container, key, keep in (
+        (news, "articles", 4),
+        (news, "clusters", 4),
+        (news, "current_drivers", 4),
+        (news, "previous_session_drivers", 4),
+        (event_risk, "critical_events", 4),
+        (event_risk.get("xtb_us_macro_calendar") or {}, "events", 8),
+        (earnings, "upcoming_mega_cap_earnings_14d", 10),
+        (earnings, "released_earnings", 10),
+    ):
+        if isinstance(container.get(key), list):
+            container[key] = container[key][:keep]
+    warnings = list(consumer.get("warnings") or [])
+    warnings.append({"code": "consumer_payload_truncated", "count": 1, "blocking": False})
+    consumer["warnings"] = warnings
+    if _payload_size(consumer) >= limit:
+        # Quality remains present, but verbose debug-only provider traces are not part of the consumer contract.
+        quality = consumer.get("quality") or {}
+        consumer["quality"] = {
+            key: value for key, value in quality.items()
+            if key in {"section_quality", "overall_data_quality", "pipeline_integrity", "consumer_quality"}
+        }
+
+
+def _ai_enrichment(value: dict[str, Any]) -> dict[str, Any]:
+    status = str(value.get("status") or "NOT_REQUIRED").upper()
+    allowed = {"NOT_REQUIRED", "PENDING", "RUNNING", "PARTIAL", "SUCCEEDED", "NO_DATA", "FAILED"}
+    normalized_status = status if status in allowed else "FAILED"
+    return {
+        "status": normalized_status,
+        "job_ids": list(value.get("job_ids") or []),
+        "requested_at": value.get("requested_at"),
+        "completed_at": value.get("completed_at"),
+        "pending_fields": list(value.get("pending_fields") or []),
+        "accepted_fields": list(value.get("accepted_fields") or []),
+        "rejected_fields": list(value.get("rejected_fields") or []),
+        "policy_version": value.get("policy_version"),
+        "prompt_version": value.get("prompt_version"),
+        "last_error": value.get("last_error"),
+    }
+
+
+def _research(value: dict[str, Any]) -> dict[str, Any]:
+    status = str(value.get("status") or "NOT_REQUIRED").upper()
+    allowed = {"NOT_REQUIRED", "PENDING", "RUNNING", "PARTIAL", "SUCCEEDED", "NO_DATA", "FAILED"}
+    normalized_status = status if status in allowed else "FAILED"
+    return {
+        "status": normalized_status,
+        "run_id": value.get("run_id"), "snapshot_id": value.get("snapshot_id"),
+        "started_at": value.get("started_at"), "completed_at": value.get("completed_at"),
+        "data_as_of": value.get("data_as_of"), "fresh_until": value.get("fresh_until"),
+        "coverage_score": float(value.get("coverage_score") or 0),
+        "required_topics": list(value.get("required_topics") or []),
+        "completed_topics": list(value.get("completed_topics") or []),
+        "missing_topics": list(value.get("missing_topics") or []),
+        "blocking_gaps": list(value.get("blocking_gaps") or []),
+        "non_blocking_gaps": list(value.get("non_blocking_gaps") or []),
+        "claim_count": int(value.get("claim_count") or 0),
+        "evidence_count": int(value.get("evidence_count") or 0),
+        "key_verified_drivers": list(value.get("key_verified_drivers") or [])[:8],
+        "critical_evidence_references": list(value.get("critical_evidence_references") or [])[:8],
+        "source_domains": list(value.get("source_domains") or [])[:12],
+        "warnings": list(value.get("warnings") or [])[:12],
+        "research_complete": normalized_status in {"NOT_REQUIRED", "SUCCEEDED"},
+        "research_partial": normalized_status == "PARTIAL",
+        "research_unavailable": normalized_status in {"NO_DATA", "FAILED"},
+    }
+
+
+def _has_temporal_status(value: Any, statuses: set[str]) -> bool:
+    if isinstance(value, dict):
+        if str(value.get("temporal_status") or value.get("release_status") or "").upper() in statuses:
+            return True
+        return any(_has_temporal_status(item, statuses) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_temporal_status(item, statuses) for item in value)
+    return False
+
+
+def _has_semantic_actual_mismatch(value: Any) -> bool:
+    if isinstance(value, dict):
+        semantics = value.get("actual_semantics")
+        if isinstance(semantics, dict) and semantics.get("semantic_compatible") is False:
+            return True
+        return any(_has_semantic_actual_mismatch(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_semantic_actual_mismatch(item) for item in value)
+    return False
 
 
 def _snapshot_summary(full: dict[str, Any]) -> dict[str, Any]:
@@ -299,7 +446,10 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
 def _earnings(full: dict[str, Any]) -> dict[str, Any]:
     earnings = (full.get("nasdaq_context") or {}).get("earnings") or {}
     events = earnings.get("upcoming") or earnings.get("events") or []
-    upcoming = [_earnings_event(item) for item in events[:20]]
+    today = datetime.now(NEW_YORK).date()
+    projected = [_earnings_event(item, today=today) for item in events[:50]]
+    upcoming = [item for item in projected if item.get("temporal_status") == "PRE_RELEASE"][:20]
+    released = [item for item in projected if item.get("temporal_status") != "PRE_RELEASE"][:20]
     return {
         "lifecycle": earnings.get("lifecycle") or {},
         "status": earnings.get("status") or (
@@ -312,6 +462,7 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
         ),
         "issuer_event_count": earnings.get("issuer_event_count", len(events)),
         "upcoming_mega_cap_earnings_14d": upcoming,
+        "released_earnings": released,
         "quality": earnings.get("data_quality") or {},
     }
 
@@ -465,7 +616,7 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
     if lineage.get("evidence_text") == lineage.get("evidence"):
         lineage.pop("evidence_text", None)
     projected = {
-        **_select(item, "event_id", "name", "event_name", "category", "impact", "date", "time_utc", "event_type", "release_period", "period_date_consistent", "event_risk_window_status"),
+        **_select(item, "event_id", "canonical_event_key", "name", "event_name", "category", "impact", "date", "time_utc", "event_type", "event_kind", "temporal_status", "release_status", "release_period", "period_date_consistent", "event_risk_window_status"),
         "release_at": _event_release_at(item),
         "consensus": enrichment.get("consensus"),
         "previous": enrichment.get("previous"),
@@ -475,6 +626,12 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
             for metric in (enrichment.get("metrics") or [])[:6]
         ],
     }
+    temporal = (enrichment.get("summary") or {}).get("temporal_domain") or temporal_event_state(item)
+    projected["canonical_event_key"] = projected.get("canonical_event_key") or temporal.get("canonical_event_key")
+    projected["event_kind"] = projected.get("event_kind") or temporal.get("event_kind")
+    projected["temporal_status"] = str(
+        projected.get("temporal_status") or temporal.get("temporal_status") or ""
+    ).upper() or None
     if lineage and (lineage.get("provider_type") in {"AI_RESEARCHER_CODEX_CLI", "MIXED"} or lineage.get("field_lineage")):
         projected["lineage"] = lineage
     return projected
@@ -498,7 +655,7 @@ def _compact_sector(exposure: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _earnings_event(item: dict[str, Any]) -> dict[str, Any]:
+def _earnings_event(item: dict[str, Any], *, today: Any | None = None) -> dict[str, Any]:
     output = _select(
         item,
         "issuer_event_id",
@@ -522,7 +679,31 @@ def _earnings_event(item: dict[str, Any]) -> dict[str, Any]:
         "lineage",
     )
     output["lineage"] = _compact_source_field_lineage(output.get("lineage"))
+    event_date = parse_datetime(output.get("earnings_date") or output.get("date"))
+    event_day = event_date.date() if event_date else None
+    today = today or datetime.now(NEW_YORK).date()
+    has_actual = output.get("eps_actual") not in (None, "") or output.get("revenue_actual") not in (None, "")
+    output["temporal_status"] = (
+        "RELEASED" if has_actual
+        else "PRE_RELEASE" if event_day is None or event_day >= today
+        else "AWAITING_ACTUAL"
+    )
+    output["eps_surprise"] = _difference(output.get("eps_actual"), output.get("eps_estimate"))
+    output["revenue_surprise"] = _difference(output.get("revenue_actual"), output.get("revenue_estimate"))
     return output
+
+
+def _difference(actual: Any, expected: Any) -> dict[str, Any] | None:
+    if actual in (None, "") or expected in (None, ""):
+        return None
+    try:
+        difference = float(actual) - float(expected)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "value": difference,
+        "direction": "above" if difference > 0 else "below" if difference < 0 else "in_line",
+    }
 
 
 def _xtb_event(item: dict[str, Any]) -> dict[str, Any]:

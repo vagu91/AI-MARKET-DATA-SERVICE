@@ -39,6 +39,13 @@ def bea_payload(table: str) -> dict:
         ],
         "T20804": [
             {
+                "LineNumber": "1",
+                "LineDescription": "Personal consumption expenditures",
+                "TimePeriod": "2026M05",
+                "DataValue": "127.123",
+                "CL_UNIT": "Index",
+            },
+            {
                 "LineNumber": "25",
                 "LineDescription": "PCE excluding food and energy",
                 "TimePeriod": "2026M05",
@@ -94,6 +101,7 @@ async def test_bea_provider_returns_requested_macro_series(tmp_path) -> None:
         "BEA:GDP",
         "BEA:REAL_GDP",
         "BEA:PCE",
+        "BEA:PCE_PRICE_INDEX",
         "BEA:CORE_PCE",
         "BEA:PERSONAL_INCOME",
         "BEA:PERSONAL_SPENDING",
@@ -122,4 +130,3 @@ async def test_bea_provider_reports_missing_series_without_breaking_response(tmp
     assert "BEA:PCE" in result.data
     assert result.metadata.is_fallback is False
     assert any("T20804 returned no data" in error for error in result.metadata.errors)
-

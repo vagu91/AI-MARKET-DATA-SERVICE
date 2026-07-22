@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import (
     get_enrichment_orchestrator,
@@ -10,6 +10,7 @@ from app.api.deps import (
     get_nasdaq_data_service,
 )
 from app.models.events import EconomicEvent
+from app.models.ai_jobs import AIResearchEnqueueRequest, MarketResearchRunRequest
 from app.models.macro import EventWindowsResponse, MacroLatestResponse
 from app.models.nasdaq import (
     EarningsResponse,
@@ -32,8 +33,6 @@ from app.services.macro_service import MacroService
 from app.services.macro_consensus_service import merge_consensus_provider_payloads
 from app.services.market_fact_repository import MarketFactRepository, init_market_db
 from app.services.market_context_builder import build_market_context_contract
-from app.services.ai_trader_contract_service import build_ai_trader_market_context
-from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
 from app.services.market_context_hardening_service import harden_market_context
 from app.services.ai_research_diagnostics import record_final_consumer_events
 from app.services.market_news_repository import MarketNewsRepository
@@ -51,6 +50,14 @@ from app.infrastructure.persistence.database_maintenance import analyze_database
 from app.infrastructure.persistence.migrations import migrate_database
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.infrastructure.storage_retention import retention_policy_report, storage_health
+from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
+from app.services.ai_research_job_repository import AIResearchJobRepository
+from app.services.ai_research_job_service import AIResearchJobService
+from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
+from app.services.event_value_candidate_repository import EventValueCandidateRepository
+from app.services.ai_research_capability_service import AIResearchCapabilityService
+from app.services.research_profiles import profile_for_job
+from app.services.research_runtime_repository import ResearchRuntimeRepository
 
 router = APIRouter()
 
@@ -58,6 +65,134 @@ router = APIRouter()
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "AI-MARKET-DATA-SERVICE"}
+
+
+@router.get("/ai-research/jobs/latest")
+async def ai_research_jobs_latest(
+    limit: int = Query(default=20, ge=1, le=100),
+    symbol: str = Query(default="MNQ", min_length=1, max_length=16),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> list[dict[str, object]]:
+    return AIResearchJobRepository(enrichment_orchestrator.settings).latest(limit=limit, symbol=symbol)
+
+
+@router.get("/ai-research/status")
+async def ai_research_status(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    repository = AIResearchJobRepository(enrichment_orchestrator.settings)
+    return {
+        **repository.status(),
+        "enrichment": AIResearchJobService(enrichment_orchestrator.settings).enrichment_status("MNQ"),
+    }
+
+
+@router.get("/ai-research/capabilities")
+async def ai_research_capabilities(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    return AIResearchCapabilityService(enrichment_orchestrator.settings).probe(persist=True)
+
+
+@router.get("/ai-research/jobs/{job_id}")
+async def ai_research_job(
+    job_id: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    job = AIResearchJobRepository(enrichment_orchestrator.settings).get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="AI research job not found")
+    return job
+
+
+@router.post("/ai-research/jobs", status_code=202)
+async def enqueue_ai_research_job(
+    request: AIResearchEnqueueRequest,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    job, created = AIResearchJobService(enrichment_orchestrator.settings).enqueue_explicit(
+        job_type=request.job_type,
+        symbol=request.symbol,
+        correlation_id=request.correlation_id,
+        request_payload=request.request_payload,
+        event_key=request.event_key,
+        pending_fields=request.pending_fields,
+        force=request.force_requeue,
+    )
+    return {"created": created, "job": job, "trading_actions": "not_supported"}
+
+
+@router.post("/market-research/mnq/runs", status_code=202)
+async def enqueue_mnq_market_research(
+    request: MarketResearchRunRequest,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    latest = MarketContextSnapshotRepository(settings).latest("MNQ")
+    context = latest["debug_payload"] if latest else {}
+    payload = {
+        "database_context": {
+            "snapshot_id": latest.get("snapshot_id") if latest else None,
+            "snapshot_revision": latest.get("revision") if latest else None,
+            "data_as_of": latest.get("data_as_of") if latest else None,
+            "event_calendar": context.get("event_calendar") or {},
+            "macro_snapshot": context.get("macro_snapshot") or {},
+            "nasdaq_context": context.get("nasdaq_context") or {},
+            "news_context": context.get("news_context") or {},
+        },
+        "context_date": (context.get("market_schedule") or {}).get("context_date"),
+        "market_session": (context.get("market_schedule") or {}).get("market_session_status"),
+        "pending_fields": [],
+        "authorized_live_smoke": request.authorized_live_smoke,
+    }
+    job, created = AIResearchJobService(settings).enqueue_explicit(
+        job_type="MNQ_MARKET_RESEARCH", symbol="MNQ",
+        correlation_id=request.correlation_id or f"mnq-research-{datetime.now(UTC).isoformat()}",
+        request_payload=payload, pending_fields=[], force=request.force_requeue,
+    )
+    profile = profile_for_job("MNQ_MARKET_RESEARCH")
+    run = ResearchRuntimeRepository(settings).ensure_run(job, profile.profile_id, profile.prompt_version)
+    return {
+        "created": created, "run_id": run["run_id"], "job_id": job["job_id"],
+        "status": run["status"], "trading_actions": "not_supported",
+    }
+
+
+@router.get("/market-research/mnq/runs/{run_id}")
+async def mnq_market_research_run(
+    run_id: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    run = ResearchRuntimeRepository(enrichment_orchestrator.settings).get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Market research run not found")
+    return run
+
+
+@router.get("/market-research/mnq/latest")
+async def mnq_market_research_latest(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    run = ResearchRuntimeRepository(enrichment_orchestrator.settings).latest("MNQ")
+    if run is None:
+        raise HTTPException(status_code=404, detail="No market research run available")
+    return run
+
+
+@router.get("/market-research/mnq/status")
+async def mnq_market_research_status(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> dict[str, object]:
+    run = ResearchRuntimeRepository(enrichment_orchestrator.settings).latest("MNQ")
+    return _research_summary(run)
+
+
+@router.get("/market-research/mnq/evidence/{claim_id}")
+async def mnq_market_research_evidence(
+    claim_id: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+) -> list[dict[str, object]]:
+    return ResearchRuntimeRepository(enrichment_orchestrator.settings).evidence_for_claim(claim_id)
 
 
 @router.get("/macro/latest", response_model=MacroLatestResponse)
@@ -111,8 +246,14 @@ async def market_context_mnq(
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
+    settings = enrichment_orchestrator.settings
+    snapshots = MarketContextSnapshotRepository(settings)
+    if refresh == "false":
+        stored = snapshots.latest("MNQ")
+        if stored is not None:
+            return stored["debug_payload"] if view == "debug" else stored["consumer_payload"]
     diagnostics = DiagnosticsService(
-        enrichment_orchestrator.settings,
+        settings,
         macro_service=macro_service,
         event_service=event_service,
         event_window_service=event_window_service,
@@ -127,16 +268,7 @@ async def market_context_mnq(
             fetch_missing_nasdaq=refresh == "force",
             refresh=refresh,
         )
-        contract = harden_market_context(contract, settings=enrichment_orchestrator.settings)
-        if view == "debug":
-            return contract
-        consumer = build_ai_trader_market_context(contract, settings=enrichment_orchestrator.settings)
-        record_final_consumer_events(
-            enrichment_orchestrator.settings,
-            (contract.get("data_quality") or {}).get("ai_diagnostic_artifact_dir"),
-            consumer,
-        )
-        return consumer
+        return _materialize_market_context(contract, refresh=refresh, view=view, settings=settings)
     macro, macro_quality = await diagnostics._macro_db_first()
     events_today_data = await event_service.today(country="US")
     now = datetime.now(UTC)
@@ -164,6 +296,17 @@ async def market_context_mnq(
     investing_refresh = "auto" if diagnostics.macro_consensus.needs_refresh(upcoming) else "false"
     investing_payload = await multi_runtime.provider("investing_economic_calendar", refresh=investing_refresh)
     xtb_payload = await multi_runtime.provider("xtb_economic_calendar", refresh="auto")
+    candidates = EventValueCandidateRepository(settings)
+    candidates.persist_provider_payload(investing_payload)
+    candidates.persist_provider_payload(xtb_payload)
+    upcoming = reconcile_calendar_events(upcoming, [investing_payload, xtb_payload], now=now)
+    facts_repository = MarketFactRepository(enrichment_orchestrator.settings)
+    for event in upcoming:
+        facts_repository.upsert_economic_event(
+            event,
+            event_key=canonical_event_key(event),
+            valid_until=enrichment_orchestrator.freshness.macro_valid_until(event),
+        )
     ranked_consensus = merge_consensus_provider_payloads(investing_payload, xtb_payload)
     upcoming, consensus_quality, _ = diagnostics.macro_consensus.enrich_and_persist(
         upcoming,
@@ -262,7 +405,7 @@ async def market_context_mnq(
     contract["risk_sentiment"] = risk_sentiment
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
     contract = harden_market_context(contract, settings=enrichment_orchestrator.settings)
-    return contract if view == "debug" else build_ai_trader_market_context(contract, settings=enrichment_orchestrator.settings)
+    return _materialize_market_context(contract, refresh=refresh, view=view, settings=settings)
 
 
 @router.get("/market-context/mnq/debug")
@@ -294,16 +437,88 @@ async def market_context_mnq_consumer(
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
-    full = await market_context_mnq(
+    return await market_context_mnq(
         refresh=refresh,
-        view="debug",
+        view="consumer",
         macro_service=macro_service,
         event_service=event_service,
         event_window_service=event_window_service,
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
     )
-    return build_ai_trader_consumer_v2(full, settings=enrichment_orchestrator.settings)
+
+
+def _materialize_market_context(
+    contract: dict[str, object],
+    *,
+    refresh: str,
+    view: str,
+    settings,
+) -> dict[str, object]:
+    snapshots = MarketContextSnapshotRepository(settings)
+    event_keys = _context_event_keys(contract)
+    ai_enrichment = AIResearchJobService(settings).enrichment_status("MNQ", event_keys=event_keys)
+    debug = dict(contract)
+    debug["data_as_of"] = debug.get("generated_at_utc") or debug.get("generated_at")
+    debug["ai_enrichment"] = ai_enrichment
+    debug["research"] = _research_summary(ResearchRuntimeRepository(settings).latest("MNQ"))
+    debug = harden_market_context(debug, settings=settings)
+    stored = snapshots.save_next(
+        symbol="MNQ",
+        refresh_mode=refresh,
+        debug_payload=debug,
+        ai_enrichment=ai_enrichment,
+        source_job_id=(ai_enrichment.get("job_ids") or [None])[0],
+        job_ids=list(ai_enrichment.get("job_ids") or []),
+    )
+    consumer = stored["consumer_payload"]
+    record_final_consumer_events(
+        settings,
+        (debug.get("data_quality") or {}).get("ai_diagnostic_artifact_dir"),
+        consumer,
+    )
+    return stored["debug_payload"] if view == "debug" else stored["consumer_payload"]
+
+
+def _context_event_keys(contract: dict[str, object]) -> list[str]:
+    output: set[str] = set()
+    calendar = contract.get("event_calendar") if isinstance(contract.get("event_calendar"), dict) else {}
+    for section in ("critical_macro_events", "fed_communications", "other_economic_events"):
+        for event in calendar.get(section) or []:
+            if not isinstance(event, dict):
+                continue
+            output.add(str(event.get("canonical_event_key") or canonical_event_key(event)))
+    return sorted(output)
+
+
+def _research_summary(run: dict[str, object] | None) -> dict[str, object]:
+    if run is None:
+        return {
+            "status": "NOT_REQUIRED", "run_id": None, "snapshot_id": None,
+            "started_at": None, "completed_at": None, "data_as_of": None,
+            "fresh_until": None, "coverage_score": 0.0, "required_topics": [],
+            "completed_topics": [], "missing_topics": [], "blocking_gaps": [],
+            "non_blocking_gaps": [], "claim_count": 0, "evidence_count": 0,
+            "source_domains": [], "warnings": [],
+        }
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    accepted = result.get("accepted_claims") or []
+    return {
+        "status": run.get("status"), "run_id": run.get("run_id"),
+        "snapshot_id": result.get("snapshot_id"), "started_at": run.get("started_at"),
+        "completed_at": run.get("completed_at"), "data_as_of": run.get("data_as_of"),
+        "fresh_until": run.get("fresh_until"), "coverage_score": run.get("coverage_score") or 0.0,
+        "required_topics": run.get("required_topics") or [],
+        "completed_topics": run.get("completed_topics") or [], "missing_topics": run.get("missing_topics") or [],
+        "blocking_gaps": run.get("blocking_gaps") or [], "non_blocking_gaps": run.get("non_blocking_gaps") or [],
+        "claim_count": len(accepted), "evidence_count": result.get("evidence_count") or 0,
+        "source_domains": run.get("source_domains") or [], "warnings": run.get("warnings") or [],
+        "key_verified_drivers": [
+            {"claim_id": item.get("claim_id"), "topic": item.get("topic"), "value": item.get("value")}
+            for item in accepted[:8]
+        ],
+        "critical_evidence_references": [item.get("claim_id") for item in accepted[:8]],
+    }
 
 
 @router.get("/db/health")

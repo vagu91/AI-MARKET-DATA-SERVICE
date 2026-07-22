@@ -25,6 +25,12 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /events/upcoming?country=US&days=7`
 - `GET /events/active-windows?symbol=MNQ`
 - `GET /market-context/mnq`
+- `GET /market-context/mnq/consumer?refresh=false|auto|force`
+- `GET /market-context/mnq/debug?refresh=false|auto|force`
+- `GET /ai-research/jobs/latest`
+- `GET /ai-research/jobs/{job_id}`
+- `GET /ai-research/status`
+- `POST /ai-research/jobs` (idempotent data-research enqueue; no trading)
 - `GET /db/health`
 - `GET /storage/health`
 - `GET /storage/retention-policy`
@@ -64,16 +70,44 @@ The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`
 AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
 
-The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, and schema migrations.
+The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-10 are additive and upgrade existing schema-6/8/9 databases without rebuilding tables.
 
 The required enrichment order is:
 
 1. valid DB fact
 2. existing provider/API/scraper chain
-3. AI Researcher when explicitly enabled
+3. persistent AI Researcher job when explicitly enabled (the HTTP request never waits for it)
 4. null values with clear warnings
 
 DB hits do not call providers or AI. Facts carry source, source URL, `retrieved_at`, `valid_until`, `next_refresh_at`, reliability, confidence, warnings, and errors. If `valid_until` is missing, TTL defaults are used; stale facts are blocked unless `AI_MARKET_ALLOW_STALE_FACTS=true`.
+
+## DB-first snapshots and refresh modes
+
+- `refresh=false` returns the latest materialized SQLite snapshot byte-for-byte when one exists: no provider, browser or AI call, no job and no write. If the database has no snapshot yet, it performs one DB/cache-only cold materialization and persists revision 1; it still performs no network, browser or AI call and creates no job.
+- `refresh=auto` reads valid DB data first, refreshes only missing or expired deterministic data, persists and reads it back, then queues only missing AI fields. The response contains `ai_enrichment.status=PENDING|RUNNING|NOT_REQUIRED` immediately.
+- `refresh=force` refreshes deterministic providers and idempotently queues missing research, but still does not wait for AI.
+
+The consumer remains `ai_trader_market_context_consumer` schema `2.1` and includes snapshot identity/revision, lifecycle, section availability, readiness/confidence and structured AI status. `ready_for_full_analysis` is fail-closed while critical temporal data or AI enrichment is pending.
+
+## Temporal domains and source policy
+
+Scheduled numeric releases move `PRE_RELEASE -> AWAITING_ACTUAL -> RELEASED` (or `ACTUAL_UNAVAILABLE` after bounded retries). Speeches move `PRE_RELEASE -> AWAITING_OUTCOME -> COMPLETED`; no numeric actual is synthesized. Earnings that have passed move out of `upcoming`. Expired news stays in retention history but is excluded from current drivers.
+
+The executable policy is [config/source_policy.json](config/source_policy.json). Official actuals require Tier-1 sources. Calendar aggregators may contribute forecast/consensus; discordant candidates are preserved separately and never overwrite an official actual.
+
+## Asynchronous AI worker
+
+The worker is controlled separately from `AI_MARKET_ENABLE_SCHEDULER`:
+
+```env
+AI_MARKET_ENABLE_AI_RESEARCHER=false
+AI_MARKET_AI_RESEARCH_WEB_ACCESS_ENABLED=false
+AI_MARKET_AI_WORKER_ENABLED=false
+```
+
+Enabling the worker without both research and web-access switches does not run Codex. Even with static prerequisites present, ordinary AI jobs remain gated at `READY_TO_SMOKE` until a separately authorized live smoke is persisted as `LIVE_VERIFIED`; CLI `--search` support alone is insufficient. Each acquired job has an atomic lease, heartbeat, persistent attempts/retries, unique workspace and one overall monotonic watchdog deadline. Release actual jobs use persisted deterministic official candidates first, have a separate configurable official-feed-delay retry horizon, and do not use AI as their primary resolver.
+
+Non-destructive rollback: stop the service, set `AI_MARKET_AI_WORKER_ENABLED=false`, and deploy the prior application version. Do not delete the SQLite database; schema-7 through schema-10 tables/columns are additive and older code can ignore them.
 
 Useful persistent-data checks:
 
@@ -310,6 +344,23 @@ Invoke-RestMethod "http://127.0.0.1:8010/market-context/mnq" | ConvertTo-Json -D
 When `FMP_API_KEY` or `AI_MARKET_FMP_API_KEY` is configured, Financial Modeling Prep stable earnings calendar is the primary source for the 14-day mega-cap earnings block; Alpha Vantage remains the controlled earnings fallback. Alpha Vantage can also supply QQQ holdings and news metadata. Mega-cap quote snapshots use Yahoo Finance Chart first to avoid consuming Alpha Vantage free-tier quote limits; Alpha Vantage `GLOBAL_QUOTE` is used only as a controlled fallback.
 
 These endpoints do not compute chart levels, generate signals, or decide actions.
+
+## Persistent semantic research runtime
+
+The optional AI Researcher is asynchronous and fail-closed. It first probes the configured Codex CLI capability, then records the bounded phases `PLAN`, `SEARCH`, `OPEN_SOURCE`, `EXTRACT`, `CROSS_CHECK`, `VALIDATE`, `PERSIST`, `READ_BACK`, `MATERIALIZE`, and `COMPLETE`. Claims and short evidence are stored atomically; source tiers and independent confirmations are recalculated by the service. HTTP requests never wait for the researcher.
+
+Official release actuals use explicit event semantics and transformations instead of publishing raw BLS/BEA levels. Unsupported mappings return visible `NO_DATA`. Automatic jobs are idempotent inside configurable run windows, while `force_requeue=true` creates an explicit post-terminal generation.
+
+Operational endpoints:
+
+- `GET /ai-research/capabilities`
+- `POST /market-research/mnq/runs`
+- `GET /market-research/mnq/runs/{run_id}`
+- `GET /market-research/mnq/latest`
+- `GET /market-research/mnq/status`
+- `GET /market-research/mnq/evidence/{claim_id}`
+
+See `docs/persistent-ai-and-temporal-architecture.md` for mappings, lifecycle, source policy, scheduler controls, readiness behavior, and the future smoke-test command. No research endpoint supports trading or order submission.
 News responses accept `recency_days` and filter articles by `published_at` when the upstream source provides a timestamp. If Alpha Vantage and GDELT are rate-limited, `/news/latest` falls back to RSS feeds and deduplicates articles by URL/title.
 
 `/nasdaq/context` separates data-quality metadata into:

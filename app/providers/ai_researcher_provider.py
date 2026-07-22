@@ -737,8 +737,11 @@ def _extract_first_json_object(text: str) -> str | None:
 
 
 def _resolve_command(command: str) -> list[str] | None:
+    resolved = shutil.which(command)
+    if resolved:
+        return [resolved]
     appdata = os.environ.get("APPDATA")
-    if appdata:
+    if appdata and Path(command).name.lower() in {"codex", "codex.cmd", "codex.exe", "codex.ps1"}:
         codex_js = Path(appdata) / "npm" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
         node = shutil.which("node")
         if codex_js.exists() and node:
@@ -746,9 +749,6 @@ def _resolve_command(command: str) -> list[str] | None:
         npm_cmd = Path(appdata) / "npm" / "codex.CMD"
         if npm_cmd.exists():
             return [str(npm_cmd)]
-    resolved = shutil.which(command)
-    if resolved:
-        return [resolved]
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         candidates = list(Path(local_app_data).glob("Microsoft/WindowsApps/codex*"))

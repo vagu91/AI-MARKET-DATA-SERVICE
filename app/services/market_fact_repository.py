@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.core.text_normalization import normalize_payload_text
@@ -14,7 +16,9 @@ FACT_COLUMNS = [
     "fact_key", "fact_type", "country", "symbol", "category", "event_name", "period", "value", "unit",
     "forecast", "previous", "consensus", "actual", "source", "source_url", "provider_type", "reliability",
     "confidence", "retrieved_at", "release_at", "valid_from", "valid_until", "next_refresh_at", "status",
-    "raw_payload_json", "notes", "warnings_json", "errors_json", "created_at", "updated_at",
+    "raw_payload_json", "notes", "warnings_json", "errors_json", "field_lineage_json",
+    "policy_version", "source_tier", "source_classification", "canonical_url",
+    "canonical_event_key", "created_at", "updated_at",
 ]
 CANONICAL_EVENT_ENRICHMENT_TYPE = "macro_event_enrichment"
 LEGACY_EVENT_ENRICHMENT_TYPE = "ai_research_result"
@@ -47,6 +51,179 @@ def database_value(value: Any) -> Any:
     return value
 
 
+def _numeric(value: Any) -> Decimal | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        return Decimal(str(value).replace("%", "").replace(",", ".").strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _surprise(actual: Any, baseline: Any) -> tuple[Decimal | None, str | None]:
+    actual_number = _numeric(actual)
+    baseline_number = _numeric(baseline)
+    if actual_number is None or baseline_number is None:
+        return None, None
+    difference = actual_number - baseline_number
+    direction = "above_consensus" if difference > 0 else "below_consensus" if difference < 0 else "in_line"
+    return difference, direction
+
+
+def _semantic_surprise(
+    row: Any,
+    raw_payload: dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[Decimal | None, str | None, bool, list[str]]:
+    baseline_field = "consensus" if row["consensus"] not in (None, "") else "forecast"
+    baseline_value = row[baseline_field]
+    if baseline_value in (None, ""):
+        return None, None, False, ["surprise_baseline_missing"]
+    actual_metric = str(candidate.get("event_metric_id") or candidate.get("metric_id") or "")
+    enrichment = raw_payload.get("enrichment") if isinstance(raw_payload.get("enrichment"), dict) else {}
+    metric = next(
+        (
+            item for item in enrichment.get("metrics") or []
+            if isinstance(item, dict) and str(item.get("metric_id") or "") == actual_metric
+        ),
+        None,
+    )
+    lineage = (enrichment.get("field_lineage") or {}).get(baseline_field) or {}
+    baseline = {
+        "metric_id": (metric or {}).get("metric_id") or lineage.get("metric_id"),
+        "period": (metric or {}).get("period") or lineage.get("period") or row["period"],
+        "frequency": (metric or {}).get("frequency") or lineage.get("frequency"),
+        "unit": (metric or {}).get("unit") or lineage.get("unit"),
+        "seasonal_adjustment": (metric or {}).get("seasonal_adjustment") or lineage.get("seasonal_adjustment"),
+    }
+    actual = {
+        "metric_id": actual_metric,
+        "period": candidate.get("reference_period") or candidate.get("period"),
+        "frequency": candidate.get("frequency"),
+        "unit": candidate.get("unit"),
+        "seasonal_adjustment": candidate.get("seasonal_adjustment"),
+    }
+    warnings: list[str] = []
+    for field, normalizer in (
+        ("metric_id", _semantic_token), ("period", _period_token),
+        ("frequency", _frequency_token), ("unit", _unit_token),
+        ("seasonal_adjustment", _semantic_token),
+    ):
+        baseline_value_semantic = baseline.get(field)
+        if field == "seasonal_adjustment" and not baseline_value_semantic and baseline.get("metric_id") == actual_metric:
+            baseline_value_semantic = actual.get(field)
+        if normalizer(baseline_value_semantic) != normalizer(actual.get(field)):
+            warnings.append(f"surprise_{field}_mismatch")
+    if warnings:
+        return None, None, False, warnings
+    surprise_value, surprise_direction = _surprise(candidate.get("value"), baseline_value)
+    return surprise_value, surprise_direction, surprise_value is not None, []
+
+
+def _semantic_token(value: Any) -> str:
+    return "_".join(str(value or "").strip().lower().replace("-", "_").split())
+
+
+def _period_token(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("month:", "").replace("quarter:", "q")
+    text = text.replace("/", "-").replace(":", "-")
+    match = re.fullmatch(r"(20\d{2})-(\d{1,2})", text)
+    if match:
+        return f"{match.group(1)}-{int(match.group(2)):02d}"
+    return text
+
+
+def _frequency_token(value: Any) -> str:
+    text = _semantic_token(value)
+    if text in {"mom", "monthly", "month_over_month"}:
+        return "monthly"
+    if text in {"qoq", "quarterly", "qoq_annualized", "qoq_annualised"}:
+        return "quarterly"
+    if text in {"yoy", "annual", "year_over_year"}:
+        return "monthly"
+    return text
+
+
+def _unit_token(value: Any) -> str:
+    text = _semantic_token(value)
+    if text in {"%", "percent", "percentage", "percentage_points"}:
+        return "percent"
+    if text in {"k", "thousand", "thousands", "thousands_of_jobs"}:
+        return "thousands_of_jobs"
+    return text
+
+
+def _candidate_lineage(candidate: dict[str, Any], policy_version: str) -> dict[str, Any]:
+    return {
+        key: candidate.get(key)
+        for key in (
+            "source_domain", "source", "source_url", "canonical_url", "publisher",
+            "source_tier", "source_classification", "published_at", "retrieved_at",
+            "evidence_text", "metric_id", "period", "frequency", "unit",
+            "field_semantics", "reliability", "confidence", "validation_status", "warnings",
+        )
+    } | {"policy_version": policy_version}
+
+
+def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row: Any) -> dict[str, Any]:
+    merged = {**existing, **incoming}
+    existing_enrichment = dict(existing.get("enrichment") or {})
+    incoming_enrichment = dict(incoming.get("enrichment") or {})
+    lineage = {
+        **dict(existing_enrichment.get("field_lineage") or {}),
+        **dict(incoming_enrichment.get("field_lineage") or {}),
+    }
+    enrichment = {**existing_enrichment, **incoming_enrichment, "field_lineage": lineage}
+    for field in ("forecast", "previous", "consensus", "actual"):
+        if incoming_enrichment.get(field) in (None, "") and existing_enrichment.get(field) not in (None, ""):
+            enrichment[field] = existing_enrichment[field]
+    merged["enrichment"] = enrichment
+    if incoming.get("actual") in (None, "") and row["actual"] not in (None, ""):
+        merged["actual"] = row["actual"]
+    if row["actual_source"]:
+        merged["actual_source"] = row["actual_source"]
+        merged["actual_source_url"] = row["actual_source_url"]
+        merged["surprise_value"] = row["surprise_value"]
+        merged["surprise_direction"] = row["surprise_direction"]
+    if row["outcome_json"]:
+        merged["outcome"] = decode(row["outcome_json"], {})
+    terminal = str(row["temporal_status"] or row["status"] or "").upper()
+    if terminal in {"RELEASED", "COMPLETED", "ACTUAL_UNAVAILABLE"}:
+        merged["temporal_status"] = terminal
+    return merged
+
+
+def _event_record_payload(row: Any) -> dict[str, Any]:
+    payload = decode(row["raw_payload_json"], {})
+    payload.update({
+        "event_id": row["event_id"], "canonical_event_key": row["canonical_event_key"],
+        "country": row["country"], "category": row["category"], "name": row["name"],
+        "reference_period": row["period"], "date": row["date"], "time_utc": row["time_utc"],
+        "time_local": row["time_local"], "impact": row["impact"], "source": row["source"],
+        "source_url": row["source_url"], "reliability": row["official_reliability"],
+        "actual": row["actual"], "actual_source": row["actual_source"],
+        "actual_source_url": row["actual_source_url"], "surprise_value": row["surprise_value"],
+        "surprise_direction": row["surprise_direction"], "release_at": row["release_at"],
+        "event_kind": row["event_kind"], "temporal_status": str(row["temporal_status"] or row["status"] or "").upper(),
+        "actual_semantics": {
+            "event_metric_id": row["actual_metric_id"], "unit": row["actual_unit"],
+            "frequency": row["actual_frequency"], "seasonal_adjustment": row["actual_seasonal_adjustment"],
+            "reference_period": row["actual_reference_period"], "transformation": row["actual_transformation"],
+            "semantic_compatible": bool(row["actual_semantic_compatible"]),
+            "warnings": decode(row["semantic_warnings_json"], []),
+        },
+    })
+    enrichment = dict(payload.get("enrichment") or {})
+    enrichment.update({
+        "forecast": row["forecast"], "previous": row["previous"], "consensus": row["consensus"],
+        "actual": row["actual"], "field_lineage": decode(row["field_lineage_json"], {}),
+    })
+    payload["enrichment"] = enrichment
+    if row["outcome_json"]:
+        payload["outcome"] = decode(row["outcome_json"], {})
+    return payload
+
+
 def connect_market_db(settings: Settings) -> Any:
     return connect_sqlite(settings.database_path)
 
@@ -74,7 +251,7 @@ class MarketFactRepository:
         payload.setdefault("created_at", timestamp)
         payload["updated_at"] = timestamp
         payload.setdefault("status", "active")
-        for key in ("warnings_json", "errors_json", "raw_payload_json"):
+        for key in ("warnings_json", "errors_json", "raw_payload_json", "field_lineage_json"):
             payload[key] = encode(payload.get(key))
         columns = [column for column in FACT_COLUMNS if column in payload]
         updates = ", ".join(
@@ -217,22 +394,48 @@ class MarketFactRepository:
         ]
 
     def upsert_economic_event(self, event: Any, event_key: str, *, valid_until: str | None = None) -> None:
+        from app.services.temporal_domain_service import canonical_event_key, temporal_event_state
+
         timestamp = now_iso()
         payload = normalize_payload_text(event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event))
         time_utc = payload.get("time_utc")
         forecast = (payload.get("enrichment") or {}).get("forecast") if isinstance(payload.get("enrichment"), dict) else None
         previous = (payload.get("enrichment") or {}).get("previous") if isinstance(payload.get("enrichment"), dict) else None
         consensus = (payload.get("enrichment") or {}).get("consensus") if isinstance(payload.get("enrichment"), dict) else None
-        actual = payload.get("actual") or ((payload.get("enrichment") or {}).get("actual") if isinstance(payload.get("enrichment"), dict) else None)
+        actual = payload.get("actual")
+        if actual in (None, "") and isinstance(payload.get("enrichment"), dict):
+            actual = (payload.get("enrichment") or {}).get("actual")
+        temporal = temporal_event_state(payload)
+        actual = temporal["actual"]
+        canonical_key = canonical_event_key(payload)
+        field_lineage = (payload.get("enrichment") or {}).get("field_lineage") if isinstance(payload.get("enrichment"), dict) else {}
         with connect_market_db(self.settings) as conn:
+            existing = conn.execute(
+                "SELECT * FROM economic_events_history WHERE event_key=? OR canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
+                (event_key, canonical_key),
+            ).fetchone()
+            terminal_status = temporal["temporal_status"]
+            if existing is not None:
+                event_key = str(existing["event_key"])
+                existing_raw = decode(existing["raw_payload_json"], {})
+                payload = _merge_event_payload(existing_raw, payload, existing)
+                if actual in (None, "") and existing["actual"] not in (None, ""):
+                    actual = existing["actual"]
+                if str(existing["temporal_status"] or existing["status"] or "").upper() in {
+                    "RELEASED", "COMPLETED", "ACTUAL_UNAVAILABLE"
+                }:
+                    terminal_status = str(existing["temporal_status"] or existing["status"]).upper()
+                existing_lineage = decode(existing["field_lineage_json"], {})
+                field_lineage = {**existing_lineage, **field_lineage}
             conn.execute(
                 """
                 INSERT INTO economic_events_history (
                     event_id, event_key, country, category, name, period, date, time_utc, time_local,
                     impact, event_risk_level, source, source_url, official_reliability,
                     forecast, previous, consensus, actual, release_at, valid_until, status,
-                    raw_payload_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_payload_json, created_at, updated_at, canonical_event_key,event_kind,
+                    temporal_status,field_lineage_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_key) DO UPDATE SET
                     country=excluded.country,
                     category=excluded.category,
@@ -246,14 +449,18 @@ class MarketFactRepository:
                     source=excluded.source,
                     source_url=excluded.source_url,
                     official_reliability=excluded.official_reliability,
-                    forecast=excluded.forecast,
-                    previous=excluded.previous,
-                    consensus=excluded.consensus,
-                    actual=excluded.actual,
+                    forecast=COALESCE(excluded.forecast,economic_events_history.forecast),
+                    previous=COALESCE(excluded.previous,economic_events_history.previous),
+                    consensus=COALESCE(excluded.consensus,economic_events_history.consensus),
+                    actual=COALESCE(excluded.actual,economic_events_history.actual),
                     release_at=excluded.release_at,
                     valid_until=excluded.valid_until,
                     status=excluded.status,
                     raw_payload_json=excluded.raw_payload_json,
+                    canonical_event_key=excluded.canonical_event_key,
+                    event_kind=excluded.event_kind,
+                    temporal_status=excluded.temporal_status,
+                    field_lineage_json=COALESCE(excluded.field_lineage_json,economic_events_history.field_lineage_json),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -262,7 +469,7 @@ class MarketFactRepository:
                     payload.get("country"),
                     payload.get("category"),
                     payload.get("name"),
-                    payload.get("period"),
+                    payload.get("reference_period") or payload.get("period"),
                     payload.get("date"),
                     time_utc,
                     payload.get("time_local"),
@@ -277,13 +484,255 @@ class MarketFactRepository:
                     actual,
                     time_utc,
                     valid_until,
-                    "active",
+                    terminal_status,
                     encode(payload),
                     timestamp,
                     timestamp,
+                    canonical_key,
+                    temporal["event_kind"],
+                    terminal_status,
+                    encode(field_lineage),
                 ),
             )
             conn.commit()
+
+    def apply_event_research_field(
+        self,
+        *,
+        canonical_event_key: str,
+        candidate: dict[str, Any],
+        policy_version: str,
+    ) -> dict[str, int]:
+        field = str(candidate.get("field") or candidate.get("field_semantics") or "")
+        if field not in {"forecast", "consensus", "previous"}:
+            raise ValueError(f"unsupported research field: {field}")
+        value = candidate.get("value")
+        if value in (None, ""):
+            raise ValueError("accepted research field has no value")
+        timestamp = now_iso()
+        with connect_market_db(self.settings) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM economic_events_history WHERE canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
+                (canonical_event_key,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise ValueError("canonical economic event not found")
+            lineage = decode(row["field_lineage_json"], {})
+            lineage[field] = _candidate_lineage(candidate, policy_version)
+            raw_payload = decode(row["raw_payload_json"], {})
+            enrichment = dict(raw_payload.get("enrichment") or {})
+            enrichment[field] = value
+            enrichment["field_lineage"] = lineage
+            raw_payload["enrichment"] = enrichment
+            conn.execute(
+                f"UPDATE economic_events_history SET {field}=?,field_lineage_json=?,policy_version=?,raw_payload_json=?,updated_at=? WHERE id=?",
+                (str(value), encode(lineage), policy_version, encode(raw_payload), timestamp, row["id"]),
+            )
+            conn.commit()
+        restored_history = self._event_history_row(canonical_event_key)
+        if restored_history is None or str(restored_history[field]) != str(value):
+            raise RuntimeError("event research history read-back failed")
+        fact_key = f"{canonical_event_key}:research_enrichment"
+        self.upsert_fact({
+            "fact_key": fact_key,
+            "fact_type": "macro_event_enrichment",
+            "country": restored_history["country"],
+            "category": restored_history["category"],
+            "event_name": restored_history["name"],
+            "period": candidate.get("period") or restored_history["period"],
+            "unit": candidate.get("unit"),
+            "forecast": restored_history["forecast"],
+            "previous": restored_history["previous"],
+            "consensus": restored_history["consensus"],
+            "actual": restored_history["actual"],
+            "source": candidate.get("source"),
+            "source_url": candidate.get("canonical_url") or candidate.get("source_url"),
+            "provider_type": "AI_RESEARCHER",
+            "reliability": candidate.get("reliability") or 0,
+            "confidence": candidate.get("confidence") or 0,
+            "retrieved_at": candidate.get("retrieved_at") or timestamp,
+            "release_at": restored_history["release_at"],
+            "status": "active",
+            "raw_payload_json": raw_payload,
+            "field_lineage_json": lineage,
+            "policy_version": policy_version,
+            "source_tier": candidate.get("source_tier"),
+            "source_classification": candidate.get("source_classification"),
+            "canonical_url": candidate.get("canonical_url"),
+            "canonical_event_key": canonical_event_key,
+        })
+        restored_fact = self.get_fact(fact_key)
+        if restored_fact is None or str(restored_fact.get(field)) != str(value):
+            raise RuntimeError("event research fact read-back failed")
+        return {"persisted_count": 1, "read_back_count": 1}
+
+    def apply_official_event_actual(
+        self,
+        *,
+        canonical_event_key: str,
+        candidate: dict[str, Any],
+        policy_version: str,
+    ) -> dict[str, Any]:
+        actual = candidate.get("value") if candidate.get("value") not in (None, "") else candidate.get("actual")
+        if actual in (None, ""):
+            raise ValueError("official actual candidate has no value")
+        timestamp = now_iso()
+        source = str(candidate.get("source") or candidate.get("publisher") or "")
+        source_url = str(candidate.get("canonical_url") or candidate.get("source_url") or "")
+        if not source or not source_url:
+            raise ValueError("official actual candidate requires source and URL")
+        with connect_market_db(self.settings) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM economic_events_history WHERE canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
+                (canonical_event_key,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise ValueError("canonical economic event not found")
+            raw_payload = decode(row["raw_payload_json"], {})
+            surprise_value, surprise_direction, semantic_compatible, semantic_warnings = _semantic_surprise(
+                row, raw_payload, candidate
+            )
+            lineage = decode(row["field_lineage_json"], {})
+            lineage["actual"] = {
+                "source_domain": candidate.get("source_domain"),
+                "source": source,
+                "source_url": source_url,
+                "canonical_url": candidate.get("canonical_url"),
+                "publisher": candidate.get("publisher"),
+                "source_tier": candidate.get("source_tier"),
+                "source_classification": candidate.get("source_classification"),
+                "published_at": candidate.get("published_at"),
+                "retrieved_at": candidate.get("retrieved_at") or timestamp,
+                "evidence_text": candidate.get("evidence_text"),
+                "metric_id": candidate.get("metric_id"),
+                "period": candidate.get("period"),
+                "frequency": candidate.get("frequency"),
+                "unit": candidate.get("unit"),
+                "field_semantics": "actual",
+                "reliability": candidate.get("reliability"),
+                "confidence": candidate.get("confidence"),
+                "validation_status": candidate.get("validation_status") or "accepted",
+                "warnings": candidate.get("warnings") or [],
+                "policy_version": policy_version,
+            }
+            raw_payload["actual"] = actual
+            raw_payload["actual_semantics"] = {
+                "event_metric_id": candidate.get("event_metric_id") or candidate.get("metric_id"),
+                "source_series_id": candidate.get("source_series_id"),
+                "transformation": candidate.get("transformation"),
+                "unit": candidate.get("unit"), "frequency": candidate.get("frequency"),
+                "seasonal_adjustment": candidate.get("seasonal_adjustment"),
+                "reference_period": candidate.get("reference_period") or candidate.get("period"),
+                "release_vintage": candidate.get("release_vintage"),
+                "semantic_compatible": semantic_compatible,
+                "warnings": semantic_warnings,
+            }
+            enrichment = dict(raw_payload.get("enrichment") or {})
+            enrichment.update({"actual": actual, "field_lineage": lineage})
+            raw_payload["enrichment"] = enrichment
+            conn.execute(
+                """
+                UPDATE economic_events_history
+                SET actual=?,actual_source=?,actual_source_url=?,surprise_value=?,surprise_direction=?,
+                    actual_retrieved_at=?,field_lineage_json=?,policy_version=?,temporal_status='RELEASED',
+                    status='RELEASED',raw_payload_json=?,updated_at=?,actual_metric_id=?,actual_unit=?,
+                    actual_frequency=?,actual_seasonal_adjustment=?,actual_reference_period=?,
+                    actual_transformation=?,actual_semantic_compatible=?,semantic_warnings_json=?
+                WHERE id=?
+                """,
+                (
+                    str(actual), source, source_url,
+                    None if surprise_value is None else str(surprise_value), surprise_direction,
+                    candidate.get("retrieved_at") or timestamp, encode(lineage), policy_version,
+                    encode(raw_payload), timestamp,
+                    candidate.get("event_metric_id") or candidate.get("metric_id"), candidate.get("unit"),
+                    candidate.get("frequency"), candidate.get("seasonal_adjustment"),
+                    candidate.get("reference_period") or candidate.get("period"), candidate.get("transformation"),
+                    int(semantic_compatible), encode(semantic_warnings), row["id"],
+                ),
+            )
+            fact_key = f"{canonical_event_key}:official_actual"
+            fact_payload = {
+                "fact_key": fact_key,
+                "fact_type": "official_event_actual",
+                "country": row["country"],
+                "category": row["category"],
+                "event_name": row["name"],
+                "period": row["period"],
+                "unit": candidate.get("unit"),
+                "forecast": row["forecast"],
+                "previous": row["previous"],
+                "consensus": row["consensus"],
+                "actual": str(actual),
+                "source": source,
+                "source_url": source_url,
+                "provider_type": "API",
+                "reliability": candidate.get("reliability") or 0,
+                "confidence": candidate.get("confidence") or 0,
+                "retrieved_at": candidate.get("retrieved_at") or timestamp,
+                "release_at": row["release_at"],
+                "status": "active",
+                "raw_payload_json": encode({
+                    **candidate, "surprise_value": surprise_value,
+                    "surprise_direction": surprise_direction,
+                    "semantic_compatible": semantic_compatible,
+                    "semantic_warnings": semantic_warnings,
+                }),
+                "field_lineage_json": encode(lineage),
+                "policy_version": policy_version,
+                "source_tier": candidate.get("source_tier"),
+                "source_classification": candidate.get("source_classification"),
+                "canonical_url": candidate.get("canonical_url"),
+                "canonical_event_key": canonical_event_key,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            columns = [column for column in FACT_COLUMNS if column in fact_payload]
+            conn.execute(
+                f"INSERT INTO market_facts ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+                f"ON CONFLICT(fact_key) DO UPDATE SET "
+                + ", ".join(f"{column}=excluded.{column}" for column in columns if column not in {"fact_key", "created_at"}),
+                [fact_payload[column] for column in columns],
+            )
+            conn.commit()
+        restored = self.get_fact(fact_key)
+        if restored is None or str(restored.get("actual")) != str(actual):
+            raise RuntimeError("official actual read-back failed")
+        return restored
+
+    def mark_event_actual_unavailable(self, canonical_event_key: str) -> None:
+        if not canonical_event_key:
+            return
+        timestamp = now_iso()
+        with connect_market_db(self.settings) as conn:
+            conn.execute(
+                """
+                UPDATE economic_events_history
+                SET temporal_status='ACTUAL_UNAVAILABLE',status='ACTUAL_UNAVAILABLE',updated_at=?
+                WHERE canonical_event_key=? AND actual IS NULL
+                """,
+                (timestamp, canonical_event_key),
+            )
+            conn.commit()
+
+    def apply_speech_outcome(self, canonical_event_key: str, candidate: dict[str, Any]) -> None:
+        timestamp = now_iso()
+        with connect_market_db(self.settings) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE economic_events_history
+                SET outcome_json=?,temporal_status='COMPLETED',status='COMPLETED',updated_at=?
+                WHERE canonical_event_key=? AND event_kind='scheduled_speech'
+                """,
+                (encode(candidate), timestamp, canonical_event_key),
+            )
+            conn.commit()
+        if int(cursor.rowcount or 0) == 0:
+            raise ValueError("canonical speech event not found")
 
     def economic_event_payloads(self, *, country: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         with connect_market_db(self.settings) as conn:
@@ -297,6 +746,21 @@ class MarketFactRepository:
                 (country.upper(), start_date, end_date),
             ).fetchall()
         return [payload for row in rows if isinstance((payload := decode(row["raw_payload_json"], None)), dict)]
+
+    def economic_event_records(self, *, country: str = "US") -> list[dict[str, Any]]:
+        with connect_market_db(self.settings) as conn:
+            rows = conn.execute(
+                "SELECT * FROM economic_events_history WHERE country=? ORDER BY COALESCE(release_at,time_utc,date),name",
+                (country.upper(),),
+            ).fetchall()
+        return [_event_record_payload(row) for row in rows]
+
+    def _event_history_row(self, canonical_event_key: str) -> Any | None:
+        with connect_market_db(self.settings) as conn:
+            return conn.execute(
+                "SELECT * FROM economic_events_history WHERE canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
+                (canonical_event_key,),
+            ).fetchone()
 
     def db_summary(self) -> dict[str, Any]:
         with connect_market_db(self.settings) as conn:

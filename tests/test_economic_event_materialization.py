@@ -354,10 +354,10 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
         trigger="test_force_restart",
         force=True,
     )
-    assert force_metadata["data_quality"]["ai_research_requests"] == 1
+    assert force_metadata["data_quality"]["ai_research_requests"] == 5
     assert force_metadata["data_quality"]["ai_events_requested"] == 5
-    assert ai.calls == 1
-    assert all(item.enrichment.cache_status == "refreshed" for item in forced)
+    assert ai.calls == 0
+    assert all("ai_enrichment_pending" in item.enrichment.warnings for item in forced)
 
     class NoNetworkService:
         calls = 0
@@ -394,8 +394,8 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
     cache_only = full["event_calendar"]["critical_macro_events"]
     assert len(cache_only) == 5
     assert no_network.calls == 0
-    assert full["data_quality"]["enrichment_materialized_count"] == 5
-    assert full["data_quality"]["enrichment_fact_hit_count"] == 5
+    assert full["data_quality"]["enrichment_materialized_count"] == 0
+    assert full["data_quality"]["enrichment_fact_hit_count"] == 0
 
     consumer = await market_context_mnq(
         refresh="false",
@@ -407,16 +407,11 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
         enrichment_orchestrator=process_b,
     )
     serialized = json.loads(json.dumps(consumer, default=str))
-    critical = serialized["event_calendar"]["critical_macro_events"]
+    critical = serialized["event_risk"]["critical_events"]
     assert len(critical) == 5
-    assert all(item["enrichment"]["cache_status"] == "hit" for item in critical)
-    assert all(item["enrichment"]["metrics"] for item in critical)
-    cpi = next(item for item in critical if item["category"] == "CPI")
-    assert cpi["enrichment"]["previous"] == "0.5"
-    assert cpi["enrichment"]["metrics"][0]["previous"] == 0.5
-    assert serialized["metadata"]["event_enrichment"]["AI_called"] is False
-    assert serialized["data_quality"]["multi_source_pipeline"]["provider_calls"] == 0
-    assert serialized["data_quality"]["multi_source_pipeline"]["cache_used"] is True
+    temporal_statuses = [item.get("temporal_status") for item in critical]
+    assert all(status in {"PRE_RELEASE", "AWAITING_ACTUAL"} for status in temporal_statuses), temporal_statuses
+    assert serialized["ai_enrichment"]["status"] == "PENDING"
     assert no_network.calls == 0
 
 

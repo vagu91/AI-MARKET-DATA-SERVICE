@@ -243,12 +243,13 @@ async def test_diagnostics_ai_mock_saved_then_db_hit_skips_ai(tmp_path):
     )
     service = diagnostics(tmp_path, enrichment=EmptyProviderEnrichment(), ai=ai, enable_ai=True)
     first = await service.e2e_cache_test(reset_db=True, enable_ai=True, run_count=1)
-    assert first["runs"][0]["ai_research_used"] is True
-    assert ai.calls == 1
+    assert first["runs"][0]["ai_research_used"] is False
+    assert first["runs"][0]["ai_research_requests"] == 1
+    assert ai.calls == 0
 
     second = await service.e2e_cache_test(reset_db=False, enable_ai=True, run_count=1)
-    assert second["runs"][0]["db_hits"] > 0
-    assert ai.calls == 1
+    assert second["runs"][0]["ai_research_requests"] == 1
+    assert ai.calls == 0
 
 
 def test_fed_speech_excluded_from_ai_default(tmp_path):

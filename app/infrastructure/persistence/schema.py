@@ -249,6 +249,370 @@ WHERE fact_type = 'macro_event_enrichment'
 """
 
 
+PERSISTENT_AI_JOBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ai_research_jobs (
+  job_id TEXT PRIMARY KEY,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  job_type TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  event_key TEXT NULL,
+  correlation_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 100,
+  request_payload_json TEXT NOT NULL,
+  result_payload_json TEXT NULL,
+  policy_version TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  created_at TEXT NOT NULL,
+  started_at TEXT NULL,
+  heartbeat_at TEXT NULL,
+  lease_expires_at TEXT NULL,
+  completed_at TEXT NULL,
+  next_retry_at TEXT NULL,
+  last_error TEXT NULL,
+  workspace_path TEXT NULL,
+  output_checksum TEXT NULL,
+  worker_id TEXT NULL,
+  accepted_fields_json TEXT NULL,
+  rejected_fields_json TEXT NULL,
+  pending_fields_json TEXT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_research_jobs_dispatch
+  ON ai_research_jobs(status, next_retry_at, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_jobs_event
+  ON ai_research_jobs(event_key, job_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_research_jobs_correlation
+  ON ai_research_jobs(correlation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ai_research_job_attempts (
+  id INTEGER PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  worker_id TEXT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT NULL,
+  error TEXT NULL,
+  output_checksum TEXT NULL,
+  FOREIGN KEY(job_id) REFERENCES ai_research_jobs(job_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_research_job_attempt_number
+  ON ai_research_job_attempts(job_id, attempt_number);
+
+CREATE TABLE IF NOT EXISTS market_context_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  generated_at TEXT NOT NULL,
+  data_as_of TEXT NULL,
+  refresh_mode TEXT NOT NULL,
+  debug_payload_json TEXT NOT NULL,
+  consumer_payload_json TEXT NOT NULL,
+  ai_status TEXT NOT NULL,
+  source_job_id TEXT NULL,
+  checksum TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(symbol, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_context_snapshots_latest
+  ON market_context_snapshots(symbol, revision DESC);
+
+CREATE TABLE IF NOT EXISTS event_value_candidates (
+  id INTEGER PRIMARY KEY,
+  canonical_event_key TEXT NOT NULL,
+  field_name TEXT NOT NULL,
+  value TEXT NULL,
+  metric_id TEXT NULL,
+  period TEXT NULL,
+  frequency TEXT NULL,
+  unit TEXT NULL,
+  source TEXT NOT NULL,
+  source_url TEXT NOT NULL,
+  source_domain TEXT NOT NULL,
+  source_tier INTEGER NOT NULL,
+  source_classification TEXT NOT NULL,
+  evidence_text TEXT NULL,
+  reliability REAL NOT NULL DEFAULT 0,
+  confidence REAL NOT NULL DEFAULT 0,
+  validation_status TEXT NOT NULL,
+  warnings_json TEXT NULL,
+  policy_version TEXT NOT NULL,
+  retrieved_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  UNIQUE(canonical_event_key, field_name, source_url, value, period)
+);
+
+ALTER TABLE economic_events_history ADD COLUMN canonical_event_key TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN event_kind TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN temporal_status TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN outcome_json TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN field_lineage_json TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_retrieved_at TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN policy_version TEXT NULL;
+
+ALTER TABLE market_facts ADD COLUMN field_lineage_json TEXT NULL;
+ALTER TABLE market_facts ADD COLUMN policy_version TEXT NULL;
+ALTER TABLE market_facts ADD COLUMN source_tier INTEGER NULL;
+ALTER TABLE market_facts ADD COLUMN source_classification TEXT NULL;
+ALTER TABLE market_facts ADD COLUMN canonical_url TEXT NULL;
+ALTER TABLE market_facts ADD COLUMN canonical_event_key TEXT NULL;
+
+ALTER TABLE market_news ADD COLUMN canonical_url TEXT NULL;
+ALTER TABLE market_news ADD COLUMN aggregator_url TEXT NULL;
+ALTER TABLE market_news ADD COLUMN original_publisher TEXT NULL;
+ALTER TABLE market_news ADD COLUMN source_tier INTEGER NULL;
+ALTER TABLE market_news ADD COLUMN source_classification TEXT NULL;
+ALTER TABLE market_news ADD COLUMN lifecycle_status TEXT NULL;
+"""
+
+
+AI_JOB_SCOPING_SCHEMA = """
+ALTER TABLE ai_research_jobs ADD COLUMN snapshot_id TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN generation TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN run_window TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN scope_key TEXT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ai_research_jobs_scope
+  ON ai_research_jobs(scope_key, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_research_jobs_snapshot
+  ON ai_research_jobs(snapshot_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_context_snapshot_jobs (
+  snapshot_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  event_key TEXT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id, job_id),
+  FOREIGN KEY(snapshot_id) REFERENCES market_context_snapshots(snapshot_id),
+  FOREIGN KEY(job_id) REFERENCES ai_research_jobs(job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_jobs_job
+  ON market_context_snapshot_jobs(job_id, snapshot_id);
+"""
+
+
+AGENTIC_RESEARCH_RUNTIME_SCHEMA = """
+ALTER TABLE ai_research_jobs ADD COLUMN profile_id TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN input_fingerprint TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN capability_status TEXT NULL;
+
+ALTER TABLE event_value_candidates ADD COLUMN event_metric_id TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN source_series_id TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN transformation TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN seasonal_adjustment TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN reference_period TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN release_timestamp TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN release_vintage TEXT NULL;
+ALTER TABLE event_value_candidates ADD COLUMN calculation_lineage_json TEXT NULL;
+
+ALTER TABLE economic_events_history ADD COLUMN actual_metric_id TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_unit TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_frequency TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_seasonal_adjustment TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_reference_period TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_transformation TEXT NULL;
+ALTER TABLE economic_events_history ADD COLUMN actual_semantic_compatible INTEGER NULL;
+ALTER TABLE economic_events_history ADD COLUMN semantic_warnings_json TEXT NULL;
+
+CREATE TABLE IF NOT EXISTS ai_research_capability_reports (
+  report_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  backend TEXT NULL,
+  executable_path TEXT NULL,
+  executable_version TEXT NULL,
+  report_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_capability_latest
+  ON ai_research_capability_reports(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_runs (
+  run_id TEXT PRIMARY KEY,
+  job_id TEXT UNIQUE NOT NULL,
+  symbol TEXT NOT NULL,
+  event_key TEXT NULL,
+  profile_id TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  result_json TEXT NULL,
+  coverage_score REAL NOT NULL DEFAULT 0,
+  required_topics_json TEXT NOT NULL DEFAULT '[]',
+  completed_topics_json TEXT NOT NULL DEFAULT '[]',
+  missing_topics_json TEXT NOT NULL DEFAULT '[]',
+  blocking_gaps_json TEXT NOT NULL DEFAULT '[]',
+  non_blocking_gaps_json TEXT NOT NULL DEFAULT '[]',
+  source_domains_json TEXT NOT NULL DEFAULT '[]',
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT NULL,
+  completed_at TEXT NULL,
+  data_as_of TEXT NULL,
+  fresh_until TEXT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(job_id) REFERENCES ai_research_jobs(job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_runs_latest
+  ON research_runs(symbol, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_runs_fingerprint
+  ON research_runs(input_fingerprint, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_run_steps (
+  step_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  step_name TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  input_checksum TEXT NULL,
+  output_checksum TEXT NULL,
+  input_json TEXT NULL,
+  output_json TEXT NULL,
+  backend TEXT NULL,
+  tool TEXT NULL,
+  source_domains_json TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT NULL,
+  completed_at TEXT NULL,
+  duration_ms INTEGER NULL,
+  error TEXT NULL,
+  UNIQUE(run_id, step_name),
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_claims (
+  claim_id TEXT PRIMARY KEY,
+  research_run_id TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  field_semantics TEXT NOT NULL,
+  value_json TEXT NULL,
+  metric_id TEXT NULL,
+  period TEXT NULL,
+  frequency TEXT NULL,
+  unit TEXT NULL,
+  event_key TEXT NULL,
+  symbol TEXT NULL,
+  valid_from TEXT NULL,
+  valid_until TEXT NULL,
+  published_at TEXT NULL,
+  retrieved_at TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0,
+  validation_status TEXT NOT NULL,
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  policy_version TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(research_run_id) REFERENCES research_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_claims_run
+  ON research_claims(research_run_id, validation_status, topic);
+
+CREATE TABLE IF NOT EXISTS research_evidence (
+  evidence_id TEXT PRIMARY KEY,
+  claim_id TEXT NOT NULL,
+  query_text TEXT NULL,
+  source_url TEXT NOT NULL,
+  canonical_url TEXT NOT NULL,
+  publisher TEXT NULL,
+  source_domain TEXT NOT NULL,
+  source_tier INTEGER NOT NULL,
+  evidence_text TEXT NOT NULL,
+  published_at TEXT NULL,
+  retrieved_at TEXT NOT NULL,
+  redirect_url TEXT NULL,
+  source_status TEXT NULL,
+  independent_source_group TEXT NOT NULL,
+  content_checksum TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(claim_id, canonical_url, content_checksum),
+  FOREIGN KEY(claim_id) REFERENCES research_claims(claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_evidence_claim
+  ON research_evidence(claim_id, source_domain);
+
+CREATE TABLE IF NOT EXISTS research_scheduler_decisions (
+  decision_id TEXT PRIMARY KEY,
+  trigger_name TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  job_id TEXT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_scheduler_fingerprint
+  ON research_scheduler_decisions(trigger_name, symbol, input_fingerprint, created_at DESC);
+"""
+
+
+VERIFIED_RESEARCH_RUNTIME_SCHEMA = """
+ALTER TABLE ai_research_jobs ADD COLUMN retry_class TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN retry_deadline_at TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN last_retry_reason TEXT NULL;
+
+ALTER TABLE research_runs ADD COLUMN valid_not_applicable_topics_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE research_runs ADD COLUMN search_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN opened_source_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN usage_json TEXT NULL;
+ALTER TABLE research_runs ADD COLUMN cost_json TEXT NULL;
+
+ALTER TABLE research_run_steps ADD COLUMN telemetry_json TEXT NULL;
+ALTER TABLE research_evidence ADD COLUMN source_content_hash TEXT NULL;
+
+CREATE TABLE IF NOT EXISTS research_tool_events (
+  event_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  step_id TEXT NULL,
+  event_type TEXT NOT NULL,
+  source_url TEXT NULL,
+  canonical_url TEXT NULL,
+  redirect_url TEXT NULL,
+  observed_at TEXT NOT NULL,
+  content_hash TEXT NULL,
+  http_status INTEGER NULL,
+  usage_json TEXT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
+  FOREIGN KEY(step_id) REFERENCES research_run_steps(step_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_tool_events_run
+  ON research_tool_events(run_id, event_type, observed_at);
+CREATE INDEX IF NOT EXISTS idx_research_tool_events_url
+  ON research_tool_events(run_id, canonical_url, source_url);
+
+CREATE TABLE IF NOT EXISTS ai_research_live_verifications (
+  verification_id TEXT PRIMARY KEY,
+  backend TEXT NOT NULL,
+  executable_version TEXT NULL,
+  verified_at TEXT NOT NULL,
+  expires_at TEXT NULL,
+  evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_live_verifications_latest
+  ON ai_research_live_verifications(backend, verified_at DESC);
+"""
+
+
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
     ("002_provider_cache_and_state", PROVIDER_CACHE_SCHEMA),
@@ -256,4 +620,8 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("004_risk_context_history", RISK_CONTEXT_SCHEMA),
     ("005_canonical_macro_facts", CANONICAL_MACRO_FACTS_SCHEMA),
     ("006_mixed_event_lineage", MIXED_EVENT_LINEAGE_SCHEMA),
+    ("007_persistent_ai_jobs_and_temporal_domains", PERSISTENT_AI_JOBS_SCHEMA),
+    ("008_ai_job_scoping_and_snapshot_links", AI_JOB_SCOPING_SCHEMA),
+    ("009_semantic_actuals_and_agentic_research_runtime", AGENTIC_RESEARCH_RUNTIME_SCHEMA),
+    ("010_verified_evidence_deadlines_and_completeness", VERIFIED_RESEARCH_RUNTIME_SCHEMA),
 )
