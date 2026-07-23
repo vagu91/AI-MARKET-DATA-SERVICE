@@ -333,7 +333,8 @@ if phase == 'VALIDATE':
     payload = {'status': 'SUCCEEDED', 'claims': [{
         'topic': 'missing_fields', 'field_semantics': 'forecast', 'value': '0.3',
         'metric_id': 'headline_cpi_mom', 'period': '2026-06', 'frequency': 'monthly',
-        'unit': 'percent', 'event_key': None, 'symbol': 'MNQ', 'valid_from': None,
+        'unit': 'percent', 'event_key': None, 'event_at': None, 'release_at': None,
+        'issuer': None, 'symbol': 'MNQ', 'valid_from': None,
         'valid_until': None, 'published_at': None, 'retrieved_at': '2026-07-22T10:00:00Z',
         'confidence': 0.9, 'topic_status': 'SUPPORTED', 'warnings': [],
         'evidence': [
@@ -716,7 +717,7 @@ def test_additive_migration_from_v8_preserves_rows_and_adds_runtime(tmp_path: Pa
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('preserved','Preserved','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 13
+    assert migrate_database(database)["schema_version"] == 14
     with sqlite3.connect(database) as conn:
         assert (
             conn.execute("SELECT title FROM market_news WHERE news_key='preserved'").fetchone()[0]
@@ -747,7 +748,7 @@ def test_additive_migration_from_v9_preserves_rows_and_adds_verified_runtime(
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('v9-preserved','V9','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 13
+    assert migrate_database(database)["schema_version"] == 14
     with sqlite3.connect(database) as conn:
         assert (
             conn.execute("SELECT title FROM market_news WHERE news_key='v9-preserved'").fetchone()[
@@ -938,7 +939,7 @@ def test_partial_when_only_some_claims_pass_evidence_policy(tmp_path: Path) -> N
     run = repository.ensure_run(job, "MNQ_MARKET_RESEARCH", "mnq_market_research_v1")
     valid = {
         "topic": "risk",
-        "field_semantics": "exploratory_context",
+        "field_semantics": "outcome",
         "value": "verified context",
         "evidence": [
             {
@@ -1132,7 +1133,7 @@ def test_ai_evidence_requires_actual_open_source_telemetry(
 def _topic_claim(topic: str) -> dict:
     return {
         "topic": topic,
-        "field_semantics": "exploratory_context",
+        "field_semantics": "outcome",
         "value": f"verified {topic}",
         "evidence": [
             {

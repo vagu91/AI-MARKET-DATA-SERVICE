@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.redaction import redact_payload, redact_sensitive
+from app.services.research_semantics import AI_RESEARCH_SEMANTICS
 
 
 EXTERNAL_RESEARCH_STEPS = (
@@ -83,15 +84,7 @@ def _validated_claim_schema() -> dict[str, Any]:
             "topic": _string(max_length=100),
             "field_semantics": {
                 "type": "string",
-                "enum": [
-                    "forecast",
-                    "consensus",
-                    "previous",
-                    "outcome",
-                    "transcript_url",
-                    "news",
-                    "exploratory_context",
-                ],
+                "enum": list(AI_RESEARCH_SEMANTICS),
             },
             # Numeric official actuals are deliberately impossible in this AI contract.
             "value": _nullable("string", maxLength=1000),
@@ -100,6 +93,9 @@ def _validated_claim_schema() -> dict[str, Any]:
             "frequency": _string(nullable=True, max_length=80),
             "unit": _string(nullable=True, max_length=80),
             "event_key": _string(nullable=True, max_length=300),
+            "event_at": _string(nullable=True, max_length=64),
+            "release_at": _string(nullable=True, max_length=64),
+            "issuer": _string(nullable=True, max_length=200),
             "symbol": _string(nullable=True, max_length=16),
             "valid_from": _string(nullable=True, max_length=64),
             "valid_until": _string(nullable=True, max_length=64),
@@ -217,15 +213,7 @@ def step_output_schema(
                             "topic": _string(max_length=100),
                             "field_semantics": {
                                 "type": "string",
-                                "enum": [
-                                    "forecast",
-                                    "consensus",
-                                    "previous",
-                                    "outcome",
-                                    "transcript_url",
-                                    "news",
-                                    "exploratory_context",
-                                ],
+                                "enum": list(AI_RESEARCH_SEMANTICS),
                             },
                             "value": _nullable("string", maxLength=1000),
                             "metric_id": _string(nullable=True, max_length=120),
@@ -325,6 +313,11 @@ def agentic_research_output_schema(
                             "query": _string(max_length=500),
                             "purpose": _string(max_length=300),
                             "topic": _string(max_length=100),
+                            "topics": _array(
+                                _string(max_length=100),
+                                max_items=10,
+                                min_items=1,
+                            ),
                         }
                     ),
                     max_items=max_searches,

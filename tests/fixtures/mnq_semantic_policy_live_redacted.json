@@ -1,0 +1,174 @@
+{
+  "source_run_id": "rrun-4e7200b9-9d57-4430-9636-fd231c63ad24",
+  "source_job_id": "airj-f70aaf54-a922-4731-afdd-dcd915914861",
+  "context_at": "2026-07-23T12:00:00+00:00",
+  "payload": {
+    "status": "COMPLETED",
+    "plan": {
+      "topics": ["macro", "fed_rates", "events", "earnings", "volatility_positioning", "news"],
+      "queries": [
+        {"query": "site:bea.gov July 2026 release schedule", "purpose": "official macro calendar", "topic": "macro"},
+        {"query": "site:federalreserve.gov July 2026 FOMC calendar", "purpose": "official FOMC calendar", "topic": "fed_rates"},
+        {"query": "site:bls.gov July 2026 release schedule", "purpose": "official labor calendar", "topic": "events"},
+        {"query": "site:microsoft.com July 2026 earnings date", "purpose": "official issuer earnings schedule", "topic": "earnings"},
+        {"query": "site:cboe.com July 2026 VIX context", "purpose": "bounded volatility context", "topic": "volatility_positioning"},
+        {"query": "site:sec.gov Amazon July 2026 filing", "purpose": "bounded corporate news context", "topic": "news"}
+      ],
+      "stop_conditions": ["bounded offline replay fixture"]
+    },
+    "searches": [
+      {"query": "site:bea.gov July 2026 release schedule", "discovered_urls": ["https://www.bea.gov/news/schedule/"]},
+      {"query": "site:federalreserve.gov July 2026 FOMC calendar", "discovered_urls": ["https://www.federalreserve.gov/newsevents/2026-july.htm"]},
+      {"query": "site:bls.gov July 2026 release schedule", "discovered_urls": ["https://www.bls.gov/schedule/2026/07_sched.htm"]},
+      {"query": "site:microsoft.com July 2026 earnings date", "discovered_urls": ["https://news.microsoft.com/source/2026/07/08/microsoft-announces-quarterly-earnings-release-date-68/"]},
+      {"query": "site:cboe.com July 2026 VIX context", "discovered_urls": ["https://www.cboe.com/insights/posts/markets-shrug-off-conflict-as-investors-look-to-earnings-results/"]},
+      {"query": "site:sec.gov Amazon July 2026 filing", "discovered_urls": ["https://www.sec.gov/Archives/edgar/data/1018724/filing.htm"]}
+    ],
+    "acquisition_requests": [
+      {"source_url": "https://www.bea.gov/news/schedule/", "title": "Release Schedule", "publisher": "U.S. Bureau of Economic Analysis", "published_at": null},
+      {"source_url": "https://www.federalreserve.gov/newsevents/2026-july.htm", "title": "Calendar: July 2026", "publisher": "Federal Reserve", "published_at": null},
+      {"source_url": "https://www.bls.gov/schedule/2026/07_sched.htm", "title": "Schedule of Selected Releases for July 2026", "publisher": "U.S. Bureau of Labor Statistics", "published_at": null},
+      {"source_url": "https://news.microsoft.com/source/2026/07/08/microsoft-announces-quarterly-earnings-release-date-68/", "title": "Microsoft announces quarterly earnings release date", "publisher": "Microsoft", "published_at": "2026-07-08T12:00:00+00:00"},
+      {"source_url": "https://www.cboe.com/insights/posts/markets-shrug-off-conflict-as-investors-look-to-earnings-results/", "title": "Markets Shrug Off Conflict", "publisher": "Cboe", "published_at": "2026-07-21T12:00:00+00:00"},
+      {"source_url": "https://www.sec.gov/Archives/edgar/data/1018724/filing.htm", "title": "Amazon Form 8-K", "publisher": "U.S. SEC", "published_at": "2026-07-09T12:00:00+00:00"}
+    ],
+    "claims": [
+      {
+        "topic": "macro",
+        "field_semantics": "news",
+        "value": "BEA scheduled GDP and Personal Income and Outlays for July 30, 2026.",
+        "metric_id": null,
+        "period": "2026-Q2 and 2026-06",
+        "frequency": null,
+        "unit": null,
+        "event_key": "BEA_2026-07-30_GDP_PIO",
+        "symbol": null,
+        "valid_from": "2026-07-23T12:00:00+00:00",
+        "valid_until": "2026-07-30T12:30:00-04:00",
+        "published_at": null,
+        "retrieved_at": "2026-07-23T12:00:00+00:00",
+        "confidence": 0.96,
+        "topic_status": "SUPPORTED",
+        "evidence": [
+          {"query": "site:bea.gov July 2026 release schedule", "source_url": "https://www.bea.gov/news/schedule/", "canonical_url": "https://www.bea.gov/news/schedule/", "publisher": "U.S. Bureau of Economic Analysis", "evidence_text": "July 30 8:30 AM News GDP (Advance Estimate), 2nd Quarter 2026", "published_at": null, "retrieved_at": "2026-07-23T12:00:00+00:00"},
+          {"query": "site:bea.gov July 2026 release schedule", "source_url": "https://www.bea.gov/news/schedule/", "canonical_url": "https://www.bea.gov/news/schedule/", "publisher": "U.S. Bureau of Economic Analysis", "evidence_text": "July 30 8:30 AM News Personal Income and Outlays, June 2026", "published_at": null, "retrieved_at": "2026-07-23T12:00:00+00:00"}
+        ],
+        "warnings": []
+      },
+      {
+        "topic": "fed_rates",
+        "field_semantics": "news",
+        "value": "The Federal Reserve listed a two-day FOMC meeting for July 28\u00c3\u00a2\u00c2\u0080\u00c2\u009329, 2026.",
+        "metric_id": null,
+        "period": "2026-07-28/2026-07-29",
+        "frequency": null,
+        "unit": null,
+        "event_key": "FOMC_2026-07-28_29",
+        "symbol": null,
+        "valid_from": "2026-07-23T12:00:00+00:00",
+        "valid_until": "2026-07-29T23:59:59-04:00",
+        "published_at": null,
+        "retrieved_at": "2026-07-23T12:00:00+00:00",
+        "confidence": 0.97,
+        "topic_status": "SUPPORTED",
+        "evidence": [
+          {"query": "site:federalreserve.gov July 2026 FOMC calendar", "source_url": "https://www.federalreserve.gov/newsevents/2026-july.htm", "canonical_url": "https://www.federalreserve.gov/newsevents/2026-july.htm", "publisher": "Federal Reserve", "evidence_text": "FOMC Meeting Two-day meeting, July 28 - 29 Press Conference", "published_at": null, "retrieved_at": "2026-07-23T12:00:00+00:00"}
+        ],
+        "warnings": []
+      },
+      {
+        "topic": "events",
+        "field_semantics": "news",
+        "value": "BLS scheduled the second-quarter 2026 Employment Cost Index for July 31, 2026.",
+        "metric_id": null,
+        "period": "2026-Q2",
+        "frequency": "quarterly",
+        "unit": null,
+        "event_key": "BLS_ECI_2026Q2",
+        "symbol": null,
+        "valid_from": "2026-07-23T12:00:00+00:00",
+        "valid_until": "2026-07-31T08:30:00-04:00",
+        "published_at": null,
+        "retrieved_at": "2026-07-23T12:00:00+00:00",
+        "confidence": 0.97,
+        "topic_status": "SUPPORTED",
+        "evidence": [
+          {"query": "site:bls.gov July 2026 release schedule", "source_url": "https://www.bls.gov/schedule/2026/07_sched.htm", "canonical_url": "https://www.bls.gov/schedule/2026/07_sched.htm", "publisher": "U.S. Bureau of Labor Statistics", "evidence_text": "Employment Cost Index Second Quarter 2026 08:30 AM", "published_at": null, "retrieved_at": "2026-07-23T12:00:00+00:00"}
+        ],
+        "warnings": []
+      },
+      {
+        "topic": "earnings",
+        "field_semantics": "news",
+        "value": "Microsoft will publish fiscal-year 2026 fourth-quarter results after the market close on July 29, 2026.",
+        "metric_id": null,
+        "period": "FY2026-Q4",
+        "frequency": "quarterly",
+        "unit": null,
+        "event_key": "MSFT_FY2026_Q4_EARNINGS",
+        "symbol": "MSFT",
+        "valid_from": "2026-07-08T12:00:00+00:00",
+        "valid_until": "2026-07-29T23:59:59-07:00",
+        "published_at": "2026-07-08T12:00:00+00:00",
+        "retrieved_at": "2026-07-23T12:00:00+00:00",
+        "confidence": 0.98,
+        "topic_status": "SUPPORTED",
+        "evidence": [
+          {"query": "site:microsoft.com July 2026 earnings date", "source_url": "https://news.microsoft.com/source/2026/07/08/microsoft-announces-quarterly-earnings-release-date-68/", "canonical_url": "https://news.microsoft.com/source/2026/07/08/microsoft-announces-quarterly-earnings-release-date-68/", "publisher": "Microsoft", "evidence_text": "will publish fiscal year 2026 fourth-quarter financial results after the close of the market on Wednesday, July 29, 2026", "published_at": "2026-07-08T12:00:00+00:00", "retrieved_at": "2026-07-23T12:00:00+00:00"}
+        ],
+        "warnings": []
+      },
+      {
+        "topic": "volatility_positioning",
+        "field_semantics": "exploratory_context",
+        "value": "Cboe reported that VIX was below 18 on July 21.",
+        "metric_id": "VIX_INTRADAY_CONTEXT",
+        "period": "2026-07-21",
+        "frequency": null,
+        "unit": "index points",
+        "event_key": "VIX_CONTEXT_2026-07-21",
+        "symbol": "VIX",
+        "valid_from": "2026-07-21T12:00:00+00:00",
+        "valid_until": "2026-07-21T20:00:00+00:00",
+        "published_at": "2026-07-21T12:00:00+00:00",
+        "retrieved_at": "2026-07-23T12:00:00+00:00",
+        "confidence": 0.68,
+        "topic_status": "SUPPORTED",
+        "evidence": [
+          {"query": "site:cboe.com July 2026 VIX context", "source_url": "https://www.cboe.com/insights/posts/markets-shrug-off-conflict-as-investors-look-to-earnings-results/", "canonical_url": "https://www.cboe.com/insights/posts/markets-shrug-off-conflict-as-investors-look-to-earnings-results/", "publisher": "Cboe", "evidence_text": "the Cboe Volatility Index\u00c3\u0082\u00c2\u00ae VIX\u00c3\u0082\u00c2\u00ae Index was back under 18 in early trading", "published_at": "2026-07-21T12:00:00+00:00", "retrieved_at": "2026-07-23T12:00:00+00:00"}
+        ],
+        "warnings": []
+      },
+      {
+        "topic": "news",
+        "field_semantics": "exploratory_context",
+        "value": "Amazon closed a multi-tranche debt offering on July 9, 2026.",
+        "metric_id": null,
+        "period": "2026-07-09",
+        "frequency": null,
+        "unit": null,
+        "event_key": "AMZN_DEBT_OFFERING_2026-07-09",
+        "symbol": "AMZN",
+        "valid_from": "2026-07-09T12:00:00+00:00",
+        "valid_until": "2026-08-08T12:00:00+00:00",
+        "published_at": "2026-07-09T12:00:00+00:00",
+        "retrieved_at": "2026-07-23T12:00:00+00:00",
+        "confidence": 0.9,
+        "topic_status": "SUPPORTED",
+        "evidence": [
+          {"query": "site:sec.gov Amazon July 2026 filing", "source_url": "https://www.sec.gov/Archives/edgar/data/1018724/filing.htm", "canonical_url": "https://www.sec.gov/Archives/edgar/data/1018724/filing.htm", "publisher": "U.S. SEC", "evidence_text": "closed the sale of 750 million dollars aggregate principal amount of floating rate notes due 2029", "published_at": "2026-07-09T12:00:00+00:00", "retrieved_at": "2026-07-23T12:00:00+00:00"}
+        ],
+        "warnings": []
+      }
+    ],
+    "warnings": []
+  },
+  "pages": {
+    "https://www.bea.gov/news/schedule/": "Official BEA release calendar. July 30 8:30 AM News GDP (Advance Estimate), 2nd Quarter 2026. July 30 8:30 AM News Personal Income and Outlays, June 2026.",
+    "https://www.federalreserve.gov/newsevents/2026-july.htm": "Official Federal Reserve calendar. FOMC Meeting Two-day meeting, July 28 - 29 Press Conference.",
+    "https://www.bls.gov/schedule/2026/07_sched.htm": "Official BLS release schedule for July 31. Employment Cost Index Second Quarter 2026 08:30 AM.",
+    "https://news.microsoft.com/source/2026/07/08/microsoft-announces-quarterly-earnings-release-date-68/": "Microsoft's official newsroom says it will publish fiscal year 2026 fourth-quarter financial results after the close of the market on Wednesday, July 29, 2026.",
+    "https://www.cboe.com/insights/posts/markets-shrug-off-conflict-as-investors-look-to-earnings-results/": "Historical Cboe context: the Cboe Volatility Index\u00ae VIX\u00ae Index was back under 18 in early trading.",
+    "https://www.sec.gov/Archives/edgar/data/1018724/filing.htm": "Historical SEC filing: Amazon closed the sale of 750 million dollars aggregate principal amount of floating rate notes due 2029."
+  }
+}

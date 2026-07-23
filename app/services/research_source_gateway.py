@@ -20,6 +20,11 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 import httpx
 
 from app.core.config import Settings
+from app.core.text_normalization import (
+    contains_mojibake,
+    normalize_payload_text,
+    normalize_text,
+)
 from app.services.source_policy_service import SourcePolicyService
 
 try:  # Installed as an application dependency; kept lazy for migration-only tooling.
@@ -288,6 +293,13 @@ class ResearchSourceGateway:
                 base["content_text"] = normalized[: self.settings.research_gateway_max_text_chars]
                 if extraction_reason:
                     return self._persist_failure(run_id, base, extraction_reason, started)
+                if contains_mojibake(base["content_text"]):
+                    return self._persist_failure(
+                        run_id,
+                        base,
+                        "mojibake_content_rejected",
+                        started,
+                    )
                 if len(base["content_text"] or "") < self.settings.research_gateway_min_text_chars:
                     return self._persist_failure(run_id, base, "insufficient_static_text", started)
         except SourceGatewayLimitError as exc:
@@ -321,7 +333,7 @@ class ResearchSourceGateway:
         for claim_index, raw_claim in enumerate(claims):
             if not isinstance(raw_claim, dict):
                 continue
-            claim = dict(raw_claim)
+            claim = normalize_payload_text(dict(raw_claim))
             claim_ref = str(
                 claim.get("claim_ref") or claim.get("claim_id") or f"candidate-{claim_index + 1}"
             )[:120]
@@ -330,7 +342,7 @@ class ResearchSourceGateway:
                 if not isinstance(raw_evidence, dict):
                     continue
                 started = perf_counter()
-                evidence = dict(raw_evidence)
+                evidence = normalize_payload_text(dict(raw_evidence))
                 url = str(evidence.get("canonical_url") or evidence.get("source_url") or "")
                 source = self.repository.research_source_for_url(run_id, url)
                 if source is None or source.get("fetch_status") != "FETCHED":
@@ -532,7 +544,7 @@ def match_evidence(
 
 
 def normalize_match_text(value: Any) -> str:
-    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    normalized = unicodedata.normalize("NFKC", normalize_text(value)).casefold()
     characters = [
         " " if unicodedata.category(character)[0] in {"P", "S", "Z"} else character
         for character in normalized
@@ -541,7 +553,9 @@ def normalize_match_text(value: Any) -> str:
 
 
 def normalize_document_text(value: Any) -> str:
-    return " ".join(unicodedata.normalize("NFKC", html.unescape(str(value or ""))).split())
+    return " ".join(
+        unicodedata.normalize("NFKC", normalize_text(html.unescape(str(value or "")))).split()
+    )
 
 
 def _extract_content(

@@ -789,6 +789,18 @@ CREATE INDEX IF NOT EXISTS idx_research_backend_invocations_run
   ON research_backend_invocations(run_id, created_at);
 """
 
+RESEARCH_SEMANTIC_LIFECYCLE_SCHEMA = """
+ALTER TABLE research_claims ADD COLUMN event_at TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN release_at TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN issuer TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN next_refresh_at TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN lifecycle_status TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN post_event_semantics TEXT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_research_claims_lifecycle
+  ON research_claims(validation_status, lifecycle_status, next_refresh_at);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -804,4 +816,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("011_agentic_runtime_diagnostics_and_step_history", AGENTIC_RUNTIME_DIAGNOSTICS_SCHEMA),
     ("012_observable_tool_telemetry_and_checkpoints", OBSERVABLE_TOOL_TELEMETRY_SCHEMA),
     ("013_research_source_gateway_and_backend_invocations", RESEARCH_SOURCE_GATEWAY_SCHEMA),
+    ("014_research_semantic_lifecycle", RESEARCH_SEMANTIC_LIFECYCLE_SCHEMA),
 )

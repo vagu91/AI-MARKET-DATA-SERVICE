@@ -70,7 +70,7 @@ The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`
 AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
 
-The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-11 are additive and upgrade existing schema-6/8/9/10 databases without rebuilding tables. Migration 11 adds redacted Codex diagnostics and immutable per-step attempt history.
+The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-14 are additive and upgrade existing supported databases without rebuilding tables. Migration 14 adds research event/release, issuer and post-event lifecycle lineage.
 
 `GET /ai-research/jobs/latest` returns a JSON array ordered newest-first by
 `created_at`, then by insertion order when timestamps match. Its compatible default
@@ -353,7 +353,7 @@ These endpoints do not compute chart levels, generate signals, or decide actions
 
 ## Persistent semantic research runtime
 
-The optional AI Researcher is asynchronous and fail-closed. It first probes the configured Codex CLI capability, then records the bounded phases `PLAN`, `SEARCH`, `OPEN_SOURCE`, `EXTRACT`, `CROSS_CHECK`, `VALIDATE`, `PERSIST`, `READ_BACK`, `MATERIALIZE`, and `COMPLETE`. Claims and short evidence are stored atomically; source tiers and independent confirmations are recalculated by the service. HTTP requests never wait for the researcher.
+The optional AI Researcher is asynchronous and fail-closed. It first probes the configured Codex CLI capability, then records the bounded phases `PLAN`, `SEARCH`, `OPEN_SOURCE`, `EXTRACT`, `CROSS_CHECK`, `VALIDATE`, `PERSIST`, `READ_BACK`, `MATERIALIZE`, and `COMPLETE`. Claims and short evidence are stored atomically; source tiers and independent confirmations are recalculated by the service. Scheduled official events use event-time lifecycle semantics rather than current-news freshness, while current news still requires two independent domains. HTTP requests never wait for the researcher.
 
 Every Codex invocation uses stdin for the prompt and an isolated command shape: `--search`, read-only sandbox, unique non-Git workspace, `--skip-git-repo-check`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, JSONL events, a closed phase-specific output schema, deterministic `--output-last-message`, and `--color never`. Persisted login remains available, while personal config, MCP/plugin configuration, rules and repository instructions are not part of the research contract. The final-message file is authoritative; JSONL is used only for events, observed search/source activity, usage and runtime errors.
 

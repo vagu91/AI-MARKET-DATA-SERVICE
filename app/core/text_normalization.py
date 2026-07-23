@@ -24,6 +24,7 @@ MOJIBAKE_MARKERS = (
     "â€“",
     "â€”",
 )
+MOJIBAKE_SIGNAL_CHARACTERS = ("\u00c3", "\u00c2")
 TEXT_KEYS = {
     "name",
     "holiday_name",
@@ -68,7 +69,84 @@ def normalize_payload_text(value: Any) -> Any:
     return normalize_text(value) if isinstance(value, str) else value
 
 
+def contains_mojibake(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(contains_mojibake(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_mojibake(item) for item in value)
+    return isinstance(value, str) and _has_mojibake_artifact(value)
+
+
+def _has_mojibake_artifact(text: str) -> bool:
+    return bool(
+        "\ufffd" in text
+        or any(marker in text for marker in MOJIBAKE_MARKERS)
+        or re.search(r"[\u00c2\u00c3][\u0080-\u00bf]", text)
+        or any(
+            unicodedata.category(character) == "Cc" and character not in "\n\r\t"
+            for character in text
+        )
+    )
+
+
+def _repair_mojibake(text: str) -> str:
+    if _repair_score(text) == 0:
+        return text
+    whole = _decode_candidates(text)
+    segmented = "".join(
+        _decode_candidates(part) if _repair_score(part) else part
+        for part in re.split(r"(\s+)", text)
+    )
+    return min((text, whole, segmented), key=_repair_score)
+
+
+def _decode_candidates(text: str) -> str:
+    candidates = {text}
+    frontier = {text}
+    for _ in range(3):
+        decoded: set[str] = set()
+        for candidate in frontier:
+            for source_encoding in ("latin1", "cp1252"):
+                try:
+                    decoded.add(
+                        candidate.encode(source_encoding, errors="strict").decode(
+                            "utf-8",
+                            errors="strict",
+                        )
+                    )
+                except UnicodeError:
+                    continue
+        decoded.difference_update(candidates)
+        if not decoded:
+            break
+        candidates.update(decoded)
+        frontier = decoded
+    return min(candidates, key=_repair_score)
+
+
+def _repair_score(text: str) -> int:
+    controls = sum(
+        1
+        for character in text
+        if unicodedata.category(character) == "Cc" and character not in "\n\r\t"
+    )
+    return (
+        sum(text.count(marker) for marker in MOJIBAKE_MARKERS)
+        + sum(text.count(marker) for marker in MOJIBAKE_SIGNAL_CHARACTERS)
+        + text.count("\ufffd") * 5
+        + controls * 4
+    )
+
+
 def _fix_mojibake(text: str) -> str:
+    original = text
+    text = _repair_mojibake(text)
+    if text != original:
+        text = (
+            text.replace("\u2018", "'")
+            .replace("\u2019", "'")
+            .replace("\u2026", "...")
+        )
     if not any(marker in text for marker in MOJIBAKE_MARKERS):
         return text
     candidates = [text]
