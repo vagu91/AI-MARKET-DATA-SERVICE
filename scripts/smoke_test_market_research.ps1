@@ -5,9 +5,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
-[System.IO.Directory]::CreateDirectory($outputPath) | Out-Null
 . "$PSScriptRoot\market_research_smoke_helpers.ps1"
+$outputPath = Resolve-SmokeOutputDirectory -OutputDirectory $OutputDirectory
+[System.IO.Directory]::CreateDirectory($outputPath) | Out-Null
 
 $capabilities = $null
 $queued = $null
@@ -103,10 +103,7 @@ try {
 }
 catch {
     $failureMessage = $_.Exception.Message
-    throw
-}
-finally {
-    if ($failureMessage) {
+    try {
         $diagnostic = $latestAttempt.diagnostic
         if (-not $diagnostic) { $diagnostic = $job.last_diagnostic }
         $failure = [ordered]@{
@@ -119,16 +116,22 @@ finally {
             current_step = $currentStep.step_name
             exit_code = $diagnostic.exit_code
             error_category = $diagnostic.category
-            stderr_redacted = $diagnostic.stderr_tail
+            stderr_redacted = ConvertTo-SmokeSafeText $diagnostic.stderr_tail
             retry_classification = $diagnostic.retry_classification
             capability_status = $capabilities.status
             queue_metrics = $queue.metrics
             polling_decision = $decision.reason
-            error = $failureMessage
+            error = ConvertTo-SmokeSafeText $failureMessage
             started_at = $startedAt.ToString("o")
             failed_at = [DateTimeOffset]::UtcNow.ToString("o")
         }
-        $failure | ConvertTo-Json -Depth 10 |
-            Set-Content -LiteralPath "$outputPath\failure-report.json" -Encoding utf8
+        Write-SmokeFailureReport -OutputPath $outputPath -Report $failure | Out-Null
     }
+    catch {
+        $reportWriteError = ConvertTo-SmokeSafeText $_.Exception.Message
+        [Console]::Error.WriteLine(
+            "Unable to write smoke failure report: $reportWriteError"
+        )
+    }
+    throw
 }

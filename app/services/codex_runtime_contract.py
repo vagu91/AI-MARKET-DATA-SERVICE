@@ -22,6 +22,15 @@ DIAGNOSTIC_EVENT_LIMIT = 10
 DIAGNOSTIC_EVENT_TEXT_LIMIT = 2000
 
 
+def canonicalize_workspace(workspace: Path) -> Path:
+    """Create a runtime workspace and return its one canonical absolute path."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    canonical = workspace.resolve(strict=True)
+    if not canonical.is_dir():
+        raise ValueError("workspace_not_directory")
+    return canonical
+
+
 def _nullable(kind: str, **constraints: Any) -> dict[str, Any]:
     return {"type": [kind, "null"], **constraints}
 
@@ -455,7 +464,12 @@ def build_codex_exec_command(
     ]
 
 
-def validate_isolated_command(command: list[str], prompt: str | None = None) -> None:
+def validate_isolated_command(
+    command: list[str],
+    prompt: str | None = None,
+    *,
+    cwd: Path | None = None,
+) -> None:
     required = {
         "--search",
         "read-only",
@@ -477,6 +491,81 @@ def validate_isolated_command(command: list[str], prompt: str | None = None) -> 
         raise ValueError("prompt_present_in_command")
     if command[-1] != "-":
         raise ValueError("prompt_must_be_stdin")
+    workspace = _command_path(command, "--cd")
+    schema_path = _command_path(command, "--output-schema")
+    output_path = _command_path(command, "--output-last-message")
+    canonical_cwd = _canonical_command_path(
+        cwd if cwd is not None else workspace,
+        "cwd",
+        must_exist=True,
+    )
+    canonical_workspace = _canonical_command_path(
+        workspace,
+        "workspace",
+        must_exist=True,
+    )
+    canonical_schema = _canonical_command_path(
+        schema_path,
+        "schema",
+        must_exist=True,
+    )
+    canonical_output = _canonical_command_path(
+        output_path,
+        "output",
+        must_exist=False,
+    )
+    if not canonical_cwd.is_dir() or not canonical_workspace.is_dir():
+        raise ValueError("workspace_not_directory")
+    if not canonical_schema.is_file():
+        raise ValueError("schema_file_missing")
+    if not canonical_output.parent.is_dir():
+        raise ValueError("output_parent_missing")
+    if not _same_path(canonical_cwd, canonical_workspace):
+        raise ValueError("cwd_workspace_mismatch")
+    if not _is_descendant(canonical_schema, canonical_workspace):
+        raise ValueError("schema_outside_workspace")
+    if not _is_descendant(canonical_output, canonical_workspace):
+        raise ValueError("output_outside_workspace")
+
+
+def _command_path(command: list[str], flag: str) -> Path:
+    try:
+        index = command.index(flag)
+        value = command[index + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"isolated_command_missing_value:{flag}") from exc
+    return Path(value)
+
+
+def _canonical_command_path(path: Path, label: str, *, must_exist: bool) -> Path:
+    if not path.is_absolute():
+        raise ValueError(f"{label}_path_relative")
+    if ".." in path.parts:
+        raise ValueError(f"{label}_path_traversal")
+    try:
+        canonical = path.resolve(strict=must_exist)
+    except OSError as exc:
+        raise ValueError(f"{label}_path_invalid:{type(exc).__name__}") from exc
+    if not _same_path(path, canonical):
+        raise ValueError(f"{label}_path_not_canonical")
+    return canonical
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(
+        os.path.abspath(str(right))
+    )
+
+
+def _is_descendant(path: Path, workspace: Path) -> bool:
+    normalized_path = os.path.normcase(os.path.abspath(str(path)))
+    normalized_workspace = os.path.normcase(os.path.abspath(str(workspace)))
+    try:
+        return os.path.commonpath((normalized_path, normalized_workspace)) == (
+            normalized_workspace
+        )
+    except ValueError:
+        return False
 
 
 def inherited_instruction_files(workspace: Path) -> list[str]:
@@ -543,6 +632,16 @@ def classify_codex_failure(
             ]
         ).lower()
         patterns = (
+            (
+                "PATH_INVALID",
+                (
+                    "os error 3",
+                    "path not found",
+                    "file not found",
+                    "impossibile trovare il percorso specificato",
+                    "impossibile trovare il file specificato",
+                ),
+            ),
             ("SCHEMA_INVALID", ("invalid schema", "output schema", "json schema")),
             (
                 "UNSUPPORTED_ARGUMENT",

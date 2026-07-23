@@ -16,6 +16,7 @@ from app.services.codex_runtime_contract import (
     CodexCLIError,
     build_codex_exec_command,
     build_diagnostic,
+    canonicalize_workspace,
     classify_codex_failure,
     inherited_instruction_files,
     safe_subprocess_environment,
@@ -68,7 +69,16 @@ class PersistentAIJobExecutor:
                 workspace=workspace,
                 command=[self.settings.codex_cli_command],
             )
-        workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            workspace = canonicalize_workspace(workspace)
+        except (OSError, ValueError) as exc:
+            raise self._preflight_error(
+                category="PATH_INVALID",
+                step=step_name,
+                workspace=workspace.absolute(),
+                command=command_prefix,
+                stderr=str(exc),
+            ) from exc
         inherited_instructions = inherited_instruction_files(workspace)
         if inherited_instructions:
             raise self._preflight_error(
@@ -101,7 +111,7 @@ class PersistentAIJobExecutor:
             output_path=output_path,
         )
         try:
-            validate_isolated_command(command, prompt)
+            validate_isolated_command(command, prompt, cwd=workspace)
         except ValueError as exc:
             raise self._preflight_error(
                 category="CONFIG_INVALID",
@@ -159,10 +169,18 @@ class PersistentAIJobExecutor:
         try:
             process = subprocess.Popen(command, **kwargs)
         except OSError as exc:
+            category, retryable = classify_codex_failure(
+                exit_code=None,
+                stderr=str(exc),
+            )
             raise CodexCLIError(
                 build_diagnostic(
-                    category="EXECUTABLE_UNAVAILABLE",
-                    retryable=False,
+                    category=(
+                        "EXECUTABLE_UNAVAILABLE"
+                        if category == "UNKNOWN"
+                        else category
+                    ),
+                    retryable=retryable,
                     command=command,
                     step=step,
                     workspace=workspace,

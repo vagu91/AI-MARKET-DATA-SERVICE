@@ -14,6 +14,7 @@ from app.providers.ai_researcher_provider import _resolve_command
 from app.services.codex_runtime_contract import (
     all_step_output_schemas,
     build_codex_exec_command,
+    canonicalize_workspace,
     inherited_instruction_files,
     legacy_research_output_schema,
     safe_subprocess_environment,
@@ -89,10 +90,9 @@ class AIResearchCapabilityService:
             and auth_result.returncode == 0
             and "logged in" in f"{auth_result.stdout} {auth_result.stderr}".lower()
         )
-        workspace_writable = _workspace_writable(Path(self.settings.ai_job_workspace_root))
-        inherited_instructions = inherited_instruction_files(
-            Path(self.settings.ai_job_workspace_root)
-        )
+        workspace_root = Path(self.settings.ai_job_workspace_root)
+        workspace_writable = _workspace_writable(workspace_root)
+        inherited_instructions = inherited_instruction_files(workspace_root)
         schema_errors: dict[str, str] = {}
         schemas = {
             **all_step_output_schemas(),
@@ -106,18 +106,26 @@ class AIResearchCapabilityService:
         schemas_valid = not schema_errors
         command_isolated = False
         command_shape: list[str] = []
-        if command:
-            workspace = Path(self.settings.ai_job_workspace_root) / "capability-offline-probe"
-            command_shape = build_codex_exec_command(
-                command,
-                workspace=workspace,
-                schema_path=workspace / "output_schema.json",
-                output_path=workspace / "output.json",
-            )
+        if command and workspace_writable:
             try:
-                validate_isolated_command(command_shape)
+                workspace = canonicalize_workspace(
+                    workspace_root / "capability-offline-probe"
+                )
+                schema_path = workspace / "output_schema.json"
+                schema_path.write_text(
+                    json.dumps(schemas["PLAN"], indent=2),
+                    encoding="utf-8",
+                )
+                output_path = workspace / "output.json"
+                command_shape = build_codex_exec_command(
+                    command,
+                    workspace=workspace,
+                    schema_path=schema_path,
+                    output_path=output_path,
+                )
+                validate_isolated_command(command_shape, cwd=workspace)
                 command_isolated = True
-            except ValueError:
+            except (OSError, ValueError):
                 command_isolated = False
         try:
             policy = SourcePolicyService(self.settings.source_policy_path)

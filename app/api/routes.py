@@ -71,9 +71,14 @@ async def health() -> dict[str, str]:
 async def ai_research_jobs_latest(
     limit: int = Query(default=20, ge=1, le=100),
     symbol: str = Query(default="MNQ", min_length=1, max_length=16),
+    view: str = Query(default="full", pattern="^(full|compact)$"),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> list[dict[str, object]]:
-    return AIResearchJobRepository(enrichment_orchestrator.settings).latest(limit=limit, symbol=symbol)
+    return AIResearchJobRepository(enrichment_orchestrator.settings).latest(
+        limit=limit,
+        symbol=symbol,
+        view=view,
+    )
 
 
 @router.get("/ai-research/status")

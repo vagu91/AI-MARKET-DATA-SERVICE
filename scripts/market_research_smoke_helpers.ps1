@@ -1,3 +1,53 @@
+function Resolve-SmokeOutputDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDirectory
+    )
+
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $OutputDirectory
+    )
+    return [System.IO.Path]::GetFullPath($resolved)
+}
+
+function ConvertTo-SmokeSafeText {
+    param(
+        [AllowNull()]
+        [object]$Value,
+        [int]$MaxLength = 1000
+    )
+
+    $text = [string]$Value
+    $text = [regex]::Replace(
+        $text,
+        '(?i)(authorization\s*:\s*bearer|bearer|api[_-]?key|token|secret|password)(\s*[:=]?\s*)[^\s,;]+',
+        '$1$2<redacted>'
+    )
+    if ($text.Length -gt $MaxLength) {
+        return $text.Substring($text.Length - $MaxLength)
+    }
+    return $text
+}
+
+function Write-SmokeFailureReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Report
+    )
+
+    [System.IO.Directory]::CreateDirectory($OutputPath) | Out-Null
+    $reportPath = Join-Path -Path $OutputPath -ChildPath "failure-report.json"
+    $absoluteReportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $reportPath
+    )
+    $Report["report_path"] = [System.IO.Path]::GetFullPath($absoluteReportPath)
+    $Report | ConvertTo-Json -Depth 6 -Compress |
+        Set-Content -LiteralPath $Report["report_path"] -Encoding utf8
+    return $Report["report_path"]
+}
+
 function Get-SmokePollingDecision {
     param(
         [string]$RunStatus,

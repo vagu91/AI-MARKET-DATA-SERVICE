@@ -116,7 +116,10 @@ class AIResearchJobRepository:
         symbol: str | None = None,
         snapshot_id: str | None = None,
         event_keys: list[str] | None = None,
+        view: str = "full",
     ) -> list[dict[str, Any]]:
+        if view not in {"full", "compact"}:
+            raise ValueError("unsupported_latest_jobs_view")
         clauses: list[str] = []
         values: list[Any] = []
         if symbol:
@@ -132,11 +135,22 @@ class AIResearchJobRepository:
             values.extend(event_keys)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         values.append(limit)
+        projection = (
+            "job_id,job_type,symbol,event_key,correlation_id,status,priority,"
+            "policy_version,prompt_version,attempts,max_attempts,created_at,"
+            "started_at,completed_at,next_retry_at,last_error,updated_at,"
+            "generation,run_window,capability_status,retry_class,last_retry_reason"
+            if view == "compact"
+            else "*"
+        )
         with connect_sqlite(self.settings.database_path) as conn:
             rows = conn.execute(
-                f"SELECT * FROM ai_research_jobs {where} ORDER BY created_at DESC,rowid DESC LIMIT ?",
+                f"SELECT {projection} FROM ai_research_jobs "
+                f"{where} ORDER BY created_at DESC,rowid DESC LIMIT ?",
                 tuple(values),
             ).fetchall()
+        if view == "compact":
+            return [dict(row) for row in rows]
         return [self._row(row) for row in rows]
 
     def status(self) -> dict[str, Any]:

@@ -27,7 +27,7 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /market-context/mnq`
 - `GET /market-context/mnq/consumer?refresh=false|auto|force`
 - `GET /market-context/mnq/debug?refresh=false|auto|force`
-- `GET /ai-research/jobs/latest`
+- `GET /ai-research/jobs/latest?view=full|compact`
 - `GET /ai-research/jobs/{job_id}`
 - `GET /ai-research/status`
 - `POST /ai-research/jobs` (idempotent data-research enqueue; no trading)
@@ -71,6 +71,12 @@ AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
 
 The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-11 are additive and upgrade existing schema-6/8/9/10 databases without rebuilding tables. Migration 11 adds redacted Codex diagnostics and immutable per-step attempt history.
+
+`GET /ai-research/jobs/latest` returns a JSON array ordered newest-first by
+`created_at`, then by insertion order when timestamps match. Its compatible default
+`view=full` includes the stored `request_payload` and `result_payload`. Operational
+scripts should use `view=compact`, which omits both payloads and returns only job
+identity, lifecycle, retry, policy and timestamp fields.
 
 The required enrichment order is:
 

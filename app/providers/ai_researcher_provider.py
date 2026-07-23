@@ -20,6 +20,8 @@ from app.services.ai_research_validation_service import ValidationRequest, valid
 from app.services.ai_research_diagnostics import AIResearchDiagnostics
 from app.services.codex_runtime_contract import (
     build_codex_exec_command,
+    canonicalize_workspace,
+    classify_codex_failure,
     inherited_instruction_files,
     legacy_research_output_schema,
     safe_subprocess_environment,
@@ -81,8 +83,18 @@ class AIResearcherProvider:
 
     def _codex_cli(self, events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         diagnostics = AIResearchDiagnostics(self.settings)
-        workspace = Path(self.settings.codex_workspace_dir)
-        workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            workspace = canonicalize_workspace(
+                Path(self.settings.codex_workspace_dir)
+            )
+        except (OSError, ValueError) as exc:
+            return [], {
+                "status": "provider_failed",
+                "failure_reason": "codex_path_invalid",
+                "error_category": "PATH_INVALID",
+                "error": redact_sensitive(str(exc)),
+                "retry_classification": "NON_RETRYABLE",
+            }
         if inherited_instruction_files(workspace):
             return [], {
                 "status": "provider_failed",
@@ -117,7 +129,7 @@ class AIResearcherProvider:
             schema_path=schema_path,
             output_path=output_path,
         )
-        validate_isolated_command(command, final_prompt)
+        validate_isolated_command(command, final_prompt, cwd=workspace)
         started = perf_counter()
         cwd = workspace
         run_info: dict[str, Any] = {
@@ -186,12 +198,24 @@ class AIResearcherProvider:
             _record_diagnostic_failure(diagnostics, events, run_info)
             return [], {**run_info, "status": "provider_failed", "failure_reason": "codex_cli_timeout"}
         except (FileNotFoundError, PermissionError, OSError) as exc:
+            category, retryable = classify_codex_failure(
+                exit_code=None,
+                stderr=str(exc),
+            )
             run_info.update(
                 {
                     "status": "provider_unavailable",
                     "duration_ms": int((perf_counter() - started) * 1000),
                     "error": redact_sensitive(str(exc)),
-                    "failure_reason": "codex_cli_unavailable",
+                    "failure_reason": (
+                        "codex_path_invalid"
+                        if category == "PATH_INVALID"
+                        else "codex_cli_unavailable"
+                    ),
+                    "error_category": category,
+                    "retry_classification": (
+                        "RETRYABLE" if retryable else "NON_RETRYABLE"
+                    ),
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")

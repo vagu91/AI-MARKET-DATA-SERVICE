@@ -20,13 +20,13 @@ from app.services.market_fact_repository import MarketFactRepository
 
 
 def settings(tmp_path, **overrides) -> Settings:
-    return Settings(
-        _env_file=None,
-        database_path=tmp_path / "market.sqlite",
-        codex_workspace_dir=tmp_path / "workspace",
-        enable_ai_researcher=True,
-        **overrides,
-    )
+    values = {
+        "database_path": tmp_path / "market.sqlite",
+        "codex_workspace_dir": tmp_path / "workspace",
+        "enable_ai_researcher": True,
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
 
 
 def payload(fact_key="US:CPI:2099-07-14:consumer_price_index:macro_event_enrichment"):
@@ -135,7 +135,12 @@ def test_parse_stdout_pure_json_and_fenced_json():
 
 
 def test_codex_command_contains_skip_flag_and_writes_stdout_json(tmp_path, monkeypatch):
-    cfg = settings(tmp_path, codex_cli_command="codex")
+    monkeypatch.chdir(tmp_path)
+    cfg = settings(
+        tmp_path,
+        codex_cli_command="codex",
+        codex_workspace_dir=Path("relative-legacy-workspace"),
+    )
     provider = AIResearcherProvider(cfg)
     calls = []
 
@@ -175,7 +180,13 @@ def test_codex_command_contains_skip_flag_and_writes_stdout_json(tmp_path, monke
     assert "valid_until" in full_prompt
     assert "restituisci esclusivamente json" in full_prompt.lower()
     assert full_prompt not in calls[0][0]
-    assert calls[0][1]["cwd"] == cfg.codex_workspace_dir
+    cwd = Path(calls[0][1]["cwd"])
+    assert cwd.is_absolute() and cwd == cfg.codex_workspace_dir.resolve()
+    for path_flag in ("--cd", "--output-schema", "--output-last-message"):
+        value = Path(calls[0][0][calls[0][0].index(path_flag) + 1])
+        assert value.is_absolute()
+        if path_flag != "--cd":
+            assert value.parent == cwd
     assert (cfg.codex_workspace_dir / "research_output.json").exists()
     assert status["exit_code"] == 0
 
