@@ -154,8 +154,11 @@ class AIResearchJobService:
     ) -> tuple[dict[str, Any], bool]:
         pending = pending_fields or list(request_payload.get("pending_fields") or [])
         identity = event_key or hashlib.sha256(self._canonical(request_payload).encode("utf-8")).hexdigest()[:24]
+        sanitized_request = self.source_policy.sanitize_operational_payload(
+            request_payload
+        ) or {}
         payload = {
-            **request_payload,
+            **sanitized_request,
             "job_type": job_type,
             "symbol": symbol.upper(),
             "pending_fields": pending,
@@ -246,17 +249,32 @@ class AIResearchJobService:
             if job_type == "RELEASE_ACTUAL_REFRESH"
             else profile_for_job(job_type).prompt_version
         )
+        sanitized_event = self.source_policy.sanitize_operational_payload(event)
+        if sanitized_event is None:
+            sanitized_event = {
+                key: event.get(key)
+                for key in (
+                    "event_id",
+                    "canonical_event_key",
+                    "name",
+                    "country",
+                    "category",
+                    "date",
+                    "time_utc",
+                    "period",
+                )
+            }
         return {
             "job_type": job_type,
             "symbol": symbol,
             "target_market": "MNQ/Nasdaq futures context",
             "missing_fields": pending_fields,
-            "event": event,
+            "event": sanitized_event,
             "expected_period": event.get("period"),
             "release_at": event.get("time_utc"),
             "temporal_state": temporal_state or temporal_event_state(event),
             "sources_already_queried": list((event.get("enrichment") or {}).get("field_lineage") or {}),
-            "existing_database_results": event.get("enrichment") or {},
+            "existing_database_results": sanitized_event.get("enrichment") or {},
             "source_policy": self.source_policy.prompt_projection(),
             "policy_version": self.source_policy.policy_version,
             "prompt_version": prompt_version,

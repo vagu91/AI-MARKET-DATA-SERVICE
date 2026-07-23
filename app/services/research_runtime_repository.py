@@ -1464,7 +1464,10 @@ class ResearchRuntimeRepository:
     def get_run_for_job(self, job_id: str) -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
-                "SELECT run_id FROM research_runs WHERE job_id=?",
+                """
+                SELECT run_id FROM research_runs
+                WHERE job_id=? AND source_audit_status='ACTIVE'
+                """,
                 (job_id,),
             ).fetchone()
         return self.get_run(str(row["run_id"])) if row else None
@@ -1474,7 +1477,8 @@ class ResearchRuntimeRepository:
             row = conn.execute(
                 """
                 SELECT * FROM research_runs
-                WHERE symbol=? ORDER BY created_at DESC,rowid DESC LIMIT 1
+                WHERE symbol=? AND source_audit_status='ACTIVE'
+                ORDER BY created_at DESC,rowid DESC LIMIT 1
                 """,
                 (symbol.upper(),),
             ).fetchone()
@@ -1483,7 +1487,12 @@ class ResearchRuntimeRepository:
     def evidence_for_claim(self, claim_id: str) -> list[dict[str, Any]]:
         with connect_sqlite(self.settings.database_path) as conn:
             rows = conn.execute(
-                "SELECT * FROM research_evidence WHERE claim_id=? ORDER BY source_tier,source_domain",
+                """
+                SELECT * FROM research_evidence
+                WHERE claim_id=? AND audit_status='ACTIVE'
+                  AND source_audit_status='ACTIVE'
+                ORDER BY source_tier,source_domain
+                """,
                 (claim_id,),
             ).fetchall()
         return [normalize_payload_text(dict(row)) for row in rows]
@@ -1635,7 +1644,10 @@ class ResearchRuntimeRepository:
                   source_content_hash,tool_event_id,source_id,verification_id,
                   verification_method,verification_reason,verification_score,audit_status
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(evidence_id) DO UPDATE SET audit_status='ACTIVE'
+                ON CONFLICT(evidence_id) DO UPDATE SET
+                  audit_status=CASE
+                    WHEN research_evidence.source_audit_status='QUARANTINED'
+                    THEN research_evidence.audit_status ELSE 'ACTIVE' END
                 """,
                 (
                     evidence_id,

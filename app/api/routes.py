@@ -570,6 +570,9 @@ async def db_health(
         "ai_researcher_enabled": settings.enable_ai_researcher,
         "ai_researcher_mode": settings.ai_researcher_mode,
         "db_summary": repository.db_summary(),
+        "source_quarantine": MarketContextSnapshotRepository(
+            settings
+        ).source_quarantine_read_model(),
     }
 
 
@@ -594,6 +597,9 @@ async def db_health_details(
         "pending_migrations": health["pending_migrations"],
         "cache_stats": ProviderCacheRepository(settings.database_path).stats(),
         "canonical_stats": MarketFactRepository(settings).db_summary(),
+        "source_quarantine": MarketContextSnapshotRepository(
+            settings
+        ).source_quarantine_read_model(),
         "service_role": "data provider only",
     }
 

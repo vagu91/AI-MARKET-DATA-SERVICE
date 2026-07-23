@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -16,6 +17,8 @@ from app.services.temporal_validation_service import (
     TemporalDecision,
     TemporalValidationService,
 )
+from app.services.source_policy_service import SourcePolicyService
+from app.infrastructure.persistence.database_safety import assert_test_database_isolated
 
 FACT_COLUMNS = [
     "fact_key", "fact_type", "country", "symbol", "category", "event_name", "period", "value", "unit",
@@ -23,7 +26,8 @@ FACT_COLUMNS = [
     "confidence", "retrieved_at", "release_at", "valid_from", "valid_until", "next_refresh_at", "status",
     "raw_payload_json", "notes", "warnings_json", "errors_json", "field_lineage_json",
     "policy_version", "source_tier", "source_classification", "canonical_url",
-    "canonical_event_key", "created_at", "updated_at",
+    "canonical_event_key", "source_audit_status", "source_invalid_reason",
+    "created_at", "updated_at",
 ]
 CANONICAL_EVENT_ENRICHMENT_TYPE = "macro_event_enrichment"
 LEGACY_EVENT_ENRICHMENT_TYPE = "ai_research_result"
@@ -54,6 +58,41 @@ def database_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+def _record_source_quarantine(
+    conn: Any,
+    *,
+    entity_table: str,
+    entity_key: str,
+    invalid: Any,
+    previous_status: str,
+    lineage: dict[str, Any],
+) -> None:
+    detected_at = now_iso()
+    reason = str(invalid.reason_code or "SOURCE_URL_INVALID")
+    quarantine_id = hashlib.sha256(
+        f"{entity_table}|{entity_key}|{invalid.url}|{reason}".encode("utf-8")
+    ).hexdigest()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO source_quarantine(
+          quarantine_id,entity_table,entity_key,source_url,source_domain,
+          reason_code,previous_status,lineage_json,detected_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            quarantine_id,
+            entity_table,
+            entity_key,
+            invalid.url,
+            invalid.domain,
+            reason,
+            previous_status,
+            encode(lineage) or "{}",
+            detected_at,
+        ),
+    )
 
 
 def _numeric(value: Any) -> Decimal | None:
@@ -245,6 +284,10 @@ def connect_market_db(settings: Settings) -> Any:
 
 
 def init_market_db(settings: Settings) -> None:
+    assert_test_database_isolated(
+        settings.database_path,
+        environment=settings.environment,
+    )
     migrate_database(settings.database_path)
 
 
@@ -253,6 +296,7 @@ class MarketFactRepository:
         self.settings = settings
         init_market_db(settings)
         self.temporal_validation = TemporalValidationService(settings)
+        self.source_policy = SourcePolicyService()
 
     def upsert_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
         with connect_market_db(self.settings) as conn:
@@ -279,11 +323,28 @@ class MarketFactRepository:
         payload.setdefault("created_at", timestamp)
         payload["updated_at"] = timestamp
         payload.setdefault("status", "active")
+        invalid_sources = self.source_policy.invalid_sources(
+            payload,
+            allow_test_reserved=self.settings.environment.lower() == "test",
+        )
+        if invalid_sources:
+            payload["source_audit_status"] = QUARANTINED_STATUS
+            payload["source_invalid_reason"] = invalid_sources[0].reason_code
+            payload["reliability"] = 0.0
+        else:
+            payload.setdefault("source_audit_status", "ACTIVE")
         for key in ("warnings_json", "errors_json", "raw_payload_json", "field_lineage_json"):
             payload[key] = encode(payload.get(key))
         columns = [column for column in FACT_COLUMNS if column in payload]
         updates = ", ".join(
-            f"{column}=excluded.{column}" for column in columns if column not in {"fact_key", "created_at"}
+            (
+                f"{column}=CASE WHEN market_facts.source_audit_status='QUARANTINED' "
+                f"THEN market_facts.{column} ELSE excluded.{column} END"
+                if column in {"source_audit_status", "source_invalid_reason"}
+                else f"{column}=excluded.{column}"
+            )
+            for column in columns
+            if column not in {"fact_key", "created_at"}
         )
         conn.execute(
             f"""
@@ -292,6 +353,15 @@ class MarketFactRepository:
             """,
             [database_value(payload[column]) for column in columns],
         )
+        for invalid in invalid_sources:
+            _record_source_quarantine(
+                conn,
+                entity_table="market_facts",
+                entity_key=str(payload["fact_key"]),
+                invalid=invalid,
+                previous_status="ACTIVE",
+                lineage={"field_lineage": decode(payload.get("field_lineage_json"), {})},
+            )
         return self.get_fact_in_transaction(conn, payload["fact_key"]) or payload
 
     def get_fact(self, fact_key: str) -> dict[str, Any] | None:
@@ -326,7 +396,10 @@ class MarketFactRepository:
         return max((fact for fact in facts if fact), key=_event_fact_rank, default=None)
 
     def search_facts(self, country: str | None = None, category: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        where: list[str] = ["temporal_audit_status!='QUARANTINED'"]
+        where: list[str] = [
+            "temporal_audit_status!='QUARANTINED'",
+            "source_audit_status!='QUARANTINED'",
+        ]
         params: list[Any] = []
         if country:
             where.append("country = ?")
@@ -358,6 +431,7 @@ class MarketFactRepository:
                 SELECT COUNT(*) c FROM market_facts
                 WHERE country = ? AND status = 'active'
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                   AND (valid_until IS NULL OR valid_until > ?)
                 """,
                 (country.upper(), now_iso()),
@@ -397,6 +471,7 @@ class MarketFactRepository:
                     SELECT COUNT(*) c FROM market_facts
                     WHERE status = 'active'
                       AND temporal_audit_status!='QUARANTINED'
+                      AND source_audit_status!='QUARANTINED'
                       AND (valid_until IS NULL OR valid_until > ?)
                     """,
                     (now_iso(),),
@@ -413,6 +488,7 @@ class MarketFactRepository:
                 WHERE fact_type IN ({placeholders})
                   AND status = 'active'
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                 ORDER BY updated_at DESC
                 """,
                 fact_types,
@@ -444,6 +520,10 @@ class MarketFactRepository:
 
         timestamp = now_iso()
         payload = normalize_payload_text(event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event))
+        invalid_sources = self.source_policy.invalid_sources(
+            payload,
+            allow_test_reserved=self.settings.environment.lower() == "test",
+        )
         time_utc = payload.get("time_utc")
         forecast = (payload.get("enrichment") or {}).get("forecast") if isinstance(payload.get("enrichment"), dict) else None
         previous = (payload.get("enrichment") or {}).get("previous") if isinstance(payload.get("enrichment"), dict) else None
@@ -468,6 +548,12 @@ class MarketFactRepository:
             terminal_status = temporal["temporal_status"]
             audit_status = "ACTIVE"
             invalid_reason = None
+            source_audit_status = "ACTIVE"
+            source_invalid_reason = None
+            if invalid_sources:
+                source_audit_status = QUARANTINED_STATUS
+                source_invalid_reason = invalid_sources[0].reason_code
+                payload["reliability"] = 0.0
             if not decision.accepted:
                 terminal_status = QUARANTINED_STATUS
                 audit_status = QUARANTINED_STATUS
@@ -511,8 +597,8 @@ class MarketFactRepository:
                     forecast, previous, consensus, actual, release_at, valid_until, status,
                     raw_payload_json, created_at, updated_at, canonical_event_key,event_kind,
                     temporal_status,field_lineage_json,temporal_audit_status,
-                    temporal_invalid_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    temporal_invalid_reason,source_audit_status,source_invalid_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_key) DO UPDATE SET
                     country=excluded.country,
                     category=excluded.category,
@@ -523,9 +609,15 @@ class MarketFactRepository:
                     time_local=excluded.time_local,
                     impact=excluded.impact,
                     event_risk_level=excluded.event_risk_level,
-                    source=excluded.source,
-                    source_url=excluded.source_url,
-                    official_reliability=excluded.official_reliability,
+                    source=CASE
+                      WHEN economic_events_history.source_audit_status='QUARANTINED'
+                      THEN economic_events_history.source ELSE excluded.source END,
+                    source_url=CASE
+                      WHEN economic_events_history.source_audit_status='QUARANTINED'
+                      THEN economic_events_history.source_url ELSE excluded.source_url END,
+                    official_reliability=CASE
+                      WHEN economic_events_history.source_audit_status='QUARANTINED'
+                      THEN 0 ELSE excluded.official_reliability END,
                     forecast=COALESCE(excluded.forecast,economic_events_history.forecast),
                     previous=COALESCE(excluded.previous,economic_events_history.previous),
                     consensus=COALESCE(excluded.consensus,economic_events_history.consensus),
@@ -535,7 +627,10 @@ class MarketFactRepository:
                     status=CASE
                       WHEN economic_events_history.temporal_audit_status='QUARANTINED'
                       THEN 'QUARANTINED' ELSE excluded.status END,
-                    raw_payload_json=excluded.raw_payload_json,
+                    raw_payload_json=CASE
+                      WHEN economic_events_history.source_audit_status='QUARANTINED'
+                      THEN economic_events_history.raw_payload_json
+                      ELSE excluded.raw_payload_json END,
                     canonical_event_key=excluded.canonical_event_key,
                     event_kind=excluded.event_kind,
                     temporal_status=CASE
@@ -548,6 +643,13 @@ class MarketFactRepository:
                     temporal_invalid_reason=COALESCE(
                       economic_events_history.temporal_invalid_reason,
                       excluded.temporal_invalid_reason
+                    ),
+                    source_audit_status=CASE
+                      WHEN economic_events_history.source_audit_status='QUARANTINED'
+                      THEN 'QUARANTINED' ELSE excluded.source_audit_status END,
+                    source_invalid_reason=COALESCE(
+                      economic_events_history.source_invalid_reason,
+                      excluded.source_invalid_reason
                     ),
                     updated_at=excluded.updated_at
                 """,
@@ -582,6 +684,8 @@ class MarketFactRepository:
                     encode(field_lineage),
                     audit_status,
                     invalid_reason,
+                    source_audit_status,
+                    source_invalid_reason,
                 ),
             )
             stored = conn.execute(
@@ -621,6 +725,16 @@ class MarketFactRepository:
                     """,
                     (invalid_reason, stored["canonical_event_key"]),
                 )
+            if stored is not None and invalid_sources:
+                for invalid in invalid_sources:
+                    _record_source_quarantine(
+                        conn,
+                        entity_table="economic_events_history",
+                        entity_key=str(stored["event_key"]),
+                        invalid=invalid,
+                        previous_status="ACTIVE",
+                        lineage={"field_lineage": field_lineage},
+                    )
             conn.commit()
 
     def apply_event_research_field(
@@ -630,6 +744,15 @@ class MarketFactRepository:
         candidate: dict[str, Any],
         policy_version: str,
     ) -> dict[str, int]:
+        candidate_url = candidate.get("canonical_url") or candidate.get("source_url")
+        source_validation = self.source_policy.validate_url(
+            str(candidate_url or ""),
+            allow_test_reserved=self.settings.environment.lower() == "test",
+        )
+        if not source_validation.accepted:
+            raise ValueError(
+                f"source_invalid:{source_validation.reason_code}"
+            )
         field = str(candidate.get("field") or candidate.get("field_semantics") or "")
         if field not in {"forecast", "consensus", "previous"}:
             raise ValueError(f"unsupported research field: {field}")
@@ -644,6 +767,7 @@ class MarketFactRepository:
                 SELECT * FROM economic_events_history
                 WHERE canonical_event_key=?
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                 ORDER BY updated_at DESC LIMIT 1
                 """,
                 (canonical_event_key,),
@@ -707,6 +831,15 @@ class MarketFactRepository:
         candidate: dict[str, Any],
         policy_version: str,
     ) -> dict[str, Any]:
+        candidate_url = candidate.get("canonical_url") or candidate.get("source_url")
+        source_validation = self.source_policy.validate_url(
+            str(candidate_url or ""),
+            allow_test_reserved=self.settings.environment.lower() == "test",
+        )
+        if not source_validation.accepted:
+            raise ValueError(
+                f"source_invalid:{source_validation.reason_code}"
+            )
         actual = candidate.get("value") if candidate.get("value") not in (None, "") else candidate.get("actual")
         if actual in (None, ""):
             raise ValueError("official actual candidate has no value")
@@ -722,6 +855,7 @@ class MarketFactRepository:
                 SELECT * FROM economic_events_history
                 WHERE canonical_event_key=?
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                 ORDER BY updated_at DESC LIMIT 1
                 """,
                 (canonical_event_key,),
@@ -780,6 +914,7 @@ class MarketFactRepository:
                     actual_frequency=?,actual_seasonal_adjustment=?,actual_reference_period=?,
                     actual_transformation=?,actual_semantic_compatible=?,semantic_warnings_json=?
                 WHERE id=? AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                 """,
                 (
                     str(actual), source, source_url,
@@ -852,6 +987,7 @@ class MarketFactRepository:
                 SET temporal_status='ACTUAL_UNAVAILABLE',status='ACTUAL_UNAVAILABLE',updated_at=?
                 WHERE canonical_event_key=? AND actual IS NULL
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                 """,
                 (timestamp, canonical_event_key),
             )
@@ -866,6 +1002,7 @@ class MarketFactRepository:
                 SET outcome_json=?,temporal_status='COMPLETED',status='COMPLETED',updated_at=?
                 WHERE canonical_event_key=? AND event_kind='scheduled_speech'
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                 """,
                 (encode(candidate), timestamp, canonical_event_key),
             )
@@ -881,6 +1018,7 @@ class MarketFactRepository:
                 FROM economic_events_history
                 WHERE country = ? AND date >= ? AND date <= ?
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                   AND temporal_status!='QUARANTINED'
                 ORDER BY time_utc ASC
                 """,
@@ -895,6 +1033,7 @@ class MarketFactRepository:
                 SELECT * FROM economic_events_history
                 WHERE country=?
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                   AND temporal_status!='QUARANTINED'
                 ORDER BY COALESCE(release_at,time_utc,date),name
                 """,
@@ -918,6 +1057,7 @@ class MarketFactRepository:
                 SELECT COUNT(*) c FROM market_facts
                 WHERE status = 'active'
                   AND temporal_audit_status!='QUARANTINED'
+                  AND source_audit_status!='QUARANTINED'
                   AND (valid_until IS NULL OR valid_until > ?)
                 """,
                 (now_iso(),),

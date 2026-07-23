@@ -828,20 +828,22 @@ def _annotate_event(raw: Any) -> Any:
 def _walk_semantics(value: Any, *, session_status: str, now: datetime) -> None:
     if isinstance(value, dict):
         source = value.get("source")
-        source_url = value.get("source_url")
+        source_url = value.get("canonical_url") or value.get("source_url")
         if source or source_url:
             classification = classify_source(source, source_url)
-            source_text = f"{source or ''} {source_url or ''}".lower()
-            redistributor = "fred" in source_text
-            official = bool(classification["is_official_source"]) or any(
-                token in source_text
-                for token in ("fred", "stlouisfed.org", "cboe", "nasdaq official", "cme group", "cmegroup.com")
-            )
-            value.setdefault("data_origin_is_official", official)
-            value.setdefault("distribution_source_is_official", official)
-            value.setdefault("source_is_primary_originator", official and not redistributor)
-            value.setdefault("source_is_official_redistributor", official and redistributor)
-            value.setdefault("is_official_source", official)
+            for field in (
+                "data_origin_is_official",
+                "distribution_source_is_official",
+                "source_is_primary_originator",
+                "source_is_official_redistributor",
+                "is_official_source",
+                "source_classification",
+                "source_tier",
+                "validation",
+            ):
+                value[field] = classification[field]
+            if classification["validation"]["status"] == "rejected":
+                value["reliability"] = 0.0
         if str(value.get("freshness") or "").upper() in {"", "UNKNOWN"} and (
             value.get("data_as_of") or value.get("retrieved_at")
         ):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,14 @@ class SourceDecision:
     reliability: float
     policy_version: str
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SourceUrlValidation:
+    accepted: bool
+    url: str
+    domain: str
+    reason_code: str | None = None
 
 
 class SourcePolicyService:
@@ -61,7 +71,66 @@ class SourcePolicyService:
         host = urlparse(str(url or "")).hostname or ""
         return host.lower().removeprefix("www.")
 
+    def validate_url(
+        self,
+        url: str | None,
+        *,
+        require_https: bool = True,
+        allow_test_reserved: bool = False,
+    ) -> SourceUrlValidation:
+        raw = str(url or "").strip()
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        domain = host.removeprefix("www.")
+        if not raw or not host:
+            return SourceUrlValidation(False, raw, domain, "SOURCE_URL_MISSING_OR_MALFORMED")
+        if require_https and parsed.scheme.lower() != "https":
+            return SourceUrlValidation(False, raw, domain, "SOURCE_URL_HTTPS_REQUIRED")
+        if parsed.username or parsed.password:
+            return SourceUrlValidation(False, raw, domain, "SOURCE_URL_CREDENTIALS_FORBIDDEN")
+        if host == "localhost" or host.endswith(".localhost"):
+            return SourceUrlValidation(False, raw, domain, "SOURCE_HOST_LOCALHOST")
+        try:
+            address = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            address = None
+        if address is not None and (
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_unspecified
+            or address.is_reserved
+        ):
+            return SourceUrlValidation(False, raw, domain, "SOURCE_HOST_NON_PUBLIC_IP")
+        if not allow_test_reserved and (
+            host.endswith(".test")
+            or host.endswith(".invalid")
+            or host.endswith(".example")
+            or _domain_matches(host, "example.com")
+        ):
+            return SourceUrlValidation(False, raw, domain, "SOURCE_HOST_RESERVED")
+        official_domains = {
+            allowed
+            for allowed, rule in self._rules.items()
+            if int(rule["tier"]) == 1
+        }
+        if any(
+            allowed in host and not _domain_matches(host, allowed)
+            for allowed in official_domains
+        ):
+            return SourceUrlValidation(
+                False,
+                raw,
+                domain,
+                "SOURCE_HOST_OFFICIAL_IMPERSONATION",
+            )
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", host):
+            return SourceUrlValidation(False, raw, domain, "SOURCE_HOST_INVALID")
+        return SourceUrlValidation(True, raw, domain)
+
     def rule_for(self, url: str | None, publisher: str | None = None) -> dict[str, Any] | None:
+        if not self.validate_url(url).accepted:
+            return None
         domain = self.domain(url)
         candidates = [
             rule for key, rule in self._rules.items() if _domain_matches(domain, key)
@@ -155,7 +224,17 @@ class SourcePolicyService:
     ) -> SourceDecision:
         url = candidate.get("canonical_url") or candidate.get("source_url")
         publisher = candidate.get("publisher") or candidate.get("source")
-        domain = self.domain(url)
+        url_validation = self.validate_url(url)
+        domain = url_validation.domain
+        if not url_validation.accepted:
+            return self._decision(
+                False,
+                domain,
+                5,
+                "SOURCE_INVALID",
+                0.0,
+                str(url_validation.reason_code or "SOURCE_URL_INVALID"),
+            )
         forbidden = {str(item).lower() for item in self.policy.get("forbidden_domains") or []}
         if any(_domain_matches(domain, item) for item in forbidden):
             return self._decision(False, domain, 5, "FORBIDDEN", 0.0, "forbidden_domain")
@@ -215,6 +294,128 @@ class SourcePolicyService:
             *reasons,
         )
 
+    def provenance(
+        self,
+        *,
+        source: str | None,
+        source_url: str | None,
+        trusted_resolver: str | None = None,
+        server_owned_lineage: bool = False,
+    ) -> dict[str, Any]:
+        validation = self.validate_url(source_url)
+        rule = self.rule_for(source_url, source) if validation.accepted else None
+        source_text = str(source or "").lower()
+        known_market_source = any(
+            token in source_text
+            for token in (
+                "yahoo",
+                "reuters",
+                "bloomberg",
+                "marketwatch",
+                "marketbeat",
+                "cnbc",
+                "barron",
+                "seeking alpha",
+            )
+        )
+        official = bool(
+            rule
+            and int(rule["tier"]) == 1
+            and (
+                source_url
+                or (trusted_resolver and server_owned_lineage)
+            )
+        )
+        redistributor = bool(rule and self.domain(source_url) == "fred.stlouisfed.org")
+        reasons = [] if validation.accepted else [validation.reason_code]
+        if validation.accepted and rule is None:
+            reasons.append("SOURCE_DOMAIN_NOT_ALLOWLISTED")
+        return {
+            "source_domain": validation.domain,
+            "source_tier": int(rule["tier"]) if rule else 5,
+            "source_classification": (
+                "official_source"
+                if official
+                else "market_source"
+                if rule or (validation.accepted and known_market_source)
+                else "invalid_source"
+                if not validation.accepted
+                else "other_source"
+            ),
+            "reliability": float(rule["base_reliability"]) if rule and validation.accepted else 0.0,
+            "is_official_source": official,
+            "source_is_primary_originator": official and not redistributor,
+            "source_is_official_redistributor": official and redistributor,
+            "data_origin_is_official": official,
+            "distribution_source_is_official": official,
+            "validation": {
+                "status": "accepted" if validation.accepted and rule else "rejected",
+                "reason_code": reasons[0] if reasons else None,
+                "reasons": reasons,
+                "policy_version": self.policy_version,
+            },
+        }
+
+    def invalid_sources(
+        self,
+        value: Any,
+        *,
+        allow_test_reserved: bool = False,
+    ) -> list[SourceUrlValidation]:
+        findings: dict[tuple[str, str], SourceUrlValidation] = {}
+        for url in _walk_source_urls(value):
+            validation = self.validate_url(
+                url,
+                allow_test_reserved=allow_test_reserved,
+            )
+            if not validation.accepted:
+                findings[(validation.url, str(validation.reason_code))] = validation
+        return list(findings.values())
+
+    def sanitize_operational_payload(
+        self,
+        value: Any,
+        *,
+        allow_test_reserved: bool = False,
+    ) -> Any:
+        """Remove invalid source-bearing records while retaining aggregate structure."""
+        if isinstance(value, list):
+            return [
+                cleaned
+                for item in value
+                if (
+                    cleaned := self.sanitize_operational_payload(
+                        item,
+                        allow_test_reserved=allow_test_reserved,
+                    )
+                )
+                is not None
+            ]
+        if not isinstance(value, dict):
+            return value
+        direct_urls = [
+            str(raw)
+            for key, raw in value.items()
+            if raw
+            and isinstance(raw, str)
+            and _is_source_url_field(str(key))
+        ]
+        if any(
+            not self.validate_url(
+                url,
+                allow_test_reserved=allow_test_reserved,
+            ).accepted
+            for url in direct_urls
+        ):
+            return None
+        return {
+            key: self.sanitize_operational_payload(
+                item,
+                allow_test_reserved=allow_test_reserved,
+            )
+            for key, item in value.items()
+        }
+
     def prompt_projection(self) -> dict[str, Any]:
         return {
             "policy_version": self.policy_version,
@@ -240,6 +441,19 @@ class SourcePolicyService:
             "issuer_domain_allowlist": self.policy.get("issuer_domain_allowlist") or {},
             "issuer_official_sources": self.policy.get("issuer_official_sources") or {},
             "semantic_policies": self.policy.get("semantic_policies") or {},
+            "url_validation": {
+                "https_required": True,
+                "reserved_hosts_rejected": [
+                    "localhost",
+                    "loopback/private IP",
+                    ".test",
+                    ".invalid",
+                    ".example",
+                    "example.com",
+                ],
+                "dns_boundary": "exact_or_subdomain_allowlist",
+                "official_claims_are_server_owned": True,
+            },
         }
 
     def semantic_policy(self, field_semantics: str) -> dict[str, Any]:
@@ -323,3 +537,28 @@ def _domain_matches(host: str, allowed_domain: str) -> bool:
     host = str(host or "").lower().rstrip(".")
     allowed = str(allowed_domain or "").lower().strip().rstrip(".")
     return bool(host and allowed and (host == allowed or host.endswith(f".{allowed}")))
+
+
+def _is_source_url_field(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in {
+        "source_url",
+        "canonical_url",
+        "actual_source_url",
+        "forecast_source_url",
+        "redirect_url",
+        "requested_url",
+        "aggregator_url",
+    } or lowered.endswith("_source_url")
+
+
+def _walk_source_urls(value: Any):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and _is_source_url_field(str(key)):
+                yield item
+            else:
+                yield from _walk_source_urls(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_source_urls(item)

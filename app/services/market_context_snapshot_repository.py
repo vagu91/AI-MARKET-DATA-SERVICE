@@ -10,13 +10,21 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.temporal_validation_service import TemporalValidationService
+from app.services.source_policy_service import SourcePolicyService
+from app.infrastructure.persistence.database_safety import assert_test_database_isolated
 
 
 class MarketContextSnapshotRepository:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        assert_test_database_isolated(
+            settings.database_path,
+            environment=settings.environment,
+        )
         migrate_database(settings.database_path)
         self.temporal_validation = TemporalValidationService(settings)
+        self.source_policy = SourcePolicyService()
+        self.allow_test_reserved_sources = settings.environment.lower() == "test"
 
     def save_next(
         self,
@@ -34,14 +42,30 @@ class MarketContextSnapshotRepository:
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         snapshot_id = f"mcs-{uuid.uuid4()}"
         symbol = symbol.upper()
-        debug = self.temporal_validation.sanitize_payload(
+        temporal_debug = self.temporal_validation.sanitize_payload(
             dict(debug_payload),
             entity_table="market_context_snapshot_input",
         )
+        invalid_sources = self.source_policy.invalid_sources(
+            temporal_debug,
+            allow_test_reserved=self.allow_test_reserved_sources,
+        )
+        debug = self.source_policy.sanitize_operational_payload(
+            temporal_debug,
+            allow_test_reserved=self.allow_test_reserved_sources,
+        ) or {}
         audit = dict(debug.get("audit") or {})
         audit["temporal_quarantine"] = (
             self.temporal_validation.quarantine_read_model()
         )
+        audit["source_validation"] = {
+            "status": "sanitized" if invalid_sources else "accepted",
+            "invalid_source_count": len(invalid_sources),
+            "reason_codes": sorted(
+                {str(item.reason_code) for item in invalid_sources if item.reason_code}
+            ),
+            "policy_version": self.source_policy.policy_version,
+        }
         debug["audit"] = audit
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -68,8 +92,38 @@ class MarketContextSnapshotRepository:
                 "research_run_id": research_run_id,
                 "parent_run_id": parent_run_id,
             })
+            final_invalid_sources = self.source_policy.invalid_sources(
+                debug,
+                allow_test_reserved=self.allow_test_reserved_sources,
+            )
+            if final_invalid_sources:
+                debug = self.source_policy.sanitize_operational_payload(
+                    debug,
+                    allow_test_reserved=self.allow_test_reserved_sources,
+                ) or {}
+                source_audit = dict((debug.get("audit") or {}).get("source_validation") or {})
+                source_audit["status"] = "sanitized"
+                source_audit["invalid_source_count"] = (
+                    int(source_audit.get("invalid_source_count") or 0)
+                    + len(final_invalid_sources)
+                )
+                source_audit["reason_codes"] = sorted(
+                    {
+                        *list(source_audit.get("reason_codes") or []),
+                        *[
+                            str(item.reason_code)
+                            for item in final_invalid_sources
+                            if item.reason_code
+                        ],
+                    }
+                )
+                debug.setdefault("audit", {})["source_validation"] = source_audit
             from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
             consumer = build_ai_trader_consumer_v2(debug, settings=self.settings)
+            consumer = self.source_policy.sanitize_operational_payload(
+                consumer,
+                allow_test_reserved=self.allow_test_reserved_sources,
+            ) or {}
             generated_at = str(debug.get("generated_at_utc") or debug.get("generated_at") or now)
             data_as_of = str(consumer.get("data_as_of") or generated_at)
             debug_json = self._json(debug)
@@ -119,10 +173,11 @@ class MarketContextSnapshotRepository:
             rows = conn.execute(
                 """
                 SELECT component_name,component_json FROM market_context_components c
-                WHERE symbol=? AND source_revision=(
+                WHERE symbol=? AND source_audit_status='ACTIVE' AND source_revision=(
                   SELECT MAX(source_revision) FROM market_context_components newer
                   WHERE newer.symbol=c.symbol
                     AND newer.component_name=c.component_name
+                    AND newer.source_audit_status='ACTIVE'
                 )
                 ORDER BY component_name
                 """,
@@ -147,6 +202,14 @@ class MarketContextSnapshotRepository:
     ) -> dict[str, Any]:
         """Compatibility helper for fixtures importing an already allocated immutable snapshot."""
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
+        debug_payload = self.source_policy.sanitize_operational_payload(
+            debug_payload,
+            allow_test_reserved=self.allow_test_reserved_sources,
+        ) or {}
+        consumer_payload = self.source_policy.sanitize_operational_payload(
+            consumer_payload,
+            allow_test_reserved=self.allow_test_reserved_sources,
+        ) or {}
         generated_at = str(debug_payload.get("generated_at_utc") or debug_payload.get("generated_at") or now)
         data_as_of = str(consumer_payload.get("data_as_of") or generated_at)
         debug_json = self._json(debug_payload)
@@ -175,6 +238,7 @@ class MarketContextSnapshotRepository:
                 """
                 SELECT * FROM market_context_snapshots
                 WHERE symbol=? AND audit_status='ACTIVE'
+                  AND source_audit_status='ACTIVE'
                 ORDER BY revision DESC LIMIT 1
                 """,
                 (symbol.upper(),),
@@ -222,7 +286,10 @@ class MarketContextSnapshotRepository:
         if not research_run_id:
             return None
         run = conn.execute(
-            "SELECT * FROM research_runs WHERE run_id=?",
+            """
+            SELECT * FROM research_runs
+            WHERE run_id=? AND source_audit_status='ACTIVE'
+            """,
             (research_run_id,),
         ).fetchone()
         if (
@@ -245,6 +312,7 @@ class MarketContextSnapshotRepository:
                 SELECT COUNT(*) FROM research_claims
                 WHERE research_run_id=? AND validation_status='accepted'
                   AND materialization_status='ELIGIBLE'
+                  AND source_audit_status='ACTIVE'
                 """,
                 (run_id,),
             ).fetchone()[0]
@@ -256,6 +324,7 @@ class MarketContextSnapshotRepository:
                 JOIN research_claims c ON c.claim_id=e.claim_id
                 WHERE c.research_run_id=? AND c.validation_status='accepted'
                   AND c.materialization_status='ELIGIBLE' AND e.audit_status='ACTIVE'
+                  AND e.source_audit_status='ACTIVE'
                 """,
                 (run_id,),
             ).fetchone()[0]
@@ -268,6 +337,7 @@ class MarketContextSnapshotRepository:
                 JOIN research_claims c ON c.claim_id=e.claim_id
                 WHERE c.research_run_id=? AND c.validation_status='accepted'
                   AND c.materialization_status='ELIGIBLE' AND e.audit_status='ACTIVE'
+                  AND e.source_audit_status='ACTIVE'
                 ORDER BY e.source_domain
                 """,
                 (run_id,),
@@ -310,7 +380,10 @@ class MarketContextSnapshotRepository:
         projections = []
         for run_id in run_ids:
             row = conn.execute(
-                "SELECT * FROM research_runs WHERE run_id=?",
+                """
+                SELECT * FROM research_runs
+                WHERE run_id=? AND source_audit_status='ACTIVE'
+                """,
                 (run_id,),
             ).fetchone()
             if row is not None and str(row["status"]) in {
@@ -446,6 +519,36 @@ class MarketContextSnapshotRepository:
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+    def source_quarantine_read_model(self) -> dict[str, Any]:
+        with connect_sqlite(self.settings.database_path) as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM source_quarantine").fetchone()[0])
+            reasons = {
+                str(row["reason_code"]): int(row["count"])
+                for row in conn.execute(
+                    "SELECT reason_code,COUNT(*) AS count FROM source_quarantine GROUP BY reason_code"
+                )
+            }
+            domains = [
+                str(row["source_domain"])
+                for row in conn.execute(
+                    "SELECT DISTINCT source_domain FROM source_quarantine ORDER BY source_domain"
+                )
+            ]
+            latest = conn.execute("SELECT MAX(detected_at) FROM source_quarantine").fetchone()[0]
+            snapshots = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM market_context_snapshots "
+                    "WHERE source_audit_status='QUARANTINED'"
+                ).fetchone()[0]
+            )
+        return {
+            "invalid_source_count": total,
+            "by_reason_code": reasons,
+            "domains": domains,
+            "last_detected_at": latest,
+            "unusable_snapshot_count": snapshots,
+        }
 
     @staticmethod
     def _row(row: Any) -> dict[str, Any]:

@@ -86,6 +86,7 @@ class ResearchGapManifestBuilder:
             dict(components or ((snapshot or {}).get("debug_payload") or {})),
             entity_table="research_gap_manifest_input",
         )
+        context = self.policy.sanitize_operational_payload(context) or {}
         items = [
             self._evaluate_topic(topic, context, now)
             for topic in MNQ_TOPICS

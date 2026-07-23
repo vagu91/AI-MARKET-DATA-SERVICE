@@ -389,7 +389,7 @@ def test_additive_migration_from_v6_preserves_existing_rows(tmp_path: Path) -> N
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('keep','Keep','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(db)["schema_version"] == 17
+    assert migrate_database(db)["schema_version"] == 18
     with sqlite3.connect(db) as conn:
         assert (
             conn.execute("SELECT title FROM market_news WHERE news_key='keep'").fetchone()[0]

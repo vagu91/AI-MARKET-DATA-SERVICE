@@ -35,10 +35,10 @@ def minimal_full(*, now: datetime = SATURDAY) -> dict:
         "generated_at_utc": now.isoformat(),
         "macro_snapshot": {
             "rates_and_yields": {
-                "DGS2": {"value": 3.5, "data_as_of": "2026-07-10", "source": "FRED", "frequency": "daily"},
-                "DGS10": {"value": 4.0, "data_as_of": "2026-07-10", "source": "FRED", "frequency": "daily"},
+                "DGS2": {"value": 3.5, "data_as_of": "2026-07-10", "source": "FRED", "source_url": "https://fred.stlouisfed.org/series/DGS2", "frequency": "daily"},
+                "DGS10": {"value": 4.0, "data_as_of": "2026-07-10", "source": "FRED", "source_url": "https://fred.stlouisfed.org/series/DGS10", "frequency": "daily"},
             },
-            "financial_conditions": {"VIXCLS": {"value": 16.0, "data_as_of": "2026-07-10", "source": "FRED"}},
+            "financial_conditions": {"VIXCLS": {"value": 16.0, "data_as_of": "2026-07-10", "source": "FRED", "source_url": "https://fred.stlouisfed.org/series/VIXCLS"}},
         },
         "event_calendar": {"critical_macro_events": [], "fed_communications": [], "other_economic_events": []},
         "events_today": [],
