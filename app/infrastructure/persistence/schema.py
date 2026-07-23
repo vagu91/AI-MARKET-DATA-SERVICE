@@ -641,6 +641,65 @@ CREATE INDEX IF NOT EXISTS idx_research_step_attempts_run
   ON research_step_attempts(run_id, step_name, attempt);
 """
 
+OBSERVABLE_TOOL_TELEMETRY_SCHEMA = """
+ALTER TABLE research_tool_events ADD COLUMN raw_event_type TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN lifecycle TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN item_id TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN item_type TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN phase TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN job_id TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN provider_tool_type TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN semantic_action TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN tool_action_fingerprint TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN status TEXT NULL;
+ALTER TABLE research_tool_events ADD COLUMN counts_usage INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_evidence ADD COLUMN tool_event_id TEXT NULL;
+
+ALTER TABLE research_runs ADD COLUMN metrics_json TEXT NULL;
+ALTER TABLE research_runs ADD COLUMN checkpoint_json TEXT NULL;
+ALTER TABLE research_runs ADD COLUMN continuation_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN threshold_warnings_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE research_runs ADD COLUMN loop_detection_count INTEGER NOT NULL DEFAULT 0;
+
+UPDATE research_tool_events
+SET raw_event_type=COALESCE(raw_event_type,'legacy.completed'),
+    lifecycle=COALESCE(lifecycle,'completed'),
+    phase=COALESCE(
+      phase,
+      (SELECT step_name FROM research_run_steps
+       WHERE research_run_steps.step_id=research_tool_events.step_id),
+      'UNKNOWN'
+    ),
+    job_id=COALESCE(
+      job_id,
+      (SELECT job_id FROM research_runs
+       WHERE research_runs.run_id=research_tool_events.run_id)
+    ),
+    provider_tool_type=COALESCE(provider_tool_type,event_type),
+    semantic_action=COALESCE(
+      semantic_action,
+      CASE
+        WHEN event_type='search' THEN 'search'
+        WHEN event_type IN ('open_source','server_source_verified')
+          THEN 'open_source'
+        ELSE 'non_operational'
+      END
+    ),
+    tool_action_fingerprint=COALESCE(tool_action_fingerprint,event_id),
+    status=COALESCE(status,'completed'),
+    counts_usage=CASE
+      WHEN event_type IN ('search','open_source','server_source_verified')
+        THEN 1 ELSE counts_usage END;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_research_tool_event_lifecycle
+  ON research_tool_events(run_id, phase, tool_action_fingerprint, lifecycle)
+  WHERE tool_action_fingerprint IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_research_tool_event_semantic_usage
+  ON research_tool_events(run_id, semantic_action, lifecycle, counts_usage);
+CREATE INDEX IF NOT EXISTS idx_research_evidence_tool_event
+  ON research_evidence(tool_event_id);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -654,4 +713,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("009_semantic_actuals_and_agentic_research_runtime", AGENTIC_RESEARCH_RUNTIME_SCHEMA),
     ("010_verified_evidence_deadlines_and_completeness", VERIFIED_RESEARCH_RUNTIME_SCHEMA),
     ("011_agentic_runtime_diagnostics_and_step_history", AGENTIC_RUNTIME_DIAGNOSTICS_SCHEMA),
+    ("012_observable_tool_telemetry_and_checkpoints", OBSERVABLE_TOOL_TELEMETRY_SCHEMA),
 )

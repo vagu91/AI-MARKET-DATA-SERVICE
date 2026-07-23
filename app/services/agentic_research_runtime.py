@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -14,13 +13,17 @@ from app.services.evidence_verification_service import (
     DeterministicEvidenceVerifier,
     EvidenceVerifierProtocol,
 )
-from app.services.data_freshness_service import parse_datetime
 from app.services.codex_runtime_contract import CodexCLIError
 from app.services.research_budget import (
     ResearchBudgetExceeded,
     build_effective_budget,
     refresh_effective_budget,
 )
+from app.services.research_tool_telemetry import (
+    ProgressLoopGuard,
+    ResearchLoopDetected,
+)
+from app.services.research_metrics_service import ResearchMetricsService
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,7 @@ class AgenticResearchRuntime:
         self.repository = repository or ResearchRuntimeRepository(settings)
         self.verifier = verifier or DeterministicEvidenceVerifier(settings)
         self.monotonic = monotonic or time.monotonic
+        self.metrics = ResearchMetricsService(settings)
 
     def run(
         self,
@@ -51,8 +55,7 @@ class AgenticResearchRuntime:
     ) -> dict[str, Any]:
         profile = profile_for_job(str(job["job_type"]))
         run = self.repository.ensure_run(job, profile.profile_id, profile.prompt_version)
-        elapsed = _elapsed_job_seconds(job)
-        deadline = self.monotonic() + max(float(timeout_seconds) - elapsed, 0.0)
+        deadline = self.monotonic() + max(float(timeout_seconds), 0.0)
         daily_usage = self.repository.daily_budget_usage(
             exclude_run_id=str(run["run_id"])
         )
@@ -64,16 +67,35 @@ class AgenticResearchRuntime:
                 daily_usage=daily_usage,
                 daily_runs=daily_usage["run_count"],
                 runtime_seconds=timeout_seconds,
-                elapsed_seconds=elapsed,
+                elapsed_seconds=0,
             ),
         )
+        budget_mode = str(base_budget.get("budget_mode") or "observe")
+        known_sources = [
+            str(item.get("canonical_url") or item.get("source_url") or "")
+            for item in self.repository.observed_sources(str(run["run_id"]))
+            if item.get("canonical_url") or item.get("source_url")
+        ]
+        guard = ProgressLoopGuard(
+            self.settings,
+            known_queries=self.repository.observed_queries(str(run["run_id"])),
+            known_sources=known_sources,
+        )
+        invocation_progress = False
+        completed_steps: list[str] = []
         context: dict[str, Any] = {
             "job_id": job["job_id"], "run_id": run["run_id"],
         }
         for ordinal, step_name in enumerate(EXTERNAL_STEPS, start=1):
             remaining = deadline - self.monotonic()
             if remaining <= 0:
-                return _deadline_result(run, step_name)
+                return self._checkpoint_or_deadline(
+                    run,
+                    step_name,
+                    invocation_progress,
+                    completed_steps,
+                    guard,
+                )
             current_run = self.repository.get_run(run["run_id"]) or run
             completed_queries = self.repository.observed_queries(str(run["run_id"]))
             completed_opened_sources = [
@@ -106,6 +128,7 @@ class AgenticResearchRuntime:
                 backend="codex_cli", tool=_step_tool(step_name),
             )
             if not execute:
+                completed_steps.append(step_name)
                 context[step_name.lower()] = step.get("output") or {}
                 continue
             budget_resource = (
@@ -128,7 +151,11 @@ class AgenticResearchRuntime:
                 if budget_resource == "opened_sources"
                 else 0
             )
-            if budget_resource and remaining_before_step <= 0:
+            if (
+                budget_mode == "enforce"
+                and budget_resource
+                and remaining_before_step <= 0
+            ):
                 bounded = {
                     "status": "NO_DATA",
                     "warnings": [f"{budget_resource}_budget_exhausted"],
@@ -145,6 +172,7 @@ class AgenticResearchRuntime:
             observed_step_events: list[dict[str, Any]] = []
 
             def observe_tool_event(event: dict[str, Any]) -> None:
+                nonlocal invocation_progress
                 observed_step_events.append(event)
                 counts = self.repository.record_tool_events(
                     str(run["run_id"]),
@@ -204,22 +232,52 @@ class AgenticResearchRuntime:
                     )
                     observed_count = counts["opened_source_count"]
                 if resource:
-                    raise ResearchBudgetExceeded(
-                        step=step_name,
-                        resource=resource,
-                        configured_limit=configured_limit,
-                        observed_count=observed_count,
-                        remaining_before_step=(
-                            remaining_opens_before_step
-                            if event_resource
-                            in {"open_source", "server_source_verified"}
-                            else remaining_searches_before_step
-                        ),
-                        run_id=str(run["run_id"]),
-                        job_id=str(job["job_id"]),
-                        effective_budget=current_budget,
-                        tool_events=observed_step_events,
-                    )
+                    if budget_mode == "observe":
+                        self.repository.record_threshold_warning(
+                            str(run["run_id"]),
+                            {
+                                "resource": resource,
+                                "configured_limit": configured_limit,
+                                "observed_count": observed_count,
+                                "step": step_name,
+                            },
+                        )
+                    else:
+                        raise ResearchBudgetExceeded(
+                            step=step_name,
+                            resource=resource,
+                            configured_limit=configured_limit,
+                            observed_count=observed_count,
+                            remaining_before_step=(
+                                remaining_opens_before_step
+                                if event_resource
+                                in {
+                                    "open_source",
+                                    "server_source_verified",
+                                }
+                                else remaining_searches_before_step
+                            ),
+                            run_id=str(run["run_id"]),
+                            job_id=str(job["job_id"]),
+                            effective_budget=current_budget,
+                            tool_events=observed_step_events,
+                        )
+                for inserted in counts.get("inserted_events") or []:
+                    progress, loop_reason = guard.observe(inserted)
+                    invocation_progress = invocation_progress or progress
+                    if loop_reason:
+                        loop_error = ResearchLoopDetected(
+                            step=step_name,
+                            run_id=str(run["run_id"]),
+                            job_id=str(job["job_id"]),
+                            reason=loop_reason,
+                            evidence=guard.evidence(),
+                        )
+                        self.repository.record_loop_detection(
+                            str(run["run_id"]),
+                            loop_error.diagnostic,
+                        )
+                        raise loop_error
 
             try:
                 output = executor.execute_step(
@@ -243,8 +301,16 @@ class AgenticResearchRuntime:
                     run["run_id"], step["step_id"], [],
                     usage=usage if isinstance(usage, dict) else None,
                 )
+                if step_name == "OPEN_SOURCE":
+                    output = _reconcile_declared_sources(
+                        output,
+                        self.repository.observed_sources(str(run["run_id"])),
+                    )
                 domains = _source_domains(output)
                 self.repository.complete_step(step["step_id"], output, source_domains=domains)
+                completed_steps.append(step_name)
+                invocation_progress = True
+                guard.mark_phase_progress()
                 context[step_name.lower()] = output
                 logger.info("research_step_completed", extra={
                     "job_id": job["job_id"], "run_id": run["run_id"], "step": step_name,
@@ -260,6 +326,7 @@ class AgenticResearchRuntime:
                     f"{type(exc).__name__}:{exc}",
                     diagnostic=diagnostic,
                 )
+                self.metrics.snapshot(str(run["run_id"]), persist=True)
                 logger.exception(
                     "research_step_failed",
                     extra={
@@ -273,7 +340,14 @@ class AgenticResearchRuntime:
                         ),
                     },
                 )
-                if isinstance(exc, (CodexCLIError, ResearchBudgetExceeded)):
+                if isinstance(
+                    exc,
+                    (
+                        CodexCLIError,
+                        ResearchBudgetExceeded,
+                        ResearchLoopDetected,
+                    ),
+                ):
                     raise
                 if "watchdog" in str(exc).lower() or self.monotonic() >= deadline:
                     return _deadline_result(run, step_name)
@@ -284,10 +358,20 @@ class AgenticResearchRuntime:
             run,
             step["step_id"],
             claims,
-            max_opened_sources=int(base_budget["max_opened_sources"]),
+            max_opened_sources=(
+                int(base_budget["max_opened_sources"])
+                if budget_mode == "enforce"
+                else None
+            ),
         )
         if self.monotonic() >= deadline:
-            return _deadline_result(run, "PERSIST")
+            return self._checkpoint_or_deadline(
+                run,
+                "PERSIST",
+                invocation_progress,
+                completed_steps,
+                guard,
+            )
         persist_step, should_persist = self.repository.begin_step(
             run["run_id"], "PERSIST", 7, {"claim_count": len(claims)},
             backend="service", tool="sqlite",
@@ -348,7 +432,40 @@ class AgenticResearchRuntime:
                 ],
             ),
             "usage_status": "available" if (self.repository.get_run(run["run_id"]) or {}).get("usage") else "usage_unavailable",
+            "metrics": self.metrics.snapshot(
+                str(run["run_id"]),
+                persist=True,
+            ),
         }
+
+    def _checkpoint_or_deadline(
+        self,
+        run: dict[str, Any],
+        next_step: str,
+        invocation_progress: bool,
+        completed_steps: list[str],
+        guard: ProgressLoopGuard,
+    ) -> dict[str, Any]:
+        if invocation_progress and self.settings.research_checkpoint_on_deadline:
+            checkpoint = self.repository.checkpoint_run(
+                str(run["run_id"]),
+                {
+                    "next_step": next_step,
+                    "completed_steps": completed_steps,
+                    "progress": guard.snapshot(),
+                },
+            )
+            metrics = self.metrics.snapshot(str(run["run_id"]), persist=True)
+            return {
+                "status": "CHECKPOINTED",
+                "run_id": run["run_id"],
+                "checkpoint": checkpoint,
+                "continuation_required": True,
+                "retryable": True,
+                "retry_classification": "CONTINUATION",
+                "metrics": metrics,
+            }
+        return _deadline_result(run, next_step)
 
     def _verify_unobserved_evidence(
         self,
@@ -356,7 +473,7 @@ class AgenticResearchRuntime:
         step_id: str,
         claims: list[dict[str, Any]],
         *,
-        max_opened_sources: int,
+        max_opened_sources: int | None,
     ) -> None:
         observed = self.repository.observed_sources(str(run["run_id"]))
         observed_urls = {
@@ -366,7 +483,16 @@ class AgenticResearchRuntime:
         verified_events: list[dict[str, Any]] = []
         current_run = self.repository.get_run(str(run["run_id"])) or {}
         remaining_open_budget = max(
-            max_opened_sources
+            (
+                max_opened_sources
+                if max_opened_sources is not None
+                else int(current_run.get("opened_source_count") or 0)
+                + sum(
+                    len(claim.get("evidence") or [])
+                    for claim in claims
+                    if isinstance(claim, dict)
+                )
+            )
             - int(current_run.get("opened_source_count") or 0),
             0,
         )
@@ -423,17 +549,73 @@ def _source_domains(payload: Any) -> list[str]:
     return sorted(domains)
 
 
+def _reconcile_declared_sources(
+    output: dict[str, Any],
+    observed_sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reconciled = dict(output)
+    sources: list[dict[str, Any]] = []
+    for raw in output.get("sources") or []:
+        if not isinstance(raw, dict):
+            continue
+        source = dict(raw)
+        model_declared_status = source.get("source_status")
+        model_declared_evidence = source.get("evidence_available")
+        model_declared_http_status = source.get("http_status")
+        model_declared_content_hash = source.get("content_hash")
+        url = str(source.get("canonical_url") or source.get("source_url") or "")
+        observation = next(
+            (
+                item
+                for item in observed_sources
+                if _source_key(
+                    item.get("canonical_url") or item.get("source_url")
+                )
+                == _source_key(url)
+            ),
+            None,
+        )
+        payload = (observation or {}).get("payload") or {}
+        content_verified = bool(
+            observation
+            and (
+                observation.get("content_hash")
+                or payload.get("evidence_text_verified") is True
+            )
+        )
+        source.update(
+            {
+                "model_declared_status": model_declared_status,
+                "model_declared_evidence_available": model_declared_evidence,
+                "model_declared_http_status": model_declared_http_status,
+                "model_declared_content_hash": model_declared_content_hash,
+                "observed_status": "OPENED" if observation else "UNVERIFIED",
+                "verified_status": (
+                    "VERIFIED" if content_verified else "UNVERIFIED"
+                ),
+                "source_status": "OPENED" if observation else "UNVERIFIED",
+                "evidence_available": content_verified,
+                "http_status": (
+                    observation.get("http_status") if observation else None
+                ),
+                "content_hash": (
+                    observation.get("content_hash") if observation else None
+                ),
+            }
+        )
+        sources.append(source)
+    reconciled["sources"] = sources
+    return reconciled
+
+
+def _source_key(value: Any) -> str:
+    return str(value or "").strip().lower().rstrip("/")
+
+
 def _enforce_step_limits(output: dict[str, Any]) -> None:
     # Model-declared arrays are intentionally not treated as observed usage.
     if not isinstance(output, dict):
         raise ValueError("agent_step_output_not_object")
-
-
-def _elapsed_job_seconds(job: dict[str, Any]) -> float:
-    started = parse_datetime(job.get("started_at"))
-    if started is None:
-        return 0.0
-    return max((datetime.now(UTC) - started).total_seconds(), 0.0)
 
 
 def _deadline_result(run: dict[str, Any], step_name: str) -> dict[str, Any]:

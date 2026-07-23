@@ -127,7 +127,7 @@ def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
         FROM research_runs r
         JOIN ai_research_jobs j ON j.job_id=r.job_id
         WHERE (
-          j.status IN ('SUCCEEDED','PARTIAL','NO_DATA','REJECTED','FAILED','TIMED_OUT','CANCELLED')
+          j.status IN ('SUCCEEDED','PARTIAL','NO_DATA','REJECTED','FAILED','LOOP_DETECTED','TIMED_OUT','CANCELLED')
           AND r.status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
         ) OR (
           j.status='RETRY_SCHEDULED' AND r.status='RUNNING'
@@ -136,7 +136,13 @@ def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
     ).fetchall()
     now = datetime.now(UTC).replace(microsecond=0).isoformat()
     repaired = 0
-    failure_statuses = {"REJECTED", "FAILED", "TIMED_OUT", "CANCELLED"}
+    failure_statuses = {
+        "REJECTED",
+        "FAILED",
+        "LOOP_DETECTED",
+        "TIMED_OUT",
+        "CANCELLED",
+    }
     for row in rows:
         job_status = str(row["job_status"])
         if job_status == "RETRY_SCHEDULED":

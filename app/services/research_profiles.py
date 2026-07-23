@@ -99,6 +99,7 @@ def prompt_context(
             "context_date": request.get("context_date"), "market_session": request.get("market_session"),
         },
         "limits": {
+            "budget_mode": str(budget.get("budget_mode") or "observe"),
             "max_searches": max_searches,
             "max_opened_sources": max_opened_sources,
             "remaining_searches": int(
@@ -128,6 +129,7 @@ def prompt_context(
         "completed_opened_sources": (
             budget.get("completed_opened_sources") or []
         ),
+        "threshold_exceeded": budget.get("threshold_exceeded") or {},
         "no_data_criteria": profile.no_data_criteria,
         "prohibitions": [
             "no invented data", "no trading recommendations", "no orders", "no buy/sell",

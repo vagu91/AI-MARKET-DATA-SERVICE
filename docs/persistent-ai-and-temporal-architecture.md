@@ -52,20 +52,53 @@ increasing an environment value is not required for structural compatibility.
 Every phase receives numeric limits, plus already completed queries and opened
 URLs on recovery.
 
-Observed JSONL tool events are authoritative usage. They are persisted and counted
-transactionally as they arrive, including the event that demonstrates an
-overshoot; model-declared result arrays do not consume or prove tool usage. At the
-configured boundary the prompt and schema prohibit more work. If Codex emits an
-additional search or open event, the process group is stopped and the step fails
-with non-retryable `BUDGET_EXCEEDED` diagnostics containing the resource, limit,
-observed count, prior remainder, compact event tail and effective usage. Normal
-bounded completion with no accepted evidence is `NO_DATA`; accepted incomplete
-coverage is `PARTIAL`; only a contract overshoot or technical failure is `FAILED`.
+Observed JSONL tool events are authoritative usage. Each bounded, redacted
+envelope preserves raw event type, lifecycle, item identity/type, phase, provider
+tool type, semantic action, query or URL, fingerprint, status and available
+usage. `started`, `completed` and replayed events for one action share a
+fingerprint; only one terminal completed action consumes usage. Empty lifecycle
+events remain observable but do not increment counters. A URL-only `web_search`
+is an `open_source` action during `OPEN_SOURCE` and an open/verify action during
+`CROSS_CHECK`, rather than an economic search.
+
+`AI_MARKET_RESEARCH_BUDGET_MODE=observe` is the initial default. Per-run and daily
+search/open values are telemetry thresholds: overshoot records a compact warning
+and execution continues while it produces new sources, claims or phase progress.
+`enforce` retains non-retryable `BUDGET_EXCEEDED`, but applies it only to
+deduplicated terminal actions. The independent emergency tool-action ceiling,
+per-call watchdog, cancellation, heartbeat and process-group termination remain
+active in both modes.
+
+The progress guard detects repeated normalized queries without new URLs, reopened
+URLs without new evidence, cyclic fingerprint sequences, configurable
+no-progress windows and the emergency ceiling. It emits non-retryable
+`LOOP_DETECTED`; many searches that continue discovering new sources are not a
+loop. All thresholds are configurable in `.env.example`.
+
+At the end of a productive operational window, the run stores a checkpoint and
+the worker schedules a technical continuation instead of reporting a timeout.
+Completed phases and tool fingerprints are reused on resume, the same logical
+job/run is retained, and the continuation does not consume a new daily run.
+Single-call watchdogs and an unproductive overall deadline still fail closed.
+
+Model-declared `OPENED`, evidence availability, HTTP status and content hashes are
+retained only as declarations. Runtime reconciliation records separate observed
+and verified states; only terminal tool observations, deterministic server
+verification, or valid cached lineage can establish them. Claims referencing
+unobserved or unverified evidence are rejected. Source domains are derived from
+policy-valid observed canonical URLs.
+
+Per-run metrics include raw/normalized/deduplicated action counts, token fields,
+searches/opens/new sources, extracted/accepted/rejected claims, phase durations,
+tokens and cost per accepted claim, searches per new source, warnings, loops and
+continuations. Monetary cost is `cost_unavailable` unless the runtime actually
+provides it.
 
 | Failure category | Retry |
 | --- | --- |
 | invalid schema, unsupported argument, invalid config, missing auth/executable, incompatible output contract, deterministic policy rejection | never |
 | `BUDGET_EXCEEDED` contract violation | never |
+| `LOOP_DETECTED` with bounded fingerprint evidence | never |
 | rate limit, watchdog timeout, temporary network failure, backend 5xx, documented transient interruption | bounded backoff |
 | unknown/opaque CLI exit | never (fail closed) |
 
@@ -87,8 +120,10 @@ Job and run lifecycle is synchronized transactionally:
 | Job transition | Run transition | Step behavior |
 | --- | --- | --- |
 | acquired | `RUNNING` | failed step can start a new numbered attempt |
+| productive window checkpoint | `RETRY_SCHEDULED` | completed steps and deduplicated tool events are retained |
 | transient failure | `RETRY_SCHEDULED` | current attempt remains terminal and queryable |
 | `SUCCEEDED`, `PARTIAL`, `NO_DATA` | same terminal status, `completed_at` set | completed history retained |
+| `LOOP_DETECTED` | same terminal status, `completed_at` set | bounded loop evidence retained |
 | `FAILED`, `TIMED_OUT`, `CANCELLED`, `REJECTED` | same terminal status, `completed_at` set | diagnostic and blocking gaps retained |
 
 Migration/startup reconciliation is idempotent. A terminal job linked to a `PENDING`, `RUNNING` or `RETRY_SCHEDULED` run closes that run without deleting history. An active run linked to a retry-scheduled job becomes `RETRY_SCHEDULED`.

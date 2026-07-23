@@ -96,6 +96,11 @@ try {
         trading_or_order_endpoints_called = $false
         ai_trader_modified = $false
         requested_job_count = 1
+        research_metrics = Get-SmokeCompactResearchMetrics $run.metrics
+        budget_mode = $run.metrics.budget_mode
+        threshold_exceeded = @($run.metrics.threshold_warnings)
+        checkpoint = $run.checkpoint
+        continuation_count = $run.continuation_count
     }
     $summary | ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath "$outputPath\summary.json" -Encoding utf8
@@ -130,6 +135,17 @@ catch {
             )
             effective_usage = $diagnostic.effective_usage
             effective_budget = Get-SmokeCompactBudget $diagnostic.effective_budget
+            budget_mode = $run.metrics.budget_mode
+            threshold_exceeded = @($run.metrics.threshold_warnings)
+            research_metrics = Get-SmokeCompactResearchMetrics $run.metrics
+            progress = $diagnostic.progress
+            loop_guard = [ordered]@{
+                category = $diagnostic.category
+                reason = $diagnostic.reason
+                fingerprints = @($diagnostic.fingerprints) | Select-Object -Last 12
+            }
+            checkpoint = $run.checkpoint
+            continuation_count = $run.continuation_count
             diagnostic = [ordered]@{
                 category = $diagnostic.category
                 resource = $diagnostic.resource

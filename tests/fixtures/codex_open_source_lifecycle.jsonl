@@ -1,0 +1,5 @@
+{"type":"item.started","item":{"id":"open-bls-1","type":"web_search","query":"https://www.bls.gov/news.release/cpi.nr0.htm"}}
+{"type":"item.completed","item":{"id":"open-bls-1","type":"web_search","query":"https://www.bls.gov/news.release/cpi.nr0.htm","url":"https://www.bls.gov/news.release/cpi.nr0.htm","http_status":200,"content_hash":"bls-content-hash"}}
+{"type":"item.started","item":{"id":"fetch-fed-1","type":"web_fetch","url":"https://www.federalreserve.gov/monetarypolicy.htm"}}
+{"type":"item.completed","item":{"id":"fetch-fed-1","type":"web_fetch","url":"https://www.federalreserve.gov/monetarypolicy.htm","status_code":200,"content_hash":"fed-content-hash"}}
+{"type":"item.failed","item":{"id":"fetch-bea-failed","type":"web_fetch","url":"https://www.bea.gov/news/glance","status":"failed"}}

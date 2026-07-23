@@ -569,7 +569,7 @@ def test_additive_migration_from_v8_preserves_rows_and_adds_runtime(tmp_path: Pa
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('preserved','Preserved','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 11
+    assert migrate_database(database)["schema_version"] == 12
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT title FROM market_news WHERE news_key='preserved'").fetchone()[0] == "Preserved"
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -589,7 +589,7 @@ def test_additive_migration_from_v9_preserves_rows_and_adds_verified_runtime(tmp
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('v9-preserved','V9','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 11
+    assert migrate_database(database)["schema_version"] == 12
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT title FROM market_news WHERE news_key='v9-preserved'").fetchone()[0] == "V9"
         columns = {row[1] for row in conn.execute("PRAGMA table_info(research_runs)")}
@@ -927,7 +927,8 @@ def test_agentic_deadline_is_global_not_reapplied_per_phase(tmp_path: Path) -> N
     result = AgenticResearchRuntime(cfg, monotonic=clock, verifier=NullEvidenceVerifier()).run(
         job, tmp_path / "deadline", executor, 5,
     )
-    assert result["status"] == "TIMED_OUT" and result["error"] == "overall_job_deadline_expired"
+    assert result["status"] == "CHECKPOINTED"
+    assert result["continuation_required"] is True
     assert executor.watchdogs == [5, 3, 1]
 
 
@@ -941,7 +942,11 @@ class ToolBudgetExecutor:
 
 
 def test_observed_tool_budget_is_cumulative_across_run(tmp_path: Path) -> None:
-    cfg = settings(tmp_path, research_max_searches=2)
+    cfg = settings(
+        tmp_path,
+        research_max_searches=2,
+        research_budget_mode="enforce",
+    )
     job, _ = AIResearchJobService(cfg).enqueue_explicit(
         job_type="MNQ_MARKET_RESEARCH", symbol="MNQ", correlation_id="budget",
         request_payload={"database_context": {}},

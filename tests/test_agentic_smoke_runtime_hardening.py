@@ -806,7 +806,7 @@ def test_additive_migration_from_schema_10_preserves_rows_and_repairs_run(
         conn.commit()
 
     result = migrate_database(database)
-    assert result["schema_version"] == 11
+    assert result["schema_version"] == 12
     assert result["reconciled_research_runs"] == 1
     with connect_sqlite(database) as conn:
         job = conn.execute(
@@ -1063,14 +1063,12 @@ catch {{
     assert report["remaining_before_step"] == 8
     assert report["step"] == "SEARCH"
     assert report["retry_classification"] == "NON_RETRYABLE"
-    assert report["tool_events_observed"] == [
-        {
-            "event_type": "search",
-            "query": "bounded query",
-            "source_url": "",
-            "canonical_url": "",
-        }
-    ]
+    assert len(report["tool_events_observed"]) == 1
+    event = report["tool_events_observed"][0]
+    assert event["event_type"] == "search"
+    assert event["query"] == "bounded query"
+    assert event["source_url"] == ""
+    assert event["canonical_url"] == ""
     assert report["effective_usage"]["search_count"] == 9
     assert report["effective_budget"]["remaining_searches"] == 0
     assert report["diagnostic"]["category"] == "BUDGET_EXCEEDED"
