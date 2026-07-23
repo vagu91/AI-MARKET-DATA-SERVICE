@@ -109,7 +109,8 @@ try {
 catch {
     $failureMessage = $_.Exception.Message
     try {
-        $diagnostic = $latestAttempt.diagnostic
+        $diagnostic = $currentStep.diagnostic
+        if (-not $diagnostic) { $diagnostic = $latestAttempt.diagnostic }
         if (-not $diagnostic) { $diagnostic = $job.last_diagnostic }
         $failureStep = $diagnostic.step
         if (-not $failureStep) { $failureStep = $currentStep.step_name }
@@ -148,10 +149,19 @@ catch {
             continuation_count = $run.continuation_count
             diagnostic = [ordered]@{
                 category = $diagnostic.category
+                exception_type = $diagnostic.exception_type
+                message = ConvertTo-SmokeSafeText $diagnostic.message 500
                 resource = $diagnostic.resource
                 step = $diagnostic.step
+                claim_ref = $diagnostic.claim_ref
+                topic = $diagnostic.topic
+                field_semantics = $diagnostic.field_semantics
+                run_id = $diagnostic.run_id
+                job_id = $diagnostic.job_id
                 retry_classification = $diagnostic.retry_classification
                 timestamp = $diagnostic.timestamp
+                stack_fingerprint = $diagnostic.stack_fingerprint
+                transaction_outcome = $diagnostic.transaction_outcome
             }
             capability_status = $capabilities.status
             queue_metrics = $queue.metrics

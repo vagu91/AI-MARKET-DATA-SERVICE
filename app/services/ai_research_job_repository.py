@@ -187,9 +187,15 @@ class AIResearchJobRepository:
                 SELECT SUM(CASE WHEN validation_status='accepted' THEN 1 ELSE 0 END) accepted,
                        SUM(CASE WHEN validation_status!='accepted' THEN 1 ELSE 0 END) rejected
                 FROM research_claims
+                WHERE materialization_status!='ORPHANED'
                 """
             ).fetchone()
-            unique_domains = conn.execute("SELECT COUNT(DISTINCT source_domain) FROM research_evidence").fetchone()[0]
+            unique_domains = conn.execute(
+                """
+                SELECT COUNT(DISTINCT source_domain)
+                FROM research_evidence WHERE audit_status='ACTIVE'
+                """
+            ).fetchone()[0]
             usage_metrics = conn.execute(
                 """
                 SELECT COUNT(*) AS run_count,

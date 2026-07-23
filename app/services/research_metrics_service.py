@@ -66,7 +66,8 @@ class ResearchMetricsService:
                          AS accepted,
                        SUM(CASE WHEN validation_status!='accepted' THEN 1 ELSE 0 END)
                          AS rejected
-                FROM research_claims WHERE research_run_id=?
+                FROM research_claims
+                WHERE research_run_id=? AND materialization_status!='ORPHANED'
                 """,
                 (run_id,),
             ).fetchone()
@@ -82,8 +83,9 @@ class ResearchMetricsService:
                 SELECT COUNT(DISTINCT canonical_url)
                 FROM research_evidence
                 WHERE claim_id IN (
-                  SELECT claim_id FROM research_claims WHERE research_run_id=?
-                ) AND source_status='VERIFIED'
+                  SELECT claim_id FROM research_claims
+                  WHERE research_run_id=? AND materialization_status!='ORPHANED'
+                ) AND source_status='VERIFIED' AND audit_status='ACTIVE'
                 """,
                 (run_id,),
             ).fetchone()[0]

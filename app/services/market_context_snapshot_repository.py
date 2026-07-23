@@ -116,7 +116,11 @@ class MarketContextSnapshotRepository:
     def latest(self, symbol: str = "MNQ") -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
-                "SELECT * FROM market_context_snapshots WHERE symbol=? ORDER BY revision DESC LIMIT 1",
+                """
+                SELECT * FROM market_context_snapshots
+                WHERE symbol=? AND audit_status='ACTIVE'
+                ORDER BY revision DESC LIMIT 1
+                """,
                 (symbol.upper(),),
             ).fetchone()
         return self._row(row) if row else None
