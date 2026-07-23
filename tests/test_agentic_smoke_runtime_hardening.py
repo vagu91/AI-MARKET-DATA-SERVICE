@@ -941,3 +941,136 @@ catch {{
     assert catch_body.index("Write-SmokeFailureReport") < catch_body.rindex(
         "\n    throw\n"
     )
+
+
+def test_smoke_failure_report_contains_complete_budget_diagnostic(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "smoke_test_market_research.ps1"
+    )
+    output = tmp_path / "budget-failure"
+    command = f"""
+function global:Invoke-RestMethod {{
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [string]$ContentType,
+        [string]$Body
+    )
+    if ($Uri -match '/ai-research/capabilities$') {{
+        return [pscustomobject]@{{ status = 'READY_TO_SMOKE' }}
+    }}
+    if ($Method -eq 'Post') {{
+        return [pscustomobject]@{{ run_id = 'run-budget'; job_id = 'job-budget' }}
+    }}
+    if ($Uri -match '/market-research/mnq/runs/run-budget$') {{
+        return [pscustomobject]@{{
+            status = 'FAILED'
+            steps = @([pscustomobject]@{{ step_name = 'SEARCH'; status = 'FAILED' }})
+        }}
+    }}
+    if ($Uri -match '/ai-research/jobs/job-budget$') {{
+        $diagnostic = [pscustomobject]@{{
+            category = 'BUDGET_EXCEEDED'
+            resource = 'searches'
+            configured_limit = 8
+            observed_count = 9
+            remaining_before_step = 8
+            step = 'SEARCH'
+            retry_classification = 'NON_RETRYABLE'
+            timestamp = '2026-07-23T10:00:00+00:00'
+            tool_events_observed = @(
+                [pscustomobject]@{{
+                    event_type = 'search'
+                    query = 'bounded query'
+                    source_url = $null
+                    canonical_url = $null
+                }}
+            )
+            effective_usage = [pscustomobject]@{{
+                search_count = 9
+                opened_source_count = 0
+            }}
+            effective_budget = [pscustomobject]@{{
+                max_searches = 8
+                max_opened_sources = 12
+                remaining_searches = 0
+                remaining_opened_sources = 12
+                daily_runs_remaining = 7
+                daily_searches_remaining = 55
+                daily_opened_sources_remaining = 96
+                remaining_runtime_seconds = 420
+            }}
+        }}
+        return [pscustomobject]@{{
+            status = 'FAILED'
+            attempts = 1
+            max_attempts = 3
+            attempt_history = @(
+                [pscustomobject]@{{ status = 'FAILED'; diagnostic = $diagnostic }}
+            )
+            last_diagnostic = $diagnostic
+        }}
+    }}
+    if ($Uri -match '/ai-research/status$') {{
+        return [pscustomobject]@{{
+            metrics = [pscustomobject]@{{ queue_depth = 0; running_jobs = 0 }}
+        }}
+    }}
+    throw "unexpected URI: $Uri"
+}}
+try {{
+    & '{script}' -OutputDirectory '{output}' -TimeoutSeconds 1
+    exit 2
+}}
+catch {{
+    exit 0
+}}
+"""
+    wrapper = tmp_path / "budget-failure-wrapper.ps1"
+    wrapper.write_text(command, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(wrapper),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(
+        (output / "failure-report.json").read_text(encoding="utf-8-sig")
+    )
+    assert report["error_category"] == "BUDGET_EXCEEDED"
+    assert report["resource"] == "searches"
+    assert report["configured_limit"] == 8
+    assert report["observed_count"] == 9
+    assert report["remaining_before_step"] == 8
+    assert report["step"] == "SEARCH"
+    assert report["retry_classification"] == "NON_RETRYABLE"
+    assert report["tool_events_observed"] == [
+        {
+            "event_type": "search",
+            "query": "bounded query",
+            "source_url": "",
+            "canonical_url": "",
+        }
+    ]
+    assert report["effective_usage"]["search_count"] == 9
+    assert report["effective_budget"]["remaining_searches"] == 0
+    assert report["diagnostic"]["category"] == "BUDGET_EXCEEDED"

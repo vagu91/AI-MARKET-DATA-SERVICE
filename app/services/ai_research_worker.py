@@ -19,7 +19,7 @@ from app.services.event_value_candidate_repository import EventValueCandidateRep
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_capability_service import AIResearchCapabilityService
 from app.services.db_only_market_context_materializer import DBOnlyMarketContextMaterializer
-from app.services.codex_runtime_contract import CodexCLIError, classify_codex_failure
+from app.services.codex_runtime_contract import classify_codex_failure
 
 
 logger = logging.getLogger(__name__)
@@ -252,10 +252,10 @@ class AIResearchWorker:
             logger.info("ai_job_completed", extra={**context, "status": terminal})
             return True
         except Exception as exc:
-            diagnostic = exc.diagnostic if isinstance(exc, CodexCLIError) else None
-            if isinstance(exc, CodexCLIError):
-                error_code = exc.code
-                retryable = exc.retryable
+            diagnostic = getattr(exc, "diagnostic", None)
+            if hasattr(exc, "code") and hasattr(exc, "retryable"):
+                error_code = str(exc.code)
+                retryable = bool(exc.retryable)
             else:
                 category, retryable = classify_codex_failure(
                     exit_code=None,

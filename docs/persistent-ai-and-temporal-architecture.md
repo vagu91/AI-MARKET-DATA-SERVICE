@@ -43,9 +43,29 @@ The prompt is supplied only on stdin. The command always requests web search, a 
 
 The final-message file is the primary structured payload. JSONL contributes only event telemetry, observed searches/source opens, usage and `error`/`turn.failed` diagnostics. Every object schema is closed, every array has defined bounded items, nullable fields are explicit and the AI contract cannot produce numeric `actual` values. Source tiers, confirmation counts and verification remain server-computed.
 
+Each run persists one effective budget as the source of truth for prompts, dynamic
+schemas, execution, recovery, capability checks, telemetry and failure reports.
+It combines per-run search/open limits, remaining daily capacity and the runtime
+deadline. The MNQ profile retains the default of eight searches for ten required
+topics by grouping compatible topics into no more than eight planned queries;
+increasing an environment value is not required for structural compatibility.
+Every phase receives numeric limits, plus already completed queries and opened
+URLs on recovery.
+
+Observed JSONL tool events are authoritative usage. They are persisted and counted
+transactionally as they arrive, including the event that demonstrates an
+overshoot; model-declared result arrays do not consume or prove tool usage. At the
+configured boundary the prompt and schema prohibit more work. If Codex emits an
+additional search or open event, the process group is stopped and the step fails
+with non-retryable `BUDGET_EXCEEDED` diagnostics containing the resource, limit,
+observed count, prior remainder, compact event tail and effective usage. Normal
+bounded completion with no accepted evidence is `NO_DATA`; accepted incomplete
+coverage is `PARTIAL`; only a contract overshoot or technical failure is `FAILED`.
+
 | Failure category | Retry |
 | --- | --- |
 | invalid schema, unsupported argument, invalid config, missing auth/executable, incompatible output contract, deterministic policy rejection | never |
+| `BUDGET_EXCEEDED` contract violation | never |
 | rate limit, watchdog timeout, temporary network failure, backend 5xx, documented transient interruption | bounded backoff |
 | unknown/opaque CLI exit | never (fail closed) |
 

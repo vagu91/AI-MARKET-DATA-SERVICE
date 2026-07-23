@@ -48,6 +48,41 @@ function Write-SmokeFailureReport {
     return $Report["report_path"]
 }
 
+function Get-SmokeCompactToolEvents {
+    param(
+        [AllowNull()]
+        [object[]]$Events
+    )
+
+    return @($Events) | Select-Object -Last 20 | ForEach-Object {
+        [ordered]@{
+            event_type = ConvertTo-SmokeSafeText $_.event_type 80
+            query = ConvertTo-SmokeSafeText $_.query 300
+            source_url = ConvertTo-SmokeSafeText $_.source_url 500
+            canonical_url = ConvertTo-SmokeSafeText $_.canonical_url 500
+        }
+    }
+}
+
+function Get-SmokeCompactBudget {
+    param(
+        [AllowNull()]
+        [object]$Budget
+    )
+
+    if (-not $Budget) { return $null }
+    return [ordered]@{
+        max_searches = $Budget.max_searches
+        max_opened_sources = $Budget.max_opened_sources
+        remaining_searches = $Budget.remaining_searches
+        remaining_opened_sources = $Budget.remaining_opened_sources
+        daily_runs_remaining = $Budget.daily_runs_remaining
+        daily_searches_remaining = $Budget.daily_searches_remaining
+        daily_opened_sources_remaining = $Budget.daily_opened_sources_remaining
+        remaining_runtime_seconds = $Budget.remaining_runtime_seconds
+    }
+}
+
 function Get-SmokePollingDecision {
     param(
         [string]$RunStatus,

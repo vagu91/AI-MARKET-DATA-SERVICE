@@ -67,7 +67,22 @@ def profile_for_job(job_type: str) -> ResearchProfile:
     return PROFILES[JOB_PROFILE.get(job_type, "MNQ_MARKET_RESEARCH")]
 
 
-def prompt_context(profile: ResearchProfile, request: dict[str, Any]) -> dict[str, Any]:
+def prompt_context(
+    profile: ResearchProfile,
+    request: dict[str, Any],
+    effective_budget: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    budget = dict(effective_budget or {})
+    max_searches = int(
+        budget.get("max_searches")
+        if budget.get("max_searches") is not None
+        else request.get("max_searches") or 0
+    )
+    max_opened_sources = int(
+        budget.get("max_opened_sources")
+        if budget.get("max_opened_sources") is not None
+        else request.get("max_opened_sources") or 0
+    )
     return {
         "profile_id": profile.profile_id,
         "prompt_version": profile.prompt_version,
@@ -84,9 +99,35 @@ def prompt_context(profile: ResearchProfile, request: dict[str, Any]) -> dict[st
             "context_date": request.get("context_date"), "market_session": request.get("market_session"),
         },
         "limits": {
-            "max_searches": request.get("max_searches"),
-            "max_opened_sources": request.get("max_opened_sources"),
+            "max_searches": max_searches,
+            "max_opened_sources": max_opened_sources,
+            "remaining_searches": int(
+                budget.get("remaining_searches", max_searches)
+            ),
+            "remaining_opened_sources": int(
+                budget.get(
+                    "remaining_opened_sources",
+                    max_opened_sources,
+                )
+            ),
+            "daily_runs_remaining": int(
+                budget.get("daily_runs_remaining") or 0
+            ),
+            "daily_searches_remaining": int(
+                budget.get("daily_searches_remaining") or 0
+            ),
+            "daily_opened_sources_remaining": int(
+                budget.get("daily_opened_sources_remaining") or 0
+            ),
+            "remaining_runtime_seconds": int(
+                budget.get("remaining_runtime_seconds") or 0
+            ),
         },
+        "query_topic_groups": budget.get("query_topic_groups") or [],
+        "completed_queries": budget.get("completed_queries") or [],
+        "completed_opened_sources": (
+            budget.get("completed_opened_sources") or []
+        ),
         "no_data_criteria": profile.no_data_criteria,
         "prohibitions": [
             "no invented data", "no trading recommendations", "no orders", "no buy/sell",
