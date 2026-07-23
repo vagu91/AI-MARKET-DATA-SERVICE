@@ -612,6 +612,35 @@ CREATE INDEX IF NOT EXISTS idx_ai_live_verifications_latest
   ON ai_research_live_verifications(backend, verified_at DESC);
 """
 
+AGENTIC_RUNTIME_DIAGNOSTICS_SCHEMA = """
+ALTER TABLE ai_research_jobs ADD COLUMN last_diagnostic_json TEXT NULL;
+
+ALTER TABLE ai_research_job_attempts ADD COLUMN error_category TEXT NULL;
+ALTER TABLE ai_research_job_attempts ADD COLUMN exit_code INTEGER NULL;
+ALTER TABLE ai_research_job_attempts ADD COLUMN retry_classification TEXT NULL;
+ALTER TABLE ai_research_job_attempts ADD COLUMN diagnostic_json TEXT NULL;
+
+ALTER TABLE research_run_steps ADD COLUMN diagnostic_json TEXT NULL;
+
+CREATE TABLE IF NOT EXISTS research_step_attempts (
+  step_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  run_id TEXT NOT NULL,
+  step_name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT NULL,
+  error TEXT NULL,
+  diagnostic_json TEXT NULL,
+  PRIMARY KEY(step_id, attempt),
+  FOREIGN KEY(step_id) REFERENCES research_run_steps(step_id),
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_step_attempts_run
+  ON research_step_attempts(run_id, step_name, attempt);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -624,4 +653,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("008_ai_job_scoping_and_snapshot_links", AI_JOB_SCOPING_SCHEMA),
     ("009_semantic_actuals_and_agentic_research_runtime", AGENTIC_RESEARCH_RUNTIME_SCHEMA),
     ("010_verified_evidence_deadlines_and_completeness", VERIFIED_RESEARCH_RUNTIME_SCHEMA),
+    ("011_agentic_runtime_diagnostics_and_step_history", AGENTIC_RUNTIME_DIAGNOSTICS_SCHEMA),
 )

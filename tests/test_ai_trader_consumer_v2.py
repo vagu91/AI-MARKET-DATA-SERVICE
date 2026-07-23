@@ -448,6 +448,7 @@ def test_consumer_v2_contract_name_schema_and_payload_size() -> None:
 
 def test_consumer_with_fmp_earnings_and_xtb_calendar_stays_under_90kb() -> None:
     full = minimal_full()
+    today = datetime.now(NY).date()
     full["nasdaq_context"]["earnings"] = {
         "upcoming": [
             {
@@ -457,7 +458,11 @@ def test_consumer_with_fmp_earnings_and_xtb_calendar_stays_under_90kb() -> None:
                 "retrieved_at_utc": "2026-07-12T06:00:00Z",
                 "lineage": {"date": {"source": "Financial Modeling Prep Earnings Calendar", "source_field": "date"}},
             }
-            for symbol, date in (("NFLX", "2026-07-16"), ("TSLA", "2026-07-22"), ("GOOGL", "2026-07-23"))
+            for symbol, date in (
+                ("NFLX", (today - timedelta(days=1)).isoformat()),
+                ("TSLA", (today + timedelta(days=1)).isoformat()),
+                ("GOOGL", (today + timedelta(days=2)).isoformat()),
+            )
         ]
     }
     full["economic_calendar_enrichment"] = {

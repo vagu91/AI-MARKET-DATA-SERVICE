@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.data_freshness_service import parse_datetime
+from app.services.codex_runtime_contract import sanitize_diagnostic
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.research_profiles import PROFILES
 from app.services.source_policy_service import SourcePolicyService
@@ -97,7 +98,8 @@ class ResearchRuntimeRepository:
                 conn.execute(
                     """
                     UPDATE research_run_steps SET status='RUNNING',attempt=attempt+1,input_checksum=?,
-                      input_json=?,backend=?,tool=?,started_at=?,completed_at=NULL,error=NULL
+                      input_json=?,backend=?,tool=?,started_at=?,completed_at=NULL,error=NULL,
+                      diagnostic_json=NULL
                     WHERE step_id=?
                     """,
                     (_checksum(input_payload), input_json, backend, tool, now, row["step_id"]),
@@ -106,10 +108,24 @@ class ResearchRuntimeRepository:
                 "UPDATE research_runs SET status='RUNNING',started_at=COALESCE(started_at,?),updated_at=? WHERE run_id=?",
                 (now, now, run_id),
             )
-            conn.commit()
             restored = conn.execute(
                 "SELECT * FROM research_run_steps WHERE run_id=? AND step_name=?", (run_id, step_name)
             ).fetchone()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO research_step_attempts(
+                  step_id,attempt,run_id,step_name,status,started_at
+                ) VALUES (?,?,?,?,'RUNNING',?)
+                """,
+                (
+                    restored["step_id"],
+                    restored["attempt"],
+                    run_id,
+                    step_name,
+                    now,
+                ),
+            )
+            conn.commit()
         return self._step_row(restored), True
 
     def complete_step(self, step_id: str, output: dict[str, Any], *, source_domains: list[str] | None = None) -> dict[str, Any]:
@@ -124,16 +140,50 @@ class ResearchRuntimeRepository:
                 """,
                 (_checksum(output), output_json, _json(sorted(set(source_domains or []))), now, now, step_id),
             )
+            conn.execute(
+                """
+                UPDATE research_step_attempts
+                SET status='COMPLETED',completed_at=?
+                WHERE step_id=? AND attempt=(
+                  SELECT attempt FROM research_run_steps WHERE step_id=?
+                )
+                """,
+                (now, step_id, step_id),
+            )
             conn.commit()
             row = conn.execute("SELECT * FROM research_run_steps WHERE step_id=?", (step_id,)).fetchone()
         return self._step_row(row)
 
-    def fail_step(self, step_id: str, error: str) -> None:
+    def fail_step(
+        self,
+        step_id: str,
+        error: str,
+        *,
+        diagnostic: dict[str, Any] | None = None,
+    ) -> None:
         now = _now()
+        safe_diagnostic = sanitize_diagnostic(diagnostic) if diagnostic else None
+        diagnostic_json = _json(safe_diagnostic) if safe_diagnostic else None
+        compact_error = str(error)[:1000]
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute(
-                "UPDATE research_run_steps SET status='FAILED',error=?,completed_at=? WHERE step_id=?",
-                (error[:1000], now, step_id),
+                """
+                UPDATE research_run_steps
+                SET status='FAILED',error=?,completed_at=?,diagnostic_json=?,
+                    duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER)
+                WHERE step_id=?
+                """,
+                (compact_error, now, diagnostic_json, now, step_id),
+            )
+            conn.execute(
+                """
+                UPDATE research_step_attempts
+                SET status='FAILED',completed_at=?,error=?,diagnostic_json=?
+                WHERE step_id=? AND attempt=(
+                  SELECT attempt FROM research_run_steps WHERE step_id=?
+                )
+                """,
+                (now, compact_error, diagnostic_json, step_id, step_id),
             )
             conn.commit()
 
@@ -321,7 +371,29 @@ class ResearchRuntimeRepository:
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute("SELECT * FROM research_runs WHERE run_id=?", (run_id,)).fetchone()
-        return self._run_row(row) if row else None
+            steps = conn.execute(
+                "SELECT * FROM research_run_steps WHERE run_id=? ORDER BY ordinal",
+                (run_id,),
+            ).fetchall()
+            histories = conn.execute(
+                """
+                SELECT * FROM research_step_attempts
+                WHERE run_id=? ORDER BY step_name,attempt
+                """,
+                (run_id,),
+            ).fetchall()
+        if row is None:
+            return None
+        restored = self._run_row(row)
+        by_step: dict[str, list[dict[str, Any]]] = {}
+        for item in histories:
+            attempt = self._step_attempt_row(item)
+            by_step.setdefault(str(attempt["step_id"]), []).append(attempt)
+        restored["steps"] = [
+            {**self._step_row(step), "attempt_history": by_step.get(str(step["step_id"]), [])}
+            for step in steps
+        ]
+        return restored
 
     def latest(self, symbol: str = "MNQ") -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
@@ -329,7 +401,7 @@ class ResearchRuntimeRepository:
                 "SELECT * FROM research_runs WHERE symbol=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
                 (symbol.upper(),),
             ).fetchone()
-        return self._run_row(row) if row else None
+        return self.get_run(str(row["run_id"])) if row else None
 
     def evidence_for_claim(self, claim_id: str) -> list[dict[str, Any]]:
         with connect_sqlite(self.settings.database_path) as conn:
@@ -548,10 +620,29 @@ class ResearchRuntimeRepository:
     @staticmethod
     def _step_row(row: Any) -> dict[str, Any]:
         data = dict(row)
-        for key in ("input_json", "output_json", "source_domains_json", "telemetry_json"):
+        for key in (
+            "input_json",
+            "output_json",
+            "source_domains_json",
+            "telemetry_json",
+            "diagnostic_json",
+        ):
             data[key.removesuffix("_json")] = json.loads(
-                data.pop(key) or ("[]" if key in {"source_domains_json", "telemetry_json"} else "{}")
+                data.pop(key)
+                or (
+                    "[]"
+                    if key in {"source_domains_json", "telemetry_json"}
+                    else "null"
+                    if key == "diagnostic_json"
+                    else "{}"
+                )
             )
+        return data
+
+    @staticmethod
+    def _step_attempt_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["diagnostic"] = json.loads(data.pop("diagnostic_json") or "null")
         return data
 
 
