@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
+import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
@@ -29,6 +31,18 @@ from app.services.research_tool_telemetry import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class ResearchPersistenceError(RuntimeError):
+    code = "research_persist:unexpected"
+    retryable = False
+
+    def __init__(self, diagnostic: dict[str, Any]) -> None:
+        self.diagnostic = sanitize_diagnostic(diagnostic)
+        self.retry_classification = "NON_RETRYABLE"
+        exception_type = str(self.diagnostic.get("exception_type") or "Exception")
+        self.code = f"research_persist:unexpected:{exception_type}"[:240]
+        super().__init__(self.code)
 
 
 class ResearchRuntimeRepository:
@@ -943,9 +957,12 @@ class ResearchRuntimeRepository:
         self,
         run: dict[str, Any],
         claims: list[dict[str, Any]],
+        *,
+        step_id: str | None = None,
     ) -> dict[str, Any]:
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
+        evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
         evidence_count = 0
         read_back_count = 0
         observed_sources = self.observed_sources(str(run["run_id"]))
@@ -959,92 +976,101 @@ class ResearchRuntimeRepository:
             is not None
         )
         source_domains.discard("")
-        for raw_claim in claims:
-            claim = normalize_research_claim(
-                raw_claim,
-                policy=self.policy,
-                now=self.now(),
+        current_claim: dict[str, Any] | None = None
+        transaction_started = False
+        conn = connect_sqlite(self.settings.database_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            for raw_claim in claims:
+                current_claim = normalize_research_claim(
+                    raw_claim,
+                    policy=self.policy,
+                    now=self.now(),
+                )
+                restored, evidence_rows = self._persist_claim(
+                    conn,
+                    run,
+                    current_claim,
+                    observed_sources,
+                    acquired_sources,
+                )
+                evidence_by_claim[str(restored["claim_id"])] = evidence_rows
+                evidence_count += len(evidence_rows)
+                source_domains.update(row["source_domain"] for row in evidence_rows)
+                if restored["validation_status"] == "accepted":
+                    accepted.append(restored)
+                    if is_not_applicable(restored):
+                        conn.execute(
+                            """
+                            UPDATE research_claims
+                            SET materialization_status='NOT_APPLICABLE'
+                            WHERE claim_id=?
+                            """,
+                            (restored["claim_id"],),
+                        )
+                        restored["materialization_status"] = "NOT_APPLICABLE"
+                        read_back_count += 1
+                    elif self._project_and_read_back(conn, restored, evidence_rows):
+                        conn.execute(
+                            """
+                            UPDATE research_claims
+                            SET materialization_status='MATERIALIZED'
+                            WHERE claim_id=?
+                            """,
+                            (restored["claim_id"],),
+                        )
+                        restored["materialization_status"] = "MATERIALIZED"
+                        read_back_count += 1
+                    else:
+                        raise RuntimeError("research_fact_read_back_failed")
+                else:
+                    rejected.append(restored)
+
+            required_topics = {str(item) for item in run.get("required_topics") or []}
+            completed_topics = {
+                _resolved_topic(run, item)
+                for item in accepted
+                if not is_not_applicable(item)
+            } & required_topics
+            not_applicable_topics = {
+                _resolved_topic(run, item)
+                for item in accepted
+                if is_not_applicable(item)
+            } & required_topics
+            resolved_topics = completed_topics | not_applicable_topics
+            missing_topics = required_topics - resolved_topics
+            coverage_score = len(resolved_topics) / max(len(required_topics), 1)
+            status = (
+                "NO_DATA"
+                if not accepted
+                else "PARTIAL"
+                if missing_topics
+                else "SUCCEEDED"
             )
-            restored, evidence_rows = self._persist_claim(
-                run,
-                claim,
-                observed_sources,
-                acquired_sources,
-            )
-            evidence_count += len(evidence_rows)
-            source_domains.update(row["source_domain"] for row in evidence_rows)
-            if restored["validation_status"] == "accepted":
-                accepted.append(restored)
-                if is_not_applicable(restored):
-                    read_back_count += 1
-                elif self._project_and_read_back(restored, evidence_rows):
-                    read_back_count += 1
-            else:
-                rejected.append(restored)
-        required_topics = {str(item) for item in run.get("required_topics") or []}
-        completed_topics = {
-            _resolved_topic(run, item) for item in accepted if not is_not_applicable(item)
-        } & required_topics
-        not_applicable_topics = {
-            _resolved_topic(run, item) for item in accepted if is_not_applicable(item)
-        } & required_topics
-        resolved_topics = completed_topics | not_applicable_topics
-        missing_topics = required_topics - resolved_topics
-        coverage_score = len(resolved_topics) / max(len(required_topics), 1)
-        status = (
-            "NO_DATA" if not accepted else "PARTIAL" if missing_topics else "SUCCEEDED"
-        )
-        blocking_gaps = [f"missing_topic:{item}" for item in sorted(missing_topics)]
-        now = _now()
-        result_payload = {
-            "accepted_claims": accepted,
-            "rejected_claims": rejected,
-            "accepted_count": len(accepted),
-            "candidate_count": len(claims),
-            "persisted_count": len(accepted),
-            "read_back_count": read_back_count,
-            "evidence_count": evidence_count,
-            "source_domains": sorted(source_domains),
-            "required_topics": sorted(required_topics),
-            "completed_topics": sorted(completed_topics),
-            "valid_not_applicable_topics": sorted(not_applicable_topics),
-            "missing_topics": sorted(missing_topics),
-            "blocking_gaps": blocking_gaps,
-            "coverage_score": coverage_score,
-        }
-        with connect_sqlite(self.settings.database_path) as conn:
-            conn.execute(
-                """
-                UPDATE research_runs SET status=?,result_json=?,coverage_score=?,source_domains_json=?,
-                  completed_topics_json=?,missing_topics_json=?,warnings_json=?,data_as_of=?,updated_at=?
-                WHERE run_id=?
-                """,
-                (
-                    status,
-                    _json(result_payload),
-                    coverage_score,
-                    _json(sorted(source_domains)),
-                    _json(sorted(completed_topics)),
-                    _json(sorted(missing_topics)),
-                    _json([warning for item in rejected for warning in item.get("warnings") or []]),
-                    now,
-                    now,
-                    run["run_id"],
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE research_runs SET valid_not_applicable_topics_json=?,blocking_gaps_json=?
-                WHERE run_id=?
-                """,
-                (_json(sorted(not_applicable_topics)), _json(blocking_gaps), run["run_id"]),
-            )
-            conn.commit()
-        return {
-            "status": status,
-            **result_payload,
-            "results": [
-                self._claim_result(item)
+            blocking_gaps = [f"missing_topic:{item}" for item in sorted(missing_topics)]
+            now = _now()
+            result_payload = {
+                "accepted_claims": accepted,
+                "rejected_claims": rejected,
+                "accepted_count": len(accepted),
+                "candidate_count": len(claims),
+                "persisted_count": len(accepted),
+                "read_back_count": read_back_count,
+                "evidence_count": evidence_count,
+                "source_domains": sorted(source_domains),
+                "required_topics": sorted(required_topics),
+                "completed_topics": sorted(completed_topics),
+                "valid_not_applicable_topics": sorted(not_applicable_topics),
+                "missing_topics": sorted(missing_topics),
+                "blocking_gaps": blocking_gaps,
+                "coverage_score": coverage_score,
+            }
+            results = [
+                self._claim_result_from_evidence(
+                    item,
+                    evidence_by_claim[str(item["claim_id"])],
+                )
                 for item in accepted
                 if not is_not_applicable(item)
                 if item["field_semantics"]
@@ -1061,8 +1087,235 @@ class ResearchRuntimeRepository:
                     "current_news",
                     "current_market_context",
                 }
-            ],
-        }
+            ]
+            output = {"status": status, **result_payload, "results": results}
+            conn.execute(
+                """
+                UPDATE research_runs SET status=?,result_json=?,coverage_score=?,source_domains_json=?,
+                  completed_topics_json=?,missing_topics_json=?,warnings_json=?,data_as_of=?,
+                  completed_at=?,updated_at=?
+                WHERE run_id=?
+                """,
+                (
+                    status,
+                    _json(result_payload),
+                    coverage_score,
+                    _json(sorted(source_domains)),
+                    _json(sorted(completed_topics)),
+                    _json(sorted(missing_topics)),
+                    _json([warning for item in rejected for warning in item.get("warnings") or []]),
+                    now,
+                    now,
+                    now,
+                    run["run_id"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE research_runs SET valid_not_applicable_topics_json=?,blocking_gaps_json=?
+                WHERE run_id=?
+                """,
+                (_json(sorted(not_applicable_topics)), _json(blocking_gaps), run["run_id"]),
+            )
+            if step_id:
+                self._complete_step_in_transaction(
+                    conn,
+                    step_id,
+                    output,
+                    source_domains=sorted(source_domains),
+                    completed_at=now,
+                )
+            conn.commit()
+            return output
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            diagnostic = self._persistence_diagnostic(
+                exc,
+                run=run,
+                claim=current_claim,
+                transaction_outcome=(
+                    "ROLLED_BACK" if transaction_started else "NOT_STARTED"
+                ),
+            )
+            self._record_persist_failure(
+                run,
+                step_id=step_id,
+                error=f"{type(exc).__name__}:{exc}",
+                diagnostic=diagnostic,
+            )
+            raise ResearchPersistenceError(diagnostic) from exc
+        finally:
+            conn.close()
+
+    def _complete_step_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        step_id: str,
+        output: dict[str, Any],
+        *,
+        source_domains: list[str],
+        completed_at: str,
+    ) -> None:
+        output_json = _json(output)
+        conn.execute(
+            """
+            UPDATE research_run_steps
+            SET status='COMPLETED',output_checksum=?,output_json=?,
+                source_domains_json=?,completed_at=?,
+                duration_ms=CAST(
+                  (julianday(?) - julianday(started_at))*86400000 AS INTEGER
+                ),
+                error=NULL,diagnostic_json=NULL
+            WHERE step_id=?
+            """,
+            (
+                _checksum(output),
+                output_json,
+                _json(sorted(set(source_domains))),
+                completed_at,
+                completed_at,
+                step_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE research_step_attempts
+            SET status='COMPLETED',completed_at=?,error=NULL,diagnostic_json=NULL
+            WHERE step_id=? AND attempt=(
+              SELECT attempt FROM research_run_steps WHERE step_id=?
+            )
+            """,
+            (completed_at, step_id, step_id),
+        )
+
+    def _persistence_diagnostic(
+        self,
+        exc: Exception,
+        *,
+        run: dict[str, Any],
+        claim: dict[str, Any] | None,
+        transaction_outcome: str,
+    ) -> dict[str, Any]:
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        stack_fingerprint = hashlib.sha256(trace.encode("utf-8")).hexdigest()[:24]
+        return sanitize_diagnostic(
+            {
+                "category": "PERSISTENCE_ERROR",
+                "exception_type": type(exc).__name__,
+                "message": str(exc)[:500],
+                "step": "PERSIST",
+                "failing_step": "PERSIST",
+                "claim_ref": (claim or {}).get("claim_ref"),
+                "claim_id": (claim or {}).get("claim_id"),
+                "topic": (claim or {}).get("topic"),
+                "field_semantics": (claim or {}).get("field_semantics"),
+                "run_id": run.get("run_id"),
+                "job_id": run.get("job_id"),
+                "timestamp": _now(),
+                "retryable": False,
+                "retry_classification": "NON_RETRYABLE",
+                "stack_fingerprint": stack_fingerprint,
+                "transaction_outcome": transaction_outcome,
+            }
+        )
+
+    def _record_persist_failure(
+        self,
+        run: dict[str, Any],
+        *,
+        step_id: str | None,
+        error: str,
+        diagnostic: dict[str, Any],
+    ) -> None:
+        now = _now()
+        compact_error = str(error)[:1000]
+        diagnostic_json = _json(sanitize_diagnostic(diagnostic))
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            target_step_id = step_id
+            if target_step_id is None:
+                row = conn.execute(
+                    """
+                    SELECT step_id FROM research_run_steps
+                    WHERE run_id=? AND step_name='PERSIST' AND status='RUNNING'
+                    """,
+                    (run["run_id"],),
+                ).fetchone()
+                target_step_id = str(row["step_id"]) if row else None
+            if target_step_id:
+                conn.execute(
+                    """
+                    UPDATE research_run_steps
+                    SET status='FAILED',error=?,completed_at=?,diagnostic_json=?,
+                        duration_ms=CAST(
+                          (julianday(?) - julianday(started_at))*86400000 AS INTEGER
+                        )
+                    WHERE step_id=?
+                    """,
+                    (
+                        compact_error,
+                        now,
+                        diagnostic_json,
+                        now,
+                        target_step_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE research_step_attempts
+                    SET status='FAILED',completed_at=?,error=?,diagnostic_json=?
+                    WHERE step_id=? AND attempt=(
+                      SELECT attempt FROM research_run_steps WHERE step_id=?
+                    )
+                    """,
+                    (
+                        now,
+                        compact_error,
+                        diagnostic_json,
+                        target_step_id,
+                        target_step_id,
+                    ),
+                )
+            existing = conn.execute(
+                "SELECT result_json FROM research_runs WHERE run_id=?",
+                (run["run_id"],),
+            ).fetchone()
+            try:
+                result = json.loads(existing["result_json"] or "{}") if existing else {}
+            except json.JSONDecodeError:
+                result = {}
+            for counter in (
+                "accepted_claims",
+                "rejected_claims",
+                "accepted_count",
+                "persisted_count",
+                "read_back_count",
+                "evidence_count",
+                "results",
+            ):
+                result.pop(counter, None)
+            result.update(
+                {
+                    "error": compact_error,
+                    "diagnostic": sanitize_diagnostic(diagnostic),
+                }
+            )
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET status='FAILED',result_json=?,completed_at=?,
+                    missing_topics_json=required_topics_json,
+                    blocking_gaps_json='["persist_failed"]',updated_at=?
+                WHERE run_id=?
+                """,
+                (_json(result), now, now, run["run_id"]),
+            )
+            conn.commit()
+
+    def reconcile_terminal_jobs(self) -> int:
+        """Close stranded steps and quarantine partial output without deleting audit data."""
+        return int(migrate_database(self.settings.database_path)["reconciled_research_runs"])
 
     def finish_run(self, run_id: str, status: str, result: dict[str, Any]) -> dict[str, Any]:
         now = _now()
@@ -1105,10 +1358,21 @@ class ResearchRuntimeRepository:
         ]
         return restored
 
+    def get_run_for_job(self, job_id: str) -> dict[str, Any] | None:
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                "SELECT run_id FROM research_runs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        return self.get_run(str(row["run_id"])) if row else None
+
     def latest(self, symbol: str = "MNQ") -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
-                "SELECT * FROM research_runs WHERE symbol=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                """
+                SELECT * FROM research_runs
+                WHERE symbol=? ORDER BY created_at DESC,rowid DESC LIMIT 1
+                """,
                 (symbol.upper(),),
             ).fetchone()
         return self.get_run(str(row["run_id"])) if row else None
@@ -1123,6 +1387,7 @@ class ResearchRuntimeRepository:
 
     def _persist_claim(
         self,
+        conn: sqlite3.Connection,
         run: dict[str, Any],
         claim: dict[str, Any],
         observed_sources: list[dict[str, Any]],
@@ -1145,6 +1410,10 @@ class ResearchRuntimeRepository:
             observed_sources,
             acquired_sources,
         )
+        if not_applicable:
+            # Evidence attached as historical context must not invalidate a
+            # documented negative-coverage result.
+            warnings = []
         warnings.extend(
             semantic_validation_warnings(
                 claim,
@@ -1177,101 +1446,115 @@ class ResearchRuntimeRepository:
         claim_id = str(
             claim.get("claim_id") or f"claim-{hashlib.sha256(claim_seed.encode()).hexdigest()[:24]}"
         )
-        with connect_sqlite(self.settings.database_path) as conn:
+        materialization_status = (
+            "NOT_APPLICABLE"
+            if not_applicable and validation == "accepted"
+            else "PENDING"
+            if validation == "accepted"
+            else "REJECTED"
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO research_claims(
+              claim_id,research_run_id,topic,field_semantics,value_json,metric_id,period,frequency,
+              unit,event_key,event_at,release_at,issuer,symbol,valid_from,valid_until,
+              next_refresh_at,lifecycle_status,post_event_semantics,published_at,retrieved_at,confidence,
+              validation_status,materialization_status,warnings_json,policy_version,prompt_version,
+              payload_json,checksum,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                claim_id,
+                run["run_id"],
+                str(claim.get("topic") or semantics),
+                semantics,
+                _json(claim.get("value")),
+                claim.get("metric_id"),
+                claim.get("period"),
+                claim.get("frequency"),
+                claim.get("unit"),
+                claim.get("event_key") or run.get("event_key"),
+                claim.get("event_at"),
+                claim.get("release_at"),
+                claim.get("issuer"),
+                claim.get("symbol") or run.get("symbol"),
+                claim.get("valid_from"),
+                claim.get("valid_until"),
+                claim.get("next_refresh_at"),
+                claim.get("lifecycle_status"),
+                claim.get("post_event_semantics"),
+                claim.get("published_at"),
+                claim.get("retrieved_at") or now,
+                min(
+                    float(claim.get("confidence") or 0),
+                    float(semantic_policy.get("max_reliability") or 1.0),
+                ),
+                validation,
+                materialization_status,
+                _json(sorted(set(warnings))),
+                run["policy_version"],
+                run["prompt_version"],
+                _json(claim_payload),
+                checksum,
+                now,
+            ),
+        )
+        for evidence in evidence_rows:
+            evidence_seed = (
+                f"{claim_id}|{evidence['canonical_url']}|{evidence['content_checksum']}"
+            )
+            evidence_id = f"evidence-{hashlib.sha256(evidence_seed.encode()).hexdigest()[:24]}"
             conn.execute(
                 """
-                INSERT OR IGNORE INTO research_claims(
-                  claim_id,research_run_id,topic,field_semantics,value_json,metric_id,period,frequency,
-                  unit,event_key,event_at,release_at,issuer,symbol,valid_from,valid_until,
-                  next_refresh_at,lifecycle_status,post_event_semantics,published_at,retrieved_at,confidence,
-                  validation_status,warnings_json,policy_version,prompt_version,payload_json,checksum,created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO research_evidence(
+                  evidence_id,claim_id,query_text,source_url,canonical_url,publisher,source_domain,
+                  source_tier,evidence_text,published_at,retrieved_at,redirect_url,source_status,
+                  independent_source_group,content_checksum,policy_version,created_at,
+                  source_content_hash,tool_event_id,source_id,verification_id,
+                  verification_method,verification_reason,verification_score,audit_status
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(evidence_id) DO UPDATE SET audit_status='ACTIVE'
                 """,
                 (
+                    evidence_id,
                     claim_id,
-                    run["run_id"],
-                    str(claim.get("topic") or semantics),
-                    semantics,
-                    _json(claim.get("value")),
-                    claim.get("metric_id"),
-                    claim.get("period"),
-                    claim.get("frequency"),
-                    claim.get("unit"),
-                    claim.get("event_key") or run.get("event_key"),
-                    claim.get("event_at"),
-                    claim.get("release_at"),
-                    claim.get("issuer"),
-                    claim.get("symbol") or run.get("symbol"),
-                    claim.get("valid_from"),
-                    claim.get("valid_until"),
-                    claim.get("next_refresh_at"),
-                    claim.get("lifecycle_status"),
-                    claim.get("post_event_semantics"),
-                    claim.get("published_at"),
-                    claim.get("retrieved_at") or now,
-                    min(
-                        float(claim.get("confidence") or 0),
-                        float(semantic_policy.get("max_reliability") or 1.0),
-                    ),
-                    validation,
-                    _json(sorted(set(warnings))),
+                    evidence.get("query"),
+                    evidence["source_url"],
+                    evidence["canonical_url"],
+                    evidence.get("publisher"),
+                    evidence["source_domain"],
+                    evidence["source_tier"],
+                    evidence["evidence_text"],
+                    evidence.get("published_at"),
+                    evidence["retrieved_at"],
+                    evidence.get("redirect_url"),
+                    evidence.get("source_status"),
+                    evidence["independent_source_group"],
+                    evidence["content_checksum"],
                     run["policy_version"],
-                    run["prompt_version"],
-                    _json(claim_payload),
-                    checksum,
                     now,
+                    evidence.get("source_content_hash"),
+                    evidence.get("tool_event_id"),
+                    evidence.get("source_id"),
+                    evidence.get("verification_id"),
+                    evidence.get("verification_method"),
+                    evidence.get("verification_reason"),
+                    evidence.get("verification_score"),
+                    "ACTIVE",
                 ),
             )
-            for evidence in evidence_rows:
-                evidence_seed = (
-                    f"{claim_id}|{evidence['canonical_url']}|{evidence['content_checksum']}"
-                )
-                evidence_id = f"evidence-{hashlib.sha256(evidence_seed.encode()).hexdigest()[:24]}"
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO research_evidence(
-                      evidence_id,claim_id,query_text,source_url,canonical_url,publisher,source_domain,
-                      source_tier,evidence_text,published_at,retrieved_at,redirect_url,source_status,
-                      independent_source_group,content_checksum,policy_version,created_at,
-                      source_content_hash,tool_event_id,source_id,verification_id,
-                      verification_method,verification_reason,verification_score
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        evidence_id,
-                        claim_id,
-                        evidence.get("query"),
-                        evidence["source_url"],
-                        evidence["canonical_url"],
-                        evidence.get("publisher"),
-                        evidence["source_domain"],
-                        evidence["source_tier"],
-                        evidence["evidence_text"],
-                        evidence.get("published_at"),
-                        evidence["retrieved_at"],
-                        evidence.get("redirect_url"),
-                        evidence.get("source_status"),
-                        evidence["independent_source_group"],
-                        evidence["content_checksum"],
-                        run["policy_version"],
-                        now,
-                        evidence.get("source_content_hash"),
-                        evidence.get("tool_event_id"),
-                        evidence.get("source_id"),
-                        evidence.get("verification_id"),
-                        evidence.get("verification_method"),
-                        evidence.get("verification_reason"),
-                        evidence.get("verification_score"),
-                    ),
-                )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM research_claims WHERE claim_id=?", (claim_id,)
-            ).fetchone()
+        row = conn.execute(
+            "SELECT * FROM research_claims WHERE claim_id=?", (claim_id,)
+        ).fetchone()
         restored = dict(row)
         restored["value"] = json.loads(restored.pop("value_json") or "null")
         restored["warnings"] = json.loads(restored.pop("warnings_json") or "[]")
         restored["payload"] = json.loads(restored.pop("payload_json"))
+        restored["claim_ref"] = restored["payload"].get("claim_ref")
+        restored["topic_status"] = restored["payload"].get("topic_status")
+        restored["_bounded_search_documented"] = restored["payload"].get(
+            "_bounded_search_documented"
+        )
         logger.info(
             "research_claim_policy_validated",
             extra={
@@ -1419,10 +1702,18 @@ class ResearchRuntimeRepository:
                 row["independent_source_group"] = f"content:{row['content_checksum']}"
         return rows, warnings
 
-    def _project_and_read_back(self, claim: dict[str, Any], evidence: list[dict[str, Any]]) -> bool:
+    def _project_and_read_back(
+        self,
+        conn: sqlite3.Connection,
+        claim: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> bool:
+        if not evidence:
+            raise ValueError("accepted_materializable_claim_requires_evidence")
         primary = min(evidence, key=lambda item: item["source_tier"])
         fact_key = f"research:{claim['claim_id']}"
-        self.facts.upsert_fact(
+        self.facts.upsert_fact_in_transaction(
+            conn,
             {
                 "fact_key": fact_key,
                 "fact_type": "agentic_research_claim",
@@ -1452,10 +1743,20 @@ class ResearchRuntimeRepository:
                 "canonical_event_key": claim.get("event_key"),
             }
         )
-        return self.facts.get_fact(fact_key) is not None
+        restored = self.facts.get_fact_in_transaction(conn, fact_key)
+        return restored is not None and restored.get("status") == "active"
 
     def _claim_result(self, claim: dict[str, Any]) -> dict[str, Any]:
         evidence = self.evidence_for_claim(claim["claim_id"])
+        return self._claim_result_from_evidence(claim, evidence)
+
+    @staticmethod
+    def _claim_result_from_evidence(
+        claim: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not evidence:
+            raise ValueError("materialized_claim_read_back_requires_evidence")
         primary = min(evidence, key=lambda item: item["source_tier"])
         independent_domains = sorted(
             {

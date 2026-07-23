@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
+import traceback
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +21,7 @@ from app.services.event_value_candidate_repository import EventValueCandidateRep
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_capability_service import AIResearchCapabilityService
 from app.services.db_only_market_context_materializer import DBOnlyMarketContextMaterializer
-from app.services.codex_runtime_contract import classify_codex_failure
+from app.services.codex_runtime_contract import classify_codex_failure, sanitize_diagnostic
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,14 @@ class AIResearchWorker:
         recovered = self.repository.recover_abandoned()
         if recovered:
             logger.info("ai_job_recovered_after_restart", extra={"job_id": None, "correlation_id": None, "count": recovered})
+        runtime_repository = getattr(self.agentic_runtime, "repository", None)
+        reconcile = getattr(runtime_repository, "reconcile_terminal_jobs", None)
+        reconciled = int(reconcile()) if callable(reconcile) else 0
+        if reconciled:
+            logger.warning(
+                "research_terminal_state_reconciled",
+                extra={"job_id": None, "correlation_id": None, "count": reconciled},
+            )
         while not self._stopping.is_set():
             processed = await asyncio.to_thread(self.process_once)
             if not processed:
@@ -203,15 +213,26 @@ class AIResearchWorker:
                     )
                     logger.info("ai_job_retry_scheduled", extra=context)
                 return True
-            persistence = self._persist_accepted(job, accepted)
             runtime_managed = bool(result.get("run_id"))
+            runtime_projection_complete = (
+                runtime_managed
+                and job.get("job_type") == "MNQ_MARKET_RESEARCH"
+            )
+            persistence = (
+                {
+                    "persisted_count": int(result.get("persisted_count") or 0),
+                    "read_back_count": int(result.get("read_back_count") or 0),
+                }
+                if runtime_projection_complete
+                else self._persist_accepted(job, accepted)
+            )
             accepted_count = int(result.get("accepted_count") or len(accepted)) if runtime_managed else len(accepted)
             if runtime_managed and (
                 int(result.get("persisted_count") or 0) != accepted_count
                 or int(result.get("read_back_count") or 0) != accepted_count
             ):
                 raise RuntimeError("accepted research claims were not fully persisted and read back")
-            if accepted and (
+            if accepted and not runtime_projection_complete and (
                 persistence["persisted_count"] != len(accepted)
                 or persistence["read_back_count"] != len(accepted)
             ):
@@ -269,6 +290,42 @@ class AIResearchWorker:
             return True
         except Exception as exc:
             diagnostic = getattr(exc, "diagnostic", None)
+            if diagnostic is None:
+                runtime_repository = getattr(self.agentic_runtime, "repository", None)
+                get_run = getattr(runtime_repository, "get_run_for_job", None)
+                linked_run = get_run(str(job["job_id"])) if callable(get_run) else None
+                running_step = next(
+                    (
+                        step
+                        for step in reversed((linked_run or {}).get("steps") or [])
+                        if step.get("status") == "RUNNING"
+                    ),
+                    None,
+                )
+                trace = "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                )
+                diagnostic = sanitize_diagnostic(
+                    {
+                        "category": "WORKER_ERROR",
+                        "exception_type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                        "step": (running_step or {}).get("step_name") or "WORKER",
+                        "failing_step": (running_step or {}).get("step_name") or "WORKER",
+                        "claim_ref": None,
+                        "topic": None,
+                        "field_semantics": None,
+                        "run_id": (linked_run or {}).get("run_id"),
+                        "job_id": job["job_id"],
+                        "timestamp": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                        "retryable": False,
+                        "retry_classification": "NON_RETRYABLE",
+                        "stack_fingerprint": hashlib.sha256(
+                            trace.encode("utf-8")
+                        ).hexdigest()[:24],
+                        "transaction_outcome": "NOT_STARTED",
+                    }
+                )
             if hasattr(exc, "code") and hasattr(exc, "retryable"):
                 error_code = str(exc.code)
                 retryable = bool(exc.retryable)
@@ -297,7 +354,7 @@ class AIResearchWorker:
             )
             current = self.repository.get(job["job_id"])
             if current and current.get("status") == "RUNNING" and current.get("worker_id") == self.worker_id:
-                self.repository.retry_or_fail(
+                updated = self.repository.retry_or_fail(
                     job["job_id"],
                     self.worker_id,
                     error=error_code,
@@ -306,6 +363,25 @@ class AIResearchWorker:
                     timed_out=bool(diagnostic and diagnostic.get("category") == "TIMEOUT"),
                     diagnostic=diagnostic,
                 )
+                if updated.get("status") in {
+                    "FAILED",
+                    "LOOP_DETECTED",
+                    "TIMED_OUT",
+                    "CANCELLED",
+                    "REJECTED",
+                }:
+                    runtime_repository = getattr(
+                        self.agentic_runtime,
+                        "repository",
+                        None,
+                    )
+                    reconcile = getattr(
+                        runtime_repository,
+                        "reconcile_terminal_jobs",
+                        None,
+                    )
+                    if callable(reconcile):
+                        reconcile()
             return True
         finally:
             stop_heartbeat.set()

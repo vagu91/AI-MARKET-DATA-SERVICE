@@ -1,0 +1,210 @@
+{
+  "run_id": "rrun-f88713ec-3e4e-4655-a117-e3274fa53cb7",
+  "job_id": "airj-783324ef-c0ed-4fb4-ba11-6c064f1946bf",
+  "validate_status": "PARTIAL",
+  "reference_time": "2026-07-23T12:29:51+00:00",
+  "required_topics": [
+    "macro",
+    "fed_rates",
+    "events",
+    "nasdaq_100",
+    "mega_cap_semiconductors",
+    "earnings",
+    "news",
+    "risk",
+    "volatility_positioning",
+    "conflicts"
+  ],
+  "claims": [
+    {
+      "claim_ref": "candidate-1",
+      "topic": "macro",
+      "field_semantics": "official_calendar_event",
+      "value": "BEA schedules the advance estimate of second-quarter 2026 GDP and June 2026 Personal Income and Outlays for July 30, 2026 at 8:30 a.m. ET.",
+      "event_at": "2026-07-30T12:30:00+00:00",
+      "confidence": 0.98,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://www.bea.gov/news/schedule",
+          "publisher": "U.S. Bureau of Economic Analysis",
+          "evidence_text": "July 30 8:30 AM GDP Advance Estimate, 2nd Quarter 2026",
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-2",
+      "topic": "macro",
+      "field_semantics": "official_calendar_event",
+      "value": "BLS schedules Metropolitan Area Employment and Unemployment for June 2026 for July 29, 2026 at 10:00 a.m. ET.",
+      "event_at": "2026-07-29T14:00:00+00:00",
+      "confidence": 0.98,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://www.bls.gov/schedule/2026/home.htm",
+          "publisher": "U.S. Bureau of Labor Statistics",
+          "evidence_text": "Wednesday, July 29, 2026 10:00 AM Metropolitan Area Employment",
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-3",
+      "topic": "fed_rates",
+      "field_semantics": "scheduled_event",
+      "value": "The next FOMC meeting is scheduled for July 28–29, 2026.",
+      "event_at": "2026-07-29T18:00:00+00:00",
+      "confidence": 0.99,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://www.federalreserve.gov/newsevents/calendar.htm?source=news_body_link",
+          "publisher": "Federal Reserve",
+          "evidence_text": "FOMC meeting July 28–29, 2026",
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-4",
+      "topic": "events",
+      "field_semantics": "official_calendar_event",
+      "value": "A closed Federal Reserve Board meeting is scheduled for July 28, 2026 at 10:00 a.m. ET.",
+      "event_at": "2026-07-28T14:00:00+00:00",
+      "published_at": "2026-07-21",
+      "confidence": 0.98,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://www.federalreserve.gov/recentpostings.htm",
+          "publisher": "Federal Reserve",
+          "evidence_text": "Closed Board Meeting on July 28, 2026 at 10:00 a.m.",
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-5",
+      "topic": "nasdaq_100",
+      "field_semantics": "exploratory_context",
+      "value": "Nasdaq defines the Nasdaq-100 as 100 large non-financial companies.",
+      "confidence": 0.85,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://indexes.nasdaq.com/Index/Overview/NDX",
+          "publisher": "Nasdaq",
+          "evidence_text": "The Nasdaq-100 includes 100 large non-financial companies.",
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-6",
+      "topic": "mega_cap_semiconductors",
+      "field_semantics": "issuer_announcement",
+      "value": "Microsoft announced an expansion of Azure AI infrastructure using AMD technology.",
+      "event_at": "2026-07-20T00:00:00+00:00",
+      "published_at": "2026-07-20",
+      "issuer": "Microsoft",
+      "confidence": 0.95,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://blogs.microsoft.com/blog/2026/07/20/microsoft-expands-azure-ai-and-hpc-infrastructure-with-amd/",
+          "publisher": "Microsoft",
+          "evidence_text": "Microsoft expands Azure AI infrastructure with AMD",
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-7",
+      "topic": "mega_cap_semiconductors",
+      "field_semantics": "scheduled_event",
+      "value": "NVIDIA states that DAC 2026 runs July 26–29, 2026.",
+      "event_at": "2026-07-26T00:00:00+00:00",
+      "issuer": "NVIDIA",
+      "symbol": "NVDA",
+      "confidence": 0.96,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://www.nvidia.com/en-us/events/dac/",
+          "publisher": "NVIDIA",
+          "evidence_text": "DAC 2026 runs from July 26 through July 29, 2026.",
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-8",
+      "topic": "news",
+      "field_semantics": "issuer_announcement",
+      "value": "Microsoft announced a $60 million commitment supporting the Genesis Mission.",
+      "event_at": "2026-07-22T00:00:00+00:00",
+      "published_at": "2026-07-22",
+      "issuer": "Microsoft",
+      "confidence": 0.95,
+      "topic_status": "SUPPORTED",
+      "evidence": [
+        {
+          "canonical_url": "https://blogs.microsoft.com/blog/2026/07/22/powering-americas-genesis-mission-microsofts-commitment-to-scientific-discovery/",
+          "publisher": "Microsoft",
+          "evidence_text": "backed by a $60 million investment",
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "claim_ref": "candidate-9",
+      "topic": "volatility_positioning",
+      "field_semantics": "exploratory_context",
+      "value": null,
+      "confidence": 0.1,
+      "topic_status": "NOT_APPLICABLE",
+      "_bounded_search_documented": true,
+      "evidence": []
+    },
+    {
+      "claim_ref": "candidate-10",
+      "topic": "earnings",
+      "field_semantics": "exploratory_context",
+      "value": null,
+      "confidence": 0.1,
+      "topic_status": "NOT_APPLICABLE",
+      "_bounded_search_documented": true,
+      "evidence": []
+    },
+    {
+      "claim_ref": "candidate-11",
+      "topic": "risk",
+      "field_semantics": "exploratory_context",
+      "value": null,
+      "confidence": 0.1,
+      "topic_status": "NOT_APPLICABLE",
+      "_bounded_search_documented": true,
+      "evidence": []
+    },
+    {
+      "claim_ref": "candidate-12",
+      "topic": "conflicts",
+      "field_semantics": "exploratory_context",
+      "value": "The June 2026 FOMC statement was historical background, not a current July 23 development.",
+      "published_at": "2026-06-17",
+      "confidence": 0.65,
+      "topic_status": "NOT_APPLICABLE",
+      "_bounded_search_documented": true,
+      "evidence": [
+        {
+          "canonical_url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260617a.htm",
+          "publisher": "Federal Reserve",
+          "evidence_text": "elevated uncertainty from the conflict in the Middle East",
+          "accepted": false
+        }
+      ]
+    }
+  ]
+}

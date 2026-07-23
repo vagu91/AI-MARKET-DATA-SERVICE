@@ -388,9 +388,10 @@ class AgenticResearchRuntime:
             tool="sqlite",
         )
         if should_persist:
-            persisted = self.repository.persist_claims(run, claims)
-            self.repository.complete_step(
-                persist_step["step_id"], persisted, source_domains=persisted["source_domains"]
+            persisted = self.repository.persist_claims(
+                run,
+                claims,
+                step_id=str(persist_step["step_id"]),
             )
         else:
             persisted = persist_step.get("output") or {}
@@ -800,11 +801,10 @@ class AgenticResearchRuntime:
         )
         current_run = self.repository.get_run(run_id) or run
         if should_persist:
-            persisted = self.repository.persist_claims(current_run, verified_claims)
-            self.repository.complete_step(
-                str(persist_step["step_id"]),
-                persisted,
-                source_domains=persisted["source_domains"],
+            persisted = self.repository.persist_claims(
+                current_run,
+                verified_claims,
+                step_id=str(persist_step["step_id"]),
             )
         else:
             persisted = persist_step.get("output") or {}

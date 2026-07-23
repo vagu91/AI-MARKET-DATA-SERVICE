@@ -801,6 +801,22 @@ CREATE INDEX IF NOT EXISTS idx_research_claims_lifecycle
   ON research_claims(validation_status, lifecycle_status, next_refresh_at);
 """
 
+ATOMIC_RESEARCH_PERSISTENCE_SCHEMA = """
+ALTER TABLE research_claims
+  ADD COLUMN materialization_status TEXT NOT NULL DEFAULT 'ELIGIBLE';
+ALTER TABLE research_evidence
+  ADD COLUMN audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE market_context_snapshots
+  ADD COLUMN audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+
+CREATE INDEX IF NOT EXISTS idx_research_claims_materialization
+  ON research_claims(research_run_id, materialization_status, validation_status);
+CREATE INDEX IF NOT EXISTS idx_research_evidence_audit
+  ON research_evidence(claim_id, audit_status);
+CREATE INDEX IF NOT EXISTS idx_market_context_snapshots_audit
+  ON market_context_snapshots(symbol, audit_status, revision DESC);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -817,4 +833,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("012_observable_tool_telemetry_and_checkpoints", OBSERVABLE_TOOL_TELEMETRY_SCHEMA),
     ("013_research_source_gateway_and_backend_invocations", RESEARCH_SOURCE_GATEWAY_SCHEMA),
     ("014_research_semantic_lifecycle", RESEARCH_SEMANTIC_LIFECYCLE_SCHEMA),
+    ("015_atomic_research_persistence_and_quarantine", ATOMIC_RESEARCH_PERSISTENCE_SCHEMA),
 )

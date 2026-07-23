@@ -238,12 +238,23 @@ class MarketFactRepository:
         init_market_db(settings)
 
     def upsert_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
+        with connect_market_db(self.settings) as conn:
+            restored = self.upsert_fact_in_transaction(conn, fact)
+            conn.commit()
+        return restored
+
+    def upsert_fact_in_transaction(
+        self,
+        conn: Any,
+        fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Upsert and read back through the caller-owned SQLite transaction."""
         payload = normalize_payload_text(dict(fact))
         if payload.get("fact_type") == LEGACY_EVENT_ENRICHMENT_TYPE:
             payload["fact_type"] = CANONICAL_EVENT_ENRICHMENT_TYPE
         if payload.get("fact_type") == "official_macro_latest" and payload.get("category"):
             payload["fact_key"] = _canonical_macro_fact_key(payload)
-            existing = self.get_fact(payload["fact_key"])
+            existing = self.get_fact_in_transaction(conn, payload["fact_key"])
             if existing and _official_macro_rank(existing) > _official_macro_rank(payload):
                 return existing
         timestamp = now_iso()
@@ -257,20 +268,29 @@ class MarketFactRepository:
         updates = ", ".join(
             f"{column}=excluded.{column}" for column in columns if column not in {"fact_key", "created_at"}
         )
-        with connect_market_db(self.settings) as conn:
-            conn.execute(
-                f"""
-                INSERT INTO market_facts ({", ".join(columns)}) VALUES ({", ".join("?" for _ in columns)})
-                ON CONFLICT(fact_key) DO UPDATE SET {updates}
-                """,
-                [database_value(payload[column]) for column in columns],
-            )
-            conn.commit()
-        return self.get_fact(payload["fact_key"]) or payload
+        conn.execute(
+            f"""
+            INSERT INTO market_facts ({", ".join(columns)}) VALUES ({", ".join("?" for _ in columns)})
+            ON CONFLICT(fact_key) DO UPDATE SET {updates}
+            """,
+            [database_value(payload[column]) for column in columns],
+        )
+        return self.get_fact_in_transaction(conn, payload["fact_key"]) or payload
 
     def get_fact(self, fact_key: str) -> dict[str, Any] | None:
         with connect_market_db(self.settings) as conn:
-            row = conn.execute("SELECT * FROM market_facts WHERE fact_key = ?", (fact_key,)).fetchone()
+            return self.get_fact_in_transaction(conn, fact_key)
+
+    def get_fact_in_transaction(
+        self,
+        conn: Any,
+        fact_key: str,
+    ) -> dict[str, Any] | None:
+        """Read a fact without leaving the caller-owned SQLite transaction."""
+        row = conn.execute(
+            "SELECT * FROM market_facts WHERE fact_key = ?",
+            (fact_key,),
+        ).fetchone()
         return self._row(row)
 
     def get_event_enrichment_fact(self, fact_key: str) -> dict[str, Any] | None:
