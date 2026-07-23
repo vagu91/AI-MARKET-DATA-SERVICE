@@ -29,7 +29,7 @@ from app.services.codex_runtime_contract import (
     validate_output_schema,
     validate_payload,
 )
-from app.services.research_backend import ResearchBackendResult
+from app.services.research_backend import ResearchBackendResult, normalized_backend_input
 from app.services.research_profiles import profile_for_job, prompt_context
 from app.services.research_tool_telemetry import (
     normalize_codex_event,
@@ -217,10 +217,16 @@ class PersistentAIJobExecutor:
         schema_path = workspace / "agentic_research_output_schema.json"
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         output_path = workspace / "agentic_research_output.json"
+        backend_input = normalized_backend_input(
+            job=job,
+            run=run,
+            profile=profile,
+            effective_budget=effective_budget,
+        )
         prompt = build_agentic_research_prompt(
             job,
             run,
-            profile,
+            backend_input,
             effective_budget,
         )
         command = build_codex_exec_command(
@@ -654,7 +660,9 @@ def build_agentic_research_prompt(
             "do not use an old article merely to complete a current topic",
         ],
         "not_applicable_rule": (
-            "NOT_APPLICABLE is permitted only after a completed bounded query for that topic"
+            "NOT_APPLICABLE is permitted only when the server-owned profile declares "
+            "the topic inapplicable; every MNQ topic is applicable, so a bounded empty "
+            "result must be NO_CURRENT_ITEM or NO_DATA"
         ),
         "budget_rule": (
             "in observe mode numeric budgets are warning thresholds; loop detection and "
@@ -667,7 +675,8 @@ def build_agentic_research_prompt(
         "Never modify files, call AI-TRADER, place orders, or provide trading advice.\n"
         "Never invent URLs, evidence, values, timestamps, source state, or trust labels.\n"
         "Never label a future economic release or official calendar entry as current_news.\n"
-        "Every required topic must have a documented bounded search, including NOT_APPLICABLE topics.\n"
+        "Every required topic must have a documented bounded search; never use "
+        "NOT_APPLICABLE for an empty MNQ query.\n"
         "Prefer current, temporally relevant sources over older accessible articles.\n"
         "The service independently acquires and verifies every source after this invocation.\n\n"
         f"RUN_ID\n{run['run_id']}\n\nJOB_ID\n{job['job_id']}\n\n"

@@ -379,9 +379,9 @@ def test_documented_not_applicable_can_complete_all_topics_without_facts(
         source_gateway=fixture_gateway(cfg, repository, {}),
     ).run(job, tmp_path / "jobs" / job["job_id"], backend, 120)
     assert backend.calls == 1
-    assert result["status"] == "SUCCEEDED"
-    assert result["persisted_count"] == result["read_back_count"] == len(topics)
-    assert result["valid_not_applicable_topics"] == sorted(topics)
+    assert result["status"] == "NO_DATA"
+    assert result["persisted_count"] == result["read_back_count"] == 0
+    assert result["valid_not_applicable_topics"] == []
     with connect_sqlite(cfg.database_path) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM market_facts WHERE fact_type='agentic_research_claim'"
@@ -424,7 +424,7 @@ def test_schema_policy_prompt_and_migration_expose_new_semantics(
     assert policy.required_confirmations("current_news") == 2
     assert policy.semantic_policy("current_market_context")["ttl_minutes"] == 60
     result = migrate_database(cfg.database_path)
-    assert result["schema_version"] == 15
+    assert result["schema_version"] == 16
     with connect_sqlite(cfg.database_path) as conn:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(research_claims)")

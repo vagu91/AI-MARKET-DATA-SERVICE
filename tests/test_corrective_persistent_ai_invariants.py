@@ -8,6 +8,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
+
 from app.api import routes
 from app.core.config import Settings
 from app.models.common import Impact
@@ -369,7 +372,7 @@ def test_refresh_false_reuses_existing_snapshot_without_new_rows_or_payload_chan
     assert after == before
 
 
-def test_refresh_false_without_snapshot_performs_one_db_only_cold_materialization(tmp_path: Path, monkeypatch) -> None:
+def test_refresh_false_without_snapshot_fails_closed_without_calls_or_writes(tmp_path: Path, monkeypatch) -> None:
     cfg = _settings(tmp_path)
     calls = []
 
@@ -382,16 +385,14 @@ def test_refresh_false_without_snapshot_performs_one_db_only_cold_materializatio
             return _debug_payload()
 
     monkeypatch.setattr(routes, "DiagnosticsService", FakeDiagnostics)
-    result = asyncio.run(routes.market_context_mnq(
-        refresh="false", view="consumer", macro_service=None, event_service=None,
-        event_window_service=None, nasdaq_service=None,
-        enrichment_orchestrator=SimpleNamespace(settings=cfg),
-    ))
-    assert result["snapshot_revision"] == 1
-    assert calls == [{
-        "country": "US", "days": 30, "symbol": "MNQ",
-        "fetch_missing_nasdaq": False, "refresh": "false",
-    }]
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(routes.market_context_mnq(
+            refresh="false", view="consumer", macro_service=None, event_service=None,
+            event_window_service=None, nasdaq_service=None,
+            enrichment_orchestrator=SimpleNamespace(settings=cfg),
+        ))
+    assert caught.value.status_code == 404
+    assert calls == []
     with sqlite3.connect(cfg.database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM market_context_snapshots").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM market_context_snapshots").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM ai_research_jobs").fetchone()[0] == 0

@@ -47,12 +47,15 @@ def harden_market_context(
     *,
     settings: Settings | None = None,
     now: datetime | None = None,
+    force_recalculate: bool = False,
 ) -> dict[str, Any]:
     settings = settings or Settings(_env_file=None)
     now = _aware(now or datetime.now(UTC))
     context_date = now.astimezone(NEW_YORK).date().isoformat()
     existing_hardening = ((full.get("metadata") or {}).get("hardening") or {})
     if (
+        not force_recalculate
+        and
         existing_hardening.get("completed") is True
         and existing_hardening.get("version") == HARDENING_VERSION
         and existing_hardening.get("context_date") == context_date

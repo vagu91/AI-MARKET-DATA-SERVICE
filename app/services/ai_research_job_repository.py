@@ -56,6 +56,10 @@ class AIResearchJobRepository:
         capability_status: str | None = None,
         retry_class: str | None = None,
         retry_deadline_at: str | None = None,
+        parent_job_id: str | None = None,
+        parent_run_id: str | None = None,
+        specialized_topic: str | None = None,
+        child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
         now = self._iso(self.clock())
         job_id = f"airj-{uuid.uuid4()}"
@@ -85,7 +89,8 @@ class AIResearchJobRepository:
                   request_payload_json,policy_version,prompt_version,attempts,max_attempts,created_at,
                   pending_fields_json,updated_at,snapshot_id,generation,run_window,scope_key,
                   profile_id,input_fingerprint,capability_status,retry_class,retry_deadline_at
-                ) VALUES (?,?,?,?,?,?,'PENDING',?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  ,parent_job_id,parent_run_id,specialized_topic,child_ordinal
+                ) VALUES (?,?,?,?,?,?,'PENDING',?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job_id, idempotency_key, job_type, symbol.upper(), event_key, correlation_id,
@@ -94,6 +99,7 @@ class AIResearchJobRepository:
                     self._json(pending_fields or []), now, snapshot_id, generation, run_window, scope_key,
                     profile_id, input_fingerprint, capability_status,
                     retry_class, retry_deadline_at,
+                    parent_job_id, parent_run_id, specialized_topic, child_ordinal,
                 ),
             )
             conn.commit()

@@ -16,6 +16,8 @@ from app.services.market_context_snapshot_repository import MarketContextSnapsho
 from app.services.temporal_domain_service import temporal_event_state
 from app.services.temporal_domain_service import canonical_event_key
 from app.services.data_freshness_service import parse_datetime
+from app.services.research_gap_manifest import ResearchGapManifestBuilder
+from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 
 
 class ResearchSchedulerService:
@@ -51,6 +53,28 @@ class ResearchSchedulerService:
                 job_id=str(event_jobs[0]["job_id"]), job_ids=[str(item["job_id"]) for item in event_jobs],
             )
         job_type = _job_type(trigger_name)
+        if job_type == "MNQ_MARKET_RESEARCH":
+            manifest = ResearchGapManifestBuilder(self.settings).build(
+                snapshot=snapshot,
+                components=self.snapshots.latest_components("MNQ"),
+            )
+            parent = ParallelResearchCoordinator(self.settings).create_parent(
+                manifest,
+                correlation_id=f"scheduler-{trigger_name}-{uuid.uuid4()}",
+                force=force,
+            )
+            return self._decision(
+                trigger_name,
+                fingerprint,
+                "QUEUED" if parent["child_job_ids"] else "NOT_REQUIRED",
+                (
+                    "gap_manifest_agent_children_created"
+                    if parent["child_job_ids"]
+                    else "all_topics_satisfied_by_committed_data"
+                ),
+                job_id=parent["child_job_ids"][0] if parent["child_job_ids"] else None,
+                job_ids=parent["child_job_ids"],
+            )
         job, created = self.service.enqueue_explicit(
             job_type=job_type, symbol="MNQ", correlation_id=f"scheduler-{trigger_name}-{uuid.uuid4()}",
             request_payload={

@@ -91,8 +91,9 @@ class ResearchRuntimeRepository:
                 """
                 INSERT OR IGNORE INTO research_runs(
                   run_id,job_id,symbol,event_key,profile_id,prompt_version,policy_version,status,
-                  input_fingerprint,request_json,required_topics_json,created_at,updated_at
-                ) VALUES (?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)
+                  input_fingerprint,request_json,required_topics_json,created_at,updated_at,
+                  parent_run_id
+                ) VALUES (?,?,?,?,?,?,?,'PENDING',?,?,?,?,?,?)
                 """,
                 (
                     run_id,
@@ -107,6 +108,7 @@ class ResearchRuntimeRepository:
                     _json(required_topics),
                     now,
                     now,
+                    job.get("parent_run_id"),
                 ),
             )
             conn.commit()
@@ -437,6 +439,17 @@ class ResearchRuntimeRepository:
             ).fetchone()
             searches = int(counts["searches"] or 0)
             opened = int(counts["opened"] or 0)
+            discovered_urls = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT COALESCE(canonical_url,source_url))
+                    FROM research_tool_events
+                    WHERE run_id=? AND COALESCE(canonical_url,source_url) IS NOT NULL
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
             merged_usage = _merge_usage(
                 json.loads(run_row["usage_json"] or "{}"),
                 usage,
@@ -457,12 +470,15 @@ class ResearchRuntimeRepository:
             conn.execute(
                 """
                 UPDATE research_runs SET search_count=?,opened_source_count=?,
+                  deduplicated_search_count=?,discovered_url_count=?,
                   usage_json=?,cost_json=?,source_domains_json=?,updated_at=?
                 WHERE run_id=?
                 """,
                 (
                     searches,
                     opened,
+                    searches,
+                    discovered_urls,
                     _json(merged_usage) if merged_usage else None,
                     _json(cost) if cost else None,
                     _json(sorted(domains)),
@@ -490,6 +506,9 @@ class ResearchRuntimeRepository:
             conn.commit()
         return {
             "search_count": searches,
+            "executed_search_count": searches,
+            "deduplicated_search_count": searches,
+            "discovered_url_count": discovered_urls,
             "opened_source_count": opened,
             "daily_search_count": int(daily["searches"] or 0),
             "daily_opened_source_count": int(daily["opened"] or 0),
@@ -502,6 +521,25 @@ class ResearchRuntimeRepository:
             "usage": merged_usage,
             "cost_status": "available" if cost else "cost_unavailable",
         }
+
+    def record_query_plan(self, run_id: str, queries: list[str]) -> int:
+        planned = len(
+            {
+                " ".join(str(query).split())
+                for query in queries
+                if str(query).strip()
+            }
+        )
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET planned_query_count=?,updated_at=? WHERE run_id=?
+                """,
+                (planned, _now(), run_id),
+            )
+            conn.commit()
+        return planned
 
     def record_threshold_warning(
         self,
@@ -639,8 +677,9 @@ class ResearchRuntimeRepository:
                   source_tier,publisher,title,fetch_status,verification_status,
                   rejection_reason,http_status,content_type,retrieved_at,content_sha256,
                   content_bytes,content_text,redirect_chain_json,duplicate_of_source_id,
-                  acquisition_backend,fetch_duration_ms,created_at,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  acquisition_backend,fetch_duration_ms,created_at,updated_at,
+                  stage_status,stage_error,http_fetched_at,content_extracted_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(source_id) DO UPDATE SET
                   final_url=excluded.final_url,
                   canonical_url=excluded.canonical_url,
@@ -660,6 +699,10 @@ class ResearchRuntimeRepository:
                   duplicate_of_source_id=excluded.duplicate_of_source_id,
                   acquisition_backend=excluded.acquisition_backend,
                   fetch_duration_ms=excluded.fetch_duration_ms,
+                  stage_status=excluded.stage_status,
+                  stage_error=excluded.stage_error,
+                  http_fetched_at=excluded.http_fetched_at,
+                  content_extracted_at=excluded.content_extracted_at,
                   updated_at=excluded.updated_at
                 """,
                 (
@@ -690,6 +733,10 @@ class ResearchRuntimeRepository:
                     int(source.get("fetch_duration_ms") or 0),
                     now,
                     now,
+                    str(source.get("stage_status") or "")[:40] or None,
+                    str(source.get("stage_error") or "")[:300] or None,
+                    source.get("http_fetched_at"),
+                    source.get("content_extracted_at"),
                 ),
             )
             domain = str(source.get("source_domain") or "")
@@ -708,6 +755,30 @@ class ResearchRuntimeRepository:
                     """,
                     (_json(sorted(domains)), now, run_id),
                 )
+            source_counts = conn.execute(
+                """
+                SELECT COUNT(*) AS attempts,
+                       SUM(CASE WHEN fetch_status='FETCHED' THEN 1 ELSE 0 END) AS fetched,
+                       SUM(CASE WHEN verification_status='VERIFIED' THEN 1 ELSE 0 END) AS verified
+                FROM research_sources WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchone()
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET acquisition_attempt_count=?,fetched_source_count=?,
+                    verified_source_count=?,updated_at=?
+                WHERE run_id=?
+                """,
+                (
+                    int(source_counts["attempts"] or 0),
+                    int(source_counts["fetched"] or 0),
+                    int(source_counts["verified"] or 0),
+                    now,
+                    run_id,
+                ),
+            )
             conn.commit()
             row = conn.execute(
                 "SELECT * FROM research_sources WHERE source_id=?",
@@ -817,6 +888,24 @@ class ResearchRuntimeRepository:
                     now,
                 ),
             )
+            if (
+                verification.get("source_id")
+                and str(verification.get("status") or "") != "VERIFIED"
+            ):
+                conn.execute(
+                    """
+                    UPDATE research_sources
+                    SET verification_status='REJECTED',
+                        stage_status='VERIFICATION_FAILED',
+                        stage_error=?,updated_at=?
+                    WHERE source_id=?
+                    """,
+                    (
+                        str(verification.get("reason") or "verification_failed")[:300],
+                        now,
+                        verification.get("source_id"),
+                    ),
+                )
             conn.commit()
             row = conn.execute(
                 """
@@ -844,6 +933,20 @@ class ResearchRuntimeRepository:
                 UPDATE research_sources
                 SET verification_status='VERIFIED',updated_at=?
                 WHERE source_id=? AND fetch_status='FETCHED'
+                """,
+                (_now(), source_id),
+            )
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET verified_source_count=(
+                  SELECT COUNT(*) FROM research_sources
+                  WHERE research_sources.run_id=research_runs.run_id
+                    AND verification_status='VERIFIED'
+                ),updated_at=?
+                WHERE run_id=(
+                  SELECT run_id FROM research_sources WHERE source_id=?
+                )
                 """,
                 (_now(), source_id),
             )
@@ -1414,6 +1517,19 @@ class ResearchRuntimeRepository:
             # Evidence attached as historical context must not invalidate a
             # documented negative-coverage result.
             warnings = []
+            if str(run.get("profile_id") or "") in {
+                "MNQ_MARKET_RESEARCH",
+                "MACRO_EVENTS_RESEARCH",
+                "FED_RATES_RESEARCH",
+                "VIX_RISK_RESEARCH",
+                "COT_POSITIONING_RESEARCH",
+                "NASDAQ_100_RESEARCH",
+                "MEGA_CAP_SEMICONDUCTORS_RESEARCH",
+                "EARNINGS_RESEARCH",
+                "NEWS_RESEARCH",
+                "GEOPOLITICAL_REGULATORY_RISK_RESEARCH",
+            }:
+                warnings.append("topic_is_applicable_not_applicable_forbidden")
         warnings.extend(
             semantic_validation_warnings(
                 claim,
@@ -1460,8 +1576,9 @@ class ResearchRuntimeRepository:
               unit,event_key,event_at,release_at,issuer,symbol,valid_from,valid_until,
               next_refresh_at,lifecycle_status,post_event_semantics,published_at,retrieved_at,confidence,
               validation_status,materialization_status,warnings_json,policy_version,prompt_version,
-              payload_json,checksum,created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              payload_json,checksum,created_at,event_type,event_start_at,event_end_at,
+              decision_at,confirmation_status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 claim_id,
@@ -1497,6 +1614,11 @@ class ResearchRuntimeRepository:
                 _json(claim_payload),
                 checksum,
                 now,
+                claim.get("event_type"),
+                claim.get("event_start_at"),
+                claim.get("event_end_at"),
+                claim.get("decision_at"),
+                claim.get("confirmation_status"),
             ),
         )
         for evidence in evidence_rows:
@@ -1725,8 +1847,8 @@ class ResearchRuntimeRepository:
                 "unit": claim.get("unit"),
                 "source": primary.get("publisher"),
                 "source_url": primary["canonical_url"],
-                "provider_type": "AI_RESEARCHER_CODEX_CLI",
-                "reliability": 0.0,
+                "provider_type": "AI_RESEARCHER",
+                "reliability": _tier_reliability(int(primary["source_tier"])),
                 "confidence": claim.get("confidence") or 0,
                 "retrieved_at": claim.get("retrieved_at"),
                 "release_at": claim.get("release_at") or claim.get("event_at"),
@@ -2054,6 +2176,10 @@ def _classification(tier: int) -> str:
     return {1: "OFFICIAL", 2: "PRIMARY_MARKET", 3: "FINANCIAL_MEDIA", 4: "CALENDAR_CONSENSUS"}.get(
         tier, "SECONDARY_CONTEXT"
     )
+
+
+def _tier_reliability(tier: int) -> float:
+    return {1: 0.95, 2: 0.88, 3: 0.78, 4: 0.62}.get(tier, 0.5)
 
 
 def _matching_observation(url: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:

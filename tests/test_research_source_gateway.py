@@ -66,7 +66,10 @@ def ensure_run(
         force=True,
     )
     assert created
-    repository = ResearchRuntimeRepository(cfg)
+    repository = ResearchRuntimeRepository(
+        cfg,
+        now=lambda: datetime(2026, 7, 23, 10, 0, tzinfo=UTC),
+    )
     run = repository.ensure_run(
         job,
         "MNQ_MARKET_RESEARCH",
@@ -641,7 +644,7 @@ def test_migration_14_adds_gateway_and_semantic_lineage_without_recreating_datab
 ) -> None:
     cfg = settings(tmp_path)
     result = migrate_database(cfg.database_path)
-    assert result["schema_version"] == 15
+    assert result["schema_version"] == 16
     with connect_sqlite(cfg.database_path) as conn:
         tables = {
             row[0]

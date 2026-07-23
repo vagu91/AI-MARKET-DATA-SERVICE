@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.core.logging import JsonFormatter
-from app.api.routes import market_context_mnq
+from app.api.routes import _materialize_market_context, market_context_mnq
 from app.infrastructure.persistence.migrations import migrate_database
 from app.models.common import Impact
 from app.models.events import EconomicEvent, EventEnrichment
@@ -396,6 +396,12 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
     assert no_network.calls == 0
     assert full["data_quality"]["enrichment_materialized_count"] == 0
     assert full["data_quality"]["enrichment_fact_hit_count"] == 0
+    _materialize_market_context(
+        full,
+        refresh="test_seed",
+        view="consumer",
+        settings=cfg,
+    )
 
     consumer = await market_context_mnq(
         refresh="false",

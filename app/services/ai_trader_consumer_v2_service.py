@@ -192,7 +192,10 @@ def _research(value: dict[str, Any]) -> dict[str, Any]:
     normalized_status = status if status in allowed else "FAILED"
     return {
         "status": normalized_status,
-        "run_id": value.get("run_id"), "snapshot_id": value.get("snapshot_id"),
+        "run_id": value.get("run_id"),
+        "job_id": value.get("job_id"),
+        "parent_run_id": value.get("parent_run_id"),
+        "snapshot_id": value.get("snapshot_id"),
         "started_at": value.get("started_at"), "completed_at": value.get("completed_at"),
         "data_as_of": value.get("data_as_of"), "fresh_until": value.get("fresh_until"),
         "coverage_score": float(value.get("coverage_score") or 0),

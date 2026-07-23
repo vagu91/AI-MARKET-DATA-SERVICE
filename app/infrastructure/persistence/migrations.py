@@ -45,6 +45,11 @@ def migrate_database(path: Path) -> dict[str, object]:
                 raise
         _migrate_legacy_cache_entries(conn)
         legacy_event_enrichment_facts_migrated = _migrate_legacy_event_enrichment_facts(conn)
+        market_context_components_backfilled = (
+            _backfill_market_context_components(conn)
+            if "016_gap_aware_parallel_research_and_temporal_audit" in applied
+            else 0
+        )
         reconciled_research_runs = _reconcile_research_run_lifecycle(conn)
         conn.commit()
     return {
@@ -52,12 +57,88 @@ def migrate_database(path: Path) -> dict[str, object]:
         "applied": applied,
         "schema_version": len(MIGRATIONS),
         "legacy_event_enrichment_facts_migrated": legacy_event_enrichment_facts_migrated,
+        "market_context_components_backfilled": market_context_components_backfilled,
         "reconciled_research_runs": reconciled_research_runs,
     }
 
 
 def _split_sql(sql: str) -> list[str]:
     return [statement.strip() for statement in sql.split(";") if statement.strip()]
+
+
+_DERIVED_CONTEXT_COMPONENTS = {
+    "ai_enrichment",
+    "events_today",
+    "events_today_context",
+    "generated_at",
+    "generated_at_utc",
+    "lifecycle",
+    "quality",
+    "readiness",
+    "research",
+    "snapshot_id",
+    "snapshot_revision",
+    "snapshot_summary",
+}
+
+
+def _backfill_market_context_components(conn: sqlite3.Connection) -> int:
+    tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "market_context_components" not in tables:
+        return 0
+    rows = conn.execute(
+        """
+        SELECT snapshot_id,symbol,revision,data_as_of,debug_payload_json,created_at
+        FROM market_context_snapshots ORDER BY symbol,revision
+        """
+    ).fetchall()
+    inserted = 0
+    for row in rows:
+        try:
+            payload = json.loads(str(row["debug_payload_json"]))
+        except (TypeError, ValueError):
+            continue
+        for name, value in payload.items():
+            if name in _DERIVED_CONTEXT_COMPONENTS:
+                continue
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO market_context_components(
+                  symbol,component_name,source_snapshot_id,source_revision,
+                  data_as_of,valid_until,component_checksum,component_json,created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(row["symbol"]).upper(),
+                    str(name),
+                    str(row["snapshot_id"]),
+                    int(row["revision"]),
+                    row["data_as_of"],
+                    _component_valid_until(value),
+                    hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    encoded,
+                    row["created_at"],
+                ),
+            )
+            inserted += int(cursor.rowcount or 0)
+    return inserted
+
+
+def _component_valid_until(value: object) -> str | None:
+    if isinstance(value, dict):
+        candidate = value.get("valid_until") or value.get("fresh_until")
+        return str(candidate) if candidate else None
+    return None
 
 
 def _migrate_legacy_cache_entries(conn: sqlite3.Connection) -> None:

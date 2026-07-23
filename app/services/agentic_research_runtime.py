@@ -477,6 +477,10 @@ class AgenticResearchRuntime:
             job.get("request_payload") or {},
             effective_budget,
         )
+        self.repository.record_query_plan(
+            run_id,
+            list(model_profile.get("planned_queries") or []),
+        )
         plan_step, execute_plan = self.repository.begin_step(
             run_id,
             "PLAN",

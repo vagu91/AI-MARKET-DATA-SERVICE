@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
@@ -127,6 +128,32 @@ class ResearchMetricsService:
                 """,
                 (run_id,),
             ).fetchone()
+            observed_domain_rows = conn.execute(
+                """
+                SELECT COALESCE(canonical_url,source_url) AS url
+                FROM research_tool_events
+                WHERE run_id=? AND COALESCE(canonical_url,source_url) IS NOT NULL
+                """,
+                (run_id,),
+            ).fetchall()
+            fetched_domain_rows = conn.execute(
+                """
+                SELECT source_domain,fetch_status,verification_status
+                FROM research_sources WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchall()
+            accepted_domain_rows = conn.execute(
+                """
+                SELECT DISTINCT e.source_domain
+                FROM research_evidence e
+                JOIN research_claims c ON c.claim_id=e.claim_id
+                WHERE c.research_run_id=? AND c.validation_status='accepted'
+                  AND c.materialization_status!='ORPHANED'
+                  AND e.audit_status='ACTIVE'
+                """,
+                (run_id,),
+            ).fetchall()
         usage = json.loads(run["usage_json"] or "{}")
         cost = json.loads(run["cost_json"] or "{}")
         request = json.loads(run["request_json"] or "{}")
@@ -144,6 +171,31 @@ class ResearchMetricsService:
         gateway_fetched = int(source_stats["fetched"] or 0)
         gateway_verified = int(source_stats["verified"] or 0)
         gateway_rejected = int(source_stats["rejected"] or 0)
+        observed_domains = sorted(
+            {
+                (urlsplit(str(row["url"])).hostname or "").lower().removeprefix("www.")
+                for row in observed_domain_rows
+                if row["url"]
+            }
+            - {""}
+        )
+        fetched_domains = sorted(
+            {
+                str(row["source_domain"])
+                for row in fetched_domain_rows
+                if row["fetch_status"] == "FETCHED" and row["source_domain"]
+            }
+        )
+        verified_domains = sorted(
+            {
+                str(row["source_domain"])
+                for row in fetched_domain_rows
+                if row["verification_status"] == "VERIFIED" and row["source_domain"]
+            }
+        )
+        accepted_domains = sorted(
+            {str(row["source_domain"]) for row in accepted_domain_rows if row["source_domain"]}
+        )
         metrics = {
             "budget_mode": (
                 (request.get("effective_budget") or {}).get("budget_mode")
@@ -222,6 +274,10 @@ class ResearchMetricsService:
                     for row in verification_stats
                     if str(row["status"]) == "REJECTED"
                 ],
+                "observed_source_domains": observed_domains,
+                "fetched_source_domains": fetched_domains,
+                "verified_source_domains": verified_domains,
+                "accepted_claim_source_domains": accepted_domains,
             },
         }
         if persist:
