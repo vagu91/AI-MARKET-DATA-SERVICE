@@ -9,6 +9,7 @@ from typing import Any, Callable
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
+from app.services.codex_runtime_contract import sanitize_diagnostic
 
 
 ACTIVE_JOB_STATUSES = {"PENDING", "RUNNING", "RETRY_SCHEDULED"}
@@ -92,7 +93,21 @@ class AIResearchJobRepository:
     def get(self, job_id: str) -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute("SELECT * FROM ai_research_jobs WHERE job_id=?", (job_id,)).fetchone()
-        return self._row(row) if row else None
+            attempts = conn.execute(
+                """
+                SELECT attempt_number,worker_id,status,started_at,completed_at,error,
+                       output_checksum,error_category,exit_code,retry_classification,
+                       diagnostic_json
+                FROM ai_research_job_attempts
+                WHERE job_id=? ORDER BY attempt_number
+                """,
+                (job_id,),
+            ).fetchall()
+        if row is None:
+            return None
+        restored = self._row(row)
+        restored["attempt_history"] = [self._attempt_row(item) for item in attempts]
+        return restored
 
     def latest(
         self,
@@ -214,6 +229,32 @@ class AIResearchJobRepository:
                 """,
                 (now, now, now, now),
             )
+            for row in abandoned:
+                terminal = int(row["attempts"]) >= int(
+                    conn.execute(
+                        "SELECT max_attempts FROM ai_research_jobs WHERE job_id=?",
+                        (row["job_id"],),
+                    ).fetchone()["max_attempts"]
+                )
+                conn.execute(
+                    """
+                    UPDATE research_runs
+                    SET status=?,completed_at=CASE WHEN ? THEN ? ELSE NULL END,
+                        missing_topics_json=CASE WHEN ? THEN required_topics_json ELSE missing_topics_json END,
+                        blocking_gaps_json=CASE WHEN ? THEN '["job_terminal:FAILED"]' ELSE blocking_gaps_json END,
+                        updated_at=?
+                    WHERE job_id=? AND status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
+                    """,
+                    (
+                        "FAILED" if terminal else "RETRY_SCHEDULED",
+                        terminal,
+                        now,
+                        terminal,
+                        terminal,
+                        now,
+                        row["job_id"],
+                    ),
+                )
             conn.commit()
             return max(int(cursor.rowcount or 0), 0)
 
@@ -277,6 +318,15 @@ class AIResearchJobRepository:
                 """,
                 (row["job_id"], attempt, worker_id, now),
             )
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET status='RUNNING',started_at=COALESCE(started_at,?),
+                    completed_at=NULL,updated_at=?
+                WHERE job_id=? AND status IN ('PENDING','RETRY_SCHEDULED','RUNNING')
+                """,
+                (now, now, row["job_id"]),
+            )
             conn.commit()
         return self.get(str(row["job_id"]))
 
@@ -321,12 +371,16 @@ class AIResearchJobRepository:
         rejected_fields: list[str] | None = None,
         workspace_path: str | None = None,
         error: str | None = None,
+        diagnostic: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_JOB_STATUSES:
             raise ValueError(f"invalid terminal status: {status}")
         now = self._iso(self.clock())
         result_json = self._json(result_payload) if result_payload is not None else None
         checksum = hashlib.sha256((result_json or "").encode("utf-8")).hexdigest() if result_json else None
+        safe_diagnostic = sanitize_diagnostic(diagnostic) if diagnostic else None
+        diagnostic_json = self._json(safe_diagnostic) if safe_diagnostic else None
+        compact_error = str(error or "")[:500] or None
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -341,22 +395,42 @@ class AIResearchJobRepository:
                 UPDATE ai_research_jobs
                 SET status=?,result_payload_json=?,accepted_fields_json=?,rejected_fields_json=?,
                     pending_fields_json='[]',completed_at=?,heartbeat_at=?,lease_expires_at=NULL,
-                    workspace_path=?,output_checksum=?,last_error=?,updated_at=?
+                    workspace_path=?,output_checksum=?,last_error=?,last_diagnostic_json=?,updated_at=?
                 WHERE job_id=?
                 """,
                 (
                     status, result_json, self._json(accepted_fields or []),
                     self._json(rejected_fields or []), now, now, workspace_path,
-                    checksum, error, now, job_id,
+                    checksum, compact_error, diagnostic_json, now, job_id,
                 ),
             )
             conn.execute(
                 """
                 UPDATE ai_research_job_attempts
-                SET status=?,completed_at=?,error=?,output_checksum=?
+                SET status=?,completed_at=?,error=?,output_checksum=?,error_category=?,
+                    exit_code=?,retry_classification=?,diagnostic_json=?
                 WHERE job_id=? AND attempt_number=?
                 """,
-                (status, now, error, checksum, job_id, int(row["attempts"])),
+                (
+                    status,
+                    now,
+                    compact_error,
+                    checksum,
+                    safe_diagnostic.get("category") if safe_diagnostic else None,
+                    safe_diagnostic.get("exit_code") if safe_diagnostic else None,
+                    safe_diagnostic.get("retry_classification") if safe_diagnostic else None,
+                    diagnostic_json,
+                    job_id,
+                    int(row["attempts"]),
+                ),
+            )
+            self._finish_linked_run(
+                conn,
+                job_id=job_id,
+                status=status,
+                completed_at=now,
+                error=compact_error,
+                diagnostic=safe_diagnostic,
             )
             conn.commit()
         restored = self.get(job_id)
@@ -372,13 +446,15 @@ class AIResearchJobRepository:
         error: str,
         timed_out: bool = False,
         delays: list[int] | None = None,
+        retryable: bool = True,
+        diagnostic: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         job = self.get(job_id)
         if job is None or job.get("status") != "RUNNING" or job.get("worker_id") != worker_id:
             raise RuntimeError("job lease is no longer owned by worker")
         attempts = int(job["attempts"])
         max_attempts = int(job["max_attempts"])
-        if attempts >= max_attempts:
+        if not retryable or attempts >= max_attempts:
             return self.complete(
                 job_id,
                 worker_id,
@@ -386,6 +462,7 @@ class AIResearchJobRepository:
                 result_payload=None,
                 error=error,
                 workspace_path=job.get("workspace_path"),
+                diagnostic=diagnostic,
             )
         retry_delays = delays or [30, 120, 300, 900, 1800, 3600]
         delay = retry_delays[min(attempts - 1, len(retry_delays) - 1)]
@@ -393,6 +470,9 @@ class AIResearchJobRepository:
         now = self._iso(now_dt)
         next_retry = self._iso(now_dt + timedelta(seconds=delay))
         attempt_status = "TIMED_OUT" if timed_out else "FAILED"
+        safe_diagnostic = sanitize_diagnostic(diagnostic) if diagnostic else None
+        diagnostic_json = self._json(safe_diagnostic) if safe_diagnostic else None
+        compact_error = str(error)[:500]
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -402,17 +482,96 @@ class AIResearchJobRepository:
                     next_retry_at=?,last_error=?,last_retry_reason=?,updated_at=?
                 WHERE job_id=? AND status='RUNNING' AND worker_id=?
                 """,
-                (next_retry, error, error, now, job_id, worker_id),
+                (next_retry, compact_error, compact_error, now, job_id, worker_id),
             )
             conn.execute(
                 """
-                UPDATE ai_research_job_attempts SET status=?,completed_at=?,error=?
+                UPDATE ai_research_job_attempts
+                SET status=?,completed_at=?,error=?,error_category=?,exit_code=?,
+                    retry_classification=?,diagnostic_json=?
                 WHERE job_id=? AND attempt_number=?
                 """,
-                (attempt_status, now, error, job_id, attempts),
+                (
+                    attempt_status,
+                    now,
+                    compact_error,
+                    safe_diagnostic.get("category") if safe_diagnostic else None,
+                    safe_diagnostic.get("exit_code") if safe_diagnostic else None,
+                    safe_diagnostic.get("retry_classification") if safe_diagnostic else None,
+                    diagnostic_json,
+                    job_id,
+                    attempts,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE ai_research_jobs SET last_diagnostic_json=? WHERE job_id=?
+                """,
+                (diagnostic_json, job_id),
+            )
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET status='RETRY_SCHEDULED',completed_at=NULL,updated_at=?
+                WHERE job_id=? AND status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
+                """,
+                (now, job_id),
             )
             conn.commit()
         return self.get(job_id)
+
+    def reconcile_lifecycle(self) -> int:
+        return int(migrate_database(self.settings.database_path)["reconciled_research_runs"])
+
+    def _finish_linked_run(
+        self,
+        conn: Any,
+        *,
+        job_id: str,
+        status: str,
+        completed_at: str,
+        error: str | None,
+        diagnostic: dict[str, Any] | None,
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT run_id,result_json,required_topics_json
+            FROM research_runs WHERE job_id=?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            result = json.loads(row["result_json"] or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        result["job_terminal_status"] = status
+        if error:
+            result["last_error"] = error
+        if diagnostic:
+            result["diagnostic"] = diagnostic
+        failed = status in {"FAILED", "TIMED_OUT", "CANCELLED", "REJECTED"}
+        conn.execute(
+            """
+            UPDATE research_runs
+            SET status=?,result_json=?,completed_at=?,
+                missing_topics_json=CASE WHEN ? THEN required_topics_json ELSE missing_topics_json END,
+                blocking_gaps_json=CASE WHEN ? THEN ? ELSE blocking_gaps_json END,
+                updated_at=?
+            WHERE run_id=?
+            """,
+            (
+                status,
+                self._json(result),
+                completed_at,
+                failed,
+                failed,
+                self._json([f"job_terminal:{status}"]),
+                completed_at,
+                row["run_id"],
+            ),
+        )
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -428,7 +587,7 @@ class AIResearchJobRepository:
         data = dict(row)
         for key in (
             "request_payload_json", "result_payload_json", "accepted_fields_json",
-            "rejected_fields_json", "pending_fields_json",
+            "rejected_fields_json", "pending_fields_json", "last_diagnostic_json",
         ):
             target = key.removesuffix("_json")
             raw = data.pop(key, None)
@@ -436,4 +595,14 @@ class AIResearchJobRepository:
                 data[target] = json.loads(raw) if raw else ([] if target.endswith("fields") else None)
             except json.JSONDecodeError:
                 data[target] = None
+        return data
+
+    @staticmethod
+    def _attempt_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        raw = data.pop("diagnostic_json", None)
+        try:
+            data["diagnostic"] = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            data["diagnostic"] = None
         return data

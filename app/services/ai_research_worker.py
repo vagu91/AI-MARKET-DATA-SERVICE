@@ -19,6 +19,7 @@ from app.services.event_value_candidate_repository import EventValueCandidateRep
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_capability_service import AIResearchCapabilityService
 from app.services.db_only_market_context_materializer import DBOnlyMarketContextMaterializer
+from app.services.codex_runtime_contract import CodexCLIError, classify_codex_failure
 
 
 logger = logging.getLogger(__name__)
@@ -118,18 +119,47 @@ class AIResearchWorker:
             accepted, rejected = self._validate_results(job, result)
             status = str(result.get("status") or "FAILED").upper()
             if status == "TIMED_OUT":
-                self.repository.retry_or_fail(
+                updated = self.repository.retry_or_fail(
                     job["job_id"], self.worker_id, error=str(result.get("error") or "watchdog_timeout"),
                     timed_out=True, delays=self._retry_delays(job),
+                    retryable=bool(result.get("retryable")),
                 )
-                logger.warning("ai_job_timed_out", extra=context)
+                logger.warning(
+                    "ai_job_timed_out",
+                    extra={
+                        **context,
+                        "run_id": result.get("run_id"),
+                        "error_code": result.get("error"),
+                        "exit_code": None,
+                        "step": result.get("deadline_step"),
+                        "retry_classification": result.get(
+                            "retry_classification", "NON_RETRYABLE"
+                        ),
+                        "status": updated["status"],
+                    },
+                )
                 return True
             if status in {"FAILED"}:
-                self.repository.retry_or_fail(
+                updated = self.repository.retry_or_fail(
                     job["job_id"], self.worker_id, error=str(result.get("error") or "provider_failed"),
                     delays=self._retry_delays(job),
+                    retryable=bool(result.get("retryable")),
+                    diagnostic=result.get("diagnostic"),
                 )
-                logger.warning("ai_job_retry_scheduled", extra=context)
+                logger.warning(
+                    "ai_job_provider_failed",
+                    extra={
+                        **context,
+                        "run_id": result.get("run_id"),
+                        "error_code": result.get("error"),
+                        "exit_code": (result.get("diagnostic") or {}).get("exit_code"),
+                        "step": (result.get("diagnostic") or {}).get("step"),
+                        "retry_classification": (result.get("diagnostic") or {}).get(
+                            "retry_classification", "NON_RETRYABLE"
+                        ),
+                        "status": updated["status"],
+                    },
+                )
                 return True
             if status in {"NO_DATA", "OFFICIAL_FEED_DELAYED"} and job["job_type"] == "RELEASE_ACTUAL_REFRESH":
                 retryable = status == "OFFICIAL_FEED_DELAYED" or result.get("retryable") is True
@@ -222,11 +252,43 @@ class AIResearchWorker:
             logger.info("ai_job_completed", extra={**context, "status": terminal})
             return True
         except Exception as exc:
-            logger.exception("ai_job_failed", extra=context)
+            diagnostic = exc.diagnostic if isinstance(exc, CodexCLIError) else None
+            if isinstance(exc, CodexCLIError):
+                error_code = exc.code
+                retryable = exc.retryable
+            else:
+                category, retryable = classify_codex_failure(
+                    exit_code=None,
+                    stderr=str(exc),
+                )
+                error_code = f"worker:{category.lower()}:{type(exc).__name__}"
+            logger.exception(
+                "ai_job_failed",
+                extra={
+                    **context,
+                    "run_id": (diagnostic or {}).get("run_id"),
+                    "error_code": error_code,
+                    "exit_code": (diagnostic or {}).get("exit_code"),
+                    "step": (diagnostic or {}).get("step"),
+                    "retry_classification": (
+                        diagnostic.get("retry_classification")
+                        if diagnostic
+                        else "RETRYABLE"
+                        if retryable
+                        else "NON_RETRYABLE"
+                    ),
+                },
+            )
             current = self.repository.get(job["job_id"])
             if current and current.get("status") == "RUNNING" and current.get("worker_id") == self.worker_id:
                 self.repository.retry_or_fail(
-                    job["job_id"], self.worker_id, error=str(exc), delays=self._retry_delays(job),
+                    job["job_id"],
+                    self.worker_id,
+                    error=error_code,
+                    delays=self._retry_delays(job),
+                    retryable=retryable,
+                    timed_out=bool(diagnostic and diagnostic.get("category") == "TIMEOUT"),
+                    diagnostic=diagnostic,
                 )
             return True
         finally:

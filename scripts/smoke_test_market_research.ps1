@@ -7,48 +7,128 @@ param(
 $ErrorActionPreference = "Stop"
 $outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
 [System.IO.Directory]::CreateDirectory($outputPath) | Out-Null
+. "$PSScriptRoot\market_research_smoke_helpers.ps1"
 
-$capabilities = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/capabilities"
-$capabilities | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath "$outputPath\capabilities.json" -Encoding utf8
-if ($capabilities.status -notin @("READY_TO_SMOKE", "LIVE_VERIFIED")) {
-    throw "Research capability is not ready for an authorized smoke: $($capabilities.status)"
+$capabilities = $null
+$queued = $null
+$run = $null
+$job = $null
+$queue = $null
+$latestAttempt = $null
+$currentStep = $null
+$decision = $null
+$context = $null
+$runId = $null
+$jobId = $null
+$failureMessage = $null
+$startedAt = [DateTimeOffset]::UtcNow
+
+try {
+    $capabilities = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/capabilities"
+    $capabilities | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath "$outputPath\capabilities.json" -Encoding utf8
+    if ($capabilities.status -notin @("READY_TO_SMOKE", "LIVE_VERIFIED")) {
+        throw "Research capability is not ready for an authorized smoke: $($capabilities.status)"
+    }
+
+    $request = @{
+        force_requeue = $false
+        correlation_id = "authorized-single-smoke"
+        authorized_live_smoke = $true
+    } | ConvertTo-Json
+    $queued = Invoke-RestMethod -Method Post `
+        -Uri "$BaseUrl/market-research/mnq/runs" `
+        -ContentType "application/json" `
+        -Body $request
+    $queued | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath "$outputPath\queued.json" -Encoding utf8
+    $runId = [string]$queued.run_id
+    $jobId = [string]$queued.job_id
+    if ([string]::IsNullOrWhiteSpace($runId)) { throw "The service did not return run_id" }
+    if ([string]::IsNullOrWhiteSpace($jobId)) { throw "The service did not return job_id" }
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $run = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/runs/$runId"
+        $job = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/jobs/$jobId"
+        $queue = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/status"
+        $latestAttempt = @($job.attempt_history) | Select-Object -Last 1
+        $currentStep = @($run.steps) |
+            Where-Object { $_.status -in @("RUNNING", "FAILED") } |
+            Select-Object -Last 1
+        $decision = Get-SmokePollingDecision `
+            -RunStatus ([string]$run.status) `
+            -JobStatus ([string]$job.status) `
+            -QueueDepth ([int]$queue.metrics.queue_depth) `
+            -RunningJobs ([int]$queue.metrics.running_jobs) `
+            -AttemptStatus ([string]$latestAttempt.status)
+        if ($decision.done) { break }
+        Start-Sleep -Seconds 5
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    if (-not $decision.done) {
+        throw "Bounded polling expired for run $runId and job $jobId"
+    }
+    if ($decision.failed) {
+        throw "Authorized smoke failed fast: $($decision.reason)"
+    }
+
+    $latest = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/latest"
+    $context = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-context/mnq?refresh=false"
+    $latest | ConvertTo-Json -Depth 20 |
+        Set-Content -LiteralPath "$outputPath\latest.json" -Encoding utf8
+    $context | ConvertTo-Json -Depth 20 |
+        Set-Content -LiteralPath "$outputPath\market-context.json" -Encoding utf8
+
+    $checksums = Get-ChildItem -LiteralPath $outputPath -Filter "*.json" | ForEach-Object {
+        [ordered]@{
+            file = $_.Name
+            sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        }
+    }
+    $summary = [ordered]@{
+        run_id = $runId
+        job_id = $jobId
+        terminal_status = $run.status
+        snapshot_id = $context.snapshot_id
+        snapshot_revision = $context.snapshot_revision
+        artifacts = $checksums
+        trading_or_order_endpoints_called = $false
+        ai_trader_modified = $false
+        requested_job_count = 1
+    }
+    $summary | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath "$outputPath\summary.json" -Encoding utf8
+    $summary
 }
-
-$request = @{ force_requeue = $false; correlation_id = "authorized-single-smoke"; authorized_live_smoke = $true } | ConvertTo-Json
-$queued = Invoke-RestMethod -Method Post -Uri "$BaseUrl/market-research/mnq/runs" -ContentType "application/json" -Body $request
-$queued | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath "$outputPath\queued.json" -Encoding utf8
-$runId = [string]$queued.run_id
-if ([string]::IsNullOrWhiteSpace($runId)) { throw "The service did not return run_id" }
-
-$deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
-do {
-    Start-Sleep -Seconds 5
-    $status = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/runs/$runId"
-    $status | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath "$outputPath\status.json" -Encoding utf8
-    if ($status.status -in @("SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED")) { break }
-} while ([DateTimeOffset]::UtcNow -lt $deadline)
-
-if ($status.status -notin @("SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED")) {
-    throw "Bounded polling expired for run $runId"
+catch {
+    $failureMessage = $_.Exception.Message
+    throw
 }
-
-$latest = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/latest"
-$context = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-context/mnq?refresh=false"
-$latest | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath "$outputPath\latest.json" -Encoding utf8
-$context | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath "$outputPath\market-context.json" -Encoding utf8
-
-$checksums = Get-ChildItem -LiteralPath $outputPath -Filter "*.json" | ForEach-Object {
-    [ordered]@{ file = $_.Name; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+finally {
+    if ($failureMessage) {
+        $diagnostic = $latestAttempt.diagnostic
+        if (-not $diagnostic) { $diagnostic = $job.last_diagnostic }
+        $failure = [ordered]@{
+            run_id = $runId
+            job_id = $jobId
+            run_status = $run.status
+            job_status = $job.status
+            attempts = $job.attempts
+            max_attempts = $job.max_attempts
+            current_step = $currentStep.step_name
+            exit_code = $diagnostic.exit_code
+            error_category = $diagnostic.category
+            stderr_redacted = $diagnostic.stderr_tail
+            retry_classification = $diagnostic.retry_classification
+            capability_status = $capabilities.status
+            queue_metrics = $queue.metrics
+            polling_decision = $decision.reason
+            error = $failureMessage
+            started_at = $startedAt.ToString("o")
+            failed_at = [DateTimeOffset]::UtcNow.ToString("o")
+        }
+        $failure | ConvertTo-Json -Depth 10 |
+            Set-Content -LiteralPath "$outputPath\failure-report.json" -Encoding utf8
+    }
 }
-$summary = [ordered]@{
-    run_id = $runId
-    terminal_status = $status.status
-    snapshot_id = $context.snapshot_id
-    snapshot_revision = $context.snapshot_revision
-    artifacts = $checksums
-    trading_or_order_endpoints_called = $false
-    ai_trader_modified = $false
-    requested_job_count = 1
-}
-$summary | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath "$outputPath\summary.json" -Encoding utf8
-$summary

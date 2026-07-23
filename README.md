@@ -70,7 +70,7 @@ The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`
 AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
 
-The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-10 are additive and upgrade existing schema-6/8/9 databases without rebuilding tables.
+The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-11 are additive and upgrade existing schema-6/8/9/10 databases without rebuilding tables. Migration 11 adds redacted Codex diagnostics and immutable per-step attempt history.
 
 The required enrichment order is:
 
@@ -105,9 +105,9 @@ AI_MARKET_AI_RESEARCH_WEB_ACCESS_ENABLED=false
 AI_MARKET_AI_WORKER_ENABLED=false
 ```
 
-Enabling the worker without both research and web-access switches does not run Codex. Even with static prerequisites present, ordinary AI jobs remain gated at `READY_TO_SMOKE` until a separately authorized live smoke is persisted as `LIVE_VERIFIED`; CLI `--search` support alone is insufficient. Each acquired job has an atomic lease, heartbeat, persistent attempts/retries, unique workspace and one overall monotonic watchdog deadline. Release actual jobs use persisted deterministic official candidates first, have a separate configurable official-feed-delay retry horizon, and do not use AI as their primary resolver.
+Enabling the worker without both research and web-access switches does not run Codex. Even with static prerequisites present, ordinary AI jobs remain gated at `READY_TO_SMOKE` until a separately authorized live smoke is persisted as `LIVE_VERIFIED`; CLI `--search` support alone is insufficient. `READY_TO_SMOKE` is offline readiness, not live-web verification. Keep `AI_MARKET_RESEARCH_SCHEDULER_ENABLED=false` until that smoke succeeds. Each acquired job has an atomic lease, heartbeat, persistent attempts/retries, unique workspace and one overall monotonic watchdog deadline. Release actual jobs use persisted deterministic official candidates first, have a separate configurable official-feed-delay retry horizon, and do not use AI as their primary resolver.
 
-Non-destructive rollback: stop the service, set `AI_MARKET_AI_WORKER_ENABLED=false`, and deploy the prior application version. Do not delete the SQLite database; schema-7 through schema-10 tables/columns are additive and older code can ignore them.
+Non-destructive rollback: stop the service, set `AI_MARKET_AI_WORKER_ENABLED=false`, and deploy the prior application version. Do not delete the SQLite database; schema-7 through schema-11 tables/columns are additive and older code can ignore them.
 
 Useful persistent-data checks:
 
@@ -349,6 +349,18 @@ These endpoints do not compute chart levels, generate signals, or decide actions
 
 The optional AI Researcher is asynchronous and fail-closed. It first probes the configured Codex CLI capability, then records the bounded phases `PLAN`, `SEARCH`, `OPEN_SOURCE`, `EXTRACT`, `CROSS_CHECK`, `VALIDATE`, `PERSIST`, `READ_BACK`, `MATERIALIZE`, and `COMPLETE`. Claims and short evidence are stored atomically; source tiers and independent confirmations are recalculated by the service. HTTP requests never wait for the researcher.
 
+Every Codex invocation uses stdin for the prompt and an isolated command shape: `--search`, read-only sandbox, unique non-Git workspace, `--skip-git-repo-check`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, JSONL events, a closed phase-specific output schema, deterministic `--output-last-message`, and `--color never`. Persisted login remains available, while personal config, MCP/plugin configuration, rules and repository instructions are not part of the research contract. The final-message file is authoritative; JSONL is used only for events, observed search/source activity, usage and runtime errors.
+
+Failure handling is fail-closed:
+
+- schema, CLI argument/config/auth, executable, output-contract and deterministic policy failures are non-retryable;
+- only rate limits, watchdog timeouts, temporary network failures, backend 5xx responses and documented transient interruptions receive bounded retry;
+- a non-retryable failure creates one failed attempt and atomically closes the job, run and active step;
+- a scheduled retry sets both job and run to `RETRY_SCHEDULED`; acquisition returns both to `RUNNING`;
+- startup migration/reconciliation repairs historical active runs whose linked job is already terminal.
+
+`last_error` remains compact. `GET /ai-research/jobs/{job_id}` exposes redacted attempt diagnostics, and run endpoints expose redacted step diagnostics and per-step attempt history. Diagnostics include category, exit code, bounded stderr/JSONL tails, structured error events, command shape, CLI version, step, duration, workspace and timestamp. Prompts, environment contents, credentials, cookies, `auth.json` and user config are never persisted.
+
 Official release actuals use explicit event semantics and transformations instead of publishing raw BLS/BEA levels. Unsupported mappings return visible `NO_DATA`. Automatic jobs are idempotent inside configurable run windows, while `force_requeue=true` creates an explicit post-terminal generation.
 
 Operational endpoints:
@@ -360,7 +372,9 @@ Operational endpoints:
 - `GET /market-research/mnq/status`
 - `GET /market-research/mnq/evidence/{claim_id}`
 
-See `docs/persistent-ai-and-temporal-architecture.md` for mappings, lifecycle, source policy, scheduler controls, readiness behavior, and the future smoke-test command. No research endpoint supports trading or order submission.
+The authorized smoke script polls both run and job. It fails immediately on an incompatible terminal state or an orphaned non-terminal record with an empty queue, and writes a compact `failure-report.json` even when PowerShell throws. A live smoke is never run automatically and requires explicit authorization.
+
+See `docs/persistent-ai-and-temporal-architecture.md` for mappings, lifecycle, source policy, scheduler controls, readiness behavior, smoke and recovery procedures. No research endpoint supports trading or order submission.
 News responses accept `recency_days` and filter articles by `published_at` when the upstream source provides a timestamp. If Alpha Vantage and GDELT are rate-limited, `/news/latest` falls back to RSS feeds and deduplicates articles by URL/title.
 
 `/nasdaq/context` separates data-quality metadata into:

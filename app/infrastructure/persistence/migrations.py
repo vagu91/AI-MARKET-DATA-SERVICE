@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import sqlite3
 import hashlib
+import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -44,12 +45,14 @@ def migrate_database(path: Path) -> dict[str, object]:
                 raise
         _migrate_legacy_cache_entries(conn)
         legacy_event_enrichment_facts_migrated = _migrate_legacy_event_enrichment_facts(conn)
+        reconciled_research_runs = _reconcile_research_run_lifecycle(conn)
         conn.commit()
     return {
         "path": str(path),
         "applied": applied,
         "schema_version": len(MIGRATIONS),
         "legacy_event_enrichment_facts_migrated": legacy_event_enrichment_facts_migrated,
+        "reconciled_research_runs": reconciled_research_runs,
     }
 
 
@@ -108,3 +111,82 @@ def _migrate_legacy_event_enrichment_facts(conn: sqlite3.Connection) -> int:
         """
     )
     return max(int(cursor.rowcount or 0), 0)
+
+
+def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
+    tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if not {"ai_research_jobs", "research_runs"} <= tables:
+        return 0
+    rows = conn.execute(
+        """
+        SELECT r.run_id,r.status AS run_status,r.required_topics_json,r.result_json,
+               j.status AS job_status,j.completed_at,j.last_error,j.last_diagnostic_json
+        FROM research_runs r
+        JOIN ai_research_jobs j ON j.job_id=r.job_id
+        WHERE (
+          j.status IN ('SUCCEEDED','PARTIAL','NO_DATA','REJECTED','FAILED','TIMED_OUT','CANCELLED')
+          AND r.status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
+        ) OR (
+          j.status='RETRY_SCHEDULED' AND r.status='RUNNING'
+        )
+        """
+    ).fetchall()
+    now = datetime.now(UTC).replace(microsecond=0).isoformat()
+    repaired = 0
+    failure_statuses = {"REJECTED", "FAILED", "TIMED_OUT", "CANCELLED"}
+    for row in rows:
+        job_status = str(row["job_status"])
+        if job_status == "RETRY_SCHEDULED":
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET status='RETRY_SCHEDULED',completed_at=NULL,updated_at=?
+                WHERE run_id=? AND status='RUNNING'
+                """,
+                (now, row["run_id"]),
+            )
+            repaired += 1
+            continue
+        try:
+            result = json.loads(row["result_json"] or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        result["job_terminal_status"] = job_status
+        if row["last_error"]:
+            result["last_error"] = str(row["last_error"])[:500]
+        if row["last_diagnostic_json"]:
+            try:
+                result["diagnostic"] = json.loads(row["last_diagnostic_json"])
+            except json.JSONDecodeError:
+                pass
+        required_topics = row["required_topics_json"] or "[]"
+        missing_topics = required_topics if job_status in failure_statuses else None
+        blocking_gaps = (
+            json.dumps([f"job_terminal:{job_status}"], separators=(",", ":"))
+            if job_status in failure_statuses
+            else None
+        )
+        conn.execute(
+            """
+            UPDATE research_runs
+            SET status=?,result_json=?,completed_at=COALESCE(?,?),
+                missing_topics_json=COALESCE(?,missing_topics_json),
+                blocking_gaps_json=COALESCE(?,blocking_gaps_json),updated_at=?
+            WHERE run_id=?
+            """,
+            (
+                job_status,
+                json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                row["completed_at"],
+                now,
+                missing_topics,
+                blocking_gaps,
+                now,
+                row["run_id"],
+            ),
+        )
+        repaired += 1
+    return repaired

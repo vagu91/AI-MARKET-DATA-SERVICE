@@ -11,10 +11,28 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.providers.ai_researcher_provider import _resolve_command
+from app.services.codex_runtime_contract import (
+    all_step_output_schemas,
+    build_codex_exec_command,
+    inherited_instruction_files,
+    legacy_research_output_schema,
+    safe_subprocess_environment,
+    validate_isolated_command,
+    validate_output_schema,
+)
 from app.services.source_policy_service import SourcePolicyService
 
 
-CAPABILITY_STATES = {"CONFIGURED", "READY_TO_SMOKE", "LIVE_VERIFIED", "DEGRADED", "UNAVAILABLE"}
+CAPABILITY_STATES = {
+    "READY_TO_SMOKE",
+    "LIVE_VERIFIED",
+    "NOT_CONFIGURED",
+    "AUTH_UNAVAILABLE",
+    "SCHEMA_INVALID",
+    "EXECUTOR_UNAVAILABLE",
+    "WEB_UNAVAILABLE",
+    "DEGRADED",
+}
 
 
 class AIResearchCapabilityService:
@@ -37,19 +55,70 @@ class AIResearchCapabilityService:
         exec_help_result = self._run([*(command or []), "exec", "--help"]) if command else None
         auth_result = self._run([*(command or []), "login", "status"]) if command else None
         version = _safe_version(version_result.stdout if version_result and version_result.returncode == 0 else "")
-        help_text = "\n".join(
-            result.stdout for result in (help_result, exec_help_result)
-            if result is not None and result.returncode == 0
+        global_help = help_result.stdout if help_result is not None and help_result.returncode == 0 else ""
+        exec_help = (
+            exec_help_result.stdout
+            if exec_help_result is not None and exec_help_result.returncode == 0
+            else ""
         )
-        execution_supported = "exec" in help_text and (exec_help_result is not None and exec_help_result.returncode == 0)
-        web_flag_supported = "--search" in help_text
-        structured_output_supported = "--output-schema" in help_text and "--json" in help_text
+        execution_supported = "exec" in global_help and bool(
+            exec_help_result is not None and exec_help_result.returncode == 0
+        )
+        web_flag_supported = "--search" in global_help
+        required_exec_options = {
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--output-last-message",
+            "--color",
+            "--json",
+        }
+        available_exec_options = {
+            option for option in required_exec_options if option in exec_help
+        }
+        isolation_options_supported = available_exec_options == required_exec_options
+        structured_output_supported = {
+            "--output-schema",
+            "--output-last-message",
+            "--json",
+        } <= available_exec_options
         auth_available = bool(
             auth_result is not None
             and auth_result.returncode == 0
             and "logged in" in f"{auth_result.stdout} {auth_result.stderr}".lower()
         )
         workspace_writable = _workspace_writable(Path(self.settings.ai_job_workspace_root))
+        inherited_instructions = inherited_instruction_files(
+            Path(self.settings.ai_job_workspace_root)
+        )
+        schema_errors: dict[str, str] = {}
+        schemas = {
+            **all_step_output_schemas(),
+            "LEGACY_BATCH": legacy_research_output_schema(),
+        }
+        for step, schema in schemas.items():
+            try:
+                validate_output_schema(schema)
+            except ValueError as exc:
+                schema_errors[step] = str(exc)[:500]
+        schemas_valid = not schema_errors
+        command_isolated = False
+        command_shape: list[str] = []
+        if command:
+            workspace = Path(self.settings.ai_job_workspace_root) / "capability-offline-probe"
+            command_shape = build_codex_exec_command(
+                command,
+                workspace=workspace,
+                schema_path=workspace / "output_schema.json",
+                output_path=workspace / "output.json",
+            )
+            try:
+                validate_isolated_command(command_shape)
+                command_isolated = True
+            except ValueError:
+                command_isolated = False
         try:
             policy = SourcePolicyService(self.settings.source_policy_path)
             policy_loaded = True
@@ -62,19 +131,26 @@ class AIResearchCapabilityService:
         web_configured = bool(self.settings.ai_research_web_access_enabled and web_flag_supported)
         worker_active = bool(self.settings.ai_worker_enabled)
         if not configured:
-            status = "UNAVAILABLE"
-        elif not executable_available or not execution_supported or not structured_output_supported:
-            status = "UNAVAILABLE"
-        elif not auth_available or not workspace_writable or not policy_loaded:
+            status = "NOT_CONFIGURED"
+        elif not executable_available or not execution_supported or not isolation_options_supported:
+            status = "EXECUTOR_UNAVAILABLE"
+        elif not auth_available:
+            status = "AUTH_UNAVAILABLE"
+        elif not schemas_valid:
+            status = "SCHEMA_INVALID"
+        elif not web_flag_supported or not self.settings.ai_research_web_access_enabled:
+            status = "WEB_UNAVAILABLE"
+        elif (
+            not workspace_writable
+            or not policy_loaded
+            or not command_isolated
+            or bool(inherited_instructions)
+        ):
             status = "DEGRADED"
         elif live_verified and web_configured:
             status = "LIVE_VERIFIED"
         elif web_configured and worker_active:
             status = "READY_TO_SMOKE"
-        elif not self.settings.ai_research_web_access_enabled or not worker_active:
-            status = "CONFIGURED"
-        elif not workspace_writable or not policy_loaded or not worker_active:
-            status = "DEGRADED"
         else:
             status = "DEGRADED"
         report = {
@@ -92,12 +168,27 @@ class AIResearchCapabilityService:
             "live_web_verified": live_verified,
             "live_web_verified_at": live_verification.get("verified_at") if live_verification else None,
             "structured_output_supported": structured_output_supported,
+            "output_last_message_supported": "--output-last-message" in available_exec_options,
+            "jsonl_events_supported": "--json" in available_exec_options,
+            "ignore_user_config_supported": "--ignore-user-config" in available_exec_options,
+            "ignore_rules_supported": "--ignore-rules" in available_exec_options,
+            "isolation_options_supported": isolation_options_supported,
+            "isolated_command_constructed": command_isolated,
+            "schema_validation_status": "VALID" if schemas_valid else "INVALID",
+            "schema_errors": schema_errors,
             "workspace_writable": workspace_writable,
+            "inherited_instruction_files": inherited_instructions,
+            "agent_instructions_isolated": not inherited_instructions,
             "process_group_watchdog_available": True,
             "source_policy_loaded": policy_loaded,
             "source_policy_version": policy_version,
             "worker_active": worker_active,
             "secrets_exposed": False,
+            "live_verification_note": (
+                "READY_TO_SMOKE is an offline readiness state, not proof of live web execution."
+                if status == "READY_TO_SMOKE"
+                else None
+            ),
         }
         if persist:
             self._persist(report, str((command or [None])[0] or ""))
@@ -161,7 +252,7 @@ class AIResearchCapabilityService:
         try:
             return self.runner(
                 command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=10, check=False,
+                timeout=10, check=False, env=safe_subprocess_environment(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return subprocess.CompletedProcess(command, 1, "", type(exc).__name__)

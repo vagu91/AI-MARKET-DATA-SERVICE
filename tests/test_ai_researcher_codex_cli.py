@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.core.config import Settings
@@ -49,11 +50,15 @@ def payload(fact_key="US:CPI:2099-07-14:consumer_price_index:macro_event_enrichm
                 "frequency": "monthly",
                 "source": "Reuters",
                 "source_url": "https://reuters.test/cpi",
+                "extracted_text": None,
                 "evidence_text": "Reuters reported the July 2099 headline CPI forecast at 0.3% and previous at 0.2%.",
                 "reliability": 0.7,
                 "confidence": 0.7,
                 "valid_until": "2099-07-14T12:30:00+00:00",
+                "notes": None,
                 "warnings": [],
+                "metrics": [],
+                "fomc_context": None,
             }
         ],
     }
@@ -136,6 +141,11 @@ def test_codex_command_contains_skip_flag_and_writes_stdout_json(tmp_path, monke
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
+        output_index = command.index("--output-last-message")
+        Path(command[output_index + 1]).write_text(
+            json.dumps(payload()),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload()), stderr="")
 
     monkeypatch.setattr("app.providers.ai_researcher_provider.subprocess.run", fake_run)
@@ -146,7 +156,17 @@ def test_codex_command_contains_skip_flag_and_writes_stdout_json(tmp_path, monke
     assert "exec" in calls[0][0]
     exec_index = calls[0][0].index("exec")
     assert calls[0][0][exec_index : exec_index + 2] == ["exec", "--skip-git-repo-check"]
-    full_prompt = calls[0][0][-1]
+    for flag in (
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--search",
+        "--json",
+        "--output-schema",
+        "--output-last-message",
+    ):
+        assert flag in calls[0][0]
+    assert calls[0][0][-1] == "-"
+    full_prompt = calls[0][1]["input"]
     assert len(full_prompt) > 2000
     assert "forecast" in full_prompt
     assert "previous" in full_prompt
@@ -154,7 +174,8 @@ def test_codex_command_contains_skip_flag_and_writes_stdout_json(tmp_path, monke
     assert "source_url" in full_prompt
     assert "valid_until" in full_prompt
     assert "restituisci esclusivamente json" in full_prompt.lower()
-    assert calls[0][1]["cwd"]
+    assert full_prompt not in calls[0][0]
+    assert calls[0][1]["cwd"] == cfg.codex_workspace_dir
     assert (cfg.codex_workspace_dir / "research_output.json").exists()
     assert status["exit_code"] == 0
 

@@ -5,12 +5,25 @@ import os
 import signal
 import subprocess
 import threading
+from time import perf_counter
 from pathlib import Path
 from typing import Any
 
 from app.core.config import Settings
 from app.core.redaction import redact_payload
 from app.providers.ai_researcher_provider import _resolve_command, parse_json_from_stdout
+from app.services.codex_runtime_contract import (
+    CodexCLIError,
+    build_codex_exec_command,
+    build_diagnostic,
+    classify_codex_failure,
+    inherited_instruction_files,
+    safe_subprocess_environment,
+    step_output_schema,
+    validate_isolated_command,
+    validate_output_schema,
+    validate_payload,
+)
 from app.services.research_profiles import profile_for_job, prompt_context
 
 
@@ -23,26 +36,15 @@ class PersistentAIJobExecutor:
         self._active: dict[int, subprocess.Popen[str]] = {}
 
     def __call__(self, job: dict[str, Any], workspace: Path, watchdog_seconds: int) -> dict[str, Any]:
-        if not self.settings.enable_ai_researcher:
-            return {"status": "REJECTED", "error": "ai_researcher_disabled", "results": []}
-        if not self.settings.ai_research_web_access_enabled:
-            return {"status": "REJECTED", "error": "research_web_access_not_verified", "results": []}
-        if self.settings.ai_researcher_mode != "codex_cli":
-            return {"status": "REJECTED", "error": "persistent_worker_requires_codex_cli", "results": []}
-        command_prefix = _resolve_command(self.settings.codex_cli_command)
-        if not command_prefix:
-            return {"status": "REJECTED", "error": "codex_cli_unavailable", "results": []}
-
-        workspace.mkdir(parents=True, exist_ok=True)
-        input_path = workspace / "research_input.json"
-        output_path = workspace / "research_output.json"
-        input_path.write_text(
-            json.dumps(redact_payload(job["request_payload"]), indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )
-        prompt = build_job_prompt(job)
-        command = [*command_prefix, "exec", "--skip-git-repo-check", "-"]
-        return self._invoke(command, prompt, workspace, output_path, watchdog_seconds)
+        del job, workspace, watchdog_seconds
+        return {
+            "status": "REJECTED",
+            "error": "persistent_step_runtime_required",
+            "error_category": "CONFIG_INVALID",
+            "retryable": False,
+            "retry_classification": "NON_RETRYABLE",
+            "results": [],
+        }
 
     def execute_step(
         self,
@@ -60,23 +62,70 @@ class PersistentAIJobExecutor:
             raise RuntimeError("research_web_access_not_verified")
         command_prefix = _resolve_command(self.settings.codex_cli_command)
         if not command_prefix:
-            raise RuntimeError("codex_cli_unavailable")
+            raise self._preflight_error(
+                category="EXECUTABLE_UNAVAILABLE",
+                step=step_name,
+                workspace=workspace,
+                command=[self.settings.codex_cli_command],
+            )
         workspace.mkdir(parents=True, exist_ok=True)
+        inherited_instructions = inherited_instruction_files(workspace)
+        if inherited_instructions:
+            raise self._preflight_error(
+                category="CONFIG_INVALID",
+                step=step_name,
+                workspace=workspace,
+                command=command_prefix,
+                stderr="inherited_agent_instructions_present",
+            )
         schema_path = workspace / f"{step_name.lower()}_output_schema.json"
-        schema_path.write_text(json.dumps(_step_schema(step_name), indent=2), encoding="utf-8")
+        schema = step_output_schema(step_name)
+        try:
+            validate_output_schema(schema)
+        except ValueError as exc:
+            raise self._preflight_error(
+                category="SCHEMA_INVALID",
+                step=step_name,
+                workspace=workspace,
+                command=command_prefix,
+                stderr=str(exc),
+            ) from exc
+        schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         output_path = workspace / f"{step_name.lower()}_output.json"
         profile = profile_for_job(str(job["job_type"]))
         prompt = build_step_prompt(job, run, step_name, context, prompt_context(profile, job.get("request_payload") or {}))
-        command = [
-            *command_prefix, "--search", "-s", "read-only", "-C", str(workspace),
-            "exec", "--skip-git-repo-check", "--ephemeral", "--json",
-            "--output-schema", str(schema_path), "-",
-        ]
-        result = self._invoke(
-            command, prompt, workspace, output_path, watchdog_seconds, json_event_stream=True,
+        command = build_codex_exec_command(
+            command_prefix,
+            workspace=workspace,
+            schema_path=schema_path,
+            output_path=output_path,
         )
-        if result.get("status") in {"FAILED", "REJECTED", "TIMED_OUT"}:
-            raise RuntimeError(str(result.get("error") or "agent_step_failed"))
+        try:
+            validate_isolated_command(command, prompt)
+        except ValueError as exc:
+            raise self._preflight_error(
+                category="CONFIG_INVALID",
+                step=step_name,
+                workspace=workspace,
+                command=command,
+                stderr=str(exc),
+            ) from exc
+        try:
+            result = self._invoke(
+                command,
+                prompt,
+                workspace,
+                output_path,
+                watchdog_seconds,
+                json_event_stream=True,
+                schema=schema,
+                step=step_name,
+                executable_version=self._executable_version(command_prefix),
+            )
+        except CodexCLIError as exc:
+            exc.diagnostic["run_id"] = str(run["run_id"])
+            exc.diagnostic["job_id"] = str(job["job_id"])
+            raise
         return {key: value for key, value in result.items() if key != "status"}
 
     def _invoke(
@@ -87,7 +136,12 @@ class PersistentAIJobExecutor:
         output_path: Path,
         watchdog_seconds: int,
         json_event_stream: bool = False,
+        schema: dict[str, Any] | None = None,
+        step: str = "JOB",
+        executable_version: str | None = None,
     ) -> dict[str, Any]:
+        started = perf_counter()
+        output_path.unlink(missing_ok=True)
         kwargs: dict[str, Any] = {
             "cwd": workspace,
             "stdin": subprocess.PIPE,
@@ -96,13 +150,27 @@ class PersistentAIJobExecutor:
             "text": True,
             "encoding": "utf-8",
             "errors": "replace",
-            "env": _safe_subprocess_environment(),
+            "env": safe_subprocess_environment(),
         }
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        process = subprocess.Popen(command, **kwargs)
+        try:
+            process = subprocess.Popen(command, **kwargs)
+        except OSError as exc:
+            raise CodexCLIError(
+                build_diagnostic(
+                    category="EXECUTABLE_UNAVAILABLE",
+                    retryable=False,
+                    command=command,
+                    step=step,
+                    workspace=workspace,
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    executable_version=executable_version,
+                    stderr=str(exc),
+                )
+            ) from exc
         with self._lock:
             self._active[process.pid] = process
         try:
@@ -111,33 +179,95 @@ class PersistentAIJobExecutor:
             except subprocess.TimeoutExpired:
                 _terminate_process_group(process)
                 stdout, stderr = process.communicate()
-                return {
-                    "status": "TIMED_OUT",
-                    "error": "ai_job_watchdog_expired",
-                    "stdout": stdout[-2000:],
-                    "stderr": stderr[-2000:],
-                    "results": [],
-                }
+                error_events = extract_codex_error_events(stdout)
+                raise CodexCLIError(
+                    build_diagnostic(
+                        category="TIMEOUT",
+                        retryable=True,
+                        command=command,
+                        step=step,
+                        workspace=workspace,
+                        duration_ms=int((perf_counter() - started) * 1000),
+                        executable_version=executable_version,
+                        exit_code=process.returncode,
+                        stderr=stderr,
+                        stdout=stdout,
+                        error_events=error_events,
+                    )
+                )
         finally:
             with self._lock:
                 self._active.pop(process.pid, None)
+        error_events = extract_codex_error_events(stdout)
         if process.returncode != 0:
-            return {
-                "status": "FAILED",
-                "error": f"codex_cli_exit_{process.returncode}",
-                "stderr": stderr[-2000:],
-                "results": [],
-            }
+            category, retryable = classify_codex_failure(
+                exit_code=process.returncode,
+                stderr=stderr,
+                error_events=error_events,
+            )
+            raise CodexCLIError(
+                build_diagnostic(
+                    category=category,
+                    retryable=retryable,
+                    command=command,
+                    step=step,
+                    workspace=workspace,
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    executable_version=executable_version,
+                    exit_code=process.returncode,
+                    stderr=stderr,
+                    stdout=stdout,
+                    error_events=error_events,
+                )
+            )
         if json_event_stream:
-            payload, tool_events, usage, error = parse_codex_json_event_stream(stdout)
+            _ignored_payload, tool_events, usage, _stream_error = parse_codex_json_event_stream(
+                stdout
+            )
+            payload, error = _read_structured_output(output_path)
         else:
             payload, error = parse_json_from_stdout(stdout)
             tool_events, usage = [], None
         if payload is None:
-            return {"status": "REJECTED", "error": error or "invalid_json", "results": []}
-        output_path.write_text(
-            json.dumps(redact_payload(payload), indent=2, ensure_ascii=False, default=str), encoding="utf-8"
-        )
+            raise CodexCLIError(
+                build_diagnostic(
+                    category="OUTPUT_CONTRACT",
+                    retryable=False,
+                    command=command,
+                    step=step,
+                    workspace=workspace,
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    executable_version=executable_version,
+                    exit_code=process.returncode,
+                    stderr=f"{stderr}\n{error or 'invalid_json'}",
+                    stdout=stdout,
+                    error_events=error_events,
+                )
+            )
+        if schema is not None:
+            try:
+                validate_payload(payload, schema)
+            except ValueError as exc:
+                raise CodexCLIError(
+                    build_diagnostic(
+                        category="OUTPUT_CONTRACT",
+                        retryable=False,
+                        command=command,
+                        step=step,
+                        workspace=workspace,
+                        duration_ms=int((perf_counter() - started) * 1000),
+                        executable_version=executable_version,
+                        exit_code=process.returncode,
+                        stderr=f"{stderr}\n{exc}",
+                        stdout=stdout,
+                        error_events=error_events,
+                    )
+                ) from exc
+        if not output_path.exists():
+            output_path.write_text(
+                json.dumps(redact_payload(payload), indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
         if json_event_stream:
             telemetry_path = output_path.with_name(f"{output_path.stem}_telemetry.json")
             telemetry_path.write_text(
@@ -148,6 +278,46 @@ class PersistentAIJobExecutor:
             "status": "SUCCEEDED", **payload, "_tool_events": tool_events,
             "_usage": usage, "usage_status": "available" if usage is not None else "usage_unavailable",
         }
+
+    def _preflight_error(
+        self,
+        *,
+        category: str,
+        step: str,
+        workspace: Path,
+        command: list[str],
+        stderr: str = "",
+    ) -> CodexCLIError:
+        return CodexCLIError(
+            build_diagnostic(
+                category=category,
+                retryable=False,
+                command=command,
+                step=step,
+                workspace=workspace,
+                duration_ms=0,
+                executable_version=None,
+                stderr=stderr,
+            )
+        )
+
+    def _executable_version(self, command_prefix: list[str]) -> str | None:
+        try:
+            completed = subprocess.run(
+                [*command_prefix, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                env=safe_subprocess_environment(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        return " ".join((completed.stdout or "").split())[:120] or None
 
     def cancel_all(self) -> None:
         with self._lock:
@@ -235,32 +405,6 @@ def _phase_requirements(step_name: str) -> list[str]:
     }[step_name]
 
 
-def _step_schema(step_name: str) -> dict[str, Any]:
-    base: dict[str, Any] = {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "additionalProperties": True,
-        "properties": {
-            "status": {"type": "string"},
-            "queries": {"type": "array", "items": {"type": "string"}},
-            "sources": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
-            "claims": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
-            "warnings": {"type": "array", "items": {"type": "string"}},
-        },
-    }
-    base["required"] = ["claims"] if step_name == "VALIDATE" else ["status"]
-    return base
-
-
-def _safe_subprocess_environment() -> dict[str, str]:
-    allowed = {
-        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "USERPROFILE",
-        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "CODEX_HOME", "HTTP_PROXY", "HTTPS_PROXY",
-        "NO_PROXY", "LANG", "LC_ALL",
-    }
-    return {key: value for key, value in os.environ.items() if key.upper() in allowed}
-
-
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -328,6 +472,33 @@ def parse_codex_json_event_stream(
         if payload is not None:
             return payload, events, usage, None
     return None, events, usage, "codex_json_stream_missing_structured_final_message"
+
+
+def extract_codex_error_events(stdout: str) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "").lower()
+        if event_type == "turn.failed" or "error" in event_type:
+            errors.append(redact_payload(event))
+    return errors[-10:]
+
+
+def _read_structured_output(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return None, "structured_output_file_missing"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"structured_output_file_invalid:{type(exc).__name__}:{exc}"
+    if not isinstance(payload, dict):
+        return None, "structured_output_file_not_object"
+    return payload, None
 
 
 def _observed_tool_type(item_type: str, event_type: str) -> str | None:

@@ -18,6 +18,15 @@ from app.services.market_fact_repository import now_iso
 from app.services.data_integrity_service import reject_future_actual
 from app.services.ai_research_validation_service import ValidationRequest, validate_ai_research_result
 from app.services.ai_research_diagnostics import AIResearchDiagnostics
+from app.services.codex_runtime_contract import (
+    build_codex_exec_command,
+    inherited_instruction_files,
+    legacy_research_output_schema,
+    safe_subprocess_environment,
+    validate_isolated_command,
+    validate_output_schema,
+    validate_payload,
+)
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
 PRIMARY_METRIC_IDS = {
@@ -74,8 +83,15 @@ class AIResearcherProvider:
         diagnostics = AIResearchDiagnostics(self.settings)
         workspace = Path(self.settings.codex_workspace_dir)
         workspace.mkdir(parents=True, exist_ok=True)
+        if inherited_instruction_files(workspace):
+            return [], {
+                "status": "provider_failed",
+                "failure_reason": "codex_workspace_inherits_agent_instructions",
+                "retry_classification": "NON_RETRYABLE",
+            }
         input_path = workspace / "research_input.json"
         output_path = workspace / "research_output.json"
+        schema_path = workspace / "research_output_schema.json"
         diagnostics_path = workspace / "last_codex_run.json"
         research_input = {"generated_at": now_iso(), "events": events}
         input_path.write_text(json.dumps(research_input, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
@@ -83,14 +99,27 @@ class AIResearcherProvider:
         prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "Research events and write research_output.json."
         final_prompt = build_codex_research_prompt(prompt, research_input)
         command_prefix = _resolve_command(self.settings.codex_cli_command)
-        command = [
-            *(command_prefix or [self.settings.codex_cli_command]),
-            "exec",
-            "--skip-git-repo-check",
-            final_prompt,
-        ]
+        schema = legacy_research_output_schema()
+        try:
+            validate_output_schema(schema)
+        except ValueError as exc:
+            return [], {
+                "status": "provider_failed",
+                "failure_reason": "codex_output_schema_invalid",
+                "error": redact_sensitive(str(exc)),
+                "retry_classification": "NON_RETRYABLE",
+            }
+        schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+        output_path.unlink(missing_ok=True)
+        command = build_codex_exec_command(
+            command_prefix or [self.settings.codex_cli_command],
+            workspace=workspace,
+            schema_path=schema_path,
+            output_path=output_path,
+        )
+        validate_isolated_command(command, final_prompt)
         started = perf_counter()
-        cwd = Path.cwd()
+        cwd = workspace
         run_info: dict[str, Any] = {
             "command": _safe_command(command),
             "cwd": str(cwd),
@@ -98,14 +127,16 @@ class AIResearcherProvider:
             "output_path": str(output_path.resolve()),
             "status": "started",
             **_prompt_diagnostics(final_prompt, research_input),
-            "web_search_enabled": False,
-            "web_search_note": "Codex CLI web access is controlled by the local Codex installation; no separate web-search flag is configured by this service.",
+            "web_search_enabled": True,
+            "web_search_note": "Codex CLI web search is explicitly enabled for this isolated invocation.",
+            "user_config_ignored": True,
+            "rules_ignored": True,
+            "sandbox": "read-only",
         }
         if diagnostics.enabled:
             for event in events:
                 event_id = event.get("event_id")
                 diagnostics.event_json(event_id, "input.json", research_input)
-                diagnostics.event_text(event_id, "prompt.txt", final_prompt)
                 diagnostics.event_json(
                     event_id,
                     "command.json",
@@ -131,12 +162,14 @@ class AIResearcherProvider:
             completed = subprocess.run(
                 command,
                 cwd=cwd,
+                input=final_prompt,
                 timeout=self.settings.codex_research_timeout_seconds,
                 check=False,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=safe_subprocess_environment(),
             )
         except subprocess.TimeoutExpired as exc:
             run_info.update(
@@ -189,7 +222,17 @@ class AIResearcherProvider:
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
             _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
-        payload, parse_error = parse_json_from_stdout(completed.stdout)
+        if output_path.exists():
+            try:
+                loaded = json.loads(output_path.read_text(encoding="utf-8"))
+                payload = loaded if isinstance(loaded, dict) else None
+                parse_error = None if payload is not None else "output_file_json_not_object"
+            except (OSError, json.JSONDecodeError) as exc:
+                payload = None
+                parse_error = f"output_file_invalid:{type(exc).__name__}:{exc}"
+        else:
+            payload = None
+            parse_error = "structured_output_file_missing"
         if payload is None:
             generic_failure = _generic_non_research_response(completed.stdout)
             run_info.update(
@@ -205,7 +248,25 @@ class AIResearcherProvider:
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
             _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
-        output_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        try:
+            validate_payload(payload, schema)
+        except ValueError as exc:
+            run_info.update(
+                {
+                    "status": "provider_failed",
+                    "error": redact_sensitive(str(exc)),
+                    "failure_reason": "codex_output_contract_incompatible",
+                    "retry_classification": "NON_RETRYABLE",
+                }
+            )
+            diagnostics_path.write_text(
+                json.dumps(run_info, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _record_diagnostic_failure(diagnostics, events, run_info)
+            return [], run_info
+        if not output_path.exists():
+            output_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         facts, status = self.load_payload(payload)
         _record_diagnostic_success(diagnostics, self.settings, events, payload, facts, status)
         run_info.update(status)
@@ -653,11 +714,12 @@ def build_codex_research_prompt(prompt_template: str, research_input: dict[str, 
     return f"""{prompt_template.strip()}
 
 COMPITO
-Ricerca forecast, previous, consensus e actual per gli eventi macro contenuti nell'input.
+Ricerca forecast, previous e consensus per gli eventi macro contenuti nell'input.
 
 REGOLE OPERATIVE
 - Non inventare dati.
 - Non stimare valori.
+- Lascia sempre actual a null: gli actual numerici sono risolti solo dal servizio deterministico ufficiale.
 - Ogni valore numerico deve avere source, source_url e evidence_text.
 - Il periodo della fonte deve coincidere con il periodo dell'evento.
 - Se un dato non e' verificabile, lascialo null.
@@ -693,8 +755,6 @@ def _prompt_diagnostics(prompt: str, research_input: dict[str, Any]) -> dict[str
         "prompt_line_count": len(prompt.splitlines()),
         "prompt_contains_input": bool(fact_keys) and all(key and key in prompt for key in fact_keys),
         "input_event_count": input_event_count,
-        "prompt_preview_start": prompt[:700],
-        "prompt_preview_end": prompt[-700:],
     }
 
 

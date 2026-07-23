@@ -17,11 +17,11 @@ independent worker -> capability gate -> atomic job lease -> heartbeat -> unique
                    -> terminal job state -> DB-only snapshot revision
 ```
 
-The worker is independent from the APScheduler switch. Expired `RUNNING` leases close their active attempt as `ABANDONED`; jobs with attempts remaining become `RETRY_SCHEDULED`, while exhausted jobs become `FAILED`. The process watchdog is separate from HTTP timeouts and kills the entire process group at the worker runtime limit or bounded application shutdown.
+The worker is independent from the APScheduler switch. HTTP always returns without waiting for Codex. Expired `RUNNING` leases close their active attempt as `ABANDONED`; jobs with attempts remaining become `RETRY_SCHEDULED`, while exhausted jobs become `FAILED`. The process watchdog is separate from HTTP timeouts and kills the entire process group at the worker runtime limit or bounded application shutdown.
 
 ## Storage
 
-Migration 7 adds `ai_research_jobs`, `ai_research_job_attempts`, `market_context_snapshots`, and `event_value_candidates`, plus lineage/lifecycle columns on existing event, fact, and news tables. Migration 8 adds job generation/scope/snapshot linkage and the snapshot-job join table. Migration 9 adds semantic-actual columns plus capability reports, research runs/steps, atomic claims/evidence and scheduler decisions. Migration 10 adds persistent official-feed retry deadlines, observed tool events, evidence content hashes, server-computed topic completeness and usage/cost fields. All migrations are additive and preserve schema-6/schema-8/schema-9 data.
+Migration 7 adds `ai_research_jobs`, `ai_research_job_attempts`, `market_context_snapshots`, and `event_value_candidates`, plus lineage/lifecycle columns on existing event, fact, and news tables. Migration 8 adds job generation/scope/snapshot linkage and the snapshot-job join table. Migration 9 adds semantic-actual columns plus capability reports, research runs/steps, atomic claims/evidence and scheduler decisions. Migration 10 adds persistent official-feed retry deadlines, observed tool events, evidence content hashes, server-computed topic completeness and usage/cost fields. Migration 11 adds redacted job/attempt/step diagnostics and `research_step_attempts`, preserving every retry of a failed step. All migrations are additive and preserve schema-6/schema-8/schema-9/schema-10 data.
 
 Candidate actuals retain `event_metric_id`, `source_series_id`, transformation, SA/NSA variant, frequency, unit, reference period, release vintage, observation lineage and official canonical URL. Raw macro levels are never promoted directly to event actuals. Surprise is calculated only when metric, period, frequency, unit and seasonal adjustment match the forecast/consensus baseline; incompatibility is persisted as a structured warning and remains fail-closed for full analysis.
 
@@ -35,7 +35,21 @@ Idempotency deduplicates active work by stable scope and allows only one automat
 
 ## Capability and scheduler
 
-`GET /ai-research/capabilities` checks configuration, executable/version, login status, `exec`, `--search`, structured output, workspace write access, process-group watchdog, source policy and worker state. `CONFIGURED` means the static prerequisites are present, `READY_TO_SMOKE` means a separately authorized live proof is still required, and only a persisted successful proof can produce `LIVE_VERIFIED` and `web_search_available=true`. The worker leaves ordinary AI jobs pending until that proof exists; deterministic official-actual jobs remain eligible. The boolean web setting or CLI flag support alone is never treated as proof of availability.
+`GET /ai-research/capabilities` is an offline probe. It checks command resolution, restricted environment compatibility, version/login, required global and `exec` options, all local output schemas, isolated command construction, workspace, source policy and worker state. It never calls a model. Results distinguish `NOT_CONFIGURED`, `AUTH_UNAVAILABLE`, `SCHEMA_INVALID`, `EXECUTOR_UNAVAILABLE`, `WEB_UNAVAILABLE`, `DEGRADED`, `READY_TO_SMOKE` and `LIVE_VERIFIED`. `READY_TO_SMOKE` means only that an explicitly authorized live proof may be attempted; it is not live-web verification. Only a persisted successful smoke can produce `LIVE_VERIFIED` and `web_search_available=true`. The worker leaves ordinary AI jobs pending until that proof exists; deterministic official-actual jobs remain eligible. Keep the research scheduler disabled until the smoke succeeds.
+
+## Codex execution and retry contract
+
+The prompt is supplied only on stdin. The command always requests web search, a read-only sandbox, an isolated non-Git working directory, ephemeral session state, ignored user config/rules, JSONL events, a locally validated closed schema, a deterministic final-message file and no color. Persisted authentication remains available. Personal MCP/plugin configuration and rules are outside the runtime contract. Capability and executor preflight reject a workspace with an `AGENTS.md` anywhere in its ancestor chain, so repository/user instructions cannot silently enter the research session.
+
+The final-message file is the primary structured payload. JSONL contributes only event telemetry, observed searches/source opens, usage and `error`/`turn.failed` diagnostics. Every object schema is closed, every array has defined bounded items, nullable fields are explicit and the AI contract cannot produce numeric `actual` values. Source tiers, confirmation counts and verification remain server-computed.
+
+| Failure category | Retry |
+| --- | --- |
+| invalid schema, unsupported argument, invalid config, missing auth/executable, incompatible output contract, deterministic policy rejection | never |
+| rate limit, watchdog timeout, temporary network failure, backend 5xx, documented transient interruption | bounded backoff |
+| unknown/opaque CLI exit | never (fail closed) |
+
+The compact job error contains only a stable error code. Redacted diagnostics retain category, exit code, bounded stderr/stdout tails, structured error events, safe command shape, CLI version, step, duration, workspace and timestamp. Prompts, secrets, environment contents, cookies, auth files and personal config are not stored.
 
 Optional pre-market, in-session, post-market, pre-event, post-release, speech, earnings, news and temporary-source retry triggers are disabled unless the general and research schedulers are enabled. Each trigger persists its input fingerprint and returns `NOT_REQUIRED` when inputs have not changed, the run window already ran, concurrency is full or the daily run budget is exhausted. Pre-event and post-release triggers enqueue event-scoped missing-field/official-actual work from the persisted snapshot rather than a generic timer-only job.
 
@@ -47,6 +61,17 @@ Optional pre-market, in-session, post-market, pre-event, post-release, speech, e
 | Speech/testimony | `PRE_RELEASE` | `AWAITING_OUTCOME` | `COMPLETED` with sourced outcome/transcript |
 | Earnings | upcoming | removed from upcoming | released EPS/revenue and surprises where available |
 | News | current until `valid_until` | expired/historical, excluded from current drivers | retained until retention cleanup |
+
+Job and run lifecycle is synchronized transactionally:
+
+| Job transition | Run transition | Step behavior |
+| --- | --- | --- |
+| acquired | `RUNNING` | failed step can start a new numbered attempt |
+| transient failure | `RETRY_SCHEDULED` | current attempt remains terminal and queryable |
+| `SUCCEEDED`, `PARTIAL`, `NO_DATA` | same terminal status, `completed_at` set | completed history retained |
+| `FAILED`, `TIMED_OUT`, `CANCELLED`, `REJECTED` | same terminal status, `completed_at` set | diagnostic and blocking gaps retained |
+
+Migration/startup reconciliation is idempotent. A terminal job linked to a `PENDING`, `RUNNING` or `RETRY_SCHEDULED` run closes that run without deleting history. An active run linked to a retry-scheduled job becomes `RETRY_SCHEDULED`.
 
 ## Operational API
 
@@ -63,7 +88,7 @@ Optional pre-market, in-session, post-market, pre-event, post-release, speech, e
 
 No endpoint supports trade decisions or order submission. Job payloads returned by status endpoints contain structured requests/results but no environment secrets. Keep `AI_MARKET_AI_RESEARCH_WEB_ACCESS_ENABLED=false` unless web availability has been explicitly verified.
 
-The compact schema-2.1 AI-TRADER consumer exposes research status, coverage, topic/gap counts, verified driver references, evidence IDs and freshness only. Prompts, raw Codex output, complete documents, detailed source attempts and reasoning remain in audit storage. Existing `refresh=false` snapshots are returned without calls, enqueue or writes.
+The compact schema-2.1 AI-TRADER consumer exposes research status, coverage, topic/gap counts, verified driver references, evidence IDs and freshness only. Prompts, raw Codex output, complete documents and reasoning are not exposed. Redacted bounded diagnostics remain on job/run audit APIs. Existing `refresh=false` snapshots are returned without calls, enqueue or writes.
 
 ## Authorized future smoke test
 
@@ -73,4 +98,6 @@ Do not run this during development. After explicit live authorization and servic
 .\scripts\smoke_test_market_research.ps1 -BaseUrl http://127.0.0.1:8000 -TimeoutSeconds 600
 ```
 
-The script probes capability, queues exactly one MNQ research run, polls with a deadline, records snapshot revision and SHA-256 artifact hashes, and never calls trading or AI-TRADER endpoints.
+The script probes capability, queues exactly one MNQ research run, and polls both the run and linked job. It fails immediately if either becomes incompatibly terminal or if the queue is empty with no owner and the latest attempt is terminal. `failure-report.json` is written even when the script throws and contains only compact status/diagnostic fields. On success it records snapshot revision and SHA-256 artifact hashes. It never calls trading or AI-TRADER endpoints.
+
+Recovery is non-destructive: disable the AI worker and research scheduler, inspect the job and run APIs, then restart the service so migration reconciliation can repair historical lifecycle drift. Do not delete or recreate SQLite. A subsequent single live smoke requires fresh explicit authorization; local tests and `READY_TO_SMOKE` do not prove the live issue resolved.

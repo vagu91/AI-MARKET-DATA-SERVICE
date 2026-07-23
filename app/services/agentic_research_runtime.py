@@ -15,6 +15,7 @@ from app.services.evidence_verification_service import (
     EvidenceVerifierProtocol,
 )
 from app.services.data_freshness_service import parse_datetime
+from app.services.codex_runtime_contract import CodexCLIError
 
 
 logger = logging.getLogger(__name__)
@@ -95,8 +96,30 @@ class AgenticResearchRuntime:
                     "source_domain_count": len(domains),
                 })
             except Exception as exc:
-                self.repository.fail_step(step["step_id"], f"{type(exc).__name__}:{exc}")
-                logger.exception("research_step_failed", extra={"job_id": job["job_id"], "run_id": run["run_id"], "step": step_name})
+                diagnostic = exc.diagnostic if isinstance(exc, CodexCLIError) else None
+                if diagnostic is not None:
+                    diagnostic["run_id"] = str(run["run_id"])
+                    diagnostic["job_id"] = str(job["job_id"])
+                self.repository.fail_step(
+                    step["step_id"],
+                    f"{type(exc).__name__}:{exc}",
+                    diagnostic=diagnostic,
+                )
+                logger.exception(
+                    "research_step_failed",
+                    extra={
+                        "job_id": job["job_id"],
+                        "run_id": run["run_id"],
+                        "step": step_name,
+                        "error_code": exc.code if isinstance(exc, CodexCLIError) else type(exc).__name__,
+                        "exit_code": diagnostic.get("exit_code") if diagnostic else None,
+                        "retry_classification": (
+                            diagnostic.get("retry_classification") if diagnostic else "NON_RETRYABLE"
+                        ),
+                    },
+                )
+                if isinstance(exc, CodexCLIError):
+                    raise
                 if "watchdog" in str(exc).lower() or self.monotonic() >= deadline:
                     return _deadline_result(run, step_name)
                 raise
@@ -225,6 +248,9 @@ def _deadline_result(run: dict[str, Any], step_name: str) -> dict[str, Any]:
         "status": "TIMED_OUT", "error": "overall_job_deadline_expired",
         "results": [], "run_id": run["run_id"], "deadline_step": step_name,
         "usage_status": "usage_unavailable",
+        "error_category": "OVERALL_DEADLINE",
+        "retryable": False,
+        "retry_classification": "NON_RETRYABLE",
     }
 
 

@@ -239,13 +239,16 @@ def write_fake_codex(tmp_path: Path, *, web: bool = True) -> Path:
     script.write_text(
         """
 import json, sys
+from pathlib import Path
 args = sys.argv[1:]
 if '--version' in args:
     print('codex-cli 9.9.9-fake'); raise SystemExit(0)
 if 'login' in args and 'status' in args:
     print('Logged in using fake test auth'); raise SystemExit(0)
 if '--help' in args:
-    print('exec --output-schema --json """ + ("--search" if web else "") + """'); raise SystemExit(0)
+    print('exec --sandbox --cd --skip-git-repo-check --ephemeral --ignore-user-config '
+          '--ignore-rules --output-schema --output-last-message --color --json """ + ("--search" if web else "") + """')
+    raise SystemExit(0)
 prompt = sys.stdin.read()
 phase = prompt.split('PHASE\\n', 1)[1].split('\\n', 1)[0]
 if phase == 'SEARCH':
@@ -254,17 +257,39 @@ if phase == 'OPEN_SOURCE':
     for url, digest in [('https://www.bloomberg.com/cpi-a', 'hash-bloomberg'), ('https://www.ft.com/cpi-b', 'hash-ft')]:
         print(json.dumps({'type': 'item.completed', 'item': {'type': 'web_open', 'url': url, 'content_hash': digest, 'http_status': 200, 'observed_at': '2026-07-22T10:00:00Z'}}))
 if phase == 'VALIDATE':
-    payload = {'claims': [{
+    payload = {'status': 'SUCCEEDED', 'claims': [{
         'topic': 'missing_fields', 'field_semantics': 'forecast', 'value': '0.3',
         'metric_id': 'headline_cpi_mom', 'period': '2026-06', 'frequency': 'monthly',
-        'unit': 'percent', 'confidence': 0.9,
+        'unit': 'percent', 'event_key': None, 'symbol': 'MNQ', 'valid_from': None,
+        'valid_until': None, 'published_at': None, 'retrieved_at': '2026-07-22T10:00:00Z',
+        'confidence': 0.9, 'topic_status': 'SUPPORTED', 'warnings': [],
         'evidence': [
-            {'source_url': 'https://www.bloomberg.com/cpi-a', 'publisher': 'Bloomberg', 'evidence_text': 'Survey forecast is 0.3 percent.', 'retrieved_at': '2026-07-22T10:00:00Z'},
-            {'source_url': 'https://www.ft.com/cpi-b', 'publisher': 'Financial Times', 'evidence_text': 'Independent economist survey reports 0.3 percent.', 'retrieved_at': '2026-07-22T10:00:00Z'}
+            {'query': 'bounded query', 'source_url': 'https://www.bloomberg.com/cpi-a', 'canonical_url': None, 'publisher': 'Bloomberg', 'evidence_text': 'Survey forecast is 0.3 percent.', 'published_at': None, 'retrieved_at': '2026-07-22T10:00:00Z'},
+            {'query': 'bounded query', 'source_url': 'https://www.ft.com/cpi-b', 'canonical_url': None, 'publisher': 'Financial Times', 'evidence_text': 'Independent economist survey reports 0.3 percent.', 'published_at': None, 'retrieved_at': '2026-07-22T10:00:00Z'}
         ]
-    }]}
+    }], 'missing_topics': [], 'blocking_gaps': [], 'warnings': []}
+elif phase == 'PLAN':
+    payload = {'status': 'COMPLETED', 'topics': ['missing_fields'], 'queries': [
+        {'query': 'bounded query', 'purpose': 'find forecast', 'topic': 'missing_fields'}
+    ], 'stop_conditions': ['two independent sources'], 'warnings': []}
+elif phase == 'SEARCH':
+    payload = {'status': 'COMPLETED', 'searches': [
+        {'query': 'bounded query', 'discovered_urls': ['https://www.bloomberg.com/cpi-a', 'https://www.ft.com/cpi-b']}
+    ], 'sources': [
+        {'query': 'bounded query', 'source_url': 'https://www.bloomberg.com/cpi-a', 'title': 'CPI A', 'publisher': 'Bloomberg'}
+    ], 'warnings': []}
+elif phase == 'OPEN_SOURCE':
+    payload = {'status': 'COMPLETED', 'sources': [
+        {'source_url': 'https://www.bloomberg.com/cpi-a', 'canonical_url': None, 'redirect_url': None, 'publisher': 'Bloomberg', 'published_at': None, 'retrieved_at': '2026-07-22T10:00:00Z', 'http_status': 200, 'source_status': 'OPENED', 'evidence_available': True, 'content_hash': 'hash-bloomberg'}
+    ], 'warnings': []}
+elif phase == 'EXTRACT':
+    payload = {'status': 'COMPLETED', 'claims': [], 'warnings': []}
+elif phase == 'CROSS_CHECK':
+    payload = {'status': 'COMPLETED', 'claims': [], 'warnings': []}
 else:
-    payload = {'status': 'COMPLETED', 'queries': ['model-declared-array-is-not-usage'], 'sources': []}
+    raise SystemExit(2)
+output_path = Path(args[args.index('--output-last-message') + 1])
+output_path.write_text(json.dumps(payload), encoding='utf-8')
 print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(payload)}}))
 """,
         encoding="utf-8",
@@ -301,7 +326,7 @@ def test_capability_ready_to_smoke_and_degraded_with_fake_executable(tmp_path: P
         tmp_path / "unavailable-db", codex_cli_command=str(unavailable_command),
         ai_worker_enabled=True, ai_research_web_access_enabled=True,
     )
-    assert AIResearchCapabilityService(unavailable).probe()["status"] == "DEGRADED"
+    assert AIResearchCapabilityService(unavailable).probe()["status"] == "WEB_UNAVAILABLE"
 
 
 def test_fake_agent_runs_all_persistent_steps_and_persists_claim_evidence(tmp_path: Path) -> None:
@@ -543,7 +568,7 @@ def test_additive_migration_from_v8_preserves_rows_and_adds_runtime(tmp_path: Pa
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('preserved','Preserved','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 10
+    assert migrate_database(database)["schema_version"] == 11
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT title FROM market_news WHERE news_key='preserved'").fetchone()[0] == "Preserved"
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -563,7 +588,7 @@ def test_additive_migration_from_v9_preserves_rows_and_adds_verified_runtime(tmp
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('v9-preserved','V9','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 10
+    assert migrate_database(database)["schema_version"] == 11
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT title FROM market_news WHERE news_key='v9-preserved'").fetchone()[0] == "V9"
         columns = {row[1] for row in conn.execute("PRAGMA table_info(research_runs)")}
