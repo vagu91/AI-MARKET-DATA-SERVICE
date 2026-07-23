@@ -118,9 +118,21 @@ def step_output_schema(
     effective_budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     budget = effective_budget or {}
-    max_searches = max(int(budget.get("remaining_searches", 8)), 0)
+    observe = str(budget.get("budget_mode") or "enforce") == "observe"
+    max_searches = max(
+        int(
+            budget.get("max_searches", 8)
+            if observe
+            else budget.get("remaining_searches", 8)
+        ),
+        0,
+    )
     max_opened_sources = max(
-        int(budget.get("remaining_opened_sources", 12)),
+        int(
+            budget.get("max_opened_sources", 12)
+            if observe
+            else budget.get("remaining_opened_sources", 12)
+        ),
         0,
     )
     schemas: dict[str, dict[str, Any]] = {
@@ -646,6 +658,10 @@ def classify_codex_failure(
             ]
         ).lower()
         patterns = (
+            (
+                "LOOP_DETECTED",
+                ("research_loop_detected", "loop detected"),
+            ),
             (
                 "BUDGET_EXCEEDED",
                 ("research_budget_exceeded", "budget exceeded"),

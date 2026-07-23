@@ -27,6 +27,10 @@ from app.services.codex_runtime_contract import (
     validate_payload,
 )
 from app.services.research_profiles import profile_for_job, prompt_context
+from app.services.research_tool_telemetry import (
+    normalize_codex_event,
+    normalize_usage,
+)
 
 
 class PersistentAIJobExecutor:
@@ -37,7 +41,9 @@ class PersistentAIJobExecutor:
         self._lock = threading.Lock()
         self._active: dict[int, subprocess.Popen[str]] = {}
 
-    def __call__(self, job: dict[str, Any], workspace: Path, watchdog_seconds: int) -> dict[str, Any]:
+    def __call__(
+        self, job: dict[str, Any], workspace: Path, watchdog_seconds: int
+    ) -> dict[str, Any]:
         del job, workspace, watchdog_seconds
         return {
             "status": "REJECTED",
@@ -195,11 +201,7 @@ class PersistentAIJobExecutor:
             )
             raise CodexCLIError(
                 build_diagnostic(
-                    category=(
-                        "EXECUTABLE_UNAVAILABLE"
-                        if category == "UNKNOWN"
-                        else category
-                    ),
+                    category=("EXECUTABLE_UNAVAILABLE" if category == "UNKNOWN" else category),
                     retryable=retryable,
                     command=command,
                     step=step,
@@ -219,6 +221,7 @@ class PersistentAIJobExecutor:
                         prompt,
                         max(int(watchdog_seconds), 1),
                         event_observer,
+                        step_name=step,
                     )
                 else:
                     stdout, stderr = process.communicate(
@@ -275,7 +278,8 @@ class PersistentAIJobExecutor:
             )
         if json_event_stream:
             _ignored_payload, tool_events, usage, _stream_error = parse_codex_json_event_stream(
-                stdout
+                stdout,
+                step_name=step,
             )
             payload, error = _read_structured_output(output_path)
         else:
@@ -328,8 +332,11 @@ class PersistentAIJobExecutor:
                 encoding="utf-8",
             )
         return {
-            "status": "SUCCEEDED", **payload, "_tool_events": tool_events,
-            "_usage": usage, "usage_status": "available" if usage is not None else "usage_unavailable",
+            "status": "SUCCEEDED",
+            **payload,
+            "_tool_events": tool_events,
+            "_usage": usage,
+            "usage_status": "available" if usage is not None else "usage_unavailable",
             "_events_persisted_incrementally": event_observer is not None,
         }
 
@@ -385,31 +392,33 @@ def build_job_prompt(job: dict[str, Any]) -> str:
     schema = {
         "status": "SUCCEEDED|NO_DATA",
         "job_id": job.get("job_id"),
-        "results": [{
-            "field": "forecast|consensus|previous|actual|outcome|transcript_url",
-            "value": None,
-            "source_domain": None,
-            "source": None,
-            "source_url": None,
-            "canonical_url": None,
-            "publisher": None,
-            "source_tier": None,
-            "source_classification": None,
-            "published_at": None,
-            "retrieved_at": None,
-            "evidence_text": None,
-            "metric_id": None,
-            "period": None,
-            "frequency": None,
-            "unit": None,
-            "field_semantics": None,
-            "reliability": 0.0,
-            "confidence": 0.0,
-            "validation_status": "candidate",
-            "warnings": [],
-            "discordant_values": [],
-            "policy_version": job.get("policy_version"),
-        }],
+        "results": [
+            {
+                "field": "forecast|consensus|previous|actual|outcome|transcript_url",
+                "value": None,
+                "source_domain": None,
+                "source": None,
+                "source_url": None,
+                "canonical_url": None,
+                "publisher": None,
+                "source_tier": None,
+                "source_classification": None,
+                "published_at": None,
+                "retrieved_at": None,
+                "evidence_text": None,
+                "metric_id": None,
+                "period": None,
+                "frequency": None,
+                "unit": None,
+                "field_semantics": None,
+                "reliability": 0.0,
+                "confidence": 0.0,
+                "validation_status": "candidate",
+                "warnings": [],
+                "discordant_values": [],
+                "policy_version": job.get("policy_version"),
+            }
+        ],
     }
     return (
         "You are an asynchronous data-only AI Researcher. Research only the fields explicitly listed as missing.\n"
@@ -431,7 +440,8 @@ def build_step_prompt(
     profile: dict[str, Any],
 ) -> str:
     prior = {
-        key: value for key, value in context.items()
+        key: value
+        for key, value in context.items()
         if key in {"plan", "search", "open_source", "extract", "cross_check"}
     }
     return (
@@ -459,18 +469,26 @@ def _phase_requirements(step_name: str) -> list[str]:
         "SEARCH": [
             "execute only planned queries within limits.remaining_searches",
             "never repeat completed_queries",
-            "stop when the numeric search budget is exhausted",
+            "in observe mode treat numeric budgets as warning thresholds",
+            "in enforce mode stop when the numeric search budget is exhausted",
             "return query and discovered URLs",
         ],
         "OPEN_SOURCE": [
             "open original sources within limits.remaining_opened_sources",
             "never reopen URLs listed in completed_opened_sources",
-            "stop when the numeric opened-source budget is exhausted",
-            "record status, redirect, publisher and timestamps",
+            "in observe mode treat numeric budgets as warning thresholds",
+            "in enforce mode stop when the numeric opened-source budget is exhausted",
+            "reported OPENED/evidence/http status is model-declared until service verification",
         ],
-        "EXTRACT": ["extract atomic claims and short evidence", "retain exact metric, period and unit"],
+        "EXTRACT": [
+            "extract atomic claims and short evidence",
+            "retain exact metric, period and unit",
+        ],
         "CROSS_CHECK": ["compare claims across sources", "mark conflicts and syndication"],
-        "VALIDATE": ["return final atomic claims with nested evidence", "return NO_DATA when criteria fail"],
+        "VALIDATE": [
+            "return final atomic claims with nested evidence",
+            "return NO_DATA when criteria fail",
+        ],
     }[step_name]
 
 
@@ -479,6 +497,8 @@ def _communicate_jsonl_incrementally(
     prompt: str,
     timeout_seconds: int,
     event_observer: Callable[[dict[str, Any]], None],
+    *,
+    step_name: str = "UNKNOWN",
 ) -> tuple[str, str]:
     if (
         process.stdin is None
@@ -491,7 +511,10 @@ def _communicate_jsonl_incrementally(
             timeout=timeout_seconds,
         )
         for line in stdout.splitlines():
-            for event in _tool_events_from_jsonl_line(line):
+            for event in _tool_events_from_jsonl_line(
+                line,
+                step_name=step_name,
+            ):
                 event_observer(event)
         return stdout, stderr
 
@@ -540,7 +563,10 @@ def _communicate_jsonl_incrementally(
                 completed = True
                 continue
             stdout_lines.append(line)
-            for event in _tool_events_from_jsonl_line(line):
+            for event in _tool_events_from_jsonl_line(
+                line,
+                step_name=step_name,
+            ):
                 try:
                     event_observer(event)
                 except Exception:
@@ -581,6 +607,8 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
 
 def parse_codex_json_event_stream(
     stdout: str,
+    *,
+    step_name: str = "UNKNOWN",
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None, str | None]:
     events: list[dict[str, Any]] = []
     final_messages: list[str] = []
@@ -605,8 +633,8 @@ def parse_codex_json_event_stream(
         if "usage" in event_type or event_type in {"turn.completed", "run.completed"}:
             candidate = event.get("usage") or item.get("usage")
             if isinstance(candidate, dict):
-                usage = candidate
-        events.extend(_tool_events_from_event(event))
+                usage = normalize_usage(candidate)
+        events.extend(_tool_events_from_event(event, step_name=step_name))
     for message in reversed(final_messages):
         payload, error = parse_json_from_stdout(message)
         if payload is not None:
@@ -614,27 +642,24 @@ def parse_codex_json_event_stream(
     return None, events, usage, "codex_json_stream_missing_structured_final_message"
 
 
-def _tool_events_from_jsonl_line(line: str) -> list[dict[str, Any]]:
+def _tool_events_from_jsonl_line(
+    line: str,
+    *,
+    step_name: str = "UNKNOWN",
+) -> list[dict[str, Any]]:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         return []
-    return _tool_events_from_event(event) if isinstance(event, dict) else []
+    return _tool_events_from_event(event, step_name=step_name) if isinstance(event, dict) else []
 
 
-def _tool_events_from_event(event: dict[str, Any]) -> list[dict[str, Any]]:
-    event_type = str(event.get("type") or "")
-    item = event.get("item") if isinstance(event.get("item"), dict) else event
-    item_type = str(item.get("type") or event_type).lower()
-    observed_type = _observed_tool_type(item_type, event_type)
-    if not observed_type:
-        return []
-    urls = _event_urls(item)
-    if observed_type == "search":
-        observed = _tool_event(observed_type, item, None)
-        observed["discovered_urls"] = urls
-        return [observed]
-    return [_tool_event(observed_type, item, url) for url in urls]
+def _tool_events_from_event(
+    event: dict[str, Any],
+    *,
+    step_name: str = "UNKNOWN",
+) -> list[dict[str, Any]]:
+    return normalize_codex_event(event, step_name=step_name)
 
 
 def extract_codex_error_events(stdout: str) -> list[dict[str, Any]]:
@@ -662,40 +687,3 @@ def _read_structured_output(path: Path) -> tuple[dict[str, Any] | None, str | No
     if not isinstance(payload, dict):
         return None, "structured_output_file_not_object"
     return payload, None
-
-
-def _observed_tool_type(item_type: str, event_type: str) -> str | None:
-    combined = f"{event_type} {item_type}".lower()
-    if any(token in combined for token in ("web_open", "open_source", "source.open", "web_fetch")):
-        return "open_source"
-    if any(token in combined for token in ("web_search", "search_query", "source.search")):
-        return "search"
-    return None
-
-
-def _event_urls(value: Any) -> list[str]:
-    found: set[str] = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key.lower() in {"url", "source_url", "canonical_url", "redirect_url"} and isinstance(item, str):
-                if item.startswith("https://"):
-                    found.add(item)
-            else:
-                found.update(_event_urls(item))
-    elif isinstance(value, list):
-        for item in value:
-            found.update(_event_urls(item))
-    return sorted(found)
-
-
-def _tool_event(kind: str, item: dict[str, Any], url: str | None) -> dict[str, Any]:
-    return {
-        "event_type": kind,
-        "source_url": url,
-        "canonical_url": item.get("canonical_url") if isinstance(item.get("canonical_url"), str) else url,
-        "redirect_url": item.get("redirect_url"),
-        "observed_at": item.get("observed_at") or item.get("timestamp"),
-        "content_hash": item.get("content_hash") or item.get("content_checksum"),
-        "http_status": item.get("http_status") or item.get("status_code"),
-        "query": item.get("query") or item.get("search_query"),
-    }

@@ -118,6 +118,22 @@ class AIResearchWorker:
             logger.info("ai_job_validation_started", extra=context)
             accepted, rejected = self._validate_results(job, result)
             status = str(result.get("status") or "FAILED").upper()
+            if status == "CHECKPOINTED":
+                updated = self.repository.checkpoint(
+                    job["job_id"],
+                    self.worker_id,
+                    checkpoint=result.get("checkpoint") or {},
+                    workspace_path=str(workspace),
+                )
+                logger.info(
+                    "ai_job_checkpointed",
+                    extra={
+                        **context,
+                        "run_id": result.get("run_id"),
+                        "status": updated["status"],
+                    },
+                )
+                return True
             if status == "TIMED_OUT":
                 updated = self.repository.retry_or_fail(
                     job["job_id"], self.worker_id, error=str(result.get("error") or "watchdog_timeout"),

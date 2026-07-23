@@ -39,12 +39,14 @@ def build_effective_budget(
         - int(daily_usage.get("opened_source_count") or 0),
         0,
     )
-    max_searches = min(int(settings.research_max_searches), daily_searches_remaining)
-    max_opened_sources = min(
-        int(settings.research_max_opened_sources),
-        daily_opens_remaining,
-    )
+    budget_mode = str(settings.research_budget_mode).lower()
+    max_searches = int(settings.research_max_searches)
+    max_opened_sources = int(settings.research_max_opened_sources)
+    if budget_mode == "enforce":
+        max_searches = min(max_searches, daily_searches_remaining)
+        max_opened_sources = min(max_opened_sources, daily_opens_remaining)
     return {
+        "budget_mode": budget_mode,
         "max_searches": max_searches,
         "max_opened_sources": max_opened_sources,
         "remaining_searches": max_searches,
@@ -97,6 +99,15 @@ def refresh_effective_budget(
     )
     refreshed["observed_searches"] = int(search_count)
     refreshed["observed_opened_sources"] = int(opened_source_count)
+    refreshed["threshold_exceeded"] = {
+        "searches": int(search_count) > int(budget.get("max_searches") or 0),
+        "opened_sources": int(opened_source_count)
+        > int(budget.get("max_opened_sources") or 0),
+        "daily_searches": int(search_count)
+        > int(budget.get("daily_searches_remaining") or 0),
+        "daily_opened_sources": int(opened_source_count)
+        > int(budget.get("daily_opened_sources_remaining") or 0),
+    }
     refreshed["completed_queries"] = sorted(
         {str(query) for query in completed_queries or [] if str(query)}
     )

@@ -109,7 +109,10 @@ class AIResearchCapabilityService:
             effective_budget["max_searches"] > 0
             and effective_budget["max_opened_sources"] > 0
             and effective_budget["query_topic_groups"]
-            and effective_budget["daily_runs_remaining"] > 0
+            and (
+                effective_budget["budget_mode"] == "observe"
+                or effective_budget["daily_runs_remaining"] > 0
+            )
         )
         schema_errors: dict[str, str] = {}
         schemas = {

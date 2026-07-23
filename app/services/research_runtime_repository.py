@@ -16,6 +16,10 @@ from app.services.codex_runtime_contract import sanitize_diagnostic
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.research_profiles import PROFILES
 from app.services.source_policy_service import SourcePolicyService
+from app.services.research_tool_telemetry import (
+    COUNTED_SOURCE_ACTIONS,
+    action_fingerprint,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -253,64 +257,141 @@ class ResearchRuntimeRepository:
         events: list[dict[str, Any]],
         *,
         usage: dict[str, Any] | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         now = _now()
+        inserted_events: list[dict[str, Any]] = []
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT job_id,usage_json,source_domains_json FROM research_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            step_row = conn.execute(
+                "SELECT step_name,telemetry_json FROM research_run_steps WHERE step_id=?",
+                (step_id,),
+            ).fetchone()
+            if run_row is None or step_row is None:
+                conn.rollback()
+                raise ValueError("research_tool_event_parent_not_found")
             for event in events:
                 if not isinstance(event, dict):
                     continue
+                normalized = _event_envelope(
+                    event,
+                    phase=str(step_row["step_name"]),
+                    run_id=run_id,
+                    job_id=str(run_row["job_id"]),
+                    observed_at=now,
+                )
                 normalized = {
-                    **event,
+                    **normalized,
                     "source_url": _canonical_url(str(event.get("source_url") or "")) or None,
                     "canonical_url": _canonical_url(str(event.get("canonical_url") or event.get("source_url") or "")) or None,
-                    "observed_at": str(event.get("observed_at") or now),
                 }
-                checksum = _checksum(normalized)
-                conn.execute(
+                event_seed = "|".join(
+                    (
+                        run_id,
+                        str(normalized["phase"]),
+                        str(normalized["tool_action_fingerprint"]),
+                        str(normalized["lifecycle"]),
+                    )
+                )
+                event_id = (
+                    "rtool-"
+                    f"{hashlib.sha256(event_seed.encode()).hexdigest()[:24]}"
+                )
+                cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO research_tool_events(
                       event_id,run_id,step_id,event_type,source_url,canonical_url,redirect_url,
-                      observed_at,content_hash,http_status,usage_json,payload_json,created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      observed_at,content_hash,http_status,usage_json,payload_json,created_at,
+                      raw_event_type,lifecycle,item_id,item_type,phase,job_id,provider_tool_type,
+                      semantic_action,tool_action_fingerprint,status,counts_usage
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        f"rtool-{hashlib.sha256(f'{run_id}|{checksum}'.encode()).hexdigest()[:24]}", run_id, step_id,
+                        event_id, run_id, step_id,
                         str(normalized.get("event_type") or "unknown"), normalized.get("source_url"),
                         normalized.get("canonical_url"), normalized.get("redirect_url"),
                         normalized["observed_at"], normalized.get("content_hash"),
-                        normalized.get("http_status"), _json(usage) if usage else None,
+                        normalized.get("http_status"),
+                        (
+                            _json(normalized["usage"])
+                            if normalized.get("usage")
+                            else None
+                        ),
                         _json(normalized), now,
+                        normalized.get("raw_event_type"),
+                        normalized.get("lifecycle"),
+                        normalized.get("item_id"),
+                        normalized.get("item_type"),
+                        normalized.get("phase"),
+                        normalized.get("job_id"),
+                        normalized.get("provider_tool_type"),
+                        normalized.get("semantic_action"),
+                        normalized.get("tool_action_fingerprint"),
+                        normalized.get("status"),
+                        1 if normalized.get("counts_usage") else 0,
                     ),
                 )
+                if int(cursor.rowcount or 0):
+                    inserted_events.append(normalized)
             counts = conn.execute(
                 """
                 SELECT
-                  SUM(CASE WHEN event_type='search' THEN 1 ELSE 0 END) AS searches,
-                  SUM(CASE WHEN event_type IN ('open_source','server_source_verified') THEN 1 ELSE 0 END) AS opened
+                  COUNT(*) AS raw_events,
+                  COUNT(DISTINCT CASE
+                    WHEN semantic_action!='non_operational'
+                    THEN tool_action_fingerprint END
+                  ) AS normalized_actions,
+                  COUNT(DISTINCT CASE
+                    WHEN counts_usage=1
+                    THEN tool_action_fingerprint END
+                  ) AS tool_calls,
+                  COUNT(DISTINCT CASE
+                    WHEN counts_usage=1 AND semantic_action='search'
+                    THEN tool_action_fingerprint END
+                  ) AS searches,
+                  COUNT(DISTINCT CASE
+                    WHEN counts_usage=1
+                     AND semantic_action IN ('open_source','fetch','verify_source')
+                    THEN tool_action_fingerprint END
+                  ) AS opened
                 FROM research_tool_events WHERE run_id=?
                 """,
                 (run_id,),
             ).fetchone()
             searches = int(counts["searches"] or 0)
             opened = int(counts["opened"] or 0)
-            cost = None
-            if usage:
-                provided_cost = {
-                    key: usage[key]
-                    for key in ("cost", "cost_usd", "total_cost_usd")
-                    if usage.get(key) is not None
-                }
-                cost = provided_cost or None
+            merged_usage = _merge_usage(
+                json.loads(run_row["usage_json"] or "{}"),
+                usage,
+            )
+            cost = _provided_cost(merged_usage)
+            domains = set(json.loads(run_row["source_domains_json"] or "[]"))
+            domains.update(
+                self.policy.domain(str(item.get("canonical_url") or ""))
+                for item in inserted_events
+                if item.get("counts_usage")
+                and item.get("semantic_action") in COUNTED_SOURCE_ACTIONS
+                and item.get("canonical_url")
+                and self.policy.rule_for(str(item["canonical_url"])) is not None
+            )
+            domains.discard("")
             conn.execute(
                 """
-                UPDATE research_runs
-                SET search_count=?,opened_source_count=?,usage_json=?,cost_json=?,updated_at=?
+                UPDATE research_runs SET search_count=?,opened_source_count=?,
+                  usage_json=?,cost_json=?,source_domains_json=?,updated_at=?
                 WHERE run_id=?
                 """,
                 (
-                    searches, opened, _json(usage) if usage else None,
-                    _json(cost) if cost else None, now, run_id,
+                    searches,
+                    opened,
+                    _json(merged_usage) if merged_usage else None,
+                    _json(cost) if cost else None,
+                    _json(sorted(domains)),
+                    now,
+                    run_id,
                 ),
             )
             daily = conn.execute(
@@ -322,18 +403,17 @@ class ResearchRuntimeRepository:
                 """,
                 (now,),
             ).fetchone()
-            telemetry_row = conn.execute(
-                "SELECT telemetry_json FROM research_run_steps WHERE step_id=?",
-                (step_id,),
-            ).fetchone()
             existing_telemetry = (
-                json.loads(telemetry_row["telemetry_json"] or "[]")
-                if telemetry_row
+                json.loads(step_row["telemetry_json"] or "[]")
+                if step_row
                 else []
             )
             conn.execute(
                 "UPDATE research_run_steps SET telemetry_json=? WHERE step_id=?",
-                (_json([*existing_telemetry, *events][-100:]), step_id),
+                (
+                    _json([*existing_telemetry, *inserted_events][-100:]),
+                    step_id,
+                ),
             )
             conn.commit()
         return {
@@ -341,7 +421,104 @@ class ResearchRuntimeRepository:
             "opened_source_count": opened,
             "daily_search_count": int(daily["searches"] or 0),
             "daily_opened_source_count": int(daily["opened"] or 0),
+            "raw_event_count": int(counts["raw_events"] or 0),
+            "normalized_action_count": int(
+                counts["normalized_actions"] or 0
+            ),
+            "deduplicated_tool_call_count": int(counts["tool_calls"] or 0),
+            "event_inserted": bool(inserted_events),
+            "inserted_events": inserted_events,
+            "source_domains": sorted(domains),
+            "usage": merged_usage,
+            "cost_status": "available" if cost else "cost_unavailable",
         }
+
+    def record_threshold_warning(
+        self,
+        run_id: str,
+        warning: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        compact = {
+            "resource": str(warning.get("resource") or "")[:80],
+            "configured_limit": int(warning.get("configured_limit") or 0),
+            "observed_count": int(warning.get("observed_count") or 0),
+            "step": str(warning.get("step") or "")[:80],
+            "observed_at": str(warning.get("observed_at") or _now())[:80],
+        }
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT threshold_warnings_json FROM research_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            existing = json.loads(row["threshold_warnings_json"] or "[]")
+            key = (
+                compact["resource"],
+                compact["configured_limit"],
+                compact["step"],
+            )
+            if key not in {
+                (
+                    item.get("resource"),
+                    item.get("configured_limit"),
+                    item.get("step"),
+                )
+                for item in existing
+            }:
+                existing.append(compact)
+            bounded = existing[-50:]
+            conn.execute(
+                "UPDATE research_runs SET threshold_warnings_json=?,updated_at=? WHERE run_id=?",
+                (_json(bounded), _now(), run_id),
+            )
+            conn.commit()
+        return bounded
+
+    def checkpoint_run(
+        self,
+        run_id: str,
+        checkpoint: dict[str, Any],
+    ) -> dict[str, Any]:
+        compact = {
+            "checkpointed": True,
+            "next_step": str(checkpoint.get("next_step") or "")[:80],
+            "completed_steps": [
+                str(value)[:80]
+                for value in checkpoint.get("completed_steps") or []
+            ][-20:],
+            "progress": checkpoint.get("progress") or {},
+            "checkpointed_at": _now(),
+        }
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                UPDATE research_runs SET status='RETRY_SCHEDULED',
+                  checkpoint_json=?,continuation_count=continuation_count+1,
+                  completed_at=NULL,updated_at=? WHERE run_id=?
+                """,
+                (_json(compact), _now(), run_id),
+            )
+            conn.commit()
+        return compact
+
+    def record_loop_detection(
+        self,
+        run_id: str,
+        diagnostic: dict[str, Any],
+    ) -> None:
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                UPDATE research_runs SET loop_detection_count=loop_detection_count+1,
+                  metrics_json=?,updated_at=? WHERE run_id=?
+                """,
+                (
+                    _json({"last_loop_detection": sanitize_diagnostic(diagnostic)}),
+                    _now(),
+                    run_id,
+                ),
+            )
+            conn.commit()
 
     def observed_queries(self, run_id: str) -> list[str]:
         with connect_sqlite(self.settings.database_path) as conn:
@@ -349,6 +526,7 @@ class ResearchRuntimeRepository:
                 """
                 SELECT payload_json FROM research_tool_events
                 WHERE run_id=? AND event_type='search'
+                  AND (counts_usage=1 OR lifecycle IS NULL)
                 ORDER BY observed_at,event_id
                 """,
                 (run_id,),
@@ -366,6 +544,7 @@ class ResearchRuntimeRepository:
                 """
                 SELECT * FROM research_tool_events
                 WHERE run_id=? AND event_type IN ('open_source','server_source_verified')
+                  AND (counts_usage=1 OR lifecycle IS NULL)
                 ORDER BY observed_at,event_id
                 """,
                 (run_id,),
@@ -386,8 +565,20 @@ class ResearchRuntimeRepository:
         rejected: list[dict[str, Any]] = []
         evidence_count = 0
         read_back_count = 0
-        source_domains: set[str] = set()
         observed_sources = self.observed_sources(str(run["run_id"]))
+        current_run = self.get_run(str(run["run_id"])) or run
+        source_domains: set[str] = set(current_run.get("source_domains") or [])
+        source_domains.update(
+            self.policy.domain(
+                str(item.get("canonical_url") or item.get("source_url") or "")
+            )
+            for item in observed_sources
+            if self.policy.rule_for(
+                str(item.get("canonical_url") or item.get("source_url") or "")
+            )
+            is not None
+        )
+        source_domains.discard("")
         for claim in claims:
             restored, evidence_rows = self._persist_claim(run, claim, observed_sources)
             evidence_count += len(evidence_rows)
@@ -569,8 +760,9 @@ class ResearchRuntimeRepository:
                     INSERT OR IGNORE INTO research_evidence(
                       evidence_id,claim_id,query_text,source_url,canonical_url,publisher,source_domain,
                       source_tier,evidence_text,published_at,retrieved_at,redirect_url,source_status,
-                      independent_source_group,content_checksum,policy_version,created_at,source_content_hash
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      independent_source_group,content_checksum,policy_version,created_at,
+                      source_content_hash,tool_event_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         evidence_id, claim_id, evidence.get("query"), evidence["source_url"],
@@ -578,7 +770,9 @@ class ResearchRuntimeRepository:
                         evidence["source_tier"], evidence["evidence_text"], evidence.get("published_at"),
                         evidence["retrieved_at"], evidence.get("redirect_url"), evidence.get("source_status"),
                         evidence["independent_source_group"], evidence["content_checksum"],
-                        run["policy_version"], now, evidence.get("source_content_hash"),
+                        run["policy_version"], now,
+                        evidence.get("source_content_hash"),
+                        evidence.get("tool_event_id"),
                     ),
                 )
             conn.commit()
@@ -652,6 +846,7 @@ class ResearchRuntimeRepository:
                 "redirect_url": observation.get("redirect_url"), "source_status": "VERIFIED",
                 "independent_source_group": f"domain:{domain}", "content_checksum": content_checksum,
                 "source_content_hash": observation.get("content_hash"),
+                "tool_event_id": observation.get("event_id"),
             })
             logger.info(
                 "research_source_opened_and_verified",
@@ -710,10 +905,24 @@ class ResearchRuntimeRepository:
             "request_json", "result_json", "required_topics_json", "completed_topics_json",
             "missing_topics_json", "blocking_gaps_json", "non_blocking_gaps_json",
             "source_domains_json", "warnings_json", "valid_not_applicable_topics_json",
-            "usage_json", "cost_json",
+            "usage_json", "cost_json", "metrics_json", "checkpoint_json",
+            "threshold_warnings_json",
         ):
             data[key.removesuffix("_json")] = json.loads(
-                data.pop(key) or ("{}" if key in {"request_json", "result_json", "usage_json", "cost_json"} else "[]")
+                data.pop(key)
+                or (
+                    "{}"
+                    if key
+                    in {
+                        "request_json",
+                        "result_json",
+                        "usage_json",
+                        "cost_json",
+                        "metrics_json",
+                        "checkpoint_json",
+                    }
+                    else "[]"
+                )
             )
         return data
 
@@ -748,6 +957,153 @@ class ResearchRuntimeRepository:
 
 def _now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _event_envelope(
+    event: dict[str, Any],
+    *,
+    phase: str,
+    run_id: str,
+    job_id: str,
+    observed_at: str,
+) -> dict[str, Any]:
+    semantic_action = str(
+        event.get("semantic_action")
+        or (
+            "search"
+            if event.get("event_type") == "search"
+            else "open_source"
+            if event.get("event_type")
+            in {"open_source", "server_source_verified"}
+            else "non_operational"
+        )
+    )
+    lifecycle = str(event.get("lifecycle") or "completed")
+    item_type = str(
+        event.get("item_type")
+        or event.get("provider_tool_type")
+        or event.get("event_type")
+        or "unknown"
+    )
+    fingerprint = str(
+        event.get("tool_action_fingerprint")
+        or action_fingerprint(
+            item_id=(
+                str(event["item_id"]) if event.get("item_id") else None
+            ),
+            item_type=item_type,
+            phase=phase,
+            semantic_action=semantic_action,
+            query=str(event.get("query") or "") or None,
+            source_url=str(
+                event.get("canonical_url")
+                or event.get("source_url")
+                or ""
+            )
+            or None,
+        )
+    )
+    operational = bool(
+        event.get("item_id")
+        or event.get("query")
+        or event.get("canonical_url")
+        or event.get("source_url")
+    )
+    return {
+        "raw_event_type": str(
+            event.get("raw_event_type")
+            or f"legacy.{lifecycle}"
+        )[:120],
+        "lifecycle": lifecycle[:40],
+        "item_id": str(event.get("item_id") or "")[:200] or None,
+        "item_type": item_type[:120],
+        "phase": str(event.get("phase") or phase)[:80],
+        "run_id": run_id,
+        "job_id": job_id,
+        "provider_tool_type": str(
+            event.get("provider_tool_type") or item_type
+        )[:120],
+        "semantic_action": semantic_action[:80],
+        "event_type": (
+            "search"
+            if semantic_action == "search"
+            else "open_source"
+            if semantic_action in COUNTED_SOURCE_ACTIONS
+            else "observed"
+        ),
+        "observed_at": str(event.get("observed_at") or observed_at)[:80],
+        "query": str(event.get("query") or "")[:1000] or None,
+        "source_url": str(event.get("source_url") or "")[:2048] or None,
+        "canonical_url": str(
+            event.get("canonical_url") or event.get("source_url") or ""
+        )[:2048]
+        or None,
+        "redirect_url": str(event.get("redirect_url") or "")[:2048] or None,
+        "tool_action_fingerprint": fingerprint[:64],
+        "status": str(event.get("status") or lifecycle)[:80],
+        "usage": {
+            key: max(int(value or 0), 0)
+            for key, value in (event.get("usage") or {}).items()
+            if key
+            in {
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+                "total_tokens",
+            }
+        },
+        "counts_usage": bool(
+            event.get("counts_usage")
+            if event.get("counts_usage") is not None
+            else (
+                operational
+                and lifecycle == "completed"
+                and semantic_action != "non_operational"
+            )
+        ),
+        "discovered_urls": [
+            str(value)[:2048]
+            for value in event.get("discovered_urls") or []
+            if str(value).startswith("https://")
+        ][:20],
+        "content_hash": str(event.get("content_hash") or "")[:128] or None,
+        "http_status": event.get("http_status"),
+    }
+
+
+def _merge_usage(
+    existing: dict[str, Any],
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(existing or {})
+    if not incoming:
+        return merged
+    additive = {
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    }
+    for key, value in incoming.items():
+        if key in additive and value is not None:
+            merged[key] = int(merged.get(key) or 0) + max(int(value), 0)
+        elif key in {"cost", "cost_usd", "total_cost_usd"} and value is not None:
+            merged[key] = float(merged.get(key) or 0) + max(
+                float(value),
+                0.0,
+            )
+    return merged
+
+
+def _provided_cost(usage: dict[str, Any]) -> dict[str, float] | None:
+    provided = {
+        key: float(usage[key])
+        for key in ("cost", "cost_usd", "total_cost_usd")
+        if usage.get(key) is not None
+    }
+    return provided or None
 
 
 def _json(value: Any) -> str:

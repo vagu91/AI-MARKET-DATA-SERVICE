@@ -41,6 +41,7 @@ def settings(tmp_path: Path, **overrides: Any) -> Settings:
         "ai_worker_enabled": True,
         "research_max_searches": 8,
         "research_max_opened_sources": 12,
+        "research_budget_mode": "enforce",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)

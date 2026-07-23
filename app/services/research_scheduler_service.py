@@ -34,13 +34,14 @@ class ResearchSchedulerService:
             return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "input_fingerprint_unchanged")
         if self._active_count() >= self.settings.research_max_concurrent_jobs:
             return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "max_concurrent_jobs_reached")
-        if self._daily_runs() >= self.settings.research_daily_budget_runs:
-            return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "daily_budget_exhausted")
-        usage = self._daily_tool_usage()
-        if usage["search_count"] >= self.settings.research_daily_budget_searches:
-            return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "daily_search_budget_exhausted")
-        if usage["opened_source_count"] >= self.settings.research_daily_budget_opened_sources:
-            return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "daily_opened_source_budget_exhausted")
+        if self.settings.research_budget_mode == "enforce":
+            if self._daily_runs() >= self.settings.research_daily_budget_runs:
+                return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "daily_budget_exhausted")
+            usage = self._daily_tool_usage()
+            if usage["search_count"] >= self.settings.research_daily_budget_searches:
+                return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "daily_search_budget_exhausted")
+            if usage["opened_source_count"] >= self.settings.research_daily_budget_opened_sources:
+                return self._decision(trigger_name, fingerprint, "NOT_REQUIRED", "daily_opened_source_budget_exhausted")
         event_jobs = self._event_jobs(trigger_name, snapshot)
         if event_jobs is not None:
             if not event_jobs:

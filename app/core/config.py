@@ -339,6 +339,40 @@ class Settings(BaseSettings):
     research_max_concurrent_jobs: int = Field(default=1, ge=1, validation_alias="AI_MARKET_RESEARCH_MAX_CONCURRENT_JOBS")
     research_max_searches: int = Field(default=8, ge=1, validation_alias="AI_MARKET_RESEARCH_MAX_SEARCHES")
     research_max_opened_sources: int = Field(default=12, ge=1, validation_alias="AI_MARKET_RESEARCH_MAX_OPENED_SOURCES")
+    research_budget_mode: str = Field(
+        default="observe",
+        pattern="^(observe|enforce)$",
+        validation_alias="AI_MARKET_RESEARCH_BUDGET_MODE",
+    )
+    research_loop_repeat_action_threshold: int = Field(
+        default=3,
+        ge=2,
+        validation_alias="AI_MARKET_RESEARCH_LOOP_REPEAT_ACTION_THRESHOLD",
+    )
+    research_loop_no_progress_action_threshold: int = Field(
+        default=12,
+        ge=3,
+        validation_alias="AI_MARKET_RESEARCH_LOOP_NO_PROGRESS_ACTION_THRESHOLD",
+    )
+    research_loop_cycle_window: int = Field(
+        default=4,
+        ge=2,
+        validation_alias="AI_MARKET_RESEARCH_LOOP_CYCLE_WINDOW",
+    )
+    research_loop_cycle_repetitions: int = Field(
+        default=3,
+        ge=2,
+        validation_alias="AI_MARKET_RESEARCH_LOOP_CYCLE_REPETITIONS",
+    )
+    research_emergency_max_tool_actions: int = Field(
+        default=200,
+        ge=20,
+        validation_alias="AI_MARKET_RESEARCH_EMERGENCY_MAX_TOOL_ACTIONS",
+    )
+    research_checkpoint_on_deadline: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_CHECKPOINT_ON_DEADLINE",
+    )
     research_daily_budget_runs: int = Field(default=8, ge=0, validation_alias="AI_MARKET_RESEARCH_DAILY_BUDGET_RUNS")
     research_minimum_freshness_minutes: int = Field(default=15, ge=1, validation_alias="AI_MARKET_RESEARCH_MINIMUM_FRESHNESS_MINUTES")
     research_pre_event_window_minutes: int = Field(default=120, ge=1, validation_alias="AI_MARKET_RESEARCH_PRE_EVENT_WINDOW_MINUTES")

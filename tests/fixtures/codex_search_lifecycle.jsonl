@@ -1,0 +1,6 @@
+{"type":"item.started","item":{"id":"search-1","type":"web_search","query":"US CPI Federal Reserve Nasdaq 100 July 2026"}}
+{"type":"item.completed","item":{"id":"search-1","type":"web_search","query":"US CPI Federal Reserve Nasdaq 100 July 2026","urls":["https://www.bls.gov/news.release/cpi.nr0.htm","https://www.federalreserve.gov/monetarypolicy.htm"]}}
+{"type":"item.completed","item":{"id":"search-1","type":"web_search","query":"US CPI Federal Reserve Nasdaq 100 July 2026","urls":["https://www.bls.gov/news.release/cpi.nr0.htm","https://www.federalreserve.gov/monetarypolicy.htm"]}}
+{"type":"item.started","item":{"type":"web_search"}}
+{"type":"item.completed","item":{"type":"web_search"}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"output_tokens":300,"input_tokens_details":{"cached_tokens":400},"output_tokens_details":{"reasoning_tokens":90},"total_tokens":1500}}

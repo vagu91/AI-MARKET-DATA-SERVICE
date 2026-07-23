@@ -13,7 +13,16 @@ from app.services.codex_runtime_contract import sanitize_diagnostic
 
 
 ACTIVE_JOB_STATUSES = {"PENDING", "RUNNING", "RETRY_SCHEDULED"}
-TERMINAL_JOB_STATUSES = {"SUCCEEDED", "PARTIAL", "NO_DATA", "REJECTED", "FAILED", "TIMED_OUT", "CANCELLED"}
+TERMINAL_JOB_STATUSES = {
+    "SUCCEEDED",
+    "PARTIAL",
+    "NO_DATA",
+    "REJECTED",
+    "FAILED",
+    "LOOP_DETECTED",
+    "TIMED_OUT",
+    "CANCELLED",
+}
 ALL_JOB_STATUSES = ACTIVE_JOB_STATUSES | TERMINAL_JOB_STATUSES
 
 
@@ -185,7 +194,14 @@ class AIResearchJobRepository:
                 """
                 SELECT COUNT(*) AS run_count,
                        COALESCE(SUM(search_count),0) AS searches,
-                       COALESCE(SUM(opened_source_count),0) AS opened_sources
+                       COALESCE(SUM(opened_source_count),0) AS opened_sources,
+                       COALESCE(SUM(json_extract(usage_json,'$.input_tokens')),0)
+                         AS input_tokens,
+                       COALESCE(SUM(json_extract(usage_json,'$.output_tokens')),0)
+                         AS output_tokens,
+                       COALESCE(SUM(loop_detection_count),0) AS loop_detections,
+                       COALESCE(SUM(json_array_length(threshold_warnings_json)),0)
+                         AS threshold_warnings
                 FROM research_runs
                 """
             ).fetchone()
@@ -222,6 +238,14 @@ class AIResearchJobRepository:
                     if run_count
                     else 0.0
                 ),
+                "input_tokens": int(usage_metrics["input_tokens"] or 0),
+                "output_tokens": int(usage_metrics["output_tokens"] or 0),
+                "threshold_warnings": int(
+                    usage_metrics["threshold_warnings"] or 0
+                ),
+                "loop_detections": int(
+                    usage_metrics["loop_detections"] or 0
+                ),
                 "accepted_claims": int(claim_metrics["accepted"] or 0),
                 "rejected_claims": int(claim_metrics["rejected"] or 0),
                 "unique_source_domains": int(unique_domains or 0),
@@ -248,7 +272,12 @@ class AIResearchJobRepository:
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             abandoned = conn.execute(
-                "SELECT job_id,attempts FROM ai_research_jobs WHERE status='RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+                """
+                SELECT job_id,attempts,max_attempts,last_retry_reason
+                FROM ai_research_jobs
+                WHERE status='RUNNING' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at<=?
+                """,
                 (now,),
             ).fetchall()
             for row in abandoned:
@@ -260,24 +289,28 @@ class AIResearchJobRepository:
                     """,
                     (now, row["job_id"], row["attempts"]),
                 )
-            cursor = conn.execute(
-                """
-                UPDATE ai_research_jobs
-                SET status=CASE WHEN attempts>=max_attempts THEN 'FAILED' ELSE 'RETRY_SCHEDULED' END,
-                    worker_id=NULL,lease_expires_at=NULL,
-                    next_retry_at=CASE WHEN attempts>=max_attempts THEN NULL ELSE ? END,
-                    completed_at=CASE WHEN attempts>=max_attempts THEN ? ELSE completed_at END,
-                    last_error='worker_lease_expired_recovered',updated_at=?
-                WHERE status='RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?
-                """,
-                (now, now, now, now),
-            )
-            for row in abandoned:
-                terminal = int(row["attempts"]) >= int(
-                    conn.execute(
-                        "SELECT max_attempts FROM ai_research_jobs WHERE job_id=?",
-                        (row["job_id"],),
-                    ).fetchone()["max_attempts"]
+                continuation = (
+                    str(row["last_retry_reason"] or "")
+                    == "technical_continuation"
+                )
+                terminal = (
+                    int(row["attempts"]) >= int(row["max_attempts"])
+                    and not continuation
+                )
+                conn.execute(
+                    """
+                    UPDATE ai_research_jobs SET status=?,worker_id=NULL,
+                      lease_expires_at=NULL,next_retry_at=?,completed_at=?,
+                      last_error='worker_lease_expired_recovered',updated_at=?
+                    WHERE job_id=? AND status='RUNNING'
+                    """,
+                    (
+                        "FAILED" if terminal else "RETRY_SCHEDULED",
+                        None if terminal else now,
+                        now if terminal else None,
+                        now,
+                        row["job_id"],
+                    ),
                 )
                 conn.execute(
                     """
@@ -299,7 +332,7 @@ class AIResearchJobRepository:
                     ),
                 )
             conn.commit()
-            return max(int(cursor.rowcount or 0), 0)
+            return len(abandoned)
 
     def acquire_next(
         self,
@@ -481,6 +514,67 @@ class AIResearchJobRepository:
             raise RuntimeError("job result read-back failed")
         return restored
 
+    def checkpoint(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        checkpoint: dict[str, Any],
+        workspace_path: str | None = None,
+    ) -> dict[str, Any]:
+        now = self._iso(self.clock())
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT attempts FROM ai_research_jobs
+                WHERE job_id=? AND status='RUNNING' AND worker_id=?
+                """,
+                (job_id, worker_id),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RuntimeError("job lease is no longer owned by worker")
+            conn.execute(
+                """
+                UPDATE ai_research_jobs SET status='RETRY_SCHEDULED',
+                  worker_id=NULL,lease_expires_at=NULL,next_retry_at=?,
+                  last_error=NULL,last_retry_reason='technical_continuation',
+                  workspace_path=?,updated_at=? WHERE job_id=?
+                """,
+                (now, workspace_path, now, job_id),
+            )
+            conn.execute(
+                """
+                UPDATE ai_research_job_attempts SET status='CHECKPOINTED',
+                  completed_at=?,error=NULL,error_category=NULL,
+                  retry_classification='CONTINUATION',diagnostic_json=?
+                WHERE job_id=? AND attempt_number=?
+                """,
+                (
+                    now,
+                    self._json(
+                        {
+                            "category": "CHECKPOINTED",
+                            "retryable": True,
+                            "retry_classification": "CONTINUATION",
+                            "checkpoint": checkpoint,
+                        }
+                    ),
+                    job_id,
+                    int(row["attempts"]),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE research_runs SET status='RETRY_SCHEDULED',
+                  completed_at=NULL,updated_at=? WHERE job_id=?
+                """,
+                (now, job_id),
+            )
+            conn.commit()
+        return self.get(job_id)
+
     def retry_or_fail(
         self,
         job_id: str,
@@ -498,10 +592,17 @@ class AIResearchJobRepository:
         attempts = int(job["attempts"])
         max_attempts = int(job["max_attempts"])
         if not retryable or attempts >= max_attempts:
+            terminal_status = (
+                "TIMED_OUT"
+                if timed_out
+                else "LOOP_DETECTED"
+                if (diagnostic or {}).get("category") == "LOOP_DETECTED"
+                else "FAILED"
+            )
             return self.complete(
                 job_id,
                 worker_id,
-                status="TIMED_OUT" if timed_out else "FAILED",
+                status=terminal_status,
                 result_payload=None,
                 error=error,
                 workspace_path=job.get("workspace_path"),
@@ -594,7 +695,13 @@ class AIResearchJobRepository:
             result["last_error"] = error
         if diagnostic:
             result["diagnostic"] = diagnostic
-        failed = status in {"FAILED", "TIMED_OUT", "CANCELLED", "REJECTED"}
+        failed = status in {
+            "FAILED",
+            "LOOP_DETECTED",
+            "TIMED_OUT",
+            "CANCELLED",
+            "REJECTED",
+        }
         conn.execute(
             """
             UPDATE research_runs
