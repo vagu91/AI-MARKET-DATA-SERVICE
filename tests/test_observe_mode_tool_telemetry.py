@@ -361,7 +361,7 @@ def test_declared_sources_are_reconciled_and_claims_fail_closed(
         [
             {
                 "topic": "macro",
-                "field_semantics": "exploratory_context",
+                "field_semantics": "outcome",
                 "value": "Observed BLS context",
                 "confidence": 0.8,
                 "evidence": [
@@ -377,7 +377,7 @@ def test_declared_sources_are_reconciled_and_claims_fail_closed(
             },
             {
                 "topic": "risk",
-                "field_semantics": "exploratory_context",
+                "field_semantics": "outcome",
                 "value": "Unobserved BEA context",
                 "confidence": 0.8,
                 "evidence": [
@@ -734,7 +734,7 @@ def test_migration_12_is_additive_from_schema_11(tmp_path: Path) -> None:
             "SELECT job_id FROM ai_research_jobs WHERE job_id='job-v11'"
         ).fetchone()
 
-    assert result["schema_version"] == 13
+    assert result["schema_version"] == 14
     assert {
         "raw_event_type",
         "lifecycle",

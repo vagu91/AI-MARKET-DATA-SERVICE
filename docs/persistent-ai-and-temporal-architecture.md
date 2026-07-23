@@ -21,7 +21,7 @@ The worker is independent from the APScheduler switch. HTTP always returns witho
 
 ## Storage
 
-Migration 7 adds `ai_research_jobs`, `ai_research_job_attempts`, `market_context_snapshots`, and `event_value_candidates`, plus lineage/lifecycle columns on existing event, fact, and news tables. Migration 8 adds job generation/scope/snapshot linkage and the snapshot-job join table. Migration 9 adds semantic-actual columns plus capability reports, research runs/steps, atomic claims/evidence and scheduler decisions. Migration 10 adds persistent official-feed retry deadlines, observed tool events, evidence content hashes, server-computed topic completeness and usage/cost fields. Migration 11 adds redacted job/attempt/step diagnostics and `research_step_attempts`, preserving every retry of a failed step. Migration 12 adds lifecycle-aware tool telemetry, metrics and checkpoints. Migration 13 adds acquired sources, evidence-verification decisions and backend invocation usage. All migrations are additive and preserve every supported earlier schema.
+Migration 7 adds `ai_research_jobs`, `ai_research_job_attempts`, `market_context_snapshots`, and `event_value_candidates`, plus lineage/lifecycle columns on existing event, fact, and news tables. Migration 8 adds job generation/scope/snapshot linkage and the snapshot-job join table. Migration 9 adds semantic-actual columns plus capability reports, research runs/steps, atomic claims/evidence and scheduler decisions. Migration 10 adds persistent official-feed retry deadlines, observed tool events, evidence content hashes, server-computed topic completeness and usage/cost fields. Migration 11 adds redacted job/attempt/step diagnostics and `research_step_attempts`, preserving every retry of a failed step. Migration 12 adds lifecycle-aware tool telemetry, metrics and checkpoints. Migration 13 adds acquired sources, evidence-verification decisions and backend invocation usage. Migration 14 adds event/release time, issuer and post-event lifecycle lineage to research claims. All migrations are additive and preserve every supported earlier schema.
 
 Candidate actuals retain `event_metric_id`, `source_series_id`, transformation, SA/NSA variant, frequency, unit, reference period, release vintage, observation lineage and official canonical URL. Raw macro levels are never promoted directly to event actuals. Surprise is calculated only when metric, period, frequency, unit and seasonal adjustment match the forecast/consensus baseline; incompatibility is persisted as a structured warning and remains fail-closed for full analysis.
 
@@ -92,6 +92,31 @@ official Tier-1 outcomes can require one verified source, while news and
 secondary-source semantics retain their configured independent confirmation
 count. Identical syndicated content is one group. Numeric official actuals remain
 exclusive to deterministic official resolvers.
+
+Research source policy v3 uses explicit semantic lifecycles. `scheduled_event`
+and `official_calendar_event` require `event_at`/`release_at`, accept one verified
+official Tier-1 source without `published_at`, remain `UPCOMING` before release,
+and set `next_refresh_at` to the event time for deterministic actual/outcome
+refresh. `earnings_schedule` and `issuer_announcement` require an issuer and
+event time; an explicitly configured issuer newsroom, investor-relations domain
+or pertinent SEC filing is sufficient. Allowlisted domains include real
+subdomains using a DNS-label boundary, so `news.microsoft.com` matches
+`microsoft.com` while `evilmicrosoft.com` does not.
+
+`current_news` retains two independent verified domains plus a fresh
+`published_at`. `current_market_context` has a short TTL.
+`exploratory_context` remains auditable when stale but cannot complete a current
+topic and is never projected into current market facts. Confirmation counts are
+read only from the effective semantic policy; repeated evidence from one domain
+is one confirmation, and `multiple_confirmation` metadata cannot override the
+semantic requirement. A documented `NOT_APPLICABLE` resolves a topic only when
+the same one-invocation output contains a completed bounded query for it.
+
+All model output, gateway text, SQLite payloads and research API read-back pass
+through UTF-8/Unicode normalization. Known multi-encoded mojibake is repaired
+before evidence matching and persistence; irreparable mojibake is rejected.
+Clean en dashes, registered marks, apostrophes and non-ASCII scripts are
+preserved.
 
 `AI_MARKET_RESEARCH_BUDGET_MODE=observe` is the initial default. Per-run and daily
 search/open values are telemetry thresholds: overshoot records a compact warning

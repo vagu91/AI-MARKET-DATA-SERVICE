@@ -1,5 +1,5 @@
 {
-  "policy_version": "source-policy-v2",
+  "policy_version": "source-policy-v3",
   "default_unknown_tier": 5,
   "forbidden_domains": [],
   "issuer_official_domains": ["apple.com", "microsoft.com", "nvidia.com", "amazon.com", "abc.xyz", "meta.com", "tesla.com"],
@@ -7,8 +7,24 @@
     "Apple": ["apple.com"], "Microsoft": ["microsoft.com"], "NVIDIA": ["nvidia.com"],
     "Amazon": ["amazon.com"], "Alphabet": ["abc.xyz"], "Meta": ["meta.com"], "Tesla": ["tesla.com"]
   },
+  "issuer_official_sources": {
+    "Apple": {"domains": ["apple.com"], "newsroom_domains": ["apple.com"], "investor_relations_domains": ["investor.apple.com"]},
+    "Microsoft": {"domains": ["microsoft.com"], "newsroom_domains": ["news.microsoft.com"], "investor_relations_domains": ["microsoft.com"]},
+    "NVIDIA": {"domains": ["nvidia.com"], "newsroom_domains": ["nvidianews.nvidia.com"], "investor_relations_domains": ["investor.nvidia.com"]},
+    "Amazon": {"domains": ["amazon.com"], "newsroom_domains": ["aboutamazon.com"], "investor_relations_domains": ["ir.aboutamazon.com"]},
+    "Alphabet": {"domains": ["abc.xyz"], "newsroom_domains": ["blog.google"], "investor_relations_domains": ["abc.xyz"]},
+    "Meta": {"domains": ["meta.com"], "newsroom_domains": ["about.fb.com"], "investor_relations_domains": ["investor.atmeta.com"]},
+    "Tesla": {"domains": ["tesla.com"], "newsroom_domains": ["tesla.com"], "investor_relations_domains": ["ir.tesla.com"]}
+  },
   "semantic_policies": {
     "actual": {"allowed_tiers": [1], "required_confirmations": 1, "ttl_minutes": 10080, "max_reliability": 0.99},
+    "official_actual": {"allowed_tiers": [1], "required_confirmations": 1, "ttl_minutes": 10080, "max_reliability": 0.99, "service_only": true},
+    "scheduled_event": {"allowed_tiers": [1], "required_confirmations": 1, "lifecycle_minutes": 60, "freshness_basis": "event_at", "published_at_required": false, "max_reliability": 0.99},
+    "official_calendar_event": {"allowed_tiers": [1], "required_confirmations": 1, "lifecycle_minutes": 60, "freshness_basis": "event_at", "published_at_required": false, "max_reliability": 0.99},
+    "issuer_announcement": {"allowed_tiers": [1, 2], "required_confirmations": 1, "lifecycle_minutes": 1440, "freshness_basis": "event_at", "published_at_required": false, "max_reliability": 0.99},
+    "earnings_schedule": {"allowed_tiers": [1, 2], "required_confirmations": 1, "lifecycle_minutes": 1440, "freshness_basis": "event_at", "published_at_required": false, "max_reliability": 0.99},
+    "current_news": {"allowed_tiers": [1, 2, 3], "required_confirmations": 2, "ttl_minutes": 360, "freshness_basis": "published_at", "published_at_required": true, "max_reliability": 0.98},
+    "current_market_context": {"allowed_tiers": [1, 2, 3], "required_confirmations": 1, "ttl_minutes": 60, "freshness_basis": "published_at", "published_at_required": true, "max_reliability": 0.90},
     "forecast": {"allowed_tiers": [3, 4], "required_confirmations": 2, "ttl_minutes": 1440, "max_reliability": 0.92},
     "consensus": {"allowed_tiers": [3, 4], "required_confirmations": 2, "ttl_minutes": 1440, "max_reliability": 0.92},
     "previous": {"allowed_tiers": [1, 3, 4], "required_confirmations": 2, "ttl_minutes": 10080, "max_reliability": 0.92},

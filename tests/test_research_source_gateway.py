@@ -636,12 +636,12 @@ def test_backend_usage_is_idempotent_per_invocation(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM research_backend_invocations").fetchone()[0] == 1
 
 
-def test_migration_13_adds_gateway_lineage_without_recreating_database(
+def test_migration_14_adds_gateway_and_semantic_lineage_without_recreating_database(
     tmp_path: Path,
 ) -> None:
     cfg = settings(tmp_path)
     result = migrate_database(cfg.database_path)
-    assert result["schema_version"] == 13
+    assert result["schema_version"] == 14
     with connect_sqlite(cfg.database_path) as conn:
         tables = {
             row[0]
@@ -653,6 +653,7 @@ def test_migration_13_adds_gateway_lineage_without_recreating_database(
             )
         }
         evidence_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_evidence)")}
+        claim_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_claims)")}
     assert {
         "research_sources",
         "research_evidence_verifications",
@@ -665,3 +666,11 @@ def test_migration_13_adds_gateway_lineage_without_recreating_database(
         "verification_reason",
         "verification_score",
     }.issubset(evidence_columns)
+    assert {
+        "event_at",
+        "release_at",
+        "issuer",
+        "next_refresh_at",
+        "lifecycle_status",
+        "post_event_semantics",
+    }.issubset(claim_columns)

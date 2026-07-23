@@ -26,6 +26,7 @@ from app.services.research_tool_telemetry import (
 from app.services.research_metrics_service import ResearchMetricsService
 from app.services.research_backend import ResearchBackend
 from app.services.research_source_gateway import ResearchSourceGateway
+from app.services.research_semantics import document_not_applicable_claims
 
 
 logger = logging.getLogger(__name__)
@@ -701,7 +702,11 @@ class AgenticResearchRuntime:
             )
         acquired = self.repository.research_sources(run_id)
 
-        claims = [item for item in payload.get("claims") or [] if isinstance(item, dict)]
+        claims = document_not_applicable_claims(
+            [item for item in payload.get("claims") or [] if isinstance(item, dict)],
+            payload,
+        )
+        claims = self.repository.normalize_claims(claims)
         extract_step, execute_extract = self.repository.begin_step(
             run_id,
             "EXTRACT",
@@ -1135,7 +1140,7 @@ def _deterministic_cross_check(
             groups.difference_update(f"domain:{domain}" for domain in domains)
             groups.add(f"content:{content_hash}")
         semantics = str(claim.get("field_semantics") or "exploratory_context").lower()
-        required = int(policy.semantic_policy(semantics).get("required_confirmations") or 1)
+        required = policy.required_confirmations(semantics)
         resolution = "SUPPORTED" if len(groups) >= required else "INSUFFICIENT"
         warnings = sorted(set(rejected_reasons))
         if len(groups) < required:

@@ -15,8 +15,8 @@ class ResearchProfile:
 
 PROFILES: dict[str, ResearchProfile] = {
     "MNQ_MARKET_RESEARCH": ResearchProfile(
-        "MNQ_MARKET_RESEARCH", "mnq_market_research_v1",
-        "Verify recent macro, Fed, Nasdaq-100, mega-cap, semiconductor, earnings, news, geopolitical, regulatory, volatility and positioning drivers for MNQ.",
+        "MNQ_MARKET_RESEARCH", "mnq_market_research_v2",
+        "Verify temporally relevant macro and Fed schedules, Nasdaq-100, mega-cap, semiconductor, earnings, current news, geopolitical, regulatory, volatility and positioning drivers for MNQ. Search every required topic and prefer current official, Reuters/AP, CFTC/CME/Cboe, Nasdaq/Invesco, issuer and SEC sources.",
         ("macro", "fed_rates", "events", "nasdaq_100", "mega_cap_semiconductors", "earnings", "news", "risk", "volatility_positioning", "conflicts"),
         "Return NO_DATA for a topic only after bounded searches and source-policy validation produce no current verifiable evidence.",
     ),

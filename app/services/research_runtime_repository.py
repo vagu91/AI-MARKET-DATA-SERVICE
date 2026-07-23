@@ -5,16 +5,22 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from app.core.config import Settings
+from app.core.text_normalization import normalize_payload_text
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.data_freshness_service import parse_datetime
 from app.services.codex_runtime_contract import sanitize_diagnostic
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.research_profiles import PROFILES
+from app.services.research_semantics import (
+    is_not_applicable,
+    normalize_research_claim,
+    semantic_validation_warnings,
+)
 from app.services.source_policy_service import SourcePolicyService
 from app.services.research_tool_telemetry import (
     COUNTED_SOURCE_ACTIONS,
@@ -32,11 +38,24 @@ class ResearchRuntimeRepository:
         *,
         source_policy: SourcePolicyService | None = None,
         facts: MarketFactRepository | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.policy = source_policy or SourcePolicyService(settings.source_policy_path)
         self.facts = facts or MarketFactRepository(settings)
+        self.now = now or (lambda: datetime.now(UTC))
         migrate_database(settings.database_path)
+
+    def normalize_claims(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            normalize_research_claim(
+                claim,
+                policy=self.policy,
+                now=self.now(),
+            )
+            for claim in claims
+            if isinstance(claim, dict)
+        ]
 
     def ensure_run(
         self, job: dict[str, Any], profile_id: str, prompt_version: str
@@ -940,7 +959,12 @@ class ResearchRuntimeRepository:
             is not None
         )
         source_domains.discard("")
-        for claim in claims:
+        for raw_claim in claims:
+            claim = normalize_research_claim(
+                raw_claim,
+                policy=self.policy,
+                now=self.now(),
+            )
             restored, evidence_rows = self._persist_claim(
                 run,
                 claim,
@@ -951,23 +975,24 @@ class ResearchRuntimeRepository:
             source_domains.update(row["source_domain"] for row in evidence_rows)
             if restored["validation_status"] == "accepted":
                 accepted.append(restored)
-                if self._project_and_read_back(restored, evidence_rows):
+                if is_not_applicable(restored):
+                    read_back_count += 1
+                elif self._project_and_read_back(restored, evidence_rows):
                     read_back_count += 1
             else:
                 rejected.append(restored)
         required_topics = {str(item) for item in run.get("required_topics") or []}
         completed_topics = {
-            _resolved_topic(run, item) for item in accepted if not _is_not_applicable(item)
+            _resolved_topic(run, item) for item in accepted if not is_not_applicable(item)
         } & required_topics
         not_applicable_topics = {
-            _resolved_topic(run, item) for item in accepted if _is_not_applicable(item)
+            _resolved_topic(run, item) for item in accepted if is_not_applicable(item)
         } & required_topics
         resolved_topics = completed_topics | not_applicable_topics
         missing_topics = required_topics - resolved_topics
         coverage_score = len(resolved_topics) / max(len(required_topics), 1)
-        data_claim_count = sum(1 for item in accepted if not _is_not_applicable(item))
         status = (
-            "NO_DATA" if data_claim_count == 0 else "PARTIAL" if missing_topics else "SUCCEEDED"
+            "NO_DATA" if not accepted else "PARTIAL" if missing_topics else "SUCCEEDED"
         )
         blocking_gaps = [f"missing_topic:{item}" for item in sorted(missing_topics)]
         now = _now()
@@ -1021,6 +1046,7 @@ class ResearchRuntimeRepository:
             "results": [
                 self._claim_result(item)
                 for item in accepted
+                if not is_not_applicable(item)
                 if item["field_semantics"]
                 in {
                     "forecast",
@@ -1028,6 +1054,12 @@ class ResearchRuntimeRepository:
                     "previous",
                     "outcome",
                     "transcript_url",
+                    "scheduled_event",
+                    "official_calendar_event",
+                    "issuer_announcement",
+                    "earnings_schedule",
+                    "current_news",
+                    "current_market_context",
                 }
             ],
         }
@@ -1087,7 +1119,7 @@ class ResearchRuntimeRepository:
                 "SELECT * FROM research_evidence WHERE claim_id=? ORDER BY source_tier,source_domain",
                 (claim_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [normalize_payload_text(dict(row)) for row in rows]
 
     def _persist_claim(
         self,
@@ -1097,9 +1129,15 @@ class ResearchRuntimeRepository:
         acquired_sources: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         now = _now()
+        claim = normalize_research_claim(
+            claim,
+            policy=self.policy,
+            now=self.now(),
+        )
         semantics = str(
             claim.get("field_semantics") or claim.get("field") or "exploratory_context"
         ).lower()
+        not_applicable = is_not_applicable(claim)
         evidence_input = [item for item in claim.get("evidence") or [] if isinstance(item, dict)]
         evidence_rows, warnings = self._validated_evidence(
             semantics,
@@ -1107,21 +1145,32 @@ class ResearchRuntimeRepository:
             observed_sources,
             acquired_sources,
         )
+        warnings.extend(
+            semantic_validation_warnings(
+                claim,
+                policy=self.policy,
+                now=self.now(),
+            )
+        )
         semantic_policy = self.policy.semantic_policy(semantics)
         groups = {row["independent_source_group"] for row in evidence_rows}
-        required = int(semantic_policy.get("required_confirmations") or 1)
-        if len(groups) < required:
+        required = self.policy.required_confirmations(semantics)
+        if not not_applicable and len(groups) < required:
             warnings.append("insufficient_independent_evidence")
         if semantics in {"actual", "forecast", "consensus", "previous"}:
             for field in ("metric_id", "period", "frequency", "unit"):
                 if claim.get(field) in (None, ""):
                     warnings.append(f"missing_{field}")
-        if semantics == "actual":
-            warnings.append("actual_requires_deterministic_official_resolver")
+        if semantics in {"actual", "official_actual"}:
+            warnings.append("official_actual_requires_deterministic_resolver")
         published = parse_datetime(claim.get("published_at"))
-        if published and published > datetime.now(UTC):
+        if published and published > self.now():
             warnings.append("future_published_at_rejected")
-        validation = "accepted" if evidence_rows and not warnings else "rejected"
+        validation = (
+            "accepted"
+            if (evidence_rows or not_applicable) and not warnings
+            else "rejected"
+        )
         claim_payload = {**claim, "field_semantics": semantics, "warnings": sorted(set(warnings))}
         checksum = _checksum(claim_payload)
         claim_seed = f"{run['run_id']}|{checksum}"
@@ -1133,9 +1182,10 @@ class ResearchRuntimeRepository:
                 """
                 INSERT OR IGNORE INTO research_claims(
                   claim_id,research_run_id,topic,field_semantics,value_json,metric_id,period,frequency,
-                  unit,event_key,symbol,valid_from,valid_until,published_at,retrieved_at,confidence,
+                  unit,event_key,event_at,release_at,issuer,symbol,valid_from,valid_until,
+                  next_refresh_at,lifecycle_status,post_event_semantics,published_at,retrieved_at,confidence,
                   validation_status,warnings_json,policy_version,prompt_version,payload_json,checksum,created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     claim_id,
@@ -1148,9 +1198,15 @@ class ResearchRuntimeRepository:
                     claim.get("frequency"),
                     claim.get("unit"),
                     claim.get("event_key") or run.get("event_key"),
+                    claim.get("event_at"),
+                    claim.get("release_at"),
+                    claim.get("issuer"),
                     claim.get("symbol") or run.get("symbol"),
                     claim.get("valid_from"),
                     claim.get("valid_until"),
+                    claim.get("next_refresh_at"),
+                    claim.get("lifecycle_status"),
+                    claim.get("post_event_semantics"),
                     claim.get("published_at"),
                     claim.get("retrieved_at") or now,
                     min(
@@ -1240,7 +1296,9 @@ class ResearchRuntimeRepository:
         semantic_policy = self.policy.semantic_policy(semantics)
         allowed_tiers = {int(item) for item in semantic_policy.get("allowed_tiers") or range(1, 6)}
         ttl_minutes = int(semantic_policy.get("ttl_minutes") or 0)
-        now = datetime.now(UTC)
+        freshness_basis = str(semantic_policy.get("freshness_basis") or "published_at")
+        published_at_required = bool(semantic_policy.get("published_at_required")) or semantics == "news"
+        now = self.now()
         seen: set[tuple[str, str]] = set()
         for item in items:
             url = _canonical_url(str(item.get("canonical_url") or item.get("source_url") or ""))
@@ -1252,6 +1310,9 @@ class ResearchRuntimeRepository:
             tier = int(rule["tier"])
             if tier not in allowed_tiers:
                 warnings.append("source_tier_not_allowed_for_semantics")
+                continue
+            if not self.policy.rule_supports(rule, semantics):
+                warnings.append("field_semantics_not_allowed_for_source")
                 continue
             domain = self.policy.domain(url)
             service_verification = (
@@ -1295,13 +1356,22 @@ class ResearchRuntimeRepository:
                 continue
             seen.add(key)
             published = parse_datetime(item.get("published_at"))
-            if semantics == "news" and published is None:
-                warnings.append("news_published_at_required")
+            if published_at_required and published is None:
+                warnings.append(
+                    "current_news_published_at_required"
+                    if semantics in {"news", "current_news"}
+                    else "published_at_required"
+                )
                 continue
             if published and published > now:
                 warnings.append("future_evidence_timestamp")
                 continue
-            if published and ttl_minutes and published < now - timedelta(minutes=ttl_minutes):
+            if (
+                freshness_basis == "published_at"
+                and published
+                and ttl_minutes
+                and published < now - timedelta(minutes=ttl_minutes)
+            ):
                 warnings.append("stale_evidence")
                 continue
             rows.append(
@@ -1368,8 +1438,10 @@ class ResearchRuntimeRepository:
                 "reliability": 0.0,
                 "confidence": claim.get("confidence") or 0,
                 "retrieved_at": claim.get("retrieved_at"),
+                "release_at": claim.get("release_at") or claim.get("event_at"),
                 "valid_from": claim.get("valid_from"),
                 "valid_until": claim.get("valid_until"),
+                "next_refresh_at": claim.get("next_refresh_at"),
                 "status": "active",
                 "raw_payload_json": claim.get("payload"),
                 "warnings_json": claim.get("warnings"),
@@ -1403,6 +1475,13 @@ class ResearchRuntimeRepository:
             "period": claim.get("period"),
             "frequency": claim.get("frequency"),
             "unit": claim.get("unit"),
+            "event_at": claim.get("event_at"),
+            "release_at": claim.get("release_at"),
+            "issuer": claim.get("issuer"),
+            "valid_until": claim.get("valid_until"),
+            "next_refresh_at": claim.get("next_refresh_at"),
+            "lifecycle_status": claim.get("lifecycle_status"),
+            "post_event_semantics": claim.get("post_event_semantics"),
             "source": primary.get("publisher"),
             "publisher": primary.get("publisher"),
             "source_url": primary["canonical_url"],
@@ -1419,14 +1498,14 @@ class ResearchRuntimeRepository:
     def _research_source_row(row: Any) -> dict[str, Any]:
         data = dict(row)
         data["redirect_chain"] = json.loads(data.pop("redirect_chain_json") or "[]")
-        return data
+        return normalize_payload_text(data)
 
     @staticmethod
     def _backend_invocation_row(row: Any) -> dict[str, Any]:
         data = dict(row)
         data["cost"] = json.loads(data.pop("cost_json") or "null")
         data["output"] = json.loads(data.pop("output_json") or "{}")
-        return data
+        return normalize_payload_text(data)
 
     @staticmethod
     def _run_row(row: Any) -> dict[str, Any]:
@@ -1464,7 +1543,7 @@ class ResearchRuntimeRepository:
                     else "[]"
                 )
             )
-        return data
+        return normalize_payload_text(data)
 
     @staticmethod
     def _step_row(row: Any) -> dict[str, Any]:
@@ -1486,7 +1565,7 @@ class ResearchRuntimeRepository:
                     else "{}"
                 )
             )
-        return data
+        return normalize_payload_text(data)
 
     @staticmethod
     def _step_attempt_row(row: Any) -> dict[str, Any]:

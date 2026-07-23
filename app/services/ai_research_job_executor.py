@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from app.core.config import Settings
 from app.core.redaction import redact_payload
+from app.core.text_normalization import contains_mojibake, normalize_payload_text
 from app.providers.ai_researcher_provider import _resolve_command, parse_json_from_stdout
 from app.services.codex_runtime_contract import (
     CodexCLIError,
@@ -404,6 +405,23 @@ class PersistentAIJobExecutor:
                     error_events=error_events,
                 )
             )
+        payload = normalize_payload_text(payload)
+        if contains_mojibake(payload):
+            raise CodexCLIError(
+                build_diagnostic(
+                    category="OUTPUT_CONTRACT",
+                    retryable=False,
+                    command=command,
+                    step=step,
+                    workspace=workspace,
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    executable_version=executable_version,
+                    exit_code=process.returncode,
+                    stderr=f"{stderr}\nknown_mojibake_rejected",
+                    stdout=stdout,
+                    error_events=error_events,
+                )
+            )
         if schema is not None:
             try:
                 validate_payload(payload, schema)
@@ -423,11 +441,10 @@ class PersistentAIJobExecutor:
                         error_events=error_events,
                     )
                 ) from exc
-        if not output_path.exists():
-            output_path.write_text(
-                json.dumps(redact_payload(payload), indent=2, ensure_ascii=False, default=str),
-                encoding="utf-8",
-            )
+        output_path.write_text(
+            json.dumps(redact_payload(payload), indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
         if json_event_stream:
             telemetry_path = output_path.with_name(f"{output_path.stem}_telemetry.json")
             telemetry_path.write_text(
@@ -605,12 +622,53 @@ def build_agentic_research_prompt(
             "each claim evidence_text must be a short bounded anchor actually "
             "present on its cited acquisition URL"
         ),
+        "semantic_taxonomy": {
+            "scheduled_event": "future scheduled event; event_at or release_at is mandatory",
+            "official_calendar_event": (
+                "future event from an official calendar; event_at or release_at is mandatory"
+            ),
+            "issuer_announcement": (
+                "official issuer announcement; issuer and event_at are mandatory"
+            ),
+            "earnings_schedule": (
+                "official earnings timing; issuer and event_at are mandatory"
+            ),
+            "current_news": (
+                "current material news; published_at is mandatory and two independent "
+                "domains will be required by the service"
+            ),
+            "current_market_context": (
+                "short-lived current market, volatility or positioning observation"
+            ),
+            "exploratory_context": (
+                "historical background only; it never completes a current topic"
+            ),
+        },
+        "search_strategy": [
+            "perform and report at least one bounded query for every required topic",
+            "when one query covers multiple topics, list every covered topic in plan.queries[].topics",
+            "prefer sources published today or still relevant at context_date",
+            "use official sources plus Reuters/AP for current news and conflicts",
+            "use CFTC/CME/Cboe for positioning and volatility",
+            "use Nasdaq/Invesco/issuer newsroom/issuer IR/SEC for Nasdaq-100, mega-cap and earnings",
+            "do not use an old article merely to complete a current topic",
+        ],
+        "not_applicable_rule": (
+            "NOT_APPLICABLE is permitted only after a completed bounded query for that topic"
+        ),
+        "budget_rule": (
+            "in observe mode numeric budgets are warning thresholds; loop detection and "
+            "the emergency action ceiling remain hard safety controls"
+        ),
     }
     return (
         "You are a data-only research backend for one bounded agentic invocation.\n"
         "Plan, search, identify original sources, and return candidate atomic claims in one pass.\n"
         "Never modify files, call AI-TRADER, place orders, or provide trading advice.\n"
         "Never invent URLs, evidence, values, timestamps, source state, or trust labels.\n"
+        "Never label a future economic release or official calendar entry as current_news.\n"
+        "Every required topic must have a documented bounded search, including NOT_APPLICABLE topics.\n"
+        "Prefer current, temporally relevant sources over older accessible articles.\n"
         "The service independently acquires and verifies every source after this invocation.\n\n"
         f"RUN_ID\n{run['run_id']}\n\nJOB_ID\n{job['job_id']}\n\n"
         f"PROFILE\n{_bounded_json(bounded_profile, 24000)}\n\n"

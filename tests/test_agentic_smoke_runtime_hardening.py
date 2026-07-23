@@ -797,7 +797,7 @@ def test_additive_migration_from_schema_10_preserves_rows_and_repairs_run(
         conn.commit()
 
     result = migrate_database(database)
-    assert result["schema_version"] == 13
+    assert result["schema_version"] == 14
     assert result["reconciled_research_runs"] == 1
     with connect_sqlite(database) as conn:
         job = conn.execute(
