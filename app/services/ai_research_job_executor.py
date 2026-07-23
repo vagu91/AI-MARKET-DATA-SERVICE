@@ -5,9 +5,10 @@ import os
 import signal
 import subprocess
 import threading
-from time import perf_counter
+from queue import Empty, Queue
+from time import monotonic, perf_counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.core.redaction import redact_payload
@@ -56,6 +57,8 @@ class PersistentAIJobExecutor:
         context: dict[str, Any],
         workspace: Path,
         watchdog_seconds: int,
+        effective_budget: dict[str, Any] | None = None,
+        event_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if not self.settings.enable_ai_researcher:
             raise RuntimeError("ai_researcher_disabled")
@@ -89,7 +92,11 @@ class PersistentAIJobExecutor:
                 stderr="inherited_agent_instructions_present",
             )
         schema_path = workspace / f"{step_name.lower()}_output_schema.json"
-        schema = step_output_schema(step_name)
+        schema = (
+            step_output_schema(step_name, effective_budget)
+            if effective_budget is not None
+            else step_output_schema(step_name)
+        )
         try:
             validate_output_schema(schema)
         except ValueError as exc:
@@ -103,7 +110,18 @@ class PersistentAIJobExecutor:
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         output_path = workspace / f"{step_name.lower()}_output.json"
         profile = profile_for_job(str(job["job_type"]))
-        prompt = build_step_prompt(job, run, step_name, context, prompt_context(profile, job.get("request_payload") or {}))
+        profile_payload = context.get("profile") or prompt_context(
+            profile,
+            job.get("request_payload") or {},
+            effective_budget,
+        )
+        prompt = build_step_prompt(
+            job,
+            run,
+            step_name,
+            context,
+            profile_payload,
+        )
         command = build_codex_exec_command(
             command_prefix,
             workspace=workspace,
@@ -131,6 +149,7 @@ class PersistentAIJobExecutor:
                 schema=schema,
                 step=step_name,
                 executable_version=self._executable_version(command_prefix),
+                event_observer=event_observer,
             )
         except CodexCLIError as exc:
             exc.diagnostic["run_id"] = str(run["run_id"])
@@ -149,6 +168,7 @@ class PersistentAIJobExecutor:
         schema: dict[str, Any] | None = None,
         step: str = "JOB",
         executable_version: str | None = None,
+        event_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         started = perf_counter()
         output_path.unlink(missing_ok=True)
@@ -193,10 +213,25 @@ class PersistentAIJobExecutor:
             self._active[process.pid] = process
         try:
             try:
-                stdout, stderr = process.communicate(input=prompt, timeout=max(int(watchdog_seconds), 1))
-            except subprocess.TimeoutExpired:
+                if json_event_stream and event_observer is not None:
+                    stdout, stderr = _communicate_jsonl_incrementally(
+                        process,
+                        prompt,
+                        max(int(watchdog_seconds), 1),
+                        event_observer,
+                    )
+                else:
+                    stdout, stderr = process.communicate(
+                        input=prompt,
+                        timeout=max(int(watchdog_seconds), 1),
+                    )
+            except subprocess.TimeoutExpired as exc:
                 _terminate_process_group(process)
-                stdout, stderr = process.communicate()
+                if json_event_stream and event_observer is not None:
+                    stdout = str(exc.output or "")
+                    stderr = str(exc.stderr or "")
+                else:
+                    stdout, stderr = process.communicate()
                 error_events = extract_codex_error_events(stdout)
                 raise CodexCLIError(
                     build_diagnostic(
@@ -295,6 +330,7 @@ class PersistentAIJobExecutor:
         return {
             "status": "SUCCEEDED", **payload, "_tool_events": tool_events,
             "_usage": usage, "usage_status": "available" if usage is not None else "usage_unavailable",
+            "_events_persisted_incrementally": event_observer is not None,
         }
 
     def _preflight_error(
@@ -414,13 +450,107 @@ def build_step_prompt(
 
 def _phase_requirements(step_name: str) -> list[str]:
     return {
-        "PLAN": ["identify missing topics", "produce bounded queries", "define stop conditions"],
-        "SEARCH": ["run multiple bounded searches", "return query and discovered URLs"],
-        "OPEN_SOURCE": ["open original sources", "record status, redirect, publisher and timestamps"],
+        "PLAN": [
+            "identify missing topics",
+            "produce no more queries than limits.remaining_searches",
+            "combine multiple query_topic_groups topics in one query when required",
+            "define stop conditions that stop at the numeric budget",
+        ],
+        "SEARCH": [
+            "execute only planned queries within limits.remaining_searches",
+            "never repeat completed_queries",
+            "stop when the numeric search budget is exhausted",
+            "return query and discovered URLs",
+        ],
+        "OPEN_SOURCE": [
+            "open original sources within limits.remaining_opened_sources",
+            "never reopen URLs listed in completed_opened_sources",
+            "stop when the numeric opened-source budget is exhausted",
+            "record status, redirect, publisher and timestamps",
+        ],
         "EXTRACT": ["extract atomic claims and short evidence", "retain exact metric, period and unit"],
         "CROSS_CHECK": ["compare claims across sources", "mark conflicts and syndication"],
         "VALIDATE": ["return final atomic claims with nested evidence", "return NO_DATA when criteria fail"],
     }[step_name]
+
+
+def _communicate_jsonl_incrementally(
+    process: subprocess.Popen[str],
+    prompt: str,
+    timeout_seconds: int,
+    event_observer: Callable[[dict[str, Any]], None],
+) -> tuple[str, str]:
+    if (
+        process.stdin is None
+        or process.stdout is None
+        or process.stderr is None
+        or not hasattr(process.stdout, "readline")
+    ):
+        stdout, stderr = process.communicate(
+            input=prompt,
+            timeout=timeout_seconds,
+        )
+        for line in stdout.splitlines():
+            for event in _tool_events_from_jsonl_line(line):
+                event_observer(event)
+        return stdout, stderr
+
+    stdout_lines: list[str] = []
+    stderr_parts: list[str] = []
+    lines: Queue[str | None] = Queue()
+
+    def read_stdout() -> None:
+        try:
+            while True:
+                line = process.stdout.readline()
+                if line == "":
+                    break
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    def read_stderr() -> None:
+        stderr_parts.append(process.stderr.read())
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    process.stdin.write(prompt)
+    process.stdin.close()
+    deadline = monotonic() + max(timeout_seconds, 1)
+    completed = False
+    try:
+        while not completed:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(
+                    process.args,
+                    timeout_seconds,
+                    output="".join(stdout_lines),
+                    stderr="".join(stderr_parts),
+                )
+            try:
+                line = lines.get(timeout=min(remaining, 0.1))
+            except Empty:
+                if process.poll() is not None and not stdout_thread.is_alive():
+                    break
+                continue
+            if line is None:
+                completed = True
+                continue
+            stdout_lines.append(line)
+            for event in _tool_events_from_jsonl_line(line):
+                try:
+                    event_observer(event)
+                except Exception:
+                    _terminate_process_group(process)
+                    raise
+        process.wait(timeout=max(deadline - monotonic(), 0.1))
+    finally:
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+    return "".join(stdout_lines), "".join(stderr_parts)
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -476,20 +606,35 @@ def parse_codex_json_event_stream(
             candidate = event.get("usage") or item.get("usage")
             if isinstance(candidate, dict):
                 usage = candidate
-        observed_type = _observed_tool_type(item_type, event_type)
-        if observed_type:
-            urls = _event_urls(item)
-            if observed_type == "search":
-                event = _tool_event(observed_type, item, None)
-                event["discovered_urls"] = urls
-                events.append(event)
-            else:
-                events.extend(_tool_event(observed_type, item, url) for url in urls)
+        events.extend(_tool_events_from_event(event))
     for message in reversed(final_messages):
         payload, error = parse_json_from_stdout(message)
         if payload is not None:
             return payload, events, usage, None
     return None, events, usage, "codex_json_stream_missing_structured_final_message"
+
+
+def _tool_events_from_jsonl_line(line: str) -> list[dict[str, Any]]:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    return _tool_events_from_event(event) if isinstance(event, dict) else []
+
+
+def _tool_events_from_event(event: dict[str, Any]) -> list[dict[str, Any]]:
+    event_type = str(event.get("type") or "")
+    item = event.get("item") if isinstance(event.get("item"), dict) else event
+    item_type = str(item.get("type") or event_type).lower()
+    observed_type = _observed_tool_type(item_type, event_type)
+    if not observed_type:
+        return []
+    urls = _event_urls(item)
+    if observed_type == "search":
+        observed = _tool_event(observed_type, item, None)
+        observed["discovered_urls"] = urls
+        return [observed]
+    return [_tool_event(observed_type, item, url) for url in urls]
 
 
 def extract_codex_error_events(stdout: str) -> list[dict[str, Any]]:

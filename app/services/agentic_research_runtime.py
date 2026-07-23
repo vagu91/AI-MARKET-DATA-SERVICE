@@ -16,6 +16,11 @@ from app.services.evidence_verification_service import (
 )
 from app.services.data_freshness_service import parse_datetime
 from app.services.codex_runtime_contract import CodexCLIError
+from app.services.research_budget import (
+    ResearchBudgetExceeded,
+    build_effective_budget,
+    refresh_effective_budget,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,14 +53,54 @@ class AgenticResearchRuntime:
         run = self.repository.ensure_run(job, profile.profile_id, profile.prompt_version)
         elapsed = _elapsed_job_seconds(job)
         deadline = self.monotonic() + max(float(timeout_seconds) - elapsed, 0.0)
+        daily_usage = self.repository.daily_budget_usage(
+            exclude_run_id=str(run["run_id"])
+        )
+        base_budget = self.repository.ensure_effective_budget(
+            str(run["run_id"]),
+            build_effective_budget(
+                self.settings,
+                required_topics=list(run.get("required_topics") or []),
+                daily_usage=daily_usage,
+                daily_runs=daily_usage["run_count"],
+                runtime_seconds=timeout_seconds,
+                elapsed_seconds=elapsed,
+            ),
+        )
         context: dict[str, Any] = {
             "job_id": job["job_id"], "run_id": run["run_id"],
-            "profile": prompt_context(profile, job.get("request_payload") or {}),
         }
         for ordinal, step_name in enumerate(EXTERNAL_STEPS, start=1):
             remaining = deadline - self.monotonic()
             if remaining <= 0:
                 return _deadline_result(run, step_name)
+            current_run = self.repository.get_run(run["run_id"]) or run
+            completed_queries = self.repository.observed_queries(str(run["run_id"]))
+            completed_opened_sources = [
+                str(
+                    item.get("canonical_url")
+                    or item.get("source_url")
+                    or ""
+                )
+                for item in self.repository.observed_sources(str(run["run_id"]))
+                if item.get("canonical_url") or item.get("source_url")
+            ]
+            effective_budget = refresh_effective_budget(
+                base_budget,
+                search_count=int(current_run.get("search_count") or 0),
+                opened_source_count=int(
+                    current_run.get("opened_source_count") or 0
+                ),
+                remaining_runtime_seconds=remaining,
+                completed_queries=completed_queries,
+                completed_opened_sources=completed_opened_sources,
+            )
+            context["effective_budget"] = effective_budget
+            context["profile"] = prompt_context(
+                profile,
+                job.get("request_payload") or {},
+                effective_budget,
+            )
             step, execute = self.repository.begin_step(
                 run["run_id"], step_name, ordinal, context,
                 backend="codex_cli", tool=_step_tool(step_name),
@@ -63,31 +108,141 @@ class AgenticResearchRuntime:
             if not execute:
                 context[step_name.lower()] = step.get("output") or {}
                 continue
+            budget_resource = (
+                "searches"
+                if step_name == "SEARCH"
+                else "opened_sources"
+                if step_name == "OPEN_SOURCE"
+                else None
+            )
+            remaining_searches_before_step = int(
+                effective_budget["remaining_searches"]
+            )
+            remaining_opens_before_step = int(
+                effective_budget["remaining_opened_sources"]
+            )
+            remaining_before_step = (
+                remaining_searches_before_step
+                if budget_resource == "searches"
+                else remaining_opens_before_step
+                if budget_resource == "opened_sources"
+                else 0
+            )
+            if budget_resource and remaining_before_step <= 0:
+                bounded = {
+                    "status": "NO_DATA",
+                    "warnings": [f"{budget_resource}_budget_exhausted"],
+                    "effective_budget": effective_budget,
+                }
+                if step_name == "SEARCH":
+                    bounded.update({"searches": [], "sources": []})
+                else:
+                    bounded["sources"] = []
+                self.repository.complete_step(step["step_id"], bounded)
+                context[step_name.lower()] = bounded
+                continue
             logger.info("research_step_started", extra={"job_id": job["job_id"], "run_id": run["run_id"], "step": step_name})
+            observed_step_events: list[dict[str, Any]] = []
+
+            def observe_tool_event(event: dict[str, Any]) -> None:
+                observed_step_events.append(event)
+                counts = self.repository.record_tool_events(
+                    str(run["run_id"]),
+                    str(step["step_id"]),
+                    [event],
+                )
+                current_budget = refresh_effective_budget(
+                    base_budget,
+                    search_count=counts["search_count"],
+                    opened_source_count=counts["opened_source_count"],
+                    remaining_runtime_seconds=deadline - self.monotonic(),
+                    completed_queries=self.repository.observed_queries(
+                        str(run["run_id"])
+                    ),
+                    completed_opened_sources=[
+                        str(
+                            item.get("canonical_url")
+                            or item.get("source_url")
+                            or ""
+                        )
+                        for item in self.repository.observed_sources(
+                            str(run["run_id"])
+                        )
+                        if item.get("canonical_url") or item.get("source_url")
+                    ],
+                )
+                resource: str | None = None
+                event_resource = str(event.get("event_type") or "")
+                configured_limit = 0
+                observed_count = 0
+                if (
+                    counts["daily_search_count"]
+                    > int(base_budget["daily_searches_limit"])
+                ):
+                    resource = "daily_budget"
+                    configured_limit = int(base_budget["daily_searches_limit"])
+                    observed_count = counts["daily_search_count"]
+                elif (
+                    counts["daily_opened_source_count"]
+                    > int(base_budget["daily_opened_sources_limit"])
+                ):
+                    resource = "daily_budget"
+                    configured_limit = int(
+                        base_budget["daily_opened_sources_limit"]
+                    )
+                    observed_count = counts["daily_opened_source_count"]
+                elif counts["search_count"] > int(base_budget["max_searches"]):
+                    resource = "searches"
+                    configured_limit = int(base_budget["max_searches"])
+                    observed_count = counts["search_count"]
+                elif counts["opened_source_count"] > int(
+                    base_budget["max_opened_sources"]
+                ):
+                    resource = "opened_sources"
+                    configured_limit = int(
+                        base_budget["max_opened_sources"]
+                    )
+                    observed_count = counts["opened_source_count"]
+                if resource:
+                    raise ResearchBudgetExceeded(
+                        step=step_name,
+                        resource=resource,
+                        configured_limit=configured_limit,
+                        observed_count=observed_count,
+                        remaining_before_step=(
+                            remaining_opens_before_step
+                            if event_resource
+                            in {"open_source", "server_source_verified"}
+                            else remaining_searches_before_step
+                        ),
+                        run_id=str(run["run_id"]),
+                        job_id=str(job["job_id"]),
+                        effective_budget=current_budget,
+                        tool_events=observed_step_events,
+                    )
+
             try:
                 output = executor.execute_step(
                     job=job, run=run, step_name=step_name, context=context,
                     workspace=workspace, watchdog_seconds=max(1, math.ceil(remaining)),
+                    effective_budget=effective_budget,
+                    event_observer=observe_tool_event,
                 )
                 if not isinstance(output, dict):
                     raise ValueError("agent_step_output_not_object")
-                _enforce_step_limits(output, self.settings)
+                _enforce_step_limits(output)
                 events = [item for item in output.pop("_tool_events", []) if isinstance(item, dict)]
                 usage = output.pop("_usage", None)
-                current_run = self.repository.get_run(run["run_id"]) or {}
-                new_searches, new_opens = _observed_event_counts(events)
-                if int(current_run.get("search_count") or 0) + new_searches > self.settings.research_max_searches:
-                    raise ValueError("research_max_searches_exceeded")
-                if int(current_run.get("opened_source_count") or 0) + new_opens > self.settings.research_max_opened_sources:
-                    raise ValueError("research_max_opened_sources_exceeded")
-                counts = self.repository.record_tool_events(
-                    run["run_id"], step["step_id"], events,
+                incrementally_persisted = bool(
+                    output.pop("_events_persisted_incrementally", False)
+                )
+                if not incrementally_persisted:
+                    for event in events:
+                        observe_tool_event(event)
+                self.repository.record_tool_events(
+                    run["run_id"], step["step_id"], [],
                     usage=usage if isinstance(usage, dict) else None,
                 )
-                if counts["search_count"] > self.settings.research_max_searches:
-                    raise ValueError("research_max_searches_exceeded")
-                if counts["opened_source_count"] > self.settings.research_max_opened_sources:
-                    raise ValueError("research_max_opened_sources_exceeded")
                 domains = _source_domains(output)
                 self.repository.complete_step(step["step_id"], output, source_domains=domains)
                 context[step_name.lower()] = output
@@ -96,7 +251,7 @@ class AgenticResearchRuntime:
                     "source_domain_count": len(domains),
                 })
             except Exception as exc:
-                diagnostic = exc.diagnostic if isinstance(exc, CodexCLIError) else None
+                diagnostic = getattr(exc, "diagnostic", None)
                 if diagnostic is not None:
                     diagnostic["run_id"] = str(run["run_id"])
                     diagnostic["job_id"] = str(job["job_id"])
@@ -118,14 +273,19 @@ class AgenticResearchRuntime:
                         ),
                     },
                 )
-                if isinstance(exc, CodexCLIError):
+                if isinstance(exc, (CodexCLIError, ResearchBudgetExceeded)):
                     raise
                 if "watchdog" in str(exc).lower() or self.monotonic() >= deadline:
                     return _deadline_result(run, step_name)
                 raise
         validation = context.get("validate") or {}
         claims = [item for item in validation.get("claims") or [] if isinstance(item, dict)]
-        self._verify_unobserved_evidence(run, step["step_id"], claims)
+        self._verify_unobserved_evidence(
+            run,
+            step["step_id"],
+            claims,
+            max_opened_sources=int(base_budget["max_opened_sources"]),
+        )
         if self.monotonic() >= deadline:
             return _deadline_result(run, "PERSIST")
         persist_step, should_persist = self.repository.begin_step(
@@ -157,6 +317,36 @@ class AgenticResearchRuntime:
             "prompt_version": profile.prompt_version,
             "research_steps": list(ALL_STEPS),
             "_service_evidence_verified": True,
+            "effective_budget": refresh_effective_budget(
+                base_budget,
+                search_count=int(
+                    (self.repository.get_run(run["run_id"]) or {}).get(
+                        "search_count"
+                    )
+                    or 0
+                ),
+                opened_source_count=int(
+                    (self.repository.get_run(run["run_id"]) or {}).get(
+                        "opened_source_count"
+                    )
+                    or 0
+                ),
+                remaining_runtime_seconds=deadline - self.monotonic(),
+                completed_queries=self.repository.observed_queries(
+                    str(run["run_id"])
+                ),
+                completed_opened_sources=[
+                    str(
+                        item.get("canonical_url")
+                        or item.get("source_url")
+                        or ""
+                    )
+                    for item in self.repository.observed_sources(
+                        str(run["run_id"])
+                    )
+                    if item.get("canonical_url") or item.get("source_url")
+                ],
+            ),
             "usage_status": "available" if (self.repository.get_run(run["run_id"]) or {}).get("usage") else "usage_unavailable",
         }
 
@@ -165,6 +355,8 @@ class AgenticResearchRuntime:
         run: dict[str, Any],
         step_id: str,
         claims: list[dict[str, Any]],
+        *,
+        max_opened_sources: int,
     ) -> None:
         observed = self.repository.observed_sources(str(run["run_id"]))
         observed_urls = {
@@ -174,7 +366,8 @@ class AgenticResearchRuntime:
         verified_events: list[dict[str, Any]] = []
         current_run = self.repository.get_run(str(run["run_id"])) or {}
         remaining_open_budget = max(
-            self.settings.research_max_opened_sources - int(current_run.get("opened_source_count") or 0),
+            max_opened_sources
+            - int(current_run.get("opened_source_count") or 0),
             0,
         )
         for claim in claims:
@@ -230,7 +423,7 @@ def _source_domains(payload: Any) -> list[str]:
     return sorted(domains)
 
 
-def _enforce_step_limits(output: dict[str, Any], settings: Settings) -> None:
+def _enforce_step_limits(output: dict[str, Any]) -> None:
     # Model-declared arrays are intentionally not treated as observed usage.
     if not isinstance(output, dict):
         raise ValueError("agent_step_output_not_object")
@@ -252,12 +445,3 @@ def _deadline_result(run: dict[str, Any], step_name: str) -> dict[str, Any]:
         "retryable": False,
         "retry_classification": "NON_RETRYABLE",
     }
-
-
-def _observed_event_counts(events: list[dict[str, Any]]) -> tuple[int, int]:
-    searches = sum(1 for item in events if item.get("event_type") == "search")
-    opened = sum(
-        1 for item in events
-        if item.get("event_type") in {"open_source", "server_source_verified"}
-    )
-    return searches, opened

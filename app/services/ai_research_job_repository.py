@@ -181,14 +181,24 @@ class AIResearchJobRepository:
                 """
             ).fetchone()
             unique_domains = conn.execute("SELECT COUNT(DISTINCT source_domain) FROM research_evidence").fetchone()[0]
-            searches = conn.execute(
-                "SELECT COUNT(*) FROM research_run_steps WHERE step_name='SEARCH' AND status='COMPLETED'"
-            ).fetchone()[0]
-            run_count = conn.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0]
-            daily_runs = conn.execute(
-                "SELECT COUNT(*) FROM research_runs WHERE substr(created_at,1,10)=?",
+            usage_metrics = conn.execute(
+                """
+                SELECT COUNT(*) AS run_count,
+                       COALESCE(SUM(search_count),0) AS searches,
+                       COALESCE(SUM(opened_source_count),0) AS opened_sources
+                FROM research_runs
+                """
+            ).fetchone()
+            daily_usage = conn.execute(
+                """
+                SELECT COUNT(*) AS runs,
+                       COALESCE(SUM(search_count),0) AS searches,
+                       COALESCE(SUM(opened_source_count),0) AS opened_sources
+                FROM research_runs WHERE substr(created_at,1,10)=?
+                """,
                 (self._iso(self.clock())[:10],),
-            ).fetchone()[0]
+            ).fetchone()
+        run_count = int(usage_metrics["run_count"] or 0)
         by_status = {status: 0 for status in sorted(ALL_JOB_STATUSES)}
         by_status.update({str(row["status"]): int(row["count"]) for row in counts})
         return {
@@ -202,14 +212,33 @@ class AIResearchJobRepository:
                 "running_jobs": by_status["RUNNING"],
                 "terminal_counts": {item: by_status[item] for item in sorted(TERMINAL_JOB_STATUSES)},
                 "average_duration_seconds": float(run_metrics["avg_duration"] or 0),
-                "searches_per_run": float(searches / run_count) if run_count else 0.0,
+                "searches_per_run": (
+                    float(usage_metrics["searches"] / run_count)
+                    if run_count
+                    else 0.0
+                ),
+                "opened_sources_per_run": (
+                    float(usage_metrics["opened_sources"] / run_count)
+                    if run_count
+                    else 0.0
+                ),
                 "accepted_claims": int(claim_metrics["accepted"] or 0),
                 "rejected_claims": int(claim_metrics["rejected"] or 0),
                 "unique_source_domains": int(unique_domains or 0),
                 "latest_data_as_of": run_metrics["latest_data_as_of"],
                 "last_successful_research": run_metrics["last_success"],
                 "daily_budget_consumption": {
-                    "runs": int(daily_runs), "limit": self.settings.research_daily_budget_runs,
+                    "runs": int(daily_usage["runs"] or 0),
+                    "limit": self.settings.research_daily_budget_runs,
+                    "run_limit": self.settings.research_daily_budget_runs,
+                    "searches": int(daily_usage["searches"] or 0),
+                    "search_limit": self.settings.research_daily_budget_searches,
+                    "opened_sources": int(
+                        daily_usage["opened_sources"] or 0
+                    ),
+                    "opened_source_limit": (
+                        self.settings.research_daily_budget_opened_sources
+                    ),
                 },
             },
         }

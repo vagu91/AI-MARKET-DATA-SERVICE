@@ -113,7 +113,16 @@ def _validated_claim_schema() -> dict[str, Any]:
     )
 
 
-def step_output_schema(step_name: str) -> dict[str, Any]:
+def step_output_schema(
+    step_name: str,
+    effective_budget: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    budget = effective_budget or {}
+    max_searches = max(int(budget.get("remaining_searches", 8)), 0)
+    max_opened_sources = max(
+        int(budget.get("remaining_opened_sources", 12)),
+        0,
+    )
     schemas: dict[str, dict[str, Any]] = {
         "PLAN": _closed(
             {
@@ -127,7 +136,7 @@ def step_output_schema(step_name: str) -> dict[str, Any]:
                             "topic": _string(max_length=100),
                         }
                     ),
-                    max_items=16,
+                    max_items=max_searches,
                 ),
                 "stop_conditions": _array(_string(max_length=300), max_items=12),
                 "warnings": _array(_string(max_length=300), max_items=20),
@@ -146,7 +155,7 @@ def step_output_schema(step_name: str) -> dict[str, Any]:
                             ),
                         }
                     ),
-                    max_items=16,
+                    max_items=max_searches,
                 ),
                 "sources": _array(
                     _closed(
@@ -157,7 +166,7 @@ def step_output_schema(step_name: str) -> dict[str, Any]:
                             "publisher": _string(nullable=True, max_length=200),
                         }
                     ),
-                    max_items=40,
+                    max_items=max_opened_sources,
                 ),
                 "warnings": _array(_string(max_length=300), max_items=20),
             }
@@ -185,7 +194,7 @@ def step_output_schema(step_name: str) -> dict[str, Any]:
                             "content_hash": _string(nullable=True, max_length=128),
                         }
                     ),
-                    max_items=24,
+                    max_items=max_opened_sources,
                 ),
                 "warnings": _array(_string(max_length=300), max_items=20),
             }
@@ -271,8 +280,13 @@ def step_output_schema(step_name: str) -> dict[str, Any]:
     }
 
 
-def all_step_output_schemas() -> dict[str, dict[str, Any]]:
-    return {step: step_output_schema(step) for step in EXTERNAL_RESEARCH_STEPS}
+def all_step_output_schemas(
+    effective_budget: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    return {
+        step: step_output_schema(step, effective_budget)
+        for step in EXTERNAL_RESEARCH_STEPS
+    }
 
 
 def legacy_research_output_schema() -> dict[str, Any]:
@@ -632,6 +646,10 @@ def classify_codex_failure(
             ]
         ).lower()
         patterns = (
+            (
+                "BUDGET_EXCEEDED",
+                ("research_budget_exceeded", "budget exceeded"),
+            ),
             (
                 "PATH_INVALID",
                 (

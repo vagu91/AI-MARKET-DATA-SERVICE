@@ -63,6 +63,65 @@ class ResearchRuntimeRepository:
             row = conn.execute("SELECT * FROM research_runs WHERE job_id=?", (job["job_id"],)).fetchone()
         return self._run_row(row)
 
+    def ensure_effective_budget(
+        self,
+        run_id: str,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT request_json FROM research_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise ValueError("research_run_not_found")
+            request = json.loads(row["request_json"] or "{}")
+            budget = request.get("effective_budget")
+            if not isinstance(budget, dict):
+                budget = dict(candidate)
+                request["effective_budget"] = budget
+                conn.execute(
+                    "UPDATE research_runs SET request_json=?,updated_at=? WHERE run_id=?",
+                    (_json(request), _now(), run_id),
+                )
+            conn.commit()
+        return dict(budget)
+
+    def daily_budget_usage(
+        self,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> dict[str, int]:
+        today = datetime.now(UTC).date().isoformat()
+        exclusion = " AND run_id!=?" if exclude_run_id else ""
+        values: tuple[Any, ...] = (
+            (today, exclude_run_id) if exclude_run_id else (today,)
+        )
+        with connect_sqlite(self.settings.database_path) as conn:
+            usage = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(search_count),0) AS searches,
+                       COALESCE(SUM(opened_source_count),0) AS opened
+                FROM research_runs
+                WHERE substr(created_at,1,10)=?{exclusion}
+                """,
+                values,
+            ).fetchone()
+            runs = conn.execute(
+                f"""
+                SELECT COUNT(*) FROM research_runs
+                WHERE substr(created_at,1,10)=?{exclusion}
+                """,
+                values,
+            ).fetchone()[0]
+        return {
+            "search_count": int(usage["searches"] or 0),
+            "opened_source_count": int(usage["opened"] or 0),
+            "run_count": int(runs or 0),
+        }
+
     def begin_step(
         self,
         run_id: str,
@@ -197,6 +256,7 @@ class ResearchRuntimeRepository:
     ) -> dict[str, int]:
         now = _now()
         with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             for event in events:
                 if not isinstance(event, dict):
                     continue
@@ -253,12 +313,52 @@ class ResearchRuntimeRepository:
                     _json(cost) if cost else None, now, run_id,
                 ),
             )
+            daily = conn.execute(
+                """
+                SELECT COALESCE(SUM(search_count),0) AS searches,
+                       COALESCE(SUM(opened_source_count),0) AS opened
+                FROM research_runs
+                WHERE substr(created_at,1,10)=substr(?,1,10)
+                """,
+                (now,),
+            ).fetchone()
+            telemetry_row = conn.execute(
+                "SELECT telemetry_json FROM research_run_steps WHERE step_id=?",
+                (step_id,),
+            ).fetchone()
+            existing_telemetry = (
+                json.loads(telemetry_row["telemetry_json"] or "[]")
+                if telemetry_row
+                else []
+            )
             conn.execute(
                 "UPDATE research_run_steps SET telemetry_json=? WHERE step_id=?",
-                (_json(events), step_id),
+                (_json([*existing_telemetry, *events][-100:]), step_id),
             )
             conn.commit()
-        return {"search_count": searches, "opened_source_count": opened}
+        return {
+            "search_count": searches,
+            "opened_source_count": opened,
+            "daily_search_count": int(daily["searches"] or 0),
+            "daily_opened_source_count": int(daily["opened"] or 0),
+        }
+
+    def observed_queries(self, run_id: str) -> list[str]:
+        with connect_sqlite(self.settings.database_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM research_tool_events
+                WHERE run_id=? AND event_type='search'
+                ORDER BY observed_at,event_id
+                """,
+                (run_id,),
+            ).fetchall()
+        queries = []
+        for row in rows:
+            payload = json.loads(row["payload_json"] or "{}")
+            if payload.get("query"):
+                queries.append(str(payload["query"]))
+        return sorted(set(queries))
 
     def observed_sources(self, run_id: str) -> list[dict[str, Any]]:
         with connect_sqlite(self.settings.database_path) as conn:

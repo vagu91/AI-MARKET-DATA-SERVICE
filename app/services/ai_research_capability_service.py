@@ -22,6 +22,9 @@ from app.services.codex_runtime_contract import (
     validate_output_schema,
 )
 from app.services.source_policy_service import SourcePolicyService
+from app.services.research_budget import build_effective_budget
+from app.services.research_profiles import PROFILES
+from app.services.research_runtime_repository import ResearchRuntimeRepository
 
 
 CAPABILITY_STATES = {
@@ -93,9 +96,24 @@ class AIResearchCapabilityService:
         workspace_root = Path(self.settings.ai_job_workspace_root)
         workspace_writable = _workspace_writable(workspace_root)
         inherited_instructions = inherited_instruction_files(workspace_root)
+        budget_repository = ResearchRuntimeRepository(self.settings)
+        daily_usage = budget_repository.daily_budget_usage()
+        effective_budget = build_effective_budget(
+            self.settings,
+            required_topics=list(PROFILES["MNQ_MARKET_RESEARCH"].required_topics),
+            daily_usage=daily_usage,
+            daily_runs=daily_usage["run_count"],
+            runtime_seconds=self.settings.ai_job_max_runtime_seconds,
+        )
+        budget_contract_valid = bool(
+            effective_budget["max_searches"] > 0
+            and effective_budget["max_opened_sources"] > 0
+            and effective_budget["query_topic_groups"]
+            and effective_budget["daily_runs_remaining"] > 0
+        )
         schema_errors: dict[str, str] = {}
         schemas = {
-            **all_step_output_schemas(),
+            **all_step_output_schemas(effective_budget),
             "LEGACY_BATCH": legacy_research_output_schema(),
         }
         for step, schema in schemas.items():
@@ -146,6 +164,8 @@ class AIResearchCapabilityService:
             status = "AUTH_UNAVAILABLE"
         elif not schemas_valid:
             status = "SCHEMA_INVALID"
+        elif not budget_contract_valid:
+            status = "DEGRADED"
         elif not web_flag_supported or not self.settings.ai_research_web_access_enabled:
             status = "WEB_UNAVAILABLE"
         elif (
@@ -184,6 +204,8 @@ class AIResearchCapabilityService:
             "isolated_command_constructed": command_isolated,
             "schema_validation_status": "VALID" if schemas_valid else "INVALID",
             "schema_errors": schema_errors,
+            "effective_budget": effective_budget,
+            "budget_contract_valid": budget_contract_valid,
             "workspace_writable": workspace_writable,
             "inherited_instruction_files": inherited_instructions,
             "agent_instructions_isolated": not inherited_instructions,

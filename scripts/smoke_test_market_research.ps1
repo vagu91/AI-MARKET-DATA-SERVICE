@@ -106,6 +106,8 @@ catch {
     try {
         $diagnostic = $latestAttempt.diagnostic
         if (-not $diagnostic) { $diagnostic = $job.last_diagnostic }
+        $failureStep = $diagnostic.step
+        if (-not $failureStep) { $failureStep = $currentStep.step_name }
         $failure = [ordered]@{
             run_id = $runId
             job_id = $jobId
@@ -114,10 +116,27 @@ catch {
             attempts = $job.attempts
             max_attempts = $job.max_attempts
             current_step = $currentStep.step_name
+            step = $failureStep
             exit_code = $diagnostic.exit_code
             error_category = $diagnostic.category
+            resource = $diagnostic.resource
+            configured_limit = $diagnostic.configured_limit
+            observed_count = $diagnostic.observed_count
+            remaining_before_step = $diagnostic.remaining_before_step
             stderr_redacted = ConvertTo-SmokeSafeText $diagnostic.stderr_tail
             retry_classification = $diagnostic.retry_classification
+            tool_events_observed = @(
+                Get-SmokeCompactToolEvents $diagnostic.tool_events_observed
+            )
+            effective_usage = $diagnostic.effective_usage
+            effective_budget = Get-SmokeCompactBudget $diagnostic.effective_budget
+            diagnostic = [ordered]@{
+                category = $diagnostic.category
+                resource = $diagnostic.resource
+                step = $diagnostic.step
+                retry_classification = $diagnostic.retry_classification
+                timestamp = $diagnostic.timestamp
+            }
             capability_status = $capabilities.status
             queue_metrics = $queue.metrics
             polling_decision = $decision.reason

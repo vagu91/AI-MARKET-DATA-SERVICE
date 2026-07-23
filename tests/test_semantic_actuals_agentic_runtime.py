@@ -26,6 +26,7 @@ from app.services.deterministic_actual_resolver import DeterministicActualResolv
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.market_fact_repository import MarketFactRepository, connect_market_db
 from app.services.official_actual_semantics import OFFICIAL_METRICS, derive_official_actual
+from app.services.research_budget import ResearchBudgetExceeded
 from app.services.research_runtime_repository import ResearchRuntimeRepository
 from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.temporal_domain_service import canonical_event_key
@@ -946,7 +947,11 @@ def test_observed_tool_budget_is_cumulative_across_run(tmp_path: Path) -> None:
         request_payload={"database_context": {}},
     )
     runtime = AgenticResearchRuntime(cfg, verifier=NullEvidenceVerifier())
-    with pytest.raises(ValueError, match="research_max_searches_exceeded"):
+    with pytest.raises(
+        ResearchBudgetExceeded,
+        match="research_budget_exceeded:searches",
+    ):
         runtime.run(job, tmp_path / "budget", ToolBudgetExecutor(), 30)
     run = runtime.repository.latest("MNQ")
-    assert run["search_count"] == 2
+    assert run["search_count"] == 3
+    assert run["steps"][2]["diagnostic"]["category"] == "BUDGET_EXCEEDED"
