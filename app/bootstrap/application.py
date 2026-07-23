@@ -43,6 +43,7 @@ from app.services.ai_research_worker import AIResearchWorker
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.research_scheduler_service import ResearchSchedulerService
+from app.services.temporal_validation_service import TemporalValidationService
 
 
 def build_application_state(settings: Settings) -> dict[str, Any]:
@@ -74,6 +75,7 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
             OpenAIEventEnrichmentProvider(settings),
         ],
     )
+    temporal_validation = TemporalValidationService(settings)
     event_service = EventService(
         providers=[
             FederalReserveCalendarProvider(cache, settings),
@@ -83,6 +85,7 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
             EconomicCalendarScraperProvider(cache, settings),
         ],
         enrichment_service=event_enrichment_service,
+        temporal_validation=temporal_validation,
     )
     market_news_repository = MarketNewsRepository(settings)
     nasdaq_data_service = NasdaqDataService(

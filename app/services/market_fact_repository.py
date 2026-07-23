@@ -11,6 +11,11 @@ from app.core.redaction import redact_payload
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
+from app.services.temporal_validation_service import (
+    QUARANTINED_STATUS,
+    TemporalDecision,
+    TemporalValidationService,
+)
 
 FACT_COLUMNS = [
     "fact_key", "fact_type", "country", "symbol", "category", "event_name", "period", "value", "unit",
@@ -188,15 +193,24 @@ def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row
     if row["outcome_json"]:
         merged["outcome"] = decode(row["outcome_json"], {})
     terminal = str(row["temporal_status"] or row["status"] or "").upper()
-    if terminal in {"RELEASED", "COMPLETED", "ACTUAL_UNAVAILABLE"}:
+    if terminal in {
+        "RELEASED",
+        "COMPLETED",
+        "ACTUAL_UNAVAILABLE",
+        QUARANTINED_STATUS,
+    }:
         merged["temporal_status"] = terminal
+    if str(row["temporal_audit_status"] or "").upper() == QUARANTINED_STATUS:
+        merged["temporal_audit_status"] = QUARANTINED_STATUS
+        merged["temporal_invalid_reason"] = row["temporal_invalid_reason"]
     return merged
 
 
 def _event_record_payload(row: Any) -> dict[str, Any]:
     payload = decode(row["raw_payload_json"], {})
     payload.update({
-        "event_id": row["event_id"], "canonical_event_key": row["canonical_event_key"],
+        "event_id": row["event_id"], "event_key": row["event_key"],
+        "canonical_event_key": row["canonical_event_key"],
         "country": row["country"], "category": row["category"], "name": row["name"],
         "reference_period": row["period"], "date": row["date"], "time_utc": row["time_utc"],
         "time_local": row["time_local"], "impact": row["impact"], "source": row["source"],
@@ -205,6 +219,8 @@ def _event_record_payload(row: Any) -> dict[str, Any]:
         "actual_source_url": row["actual_source_url"], "surprise_value": row["surprise_value"],
         "surprise_direction": row["surprise_direction"], "release_at": row["release_at"],
         "event_kind": row["event_kind"], "temporal_status": str(row["temporal_status"] or row["status"] or "").upper(),
+        "temporal_audit_status": row["temporal_audit_status"],
+        "temporal_invalid_reason": row["temporal_invalid_reason"],
         "actual_semantics": {
             "event_metric_id": row["actual_metric_id"], "unit": row["actual_unit"],
             "frequency": row["actual_frequency"], "seasonal_adjustment": row["actual_seasonal_adjustment"],
@@ -236,6 +252,7 @@ class MarketFactRepository:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         init_market_db(settings)
+        self.temporal_validation = TemporalValidationService(settings)
 
     def upsert_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
         with connect_market_db(self.settings) as conn:
@@ -309,7 +326,7 @@ class MarketFactRepository:
         return max((fact for fact in facts if fact), key=_event_fact_rank, default=None)
 
     def search_facts(self, country: str | None = None, category: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        where: list[str] = []
+        where: list[str] = ["temporal_audit_status!='QUARANTINED'"]
         params: list[Any] = []
         if country:
             where.append("country = ?")
@@ -340,6 +357,7 @@ class MarketFactRepository:
                 """
                 SELECT COUNT(*) c FROM market_facts
                 WHERE country = ? AND status = 'active'
+                  AND temporal_audit_status!='QUARANTINED'
                   AND (valid_until IS NULL OR valid_until > ?)
                 """,
                 (country.upper(), now_iso()),
@@ -377,7 +395,9 @@ class MarketFactRepository:
                 conn.execute(
                     """
                     SELECT COUNT(*) c FROM market_facts
-                    WHERE status = 'active' AND (valid_until IS NULL OR valid_until > ?)
+                    WHERE status = 'active'
+                      AND temporal_audit_status!='QUARANTINED'
+                      AND (valid_until IS NULL OR valid_until > ?)
                     """,
                     (now_iso(),),
                 ).fetchone()["c"]
@@ -388,7 +408,13 @@ class MarketFactRepository:
         placeholders = ", ".join("?" for _ in fact_types)
         with connect_market_db(self.settings) as conn:
             rows = conn.execute(
-                f"SELECT * FROM market_facts WHERE fact_type IN ({placeholders}) AND status = 'active' ORDER BY updated_at DESC",
+                f"""
+                SELECT * FROM market_facts
+                WHERE fact_type IN ({placeholders})
+                  AND status = 'active'
+                  AND temporal_audit_status!='QUARANTINED'
+                ORDER BY updated_at DESC
+                """,
                 fact_types,
             ).fetchall()
         facts = [self._row(row) for row in rows if row]
@@ -428,13 +454,24 @@ class MarketFactRepository:
         temporal = temporal_event_state(payload)
         actual = temporal["actual"]
         canonical_key = canonical_event_key(payload)
+        decision = self.temporal_validation.policy.evaluate(
+            payload,
+            domain="macro_calendar",
+        )
         field_lineage = (payload.get("enrichment") or {}).get("field_lineage") if isinstance(payload.get("enrichment"), dict) else {}
         with connect_market_db(self.settings) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT * FROM economic_events_history WHERE event_key=? OR canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
                 (event_key, canonical_key),
             ).fetchone()
             terminal_status = temporal["temporal_status"]
+            audit_status = "ACTIVE"
+            invalid_reason = None
+            if not decision.accepted:
+                terminal_status = QUARANTINED_STATUS
+                audit_status = QUARANTINED_STATUS
+                invalid_reason = decision.reason_code
             if existing is not None:
                 event_key = str(existing["event_key"])
                 existing_raw = decode(existing["raw_payload_json"], {})
@@ -442,11 +479,30 @@ class MarketFactRepository:
                 if actual in (None, "") and existing["actual"] not in (None, ""):
                     actual = existing["actual"]
                 if str(existing["temporal_status"] or existing["status"] or "").upper() in {
-                    "RELEASED", "COMPLETED", "ACTUAL_UNAVAILABLE"
+                    "RELEASED", "COMPLETED", "ACTUAL_UNAVAILABLE", QUARANTINED_STATUS
                 }:
                     terminal_status = str(existing["temporal_status"] or existing["status"]).upper()
+                if str(existing["temporal_audit_status"] or "").upper() == QUARANTINED_STATUS:
+                    terminal_status = QUARANTINED_STATUS
+                    audit_status = QUARANTINED_STATUS
+                    invalid_reason = str(
+                        existing["temporal_invalid_reason"]
+                        or decision.reason_code
+                        or "TEMPORALLY_INVALID"
+                    )
+                    existing_record = _event_record_payload(existing)
+                    existing_decision = self.temporal_validation.policy.evaluate(
+                        existing_record,
+                        domain="macro_calendar",
+                    )
+                    if not existing_decision.accepted:
+                        decision = existing_decision
                 existing_lineage = decode(existing["field_lineage_json"], {})
                 field_lineage = {**existing_lineage, **field_lineage}
+            if audit_status == QUARANTINED_STATUS:
+                payload["temporal_status"] = QUARANTINED_STATUS
+                payload["temporal_audit_status"] = QUARANTINED_STATUS
+                payload["temporal_invalid_reason"] = invalid_reason
             conn.execute(
                 """
                 INSERT INTO economic_events_history (
@@ -454,8 +510,9 @@ class MarketFactRepository:
                     impact, event_risk_level, source, source_url, official_reliability,
                     forecast, previous, consensus, actual, release_at, valid_until, status,
                     raw_payload_json, created_at, updated_at, canonical_event_key,event_kind,
-                    temporal_status,field_lineage_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    temporal_status,field_lineage_json,temporal_audit_status,
+                    temporal_invalid_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_key) DO UPDATE SET
                     country=excluded.country,
                     category=excluded.category,
@@ -475,12 +532,23 @@ class MarketFactRepository:
                     actual=COALESCE(excluded.actual,economic_events_history.actual),
                     release_at=excluded.release_at,
                     valid_until=excluded.valid_until,
-                    status=excluded.status,
+                    status=CASE
+                      WHEN economic_events_history.temporal_audit_status='QUARANTINED'
+                      THEN 'QUARANTINED' ELSE excluded.status END,
                     raw_payload_json=excluded.raw_payload_json,
                     canonical_event_key=excluded.canonical_event_key,
                     event_kind=excluded.event_kind,
-                    temporal_status=excluded.temporal_status,
+                    temporal_status=CASE
+                      WHEN economic_events_history.temporal_audit_status='QUARANTINED'
+                      THEN 'QUARANTINED' ELSE excluded.temporal_status END,
                     field_lineage_json=COALESCE(excluded.field_lineage_json,economic_events_history.field_lineage_json),
+                    temporal_audit_status=CASE
+                      WHEN economic_events_history.temporal_audit_status='QUARANTINED'
+                      THEN 'QUARANTINED' ELSE excluded.temporal_audit_status END,
+                    temporal_invalid_reason=COALESCE(
+                      economic_events_history.temporal_invalid_reason,
+                      excluded.temporal_invalid_reason
+                    ),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -512,8 +580,47 @@ class MarketFactRepository:
                     temporal["event_kind"],
                     terminal_status,
                     encode(field_lineage),
+                    audit_status,
+                    invalid_reason,
                 ),
             )
+            stored = conn.execute(
+                "SELECT * FROM economic_events_history WHERE event_key=?",
+                (event_key,),
+            ).fetchone()
+            if stored is not None and audit_status == QUARANTINED_STATUS:
+                quarantine_record = {
+                    **payload,
+                    "event_key": stored["event_key"],
+                    "canonical_event_key": stored["canonical_event_key"],
+                    "status": terminal_status,
+                    "temporal_status": terminal_status,
+                    "temporal_audit_status": audit_status,
+                    "temporal_invalid_reason": invalid_reason,
+                    "field_lineage": field_lineage,
+                }
+                self.temporal_validation.record_quarantine(
+                    conn,
+                    quarantine_record,
+                    entity_table="economic_events_history",
+                    entity_key=str(stored["event_key"]),
+                    domain="macro_calendar",
+                    decision=TemporalDecision(
+                        False,
+                        invalid_reason,
+                        decision.timestamp_field,
+                        decision.timestamp_value,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE market_facts
+                    SET temporal_audit_status='QUARANTINED',
+                        temporal_invalid_reason=?
+                    WHERE canonical_event_key=?
+                    """,
+                    (invalid_reason, stored["canonical_event_key"]),
+                )
             conn.commit()
 
     def apply_event_research_field(
@@ -533,7 +640,12 @@ class MarketFactRepository:
         with connect_market_db(self.settings) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM economic_events_history WHERE canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
+                """
+                SELECT * FROM economic_events_history
+                WHERE canonical_event_key=?
+                  AND temporal_audit_status!='QUARANTINED'
+                ORDER BY updated_at DESC LIMIT 1
+                """,
                 (canonical_event_key,),
             ).fetchone()
             if row is None:
@@ -606,7 +718,12 @@ class MarketFactRepository:
         with connect_market_db(self.settings) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM economic_events_history WHERE canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
+                """
+                SELECT * FROM economic_events_history
+                WHERE canonical_event_key=?
+                  AND temporal_audit_status!='QUARANTINED'
+                ORDER BY updated_at DESC LIMIT 1
+                """,
                 (canonical_event_key,),
             ).fetchone()
             if row is None:
@@ -662,7 +779,7 @@ class MarketFactRepository:
                     status='RELEASED',raw_payload_json=?,updated_at=?,actual_metric_id=?,actual_unit=?,
                     actual_frequency=?,actual_seasonal_adjustment=?,actual_reference_period=?,
                     actual_transformation=?,actual_semantic_compatible=?,semantic_warnings_json=?
-                WHERE id=?
+                WHERE id=? AND temporal_audit_status!='QUARANTINED'
                 """,
                 (
                     str(actual), source, source_url,
@@ -734,6 +851,7 @@ class MarketFactRepository:
                 UPDATE economic_events_history
                 SET temporal_status='ACTUAL_UNAVAILABLE',status='ACTUAL_UNAVAILABLE',updated_at=?
                 WHERE canonical_event_key=? AND actual IS NULL
+                  AND temporal_audit_status!='QUARANTINED'
                 """,
                 (timestamp, canonical_event_key),
             )
@@ -747,6 +865,7 @@ class MarketFactRepository:
                 UPDATE economic_events_history
                 SET outcome_json=?,temporal_status='COMPLETED',status='COMPLETED',updated_at=?
                 WHERE canonical_event_key=? AND event_kind='scheduled_speech'
+                  AND temporal_audit_status!='QUARANTINED'
                 """,
                 (encode(candidate), timestamp, canonical_event_key),
             )
@@ -761,6 +880,8 @@ class MarketFactRepository:
                 SELECT raw_payload_json
                 FROM economic_events_history
                 WHERE country = ? AND date >= ? AND date <= ?
+                  AND temporal_audit_status!='QUARANTINED'
+                  AND temporal_status!='QUARANTINED'
                 ORDER BY time_utc ASC
                 """,
                 (country.upper(), start_date, end_date),
@@ -770,7 +891,13 @@ class MarketFactRepository:
     def economic_event_records(self, *, country: str = "US") -> list[dict[str, Any]]:
         with connect_market_db(self.settings) as conn:
             rows = conn.execute(
-                "SELECT * FROM economic_events_history WHERE country=? ORDER BY COALESCE(release_at,time_utc,date),name",
+                """
+                SELECT * FROM economic_events_history
+                WHERE country=?
+                  AND temporal_audit_status!='QUARANTINED'
+                  AND temporal_status!='QUARANTINED'
+                ORDER BY COALESCE(release_at,time_utc,date),name
+                """,
                 (country.upper(),),
             ).fetchall()
         return [_event_record_payload(row) for row in rows]
@@ -789,7 +916,9 @@ class MarketFactRepository:
             facts_active = conn.execute(
                 """
                 SELECT COUNT(*) c FROM market_facts
-                WHERE status = 'active' AND (valid_until IS NULL OR valid_until > ?)
+                WHERE status = 'active'
+                  AND temporal_audit_status!='QUARANTINED'
+                  AND (valid_until IS NULL OR valid_until > ?)
                 """,
                 (now_iso(),),
             ).fetchone()["c"]
@@ -798,6 +927,7 @@ class MarketFactRepository:
                 (now_iso(),),
             ).fetchone()["c"]
             events_total = conn.execute("SELECT COUNT(*) c FROM economic_events_history").fetchone()["c"]
+            quarantine = self.temporal_validation.quarantine_summary()
             news_total = conn.execute("SELECT COUNT(*) c FROM market_news").fetchone()["c"]
             observations_total = conn.execute("SELECT COUNT(*) c FROM provider_observations").fetchone()["c"]
             runs_total = conn.execute("SELECT COUNT(*) c FROM enrichment_runs").fetchone()["c"]
@@ -823,6 +953,7 @@ class MarketFactRepository:
                 "persisted_active": facts_persisted_active,
                 "stale": facts_stale,
             },
+            "temporal_quarantine": quarantine,
             "economic_events_history": {"total": events_total},
             "market_news": {"total": news_total},
             "provider_observations": {"total": observations_total},

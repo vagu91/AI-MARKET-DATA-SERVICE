@@ -287,13 +287,12 @@ def test_04_cpi_2099_is_quarantined_and_not_exposed(tmp_path: Path) -> None:
         },
         "evt-cpi",
     )
-    records = facts.economic_event_records(country="US")
-    valid, quarantined = TemporalValidationService(
+    assert facts.economic_event_records(country="US") == []
+    quarantine = TemporalValidationService(
         settings,
         clock=lambda: NOW,
-    ).audit_economic_events(records)
-    assert not valid
-    assert quarantined[0]["reason_code"] == "EVENT_BEYOND_CONFIGURED_HORIZON"
+    ).quarantine_read_model()
+    assert quarantine["items"][0]["reason_code"] == "EVENT_BEYOND_CONFIGURED_HORIZON"
     with connect_sqlite(settings.database_path) as conn:
         row = conn.execute(
             "SELECT temporal_audit_status FROM economic_events_history"
@@ -677,7 +676,7 @@ def test_24_no_trading_or_order_api_surface() -> None:
     assert "trading_actions\": \"not_supported" in routes
 
 
-def test_25_schema_15_migrates_to_16_with_data_preserved(tmp_path: Path) -> None:
+def test_25_schema_15_migrates_to_17_with_data_preserved(tmp_path: Path) -> None:
     path = tmp_path / "schema15.sqlite"
     conn = sqlite3.connect(path)
     conn.execute(
@@ -708,7 +707,7 @@ def test_25_schema_15_migrates_to_16_with_data_preserved(tmp_path: Path) -> None
         row = migrated.execute(
             "SELECT snapshot_id,research_link_status FROM market_context_snapshots"
         ).fetchone()
-    assert result["schema_version"] == 16
+    assert result["schema_version"] == 17
     assert row["snapshot_id"] == "legacy"
     assert row["research_link_status"] == "NOT_REQUIRED"
 

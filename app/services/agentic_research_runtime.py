@@ -26,6 +26,7 @@ from app.services.research_tool_telemetry import (
 from app.services.research_metrics_service import ResearchMetricsService
 from app.services.research_backend import ResearchBackend
 from app.services.research_source_gateway import ResearchSourceGateway
+from app.services.temporal_validation_service import TemporalValidationService
 from app.services.research_semantics import document_not_applicable_claims
 
 
@@ -54,6 +55,7 @@ class AgenticResearchRuntime:
             repository=self.repository,
             policy=self.repository.policy,
         )
+        self.temporal_validation = TemporalValidationService(settings)
 
     def run(
         self,
@@ -62,6 +64,13 @@ class AgenticResearchRuntime:
         executor: Any,
         timeout_seconds: int,
     ) -> dict[str, Any]:
+        job = {
+            **job,
+            "request_payload": self.temporal_validation.sanitize_payload(
+                job.get("request_payload") or {},
+                entity_table="research_prompt_input",
+            ),
+        }
         profile = profile_for_job(str(job["job_type"]))
         run = self.repository.ensure_run(job, profile.profile_id, profile.prompt_version)
         deadline = self.monotonic() + max(float(timeout_seconds), 0.0)

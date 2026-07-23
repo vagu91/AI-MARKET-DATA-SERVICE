@@ -7,6 +7,7 @@ from app.providers.fed_calendar import FederalReserveCalendarProvider
 from app.providers.federal_reserve import FederalReserveRssProvider
 from app.providers.scraper_calendar import EconomicCalendarScraperProvider
 from app.services.event_enrichment_service import EventEnrichmentService
+from app.services.temporal_validation_service import TemporalValidationService
 
 
 class EventService:
@@ -20,9 +21,11 @@ class EventService:
             | EconomicCalendarScraperProvider
         ],
         enrichment_service: EventEnrichmentService | None = None,
+        temporal_validation: TemporalValidationService | None = None,
     ) -> None:
         self.providers = providers
         self.enrichment_service = enrichment_service
+        self.temporal_validation = temporal_validation
         self.last_enrichment_metadata: dict[str, object] = {}
 
     async def list_events(
@@ -40,6 +43,15 @@ class EventService:
             for raw in result.data:
                 event = EconomicEvent.model_validate(raw)
                 if event.country.upper() != country.upper():
+                    continue
+                event_payload = event.model_dump(mode="json")
+                if (
+                    self.temporal_validation is not None
+                    and self.temporal_validation.quarantine_if_invalid(
+                        event_payload,
+                        entity_table="provider_ingestion",
+                    )
+                ):
                     continue
                 if event.time_utc:
                     event_time = event.time_utc.astimezone(UTC)

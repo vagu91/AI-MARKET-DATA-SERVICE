@@ -83,6 +83,11 @@ class DBOnlyMarketContextMaterializer:
             "temporal_quarantine": quarantined,
         }
         debug["metadata"] = metadata
+        audit = dict(debug.get("audit") or {})
+        audit["temporal_quarantine"] = (
+            self.temporal_validation.quarantine_read_model()
+        )
+        debug["audit"] = audit
         debug = harden_market_context(
             debug,
             settings=self.settings,
@@ -152,6 +157,11 @@ class DBOnlyMarketContextMaterializer:
             "temporal_quarantine": quarantined,
         }
         debug["metadata"] = metadata
+        audit = dict(debug.get("audit") or {})
+        audit["temporal_quarantine"] = (
+            self.temporal_validation.quarantine_read_model()
+        )
+        debug["audit"] = audit
         debug = harden_market_context(
             debug,
             settings=self.settings,
