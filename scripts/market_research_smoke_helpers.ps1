@@ -109,6 +109,11 @@ function Get-SmokeCompactResearchMetrics {
         searches = $Metrics.searches
         opened_sources = $Metrics.opened_sources
         new_sources = $Metrics.new_sources
+        claims_extracted = $Metrics.claims_extracted
+        claims_accepted = $Metrics.claims_accepted
+        claims_rejected = $Metrics.claims_rejected
+        backend = $Metrics.backend
+        duration_ms = $Metrics.duration_ms
         progress = $Metrics.progress
         usage = $Metrics.usage
         cost_status = $Metrics.cost_status

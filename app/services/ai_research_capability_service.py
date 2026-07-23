@@ -12,6 +12,7 @@ from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.providers.ai_researcher_provider import _resolve_command
 from app.services.codex_runtime_contract import (
+    agentic_research_output_schema,
     all_step_output_schemas,
     build_codex_exec_command,
     canonicalize_workspace,
@@ -52,14 +53,20 @@ class AIResearchCapabilityService:
 
     def probe(self, *, persist: bool = True) -> dict[str, Any]:
         command = _resolve_command(self.settings.codex_cli_command)
-        configured = bool(self.settings.enable_ai_researcher and self.settings.ai_researcher_mode == "codex_cli")
+        configured = bool(
+            self.settings.enable_ai_researcher and self.settings.ai_researcher_mode == "codex_cli"
+        )
         executable_available = bool(command)
         version_result = self._run([*(command or []), "--version"]) if command else None
         help_result = self._run([*(command or []), "--help"]) if command else None
         exec_help_result = self._run([*(command or []), "exec", "--help"]) if command else None
         auth_result = self._run([*(command or []), "login", "status"]) if command else None
-        version = _safe_version(version_result.stdout if version_result and version_result.returncode == 0 else "")
-        global_help = help_result.stdout if help_result is not None and help_result.returncode == 0 else ""
+        version = _safe_version(
+            version_result.stdout if version_result and version_result.returncode == 0 else ""
+        )
+        global_help = (
+            help_result.stdout if help_result is not None and help_result.returncode == 0 else ""
+        )
         exec_help = (
             exec_help_result.stdout
             if exec_help_result is not None and exec_help_result.returncode == 0
@@ -79,9 +86,7 @@ class AIResearchCapabilityService:
             "--color",
             "--json",
         }
-        available_exec_options = {
-            option for option in required_exec_options if option in exec_help
-        }
+        available_exec_options = {option for option in required_exec_options if option in exec_help}
         isolation_options_supported = available_exec_options == required_exec_options
         structured_output_supported = {
             "--output-schema",
@@ -117,6 +122,7 @@ class AIResearchCapabilityService:
         schema_errors: dict[str, str] = {}
         schemas = {
             **all_step_output_schemas(effective_budget),
+            "AGENTIC_RESEARCH": agentic_research_output_schema(effective_budget),
             "LEGACY_BATCH": legacy_research_output_schema(),
         }
         for step, schema in schemas.items():
@@ -129,12 +135,17 @@ class AIResearchCapabilityService:
         command_shape: list[str] = []
         if command and workspace_writable:
             try:
-                workspace = canonicalize_workspace(
-                    workspace_root / "capability-offline-probe"
-                )
+                workspace = canonicalize_workspace(workspace_root / "capability-offline-probe")
                 schema_path = workspace / "output_schema.json"
                 schema_path.write_text(
-                    json.dumps(schemas["PLAN"], indent=2),
+                    json.dumps(
+                        schemas[
+                            "AGENTIC_RESEARCH"
+                            if self.settings.research_single_invocation_enabled
+                            else "PLAN"
+                        ],
+                        indent=2,
+                    ),
                     encoding="utf-8",
                 )
                 output_path = workspace / "output.json"
@@ -197,7 +208,9 @@ class AIResearchCapabilityService:
             "web_access_enabled": bool(self.settings.ai_research_web_access_enabled),
             "web_search_available": live_verified and web_configured,
             "live_web_verified": live_verified,
-            "live_web_verified_at": live_verification.get("verified_at") if live_verification else None,
+            "live_web_verified_at": live_verification.get("verified_at")
+            if live_verification
+            else None,
             "structured_output_supported": structured_output_supported,
             "output_last_message_supported": "--output-last-message" in available_exec_options,
             "jsonl_events_supported": "--json" in available_exec_options,
@@ -234,7 +247,9 @@ class AIResearchCapabilityService:
         executable_version: str | None = None,
     ) -> dict[str, Any]:
         if not evidence.get("observed_search_count") or not evidence.get("opened_source_count"):
-            raise ValueError("live verification requires observed search and opened source telemetry")
+            raise ValueError(
+                "live verification requires observed search and opened source telemetry"
+            )
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         verification_id = f"live-{uuid.uuid4()}"
         sanitized = {
@@ -251,8 +266,12 @@ class AIResearchCapabilityService:
                 ) VALUES (?,?,?,?,NULL,?,?)
                 """,
                 (
-                    verification_id, self.settings.ai_researcher_mode, executable_version,
-                    now, json.dumps(sanitized, sort_keys=True, separators=(",", ":")), now,
+                    verification_id,
+                    self.settings.ai_researcher_mode,
+                    executable_version,
+                    now,
+                    json.dumps(sanitized, sort_keys=True, separators=(",", ":")),
+                    now,
                 ),
             )
             conn.commit()
@@ -266,7 +285,10 @@ class AIResearchCapabilityService:
                 WHERE backend=? AND (expires_at IS NULL OR expires_at>?)
                 ORDER BY verified_at DESC,rowid DESC LIMIT 1
                 """,
-                (self.settings.ai_researcher_mode, datetime.now(UTC).replace(microsecond=0).isoformat()),
+                (
+                    self.settings.ai_researcher_mode,
+                    datetime.now(UTC).replace(microsecond=0).isoformat(),
+                ),
             ).fetchone()
         if row is None:
             return None
@@ -284,8 +306,14 @@ class AIResearchCapabilityService:
     def _run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         try:
             return self.runner(
-                command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=10, check=False, env=safe_subprocess_environment(),
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                env=safe_subprocess_environment(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return subprocess.CompletedProcess(command, 1, "", type(exc).__name__)
@@ -299,9 +327,13 @@ class AIResearchCapabilityService:
                 ) VALUES (?,?,?,?,?,?,?)
                 """,
                 (
-                    f"cap-{uuid.uuid4()}", report["status"], report["backend"],
-                    executable_path, report.get("executable_version"),
-                    json.dumps(report, sort_keys=True, separators=(",", ":")), report["checked_at"],
+                    f"cap-{uuid.uuid4()}",
+                    report["status"],
+                    report["backend"],
+                    executable_path,
+                    report.get("executable_version"),
+                    json.dumps(report, sort_keys=True, separators=(",", ":")),
+                    report["checked_at"],
                 ),
             )
             conn.commit()

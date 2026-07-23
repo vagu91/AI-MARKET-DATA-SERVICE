@@ -700,6 +700,95 @@ CREATE INDEX IF NOT EXISTS idx_research_evidence_tool_event
   ON research_evidence(tool_event_id);
 """
 
+RESEARCH_SOURCE_GATEWAY_SCHEMA = """
+ALTER TABLE research_evidence ADD COLUMN source_id TEXT NULL;
+ALTER TABLE research_evidence ADD COLUMN verification_id TEXT NULL;
+ALTER TABLE research_evidence ADD COLUMN verification_method TEXT NULL;
+ALTER TABLE research_evidence ADD COLUMN verification_reason TEXT NULL;
+ALTER TABLE research_evidence ADD COLUMN verification_score REAL NULL;
+
+CREATE TABLE IF NOT EXISTS research_sources (
+  source_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  requested_url TEXT NOT NULL,
+  final_url TEXT NULL,
+  canonical_url TEXT NULL,
+  source_domain TEXT NOT NULL,
+  source_tier INTEGER NULL,
+  publisher TEXT NULL,
+  title TEXT NULL,
+  fetch_status TEXT NOT NULL,
+  verification_status TEXT NOT NULL DEFAULT 'UNVERIFIED',
+  rejection_reason TEXT NULL,
+  http_status INTEGER NULL,
+  content_type TEXT NULL,
+  retrieved_at TEXT NOT NULL,
+  content_sha256 TEXT NULL,
+  content_bytes INTEGER NOT NULL DEFAULT 0,
+  content_text TEXT NULL,
+  redirect_chain_json TEXT NOT NULL DEFAULT '[]',
+  duplicate_of_source_id TEXT NULL,
+  acquisition_backend TEXT NOT NULL,
+  fetch_duration_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(run_id, requested_url),
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_sources_run_status
+  ON research_sources(run_id, fetch_status, verification_status);
+CREATE INDEX IF NOT EXISTS idx_research_sources_run_url
+  ON research_sources(run_id, canonical_url, final_url, requested_url);
+CREATE INDEX IF NOT EXISTS idx_research_sources_content
+  ON research_sources(run_id, content_sha256);
+
+CREATE TABLE IF NOT EXISTS research_evidence_verifications (
+  verification_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  claim_ref TEXT NOT NULL,
+  source_id TEXT NULL,
+  evidence_url TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  match_method TEXT NULL,
+  match_score REAL NOT NULL DEFAULT 0,
+  evidence_anchor TEXT NOT NULL,
+  evidence_token_count INTEGER NOT NULL DEFAULT 0,
+  matched_token_count INTEGER NOT NULL DEFAULT 0,
+  verification_duration_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, claim_ref, evidence_url, evidence_anchor),
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
+  FOREIGN KEY(source_id) REFERENCES research_sources(source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_evidence_verifications_run
+  ON research_evidence_verifications(run_id, status, reason);
+
+CREATE TABLE IF NOT EXISTS research_backend_invocations (
+  invocation_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  model TEXT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_json TEXT NULL,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  output_checksum TEXT NOT NULL,
+  output_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_backend_invocations_run
+  ON research_backend_invocations(run_id, created_at);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -714,4 +803,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("010_verified_evidence_deadlines_and_completeness", VERIFIED_RESEARCH_RUNTIME_SCHEMA),
     ("011_agentic_runtime_diagnostics_and_step_history", AGENTIC_RUNTIME_DIAGNOSTICS_SCHEMA),
     ("012_observable_tool_telemetry_and_checkpoints", OBSERVABLE_TOOL_TELEMETRY_SCHEMA),
+    ("013_research_source_gateway_and_backend_invocations", RESEARCH_SOURCE_GATEWAY_SCHEMA),
 )

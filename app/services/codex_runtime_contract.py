@@ -120,11 +120,7 @@ def step_output_schema(
     budget = effective_budget or {}
     observe = str(budget.get("budget_mode") or "enforce") == "observe"
     max_searches = max(
-        int(
-            budget.get("max_searches", 8)
-            if observe
-            else budget.get("remaining_searches", 8)
-        ),
+        int(budget.get("max_searches", 8) if observe else budget.get("remaining_searches", 8)),
         0,
     )
     max_opened_sources = max(
@@ -295,9 +291,79 @@ def step_output_schema(
 def all_step_output_schemas(
     effective_budget: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    return {step: step_output_schema(step, effective_budget) for step in EXTERNAL_RESEARCH_STEPS}
+
+
+def agentic_research_output_schema(
+    effective_budget: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One-invocation backend contract; opening and trust remain service-owned."""
+
+    budget = effective_budget or {}
+    observe = str(budget.get("budget_mode") or "observe") == "observe"
+    max_searches = max(
+        int(budget.get("max_searches", 8) if observe else budget.get("remaining_searches", 8)),
+        0,
+    )
+    max_sources = max(
+        int(
+            budget.get("max_opened_sources", 12)
+            if observe
+            else budget.get("remaining_opened_sources", 12)
+        ),
+        0,
+    )
+    claim_schema = _validated_claim_schema()
+    properties = {
+        "status": _status("COMPLETED", "NO_DATA"),
+        "plan": _closed(
+            {
+                "topics": _array(_string(max_length=100), max_items=20),
+                "queries": _array(
+                    _closed(
+                        {
+                            "query": _string(max_length=500),
+                            "purpose": _string(max_length=300),
+                            "topic": _string(max_length=100),
+                        }
+                    ),
+                    max_items=max_searches,
+                ),
+                "stop_conditions": _array(
+                    _string(max_length=300),
+                    max_items=12,
+                ),
+            }
+        ),
+        "searches": _array(
+            _closed(
+                {
+                    "query": _string(max_length=500),
+                    "discovered_urls": _array(
+                        _string(max_length=2048),
+                        max_items=20,
+                    ),
+                }
+            ),
+            max_items=max_searches,
+        ),
+        "acquisition_requests": _array(
+            _closed(
+                {
+                    "source_url": _string(max_length=2048),
+                    "title": _string(nullable=True, max_length=500),
+                    "publisher": _string(nullable=True, max_length=200),
+                    "published_at": _string(nullable=True, max_length=64),
+                }
+            ),
+            max_items=max_sources,
+        ),
+        "claims": _array(claim_schema, max_items=40),
+        "warnings": _array(_string(max_length=300), max_items=20),
+    }
     return {
-        step: step_output_schema(step, effective_budget)
-        for step in EXTERNAL_RESEARCH_STEPS
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        **_closed(properties),
     }
 
 
@@ -587,9 +653,7 @@ def _is_descendant(path: Path, workspace: Path) -> bool:
     normalized_path = os.path.normcase(os.path.abspath(str(path)))
     normalized_workspace = os.path.normcase(os.path.abspath(str(workspace)))
     try:
-        return os.path.commonpath((normalized_path, normalized_workspace)) == (
-            normalized_workspace
-        )
+        return os.path.commonpath((normalized_path, normalized_workspace)) == (normalized_workspace)
     except ValueError:
         return False
 
@@ -597,11 +661,7 @@ def _is_descendant(path: Path, workspace: Path) -> bool:
 def inherited_instruction_files(workspace: Path) -> list[str]:
     resolved = workspace.resolve()
     candidates = [resolved, *resolved.parents]
-    return [
-        str(path / "AGENTS.md")
-        for path in candidates
-        if (path / "AGENTS.md").is_file()
-    ]
+    return [str(path / "AGENTS.md") for path in candidates if (path / "AGENTS.md").is_file()]
 
 
 def safe_subprocess_environment() -> dict[str, str]:
@@ -766,9 +826,7 @@ def sanitize_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
     safe = redact_payload(diagnostic)
     safe["category"] = str(safe.get("category") or "UNKNOWN")[:80].upper()
     safe["retryable"] = bool(safe.get("retryable"))
-    safe["retry_classification"] = (
-        "RETRYABLE" if safe["retryable"] else "NON_RETRYABLE"
-    )
+    safe["retry_classification"] = "RETRYABLE" if safe["retryable"] else "NON_RETRYABLE"
     for key in ("stderr_tail", "stdout_tail"):
         safe[key] = _tail(str(safe.get(key) or ""))
     events = safe.get("error_events")

@@ -39,8 +39,16 @@ class SourcePolicyService:
         if not isinstance(rules, list) or not rules:
             raise ValueError("source policy requires non-empty rules")
         required = {
-            "domain", "publisher", "tier", "data_types", "official_actual", "consensus",
-            "news", "base_reliability", "multiple_confirmation", "aggregator",
+            "domain",
+            "publisher",
+            "tier",
+            "data_types",
+            "official_actual",
+            "consensus",
+            "news",
+            "base_reliability",
+            "multiple_confirmation",
+            "aggregator",
         }
         for rule in rules:
             if not isinstance(rule, dict) or required.difference(rule):
@@ -55,7 +63,9 @@ class SourcePolicyService:
 
     def rule_for(self, url: str | None, publisher: str | None = None) -> dict[str, Any] | None:
         domain = self.domain(url)
-        candidates = [rule for key, rule in self._rules.items() if domain == key or domain.endswith(f".{key}")]
+        candidates = [
+            rule for key, rule in self._rules.items() if domain == key or domain.endswith(f".{key}")
+        ]
         if candidates:
             return min(candidates, key=lambda item: int(item["tier"]))
         publisher_text = str(publisher or "").lower()
@@ -65,18 +75,29 @@ class SourcePolicyService:
                 for issuer, domains in (self.policy.get("issuer_domain_allowlist") or {}).items()
                 for allowed_domain in domains
                 if str(issuer).lower() in publisher_text
-                and (domain == str(allowed_domain).lower() or domain.endswith(f".{str(allowed_domain).lower()}"))
+                and (
+                    domain == str(allowed_domain).lower()
+                    or domain.endswith(f".{str(allowed_domain).lower()}")
+                )
             ),
             None,
         )
-        if issuer_match and str(url or "").lower().startswith("https://") and (
-            "investor relations" in publisher_text or publisher_text.endswith(" ir")
+        if (
+            issuer_match
+            and str(url or "").lower().startswith("https://")
+            and ("investor relations" in publisher_text or publisher_text.endswith(" ir"))
         ):
             return {
-                "domain": domain, "publisher": publisher, "tier": 1,
-                "data_types": ["actual", "earnings", "news"], "official_actual": True,
-                "consensus": False, "news": True, "base_reliability": 0.97,
-                "multiple_confirmation": False, "aggregator": False,
+                "domain": domain,
+                "publisher": publisher,
+                "tier": 1,
+                "data_types": ["actual", "earnings", "news"],
+                "official_actual": True,
+                "consensus": False,
+                "news": True,
+                "base_reliability": 0.97,
+                "multiple_confirmation": False,
+                "aggregator": False,
             }
         return None
 
@@ -104,22 +125,39 @@ class SourcePolicyService:
             reasons.append("actual_requires_official_source")
         if semantics == "actual" and int(rule["tier"]) != 1:
             reasons.append("actual_requires_tier_1")
+        rule_data_types = {str(item).lower() for item in rule["data_types"]}
         authorized_semantics = (
-            "speech" if semantics in {"outcome", "transcript_url"}
-            else "consensus" if semantics == "forecast"
-            else semantics
+            {"speech"}
+            if semantics == "transcript_url"
+            else {"consensus"}
+            if semantics == "forecast"
+            else {
+                "actual",
+                "event",
+                "market",
+                "positioning",
+                "speech",
+                "earnings",
+                "news",
+            }
+            if semantics == "outcome"
+            else {semantics}
         )
-        if authorized_semantics not in {str(item).lower() for item in rule["data_types"]}:
+        if not authorized_semantics.intersection(rule_data_types):
             reasons.append("field_semantics_not_allowed_for_source")
-        if bool(rule["multiple_confirmation"]):
-            independent = (
-                candidate.get("verified_independent_domains") or []
-                if candidate.get("_service_evidence_verified") is True
-                else []
-            )
-            confirmation_count = len({str(item).lower() for item in independent})
-            if confirmation_count < 2:
-                reasons.append("multiple_confirmation_required")
+        semantic_policy = self.semantic_policy(semantics)
+        allowed_tiers = {int(item) for item in semantic_policy.get("allowed_tiers") or range(1, 6)}
+        if int(rule["tier"]) not in allowed_tiers:
+            reasons.append("source_tier_not_allowed_for_semantics")
+        required_confirmations = int(semantic_policy.get("required_confirmations") or 1)
+        independent = (
+            candidate.get("verified_independent_domains") or []
+            if candidate.get("_service_evidence_verified") is True
+            else []
+        )
+        confirmation_count = len({str(item).lower() for item in independent if item})
+        if required_confirmations > 1 and confirmation_count < required_confirmations:
+            reasons.append("required_confirmations_not_met")
         if semantics in {"consensus", "forecast"} and not bool(rule["consensus"]):
             reasons.append("source_not_authorized_for_consensus")
         if semantics == "news" and not bool(rule["news"]):
@@ -128,7 +166,17 @@ class SourcePolicyService:
             for field in ("metric_id", "period", "unit", "source_url", "evidence_text"):
                 if candidate.get(field) in (None, ""):
                     reasons.append(f"missing_{field}")
-        classification = "OFFICIAL" if int(rule["tier"]) == 1 else "PRIMARY_MARKET" if int(rule["tier"]) == 2 else "FINANCIAL_MEDIA" if int(rule["tier"]) == 3 else "CALENDAR_CONSENSUS" if int(rule["tier"]) == 4 else "SECONDARY_CONTEXT"
+        classification = (
+            "OFFICIAL"
+            if int(rule["tier"]) == 1
+            else "PRIMARY_MARKET"
+            if int(rule["tier"]) == 2
+            else "FINANCIAL_MEDIA"
+            if int(rule["tier"]) == 3
+            else "CALENDAR_CONSENSUS"
+            if int(rule["tier"]) == 4
+            else "SECONDARY_CONTEXT"
+        )
         return self._decision(
             not reasons,
             domain,
@@ -145,8 +193,15 @@ class SourcePolicyService:
                 {
                     key: item[key]
                     for key in (
-                        "domain", "publisher", "tier", "data_types", "official_actual",
-                        "consensus", "news", "multiple_confirmation", "aggregator",
+                        "domain",
+                        "publisher",
+                        "tier",
+                        "data_types",
+                        "official_actual",
+                        "consensus",
+                        "news",
+                        "multiple_confirmation",
+                        "aggregator",
                     )
                 }
                 for item in self.policy["rules"]

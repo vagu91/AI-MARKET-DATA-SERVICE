@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import threading
+import uuid
 from queue import Empty, Queue
 from time import monotonic, perf_counter
 from pathlib import Path
@@ -15,6 +16,7 @@ from app.core.redaction import redact_payload
 from app.providers.ai_researcher_provider import _resolve_command, parse_json_from_stdout
 from app.services.codex_runtime_contract import (
     CodexCLIError,
+    agentic_research_output_schema,
     build_codex_exec_command,
     build_diagnostic,
     canonicalize_workspace,
@@ -26,6 +28,7 @@ from app.services.codex_runtime_contract import (
     validate_output_schema,
     validate_payload,
 )
+from app.services.research_backend import ResearchBackendResult
 from app.services.research_profiles import profile_for_job, prompt_context
 from app.services.research_tool_telemetry import (
     normalize_codex_event,
@@ -35,6 +38,8 @@ from app.services.research_tool_telemetry import (
 
 class PersistentAIJobExecutor:
     """Codex job executor with a per-job workspace and a real process watchdog."""
+
+    backend_name = "codex_cli"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -162,6 +167,104 @@ class PersistentAIJobExecutor:
             exc.diagnostic["job_id"] = str(job["job_id"])
             raise
         return {key: value for key, value in result.items() if key != "status"}
+
+    def execute_research(
+        self,
+        *,
+        job: dict[str, Any],
+        run: dict[str, Any],
+        profile: dict[str, Any],
+        workspace: Path,
+        watchdog_seconds: int,
+        effective_budget: dict[str, Any],
+        event_observer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> ResearchBackendResult:
+        """Execute the optimized backend contract exactly once for a logical run."""
+
+        if not self.settings.enable_ai_researcher:
+            raise RuntimeError("ai_researcher_disabled")
+        if not self.settings.ai_research_web_access_enabled:
+            raise RuntimeError("research_web_access_not_verified")
+        command_prefix = _resolve_command(self.settings.codex_cli_command)
+        if not command_prefix:
+            raise self._preflight_error(
+                category="EXECUTABLE_UNAVAILABLE",
+                step="AGENTIC_RESEARCH",
+                workspace=workspace,
+                command=[self.settings.codex_cli_command],
+            )
+        try:
+            workspace = canonicalize_workspace(workspace)
+        except (OSError, ValueError) as exc:
+            raise self._preflight_error(
+                category="PATH_INVALID",
+                step="AGENTIC_RESEARCH",
+                workspace=workspace.absolute(),
+                command=command_prefix,
+                stderr=str(exc),
+            ) from exc
+        if inherited_instruction_files(workspace):
+            raise self._preflight_error(
+                category="CONFIG_INVALID",
+                step="AGENTIC_RESEARCH",
+                workspace=workspace,
+                command=command_prefix,
+                stderr="inherited_agent_instructions_present",
+            )
+        schema = agentic_research_output_schema(effective_budget)
+        validate_output_schema(schema)
+        schema_path = workspace / "agentic_research_output_schema.json"
+        schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+        output_path = workspace / "agentic_research_output.json"
+        prompt = build_agentic_research_prompt(
+            job,
+            run,
+            profile,
+            effective_budget,
+        )
+        command = build_codex_exec_command(
+            command_prefix,
+            workspace=workspace,
+            schema_path=schema_path,
+            output_path=output_path,
+        )
+        validate_isolated_command(command, prompt, cwd=workspace)
+        invocation_id = f"rinvoke-{uuid.uuid4()}"
+        started = perf_counter()
+        try:
+            result = self._invoke(
+                command,
+                prompt,
+                workspace,
+                output_path,
+                watchdog_seconds,
+                json_event_stream=True,
+                schema=schema,
+                step="SEARCH",
+                executable_version=self._executable_version(command_prefix),
+                event_observer=event_observer,
+            )
+        except CodexCLIError as exc:
+            exc.diagnostic["run_id"] = str(run["run_id"])
+            exc.diagnostic["job_id"] = str(job["job_id"])
+            raise
+        payload = {
+            key: value
+            for key, value in result.items()
+            if not key.startswith("_") and key != "usage_status"
+        }
+        return ResearchBackendResult(
+            invocation_id=invocation_id,
+            backend=self.backend_name,
+            purpose="agentic_research",
+            payload=payload,
+            usage=dict(result.get("_usage") or {}),
+            tool_events=tuple(
+                item for item in result.get("_tool_events") or [] if isinstance(item, dict)
+            ),
+            duration_ms=int((perf_counter() - started) * 1000),
+            model=None,
+        )
 
     def _invoke(
         self,
@@ -458,6 +561,66 @@ def build_step_prompt(
     )
 
 
+def build_agentic_research_prompt(
+    job: dict[str, Any],
+    run: dict[str, Any],
+    profile: dict[str, Any],
+    effective_budget: dict[str, Any],
+) -> str:
+    """Bounded one-pass prompt that never resends the full database payload."""
+
+    request = job.get("request_payload") or {}
+    database_context = (
+        request.get("database_context") or request.get("existing_database_results") or {}
+    )
+    bounded_profile = {key: value for key, value in profile.items() if key != "database_context"}
+    input_context = {
+        "context_date": request.get("context_date"),
+        "market_session": request.get("market_session"),
+        "data_as_of": (
+            database_context.get("data_as_of") if isinstance(database_context, dict) else None
+        ),
+        "missing_fields": (request.get("missing_fields") or request.get("pending_fields") or []),
+        "database_inventory": _context_inventory(database_context),
+        "sources_already_queried": (request.get("sources_already_queried") or [])[:50],
+    }
+    contract = {
+        "backend_role": (
+            "propose queries, discover real HTTPS URLs, and return candidate "
+            "claims with short verbatim evidence anchors"
+        ),
+        "service_role": (
+            "fetch every requested URL, validate policy/SSRF/HTTP/content, "
+            "hash content, match anchors, enforce confirmations, persist and read back"
+        ),
+        "source_state_rule": (
+            "never assert OPENED, FETCHED, VERIFIED, HTTP status, content hash, "
+            "source tier or confirmation count"
+        ),
+        "actual_rule": (
+            "never emit official actual semantics; deterministic official "
+            "resolvers own numerical actuals"
+        ),
+        "evidence_rule": (
+            "each claim evidence_text must be a short bounded anchor actually "
+            "present on its cited acquisition URL"
+        ),
+    }
+    return (
+        "You are a data-only research backend for one bounded agentic invocation.\n"
+        "Plan, search, identify original sources, and return candidate atomic claims in one pass.\n"
+        "Never modify files, call AI-TRADER, place orders, or provide trading advice.\n"
+        "Never invent URLs, evidence, values, timestamps, source state, or trust labels.\n"
+        "The service independently acquires and verifies every source after this invocation.\n\n"
+        f"RUN_ID\n{run['run_id']}\n\nJOB_ID\n{job['job_id']}\n\n"
+        f"PROFILE\n{_bounded_json(bounded_profile, 24000)}\n\n"
+        f"INPUT_CONTEXT\n{_bounded_json(input_context, 16000)}\n\n"
+        f"EFFECTIVE_BUDGET\n{_bounded_json(effective_budget, 8000)}\n\n"
+        f"TRUST_CONTRACT\n{json.dumps(contract, ensure_ascii=False, indent=2)}\n\n"
+        "Return only JSON matching the supplied output schema."
+    )
+
+
 def _phase_requirements(step_name: str) -> list[str]:
     return {
         "PLAN": [
@@ -490,6 +653,63 @@ def _phase_requirements(step_name: str) -> list[str]:
             "return NO_DATA when criteria fail",
         ],
     }[step_name]
+
+
+def _context_inventory(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 3:
+        if isinstance(value, (dict, list)):
+            return {"type": type(value).__name__, "count": len(value)}
+        return str(value)[:120] if value is not None else None
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in list(value.items())[:80]:
+            if key in {
+                "raw_payload",
+                "raw_payload_json",
+                "evidence_text",
+                "summary",
+                "content",
+            }:
+                continue
+            output[str(key)[:120]] = _context_inventory(
+                item,
+                depth=depth + 1,
+            )
+        return output
+    if isinstance(value, list):
+        identifiers: list[Any] = []
+        for item in value[:10]:
+            if isinstance(item, dict):
+                identifiers.append(
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "topic",
+                            "category",
+                            "event_name",
+                            "symbol",
+                            "status",
+                            "date",
+                        )
+                        if item.get(key) is not None
+                    }
+                )
+            else:
+                identifiers.append(str(item)[:120])
+        return {"count": len(value), "sample": identifiers}
+    if isinstance(value, str):
+        return value[:300]
+    return value
+
+
+def _bounded_json(value: Any, limit: int) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    return encoded if len(encoded) <= limit else encoded[:limit] + "\n...[bounded]"
 
 
 def _communicate_jsonl_incrementally(
