@@ -75,7 +75,10 @@ Migration/startup reconciliation is idempotent. A terminal job linked to a `PEND
 
 ## Operational API
 
-- `GET /ai-research/jobs/latest`
+- `GET /ai-research/jobs/latest?view=full|compact` returns an array ordered
+  newest-first (`created_at DESC`, then insertion order DESC). The backward-compatible
+  `full` view contains request/result payloads; use `compact` for operational
+  diagnostics without those payloads.
 - `GET /ai-research/jobs/{job_id}`
 - `GET /ai-research/status`
 - `GET /ai-research/capabilities`

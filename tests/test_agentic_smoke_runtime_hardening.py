@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from app.core.config import Settings
+from app.api.routes import ai_research_jobs_latest
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import _split_sql, migrate_database
 from app.infrastructure.persistence.schema import MIGRATIONS
@@ -17,12 +20,15 @@ from app.services.ai_research_job_executor import PersistentAIJobExecutor
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.ai_research_worker import AIResearchWorker
+from app.services.ai_research_capability_service import AIResearchCapabilityService
 from app.services.codex_runtime_contract import (
     CodexCLIError,
     all_step_output_schemas,
+    build_codex_exec_command,
     build_diagnostic,
     classify_codex_failure,
     legacy_research_output_schema,
+    validate_isolated_command,
     validate_output_schema,
 )
 from app.services.research_runtime_repository import ResearchRuntimeRepository
@@ -169,6 +175,155 @@ def test_windows_cmd_command_is_isolated_and_prompt_is_stdin(
     assert result["topics"] == ["macro"]
 
 
+def test_relative_workspace_is_canonical_once_for_cwd_and_all_codex_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg = settings(tmp_path, ai_job_workspace_root=Path("relative-jobs"))
+    job, run = make_job_and_run(cfg)
+    observed: dict[str, Any] = {}
+
+    def fake_popen(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        schema = Path(command[command.index("--output-schema") + 1])
+        output = Path(command[command.index("--output-last-message") + 1])
+        observed.update(command=command, cwd=cwd, schema=schema, output=output)
+        assert cwd.is_absolute()
+        assert schema.is_absolute() and schema.is_file()
+        assert output.is_absolute() and output.parent == cwd
+        assert schema.parent == cwd
+        # A fake process starting in cwd can open the exact command paths.
+        json.loads((cwd / schema).read_text(encoding="utf-8"))
+        return FakeProcess(command, payload=plan_payload("canonical"))
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    result = PersistentAIJobExecutor(cfg).execute_step(
+        job=job,
+        run=run,
+        step_name="PLAN",
+        context={},
+        workspace=Path("relative-jobs") / job["job_id"],
+        watchdog_seconds=5,
+    )
+
+    command = observed["command"]
+    cd_path = Path(command[command.index("--cd") + 1])
+    assert result["topics"] == ["canonical"]
+    assert cd_path == observed["cwd"] == observed["cwd"].resolve()
+    assert observed["schema"].relative_to(observed["cwd"]).parts == (
+        "plan_output_schema.json",
+    )
+    assert observed["output"].relative_to(observed["cwd"]).parts == (
+        "plan_output.json",
+    )
+
+
+def test_isolated_command_rejects_relative_divergent_and_traversing_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    schema = workspace / "schema.json"
+    schema.write_text("{}", encoding="utf-8")
+    output = workspace / "output.json"
+    command = build_codex_exec_command(
+        ["codex"],
+        workspace=workspace,
+        schema_path=schema,
+        output_path=output,
+    )
+    validate_isolated_command(command, cwd=workspace)
+
+    relative = list(command)
+    relative[relative.index("--cd") + 1] = "workspace"
+    with pytest.raises(ValueError, match="workspace_path_relative"):
+        validate_isolated_command(relative, cwd=workspace)
+
+    divergent = tmp_path / "other"
+    divergent.mkdir()
+    with pytest.raises(ValueError, match="cwd_workspace_mismatch"):
+        validate_isolated_command(command, cwd=divergent)
+
+    traversing = list(command)
+    traversing[traversing.index("--output-last-message") + 1] = str(
+        workspace / "nested" / ".." / "escaped.json"
+    )
+    with pytest.raises(ValueError, match="output_path_traversal"):
+        validate_isolated_command(traversing, cwd=workspace)
+
+    outside_schema = tmp_path / "outside-schema.json"
+    outside_schema.write_text("{}", encoding="utf-8")
+    outside = list(command)
+    outside[outside.index("--output-schema") + 1] = str(outside_schema)
+    with pytest.raises(ValueError, match="schema_outside_workspace"):
+        validate_isolated_command(outside, cwd=workspace)
+
+    missing_schema = list(command)
+    missing_schema[missing_schema.index("--output-schema") + 1] = str(
+        workspace / "missing-schema.json"
+    )
+    with pytest.raises(ValueError, match="schema_path_invalid"):
+        validate_isolated_command(missing_schema, cwd=workspace)
+
+    missing_parent = list(command)
+    missing_parent[missing_parent.index("--output-last-message") + 1] = str(
+        workspace / "missing-parent" / "output.json"
+    )
+    with pytest.raises(ValueError, match="output_parent_missing"):
+        validate_isolated_command(missing_parent, cwd=workspace)
+
+
+def test_capability_contract_canonicalizes_relative_workspace_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg = settings(
+        tmp_path,
+        ai_job_workspace_root=Path("relative-capability"),
+        codex_cli_command=str(tmp_path / "codex.CMD"),
+    )
+    (tmp_path / "codex.CMD").write_text("@echo off", encoding="utf-8")
+
+    def runner(command, **kwargs):
+        del kwargs
+        joined = " ".join(command)
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "codex-cli fake", "")
+        if command[-2:] == ["login", "status"]:
+            return subprocess.CompletedProcess(command, 0, "Logged in", "")
+        if command[-2:] == ["exec", "--help"]:
+            options = (
+                "--skip-git-repo-check --ephemeral --ignore-user-config "
+                "--ignore-rules --output-schema --output-last-message --color --json"
+            )
+            return subprocess.CompletedProcess(command, 0, options, "")
+        return subprocess.CompletedProcess(command, 0, f"exec --search {joined}", "")
+
+    report = AIResearchCapabilityService(cfg, runner=runner).probe(persist=False)
+    probe = (
+        tmp_path / "relative-capability" / "capability-offline-probe"
+    ).resolve()
+    assert report["status"] == "READY_TO_SMOKE"
+    assert report["isolated_command_constructed"] is True
+    assert probe.is_absolute()
+    assert (probe / "output_schema.json").is_file()
+
+
 def test_output_file_is_primary_over_jsonl_agent_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -210,6 +365,50 @@ def test_output_file_is_primary_over_jsonl_agent_message(
         watchdog_seconds=5,
     )
     assert result["topics"] == ["from-output-file"]
+
+
+def test_executor_maps_windows_os_error_3_to_non_retryable_path_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(
+                "Error: Impossibile trovare il percorso specificato. "
+                "(os error 3)"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    with pytest.raises(CodexCLIError) as raised:
+        PersistentAIJobExecutor(cfg).execute_step(
+            job=job,
+            run=run,
+            step_name="PLAN",
+            context={},
+            workspace=tmp_path / "job",
+            watchdog_seconds=5,
+        )
+
+    assert raised.value.category == "PATH_INVALID"
+    assert raised.value.retryable is False
+    assert raised.value.retry_classification == "NON_RETRYABLE"
+    persisted_shape = raised.value.diagnostic["command_shape"]
+    for path_flag in ("--cd", "--output-schema", "--output-last-message"):
+        value = Path(persisted_shape[persisted_shape.index(path_flag) + 1])
+        assert value.is_absolute()
 
 
 def test_all_step_schemas_are_closed_bounded_and_exclude_ai_actual() -> None:
@@ -343,6 +542,9 @@ def test_cli_failure_keeps_redacted_stderr_jsonl_and_classification(
         ("network temporarily unavailable", "NETWORK_TRANSIENT", True),
         ("status 503 server error", "BACKEND_5XX", True),
         ("deadline exceeded", "TIMEOUT", True),
+        ("Error: Impossibile trovare il percorso specificato. (os error 3)", "PATH_INVALID", False),
+        ("path not found", "PATH_INVALID", False),
+        ("file not found", "PATH_INVALID", False),
         ("opaque exit", "CLI_EXIT", False),
     ],
 )
@@ -404,8 +606,14 @@ def test_non_retryable_error_has_one_attempt_and_closes_job_run_step(
         executor=FailingExecutor(
             diagnostic(
                 tmp_path,
-                category="SCHEMA_INVALID",
-                retryable=False,
+                category=classify_codex_failure(
+                    exit_code=1,
+                    stderr="Error: Impossibile trovare il percorso specificato. (os error 3)",
+                )[0],
+                retryable=classify_codex_failure(
+                    exit_code=1,
+                    stderr="Error: Impossibile trovare il percorso specificato. (os error 3)",
+                )[1],
                 secret=secret,
             )
         ),
@@ -418,6 +626,7 @@ def test_non_retryable_error_has_one_attempt_and_closes_job_run_step(
     run = ResearchRuntimeRepository(cfg).latest("MNQ")
     assert restored["status"] == "FAILED"
     assert restored["attempts"] == 1
+    assert restored["last_diagnostic"]["category"] == "PATH_INVALID"
     assert restored["completed_at"]
     assert restored["attempt_history"][0]["retry_classification"] == "NON_RETRYABLE"
     assert run["status"] == "FAILED" and run["completed_at"]
@@ -501,6 +710,51 @@ def test_reconciliation_repairs_historical_running_run_for_failed_job(
     assert restored["status"] == "FAILED"
     assert restored["completed_at"]
     assert restored["blocking_gaps"] == ["job_terminal:FAILED"]
+
+
+def test_latest_jobs_is_newest_first_and_compact_view_omits_payloads(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    repository = AIResearchJobRepository(cfg)
+    common = {
+        "job_type": "MNQ_MARKET_RESEARCH",
+        "symbol": "MNQ",
+        "correlation_id": "latest-order",
+        "request_payload": {"large_market_payload": "x" * 10_000},
+        "policy_version": "test-policy",
+        "prompt_version": "test-prompt",
+    }
+    older, _ = repository.enqueue(idempotency_key="latest-older", **common)
+    newer, _ = repository.enqueue(idempotency_key="latest-newer", **common)
+    assert older["created_at"] == newer["created_at"]
+
+    compact = repository.latest(limit=2, symbol="MNQ", view="compact")
+    full = repository.latest(limit=2, symbol="MNQ")
+    endpoint_compact = asyncio.run(
+        ai_research_jobs_latest(
+            limit=2,
+            symbol="MNQ",
+            view="compact",
+            enrichment_orchestrator=SimpleNamespace(settings=cfg),
+        )
+    )
+
+    assert [item["job_id"] for item in compact] == [
+        newer["job_id"],
+        older["job_id"],
+    ]
+    assert [item["job_id"] for item in full] == [
+        newer["job_id"],
+        older["job_id"],
+    ]
+    assert [item["job_id"] for item in endpoint_compact] == [
+        newer["job_id"],
+        older["job_id"],
+    ]
+    assert all("request_payload" not in item for item in compact)
+    assert all("result_payload" not in item for item in compact)
+    assert full[0]["request_payload"]["large_market_payload"] == "x" * 10_000
 
 
 def test_additive_migration_from_schema_10_preserves_rows_and_repairs_run(
@@ -603,3 +857,87 @@ def test_smoke_polling_helper_fails_fast_on_terminal_job(tmp_path: Path) -> None
         "failed": True,
         "reason": "job_terminal_failure:FAILED",
     }
+
+
+def test_smoke_writes_compact_failure_report_before_rethrow_in_caller_location(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "smoke_test_market_research.ps1"
+    caller_location = tmp_path / "caller-location"
+    environment_location = tmp_path / "environment-location"
+    caller_location.mkdir()
+    environment_location.mkdir()
+    output = caller_location / "relative-smoke-output"
+    caught_error = tmp_path / "caught-error.txt"
+    command = f"""
+[Environment]::CurrentDirectory = '{environment_location}'
+Set-Location -LiteralPath '{caller_location}'
+function global:Invoke-RestMethod {{
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [string]$ContentType,
+        [string]$Body
+    )
+    if ($Uri -match '/ai-research/capabilities$') {{
+        return [pscustomobject]@{{ status = 'READY_TO_SMOKE' }}
+    }}
+    if ($Method -eq 'Post') {{
+        return [pscustomobject]@{{ run_id = 'run-test'; job_id = 'job-test' }}
+    }}
+    throw 'forced failure token=super-secret-market-payload'
+}}
+try {{
+    & '{script}' -OutputDirectory '.\\relative-smoke-output' -TimeoutSeconds 1
+    exit 2
+}}
+catch {{
+    [System.IO.File]::WriteAllText(
+        '{caught_error}',
+        [string]$_.Exception.Message
+    )
+    exit 0
+}}
+"""
+    wrapper = tmp_path / "smoke-wrapper.ps1"
+    wrapper.write_text(command, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(wrapper),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (output / "failure-report.json").is_file()
+    assert (output / "capabilities.json").is_file()
+    assert (output / "queued.json").is_file()
+    assert caught_error.read_text(encoding="utf-8").startswith("forced failure")
+    raw_report = (output / "failure-report.json").read_text(
+        encoding="utf-8-sig"
+    ).strip()
+    report = json.loads(raw_report)
+    assert Path(report["report_path"]) == (output / "failure-report.json").resolve()
+    assert "super-secret-market-payload" not in raw_report
+    assert "request_payload" not in raw_report
+    assert "result_payload" not in raw_report
+    assert "\n" not in raw_report and "\r" not in raw_report
+    script_text = script.read_text(encoding="utf-8")
+    catch_body = script_text[script_text.index("catch {") :]
+    assert catch_body.index("Write-SmokeFailureReport") < catch_body.rindex(
+        "\n    throw\n"
+    )
