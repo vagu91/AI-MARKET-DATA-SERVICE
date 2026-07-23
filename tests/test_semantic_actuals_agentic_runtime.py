@@ -696,7 +696,9 @@ def test_async_market_research_api_enqueues_once_without_running_agent(tmp_path:
     assert first["run_id"] == second["run_id"] and first["job_id"] == second["job_id"]
     assert asyncio.run(routes.mnq_market_research_status(dependency))["status"] == "PENDING"
     with sqlite3.connect(cfg.database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM ai_research_jobs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM ai_research_jobs").fetchone()[0] == len(
+            first["child_job_ids"]
+        )
         assert conn.execute("SELECT COUNT(*) FROM research_run_steps").fetchone()[0] == 0
 
 
@@ -717,7 +719,7 @@ def test_additive_migration_from_v8_preserves_rows_and_adds_runtime(tmp_path: Pa
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('preserved','Preserved','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 15
+    assert migrate_database(database)["schema_version"] == 16
     with sqlite3.connect(database) as conn:
         assert (
             conn.execute("SELECT title FROM market_news WHERE news_key='preserved'").fetchone()[0]
@@ -748,7 +750,7 @@ def test_additive_migration_from_v9_preserves_rows_and_adds_verified_runtime(
             "INSERT INTO market_news(news_key,title,source_url,retrieved_at) VALUES ('v9-preserved','V9','https://example.com','2026-01-01')"
         )
         conn.commit()
-    assert migrate_database(database)["schema_version"] == 15
+    assert migrate_database(database)["schema_version"] == 16
     with sqlite3.connect(database) as conn:
         assert (
             conn.execute("SELECT title FROM market_news WHERE news_key='v9-preserved'").fetchone()[

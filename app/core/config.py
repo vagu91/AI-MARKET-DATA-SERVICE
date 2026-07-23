@@ -326,6 +326,31 @@ class Settings(BaseSettings):
     ai_researcher_mode: str = Field(
         default="codex_cli", validation_alias="AI_MARKET_AI_RESEARCHER_MODE"
     )
+    research_backend: str = Field(
+        default="codex_cli",
+        validation_alias="AI_MARKET_RESEARCH_BACKEND",
+    )
+    research_parallelism: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        validation_alias="AI_MARKET_RESEARCH_PARALLELISM",
+    )
+    research_clock_skew_seconds: int = Field(
+        default=300,
+        ge=0,
+        validation_alias="AI_MARKET_RESEARCH_CLOCK_SKEW_SECONDS",
+    )
+    research_macro_horizon_days: int = Field(
+        default=550,
+        ge=1,
+        validation_alias="AI_MARKET_RESEARCH_MACRO_HORIZON_DAYS",
+    )
+    research_earnings_horizon_days: int = Field(
+        default=400,
+        ge=1,
+        validation_alias="AI_MARKET_RESEARCH_EARNINGS_HORIZON_DAYS",
+    )
     ai_researcher_max_events: int = Field(
         default=5, validation_alias="AI_MARKET_AI_RESEARCHER_MAX_EVENTS"
     )

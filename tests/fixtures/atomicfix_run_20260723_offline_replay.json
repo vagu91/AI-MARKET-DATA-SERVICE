@@ -1,0 +1,43 @@
+{
+  "source_artifact": "mds-atomicfix-forensics-20260723.zip",
+  "run_id": "rrun-f6c7c83d-9fa4-4638-99e2-9cd2749df5d0",
+  "job_id": "airj-17b9f74e-adef-46c4-82aa-65e230e02392",
+  "snapshot_id": "mcs-fc1be2c3-8fe8-4d09-8ca3-81d937e3076c",
+  "snapshot_revision": 67,
+  "terminal_status": "PARTIAL",
+  "candidate_count": 11,
+  "accepted_count": 6,
+  "persisted_count": 6,
+  "read_back_count": 6,
+  "backend": "codex_cli",
+  "backend_invocations": 1,
+  "total_tokens": 156883,
+  "ai_duration_ms": 145633,
+  "discovered_source_count": 13,
+  "acquired_source_count": 9,
+  "verified_source_count": 6,
+  "executed_search_count": 3,
+  "observed_steps": [
+    "PLAN",
+    "SEARCH",
+    "OPEN_SOURCE",
+    "EXTRACT",
+    "CROSS_CHECK",
+    "VALIDATE",
+    "PERSIST",
+    "READ_BACK",
+    "MATERIALIZE",
+    "COMPLETE"
+  ],
+  "snapshot_projection_defects": {
+    "projected_research_run_id": "rrun-f88713ec-3e4e-4655-a117-e3274fa53cb7",
+    "projected_research_status": "FAILED",
+    "generated_at": "2026-07-23T15:25:40+00:00",
+    "nasdaq_cash_status": "market_closed",
+    "mnq_status": "open",
+    "global_market_session_status": "market_closed",
+    "impossible_event_id": "evt-cpi",
+    "impossible_event_release_at": "2099-07-14T12:30:00Z"
+  },
+  "network_required": false
+}

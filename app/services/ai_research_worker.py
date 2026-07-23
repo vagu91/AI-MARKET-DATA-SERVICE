@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.core.config import Settings
-from app.services.ai_research_job_executor import PersistentAIJobExecutor
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.market_fact_repository import MarketFactRepository
@@ -22,6 +21,8 @@ from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_capability_service import AIResearchCapabilityService
 from app.services.db_only_market_context_materializer import DBOnlyMarketContextMaterializer
 from app.services.codex_runtime_contract import classify_codex_failure, sanitize_diagnostic
+from app.services.research_backend import ResearchBackend, select_research_backend
+from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ class AIResearchWorker:
     ) -> None:
         self.settings = settings
         self.repository = repository or AIResearchJobRepository(settings)
-        self.executor = executor or PersistentAIJobExecutor(settings)
+        self.executor = executor or select_research_backend(settings)
         self.actual_resolver = actual_resolver or DeterministicActualResolver(settings)
         self.source_policy = source_policy or SourcePolicyService(settings.source_policy_path)
         self.facts = facts or MarketFactRepository(settings)
@@ -53,7 +54,9 @@ class AIResearchWorker:
         self.materializer = DBOnlyMarketContextMaterializer(settings, facts=self.facts, snapshots=self.snapshots)
         self.agentic_runtime = agentic_runtime or AgenticResearchRuntime(settings)
         self.capabilities = capabilities or AIResearchCapabilityService(settings)
+        self.parallel_coordinator = ParallelResearchCoordinator(settings)
         self._capability_report: dict[str, Any] | None = None
+        self._capability_lock = threading.Lock()
         self.worker_id = worker_id or f"ai-worker-{uuid.uuid4()}"
         self._stopping = asyncio.Event()
 
@@ -70,8 +73,13 @@ class AIResearchWorker:
                 extra={"job_id": None, "correlation_id": None, "count": reconciled},
             )
         while not self._stopping.is_set():
-            processed = await asyncio.to_thread(self.process_once)
-            if not processed:
+            processed = await asyncio.gather(
+                *[
+                    asyncio.to_thread(self.process_once)
+                    for _ in range(int(self.settings.research_parallelism))
+                ]
+            )
+            if not any(processed):
                 try:
                     await asyncio.wait_for(self._stopping.wait(), timeout=self.settings.ai_worker_poll_seconds)
                 except TimeoutError:
@@ -86,9 +94,14 @@ class AIResearchWorker:
     def process_once(self) -> bool:
         allowed_job_types = None
         authorized_smoke_only = False
-        if hasattr(self.executor, "execute_step"):
+        if (
+            getattr(self.executor, "backend_name", None) == "codex_cli"
+            and hasattr(self.executor, "execute_step")
+        ):
             if self._capability_report is None:
-                self._capability_report = self.capabilities.probe(persist=True)
+                with self._capability_lock:
+                    if self._capability_report is None:
+                        self._capability_report = self.capabilities.probe(persist=True)
             capability_status = str(self._capability_report["status"])
             if capability_status == "READY_TO_SMOKE":
                 authorized_smoke_only = True
@@ -119,7 +132,9 @@ class AIResearchWorker:
             logger.info("ai_job_provider_started", extra=context)
             if job["job_type"] == "RELEASE_ACTUAL_REFRESH":
                 result = self.actual_resolver(job, workspace, self.settings.ai_job_max_runtime_seconds)
-            elif hasattr(self.executor, "execute_step"):
+            elif isinstance(self.executor, ResearchBackend) or hasattr(
+                self.executor, "execute_step"
+            ):
                 result = self.agentic_runtime.run(
                     job, workspace, self.executor, self.settings.ai_job_max_runtime_seconds
                 )
@@ -164,6 +179,7 @@ class AIResearchWorker:
                         "status": updated["status"],
                     },
                 )
+                self._reconcile_terminal_parent(job, updated)
                 return True
             if status in {"FAILED"}:
                 updated = self.repository.retry_or_fail(
@@ -186,6 +202,7 @@ class AIResearchWorker:
                         "status": updated["status"],
                     },
                 )
+                self._reconcile_terminal_parent(job, updated)
                 return True
             if status in {"NO_DATA", "OFFICIAL_FEED_DELAYED"} and job["job_type"] == "RELEASE_ACTUAL_REFRESH":
                 retryable = status == "OFFICIAL_FEED_DELAYED" or result.get("retryable") is True
@@ -264,10 +281,37 @@ class AIResearchWorker:
                 error=str(result.get("error")) if result.get("error") else None,
             )
             logger.info("ai_job_read_back_completed", extra=context)
-            materialized = self.materializer.materialize_for_job(
-                job=completed,
-                ai_enrichment=_job_enrichment(completed),
-            )
+            materialized = None
+            parent_run_id = completed.get("parent_run_id")
+            if parent_run_id:
+                parent = self.parallel_coordinator.reconcile_parent(
+                    str(parent_run_id)
+                )
+                if (
+                    parent["status"] in {"SUCCEEDED", "PARTIAL", "NO_DATA"}
+                    and self.parallel_coordinator.claim_materialization(
+                        str(parent_run_id)
+                    )
+                ):
+                    try:
+                        materialized = self.materializer.materialize_for_parent(
+                            parent=parent,
+                            ai_enrichment=_parent_enrichment(parent),
+                        )
+                    finally:
+                        self.parallel_coordinator.finish_materialization(
+                            str(parent_run_id),
+                            (
+                                str(materialized["snapshot_id"])
+                                if materialized
+                                else None
+                            ),
+                        )
+            else:
+                materialized = self.materializer.materialize_for_job(
+                    job=completed,
+                    ai_enrichment=_job_enrichment(completed),
+                )
             if result.get("run_id"):
                 self.agentic_runtime.record_materialization(
                     str(result["run_id"]),
@@ -382,6 +426,7 @@ class AIResearchWorker:
                     )
                     if callable(reconcile):
                         reconcile()
+                    self._reconcile_terminal_parent(job, updated)
             return True
         finally:
             stop_heartbeat.set()
@@ -393,6 +438,35 @@ class AIResearchWorker:
             if not self.repository.heartbeat(job_id, self.worker_id):
                 return
             logger.info("ai_job_heartbeat", extra={"job_id": job_id, "correlation_id": None})
+
+    def _reconcile_terminal_parent(
+        self,
+        job: dict[str, Any],
+        updated: dict[str, Any],
+    ) -> None:
+        parent_run_id = job.get("parent_run_id")
+        if (
+            not parent_run_id
+            or str(updated.get("status") or "")
+            not in {"FAILED", "LOOP_DETECTED", "TIMED_OUT", "CANCELLED", "REJECTED"}
+        ):
+            return
+        parent = self.parallel_coordinator.reconcile_parent(str(parent_run_id))
+        if (
+            parent["status"] in {"SUCCEEDED", "PARTIAL", "NO_DATA"}
+            and self.parallel_coordinator.claim_materialization(str(parent_run_id))
+        ):
+            materialized = None
+            try:
+                materialized = self.materializer.materialize_for_parent(
+                    parent=parent,
+                    ai_enrichment=_parent_enrichment(parent),
+                )
+            finally:
+                self.parallel_coordinator.finish_materialization(
+                    str(parent_run_id),
+                    str(materialized["snapshot_id"]) if materialized else None,
+                )
 
     def _validate_results(
         self,
@@ -517,4 +591,20 @@ def _job_enrichment(job: dict[str, Any]) -> dict[str, Any]:
         "policy_version": job.get("policy_version"),
         "prompt_version": job.get("prompt_version"),
         "last_error": job.get("last_error"),
+    }
+
+
+def _parent_enrichment(parent: dict[str, Any]) -> dict[str, Any]:
+    children = list(parent.get("children") or [])
+    return {
+        "status": parent.get("status"),
+        "job_ids": [item.get("child_job_id") for item in children],
+        "requested_at": parent.get("created_at"),
+        "completed_at": parent.get("completed_at"),
+        "pending_fields": [],
+        "accepted_fields": [],
+        "rejected_fields": [],
+        "policy_version": None,
+        "prompt_version": "gap_aware_parallel_research_v1",
+        "last_error": None,
     }

@@ -160,6 +160,10 @@ class ResearchSourceGateway:
             "content_text": None,
             "duplicate_of_source_id": None,
             "acquisition_backend": "service_http_gateway",
+            "stage_status": "HTTP_FAILED",
+            "stage_error": None,
+            "http_fetched_at": None,
+            "content_extracted_at": None,
         }
         valid, reason, rule = self._validate_url(original_url, request.get("publisher"))
         if not valid:
@@ -270,6 +274,8 @@ class ResearchSourceGateway:
                     return self._persist_failure(
                         run_id, base, f"http_status_{response.status_code}", started
                     )
+                base["stage_status"] = "HTTP_FETCHED"
+                base["http_fetched_at"] = _iso(self.now())
                 if content_type not in SUPPORTED_CONTENT_TYPES:
                     return self._persist_failure(
                         run_id,
@@ -319,6 +325,9 @@ class ResearchSourceGateway:
             {
                 "fetch_status": "FETCHED",
                 "rejection_reason": None,
+                "stage_status": "CONTENT_EXTRACTED",
+                "stage_error": None,
+                "content_extracted_at": _iso(self.now()),
                 "fetch_duration_ms": int((perf_counter() - started) * 1000),
             }
         )
@@ -412,6 +421,7 @@ class ResearchSourceGateway:
         reason: str,
         started: float,
     ) -> dict[str, Any]:
+        stage_status = _failure_stage(reason, http_fetched=bool(base.get("http_fetched_at")))
         return self.repository.persist_research_source(
             run_id,
             {
@@ -419,6 +429,8 @@ class ResearchSourceGateway:
                 "fetch_status": "REJECTED",
                 "verification_status": "UNVERIFIED",
                 "rejection_reason": str(reason)[:300],
+                "stage_status": stage_status,
+                "stage_error": str(reason)[:300],
                 "fetch_duration_ms": int((perf_counter() - started) * 1000),
             },
         )
@@ -465,6 +477,19 @@ class ResearchSourceGateway:
 
 class SourceGatewayLimitError(RuntimeError):
     pass
+
+
+def _failure_stage(reason: str, *, http_fetched: bool) -> str:
+    if reason.startswith("unsupported_content_type"):
+        return "UNSUPPORTED_CONTENT"
+    if http_fetched or reason in {
+        "pdf_extraction_unavailable",
+        "pdf_text_extraction_failed",
+        "insufficient_static_text",
+        "mojibake_content_rejected",
+    }:
+        return "EXTRACTION_FAILED"
+    return "HTTP_FAILED"
 
 
 def match_evidence(

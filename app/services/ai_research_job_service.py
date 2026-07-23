@@ -147,6 +147,10 @@ class AIResearchJobService:
         event_key: str | None = None,
         pending_fields: list[str] | None = None,
         force: bool = False,
+        parent_job_id: str | None = None,
+        parent_run_id: str | None = None,
+        specialized_topic: str | None = None,
+        child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
         pending = pending_fields or list(request_payload.get("pending_fields") or [])
         identity = event_key or hashlib.sha256(self._canonical(request_payload).encode("utf-8")).hexdigest()[:24]
@@ -178,6 +182,10 @@ class AIResearchJobService:
             allow_requeue_terminal=force,
             profile_id=profile.profile_id,
             input_fingerprint=self._fingerprint(payload),
+            parent_job_id=parent_job_id,
+            parent_run_id=parent_run_id,
+            specialized_topic=specialized_topic,
+            child_ordinal=child_ordinal,
         )
 
     def enrichment_status(

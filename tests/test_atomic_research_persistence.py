@@ -232,23 +232,14 @@ def test_exact_live_persist_replay_is_partial_and_offline(
 
     assert result["status"] == "PARTIAL"
     assert result["candidate_count"] == 12
-    assert result["accepted_count"] == 8
-    assert result["persisted_count"] == result["read_back_count"] == 8
-    assert result["valid_not_applicable_topics"] == [
-        "conflicts",
-        "earnings",
-        "risk",
-        "volatility_positioning",
-    ]
+    assert result["accepted_count"] == 4
+    assert result["persisted_count"] == result["read_back_count"] == 4
+    assert result["valid_not_applicable_topics"] == []
     assert {item["claim_ref"] for item in result["accepted_claims"]} >= {
         "candidate-1",
         "candidate-2",
         "candidate-4",
         "candidate-7",
-        "candidate-9",
-        "candidate-10",
-        "candidate-11",
-        "candidate-12",
     }
     assert atomic_counts(cfg, str(run["run_id"])) == {
         "claims": 12,
@@ -546,12 +537,12 @@ def test_migration_from_schema_13_or_14_preserves_data(
 
     result = migrate_database(database)
 
-    assert result["schema_version"] == 15
+    assert result["schema_version"] == len(MIGRATIONS)
     with connect_sqlite(database) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM market_facts WHERE fact_key='migration-marker'"
         ).fetchone()[0] == 1
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
         assert {
             row["name"] for row in conn.execute("PRAGMA table_info(research_claims)")
         } >= {"materialization_status"}

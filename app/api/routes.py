@@ -56,8 +56,9 @@ from app.services.ai_research_job_service import AIResearchJobService
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
 from app.services.ai_research_capability_service import AIResearchCapabilityService
-from app.services.research_profiles import profile_for_job
 from app.services.research_runtime_repository import ResearchRuntimeRepository
+from app.services.research_gap_manifest import ResearchGapManifestBuilder
+from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 
 router = APIRouter()
 
@@ -133,33 +134,39 @@ async def enqueue_mnq_market_research(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
     settings = enrichment_orchestrator.settings
-    latest = MarketContextSnapshotRepository(settings).latest("MNQ")
-    context = latest["debug_payload"] if latest else {}
-    payload = {
-        "database_context": {
-            "snapshot_id": latest.get("snapshot_id") if latest else None,
-            "snapshot_revision": latest.get("revision") if latest else None,
-            "data_as_of": latest.get("data_as_of") if latest else None,
-            "event_calendar": context.get("event_calendar") or {},
-            "macro_snapshot": context.get("macro_snapshot") or {},
-            "nasdaq_context": context.get("nasdaq_context") or {},
-            "news_context": context.get("news_context") or {},
-        },
-        "context_date": (context.get("market_schedule") or {}).get("context_date"),
-        "market_session": (context.get("market_schedule") or {}).get("market_session_status"),
-        "pending_fields": [],
-        "authorized_live_smoke": request.authorized_live_smoke,
-    }
-    job, created = AIResearchJobService(settings).enqueue_explicit(
-        job_type="MNQ_MARKET_RESEARCH", symbol="MNQ",
-        correlation_id=request.correlation_id or f"mnq-research-{datetime.now(UTC).isoformat()}",
-        request_payload=payload, pending_fields=[], force=request.force_requeue,
+    snapshots = MarketContextSnapshotRepository(settings)
+    latest = snapshots.latest("MNQ")
+    components = snapshots.latest_components("MNQ")
+    manifest = ResearchGapManifestBuilder(settings).build(
+        snapshot=latest,
+        components=components,
     )
-    profile = profile_for_job("MNQ_MARKET_RESEARCH")
-    run = ResearchRuntimeRepository(settings).ensure_run(job, profile.profile_id, profile.prompt_version)
+    parent = ParallelResearchCoordinator(settings).create_parent(
+        manifest,
+        correlation_id=(
+            request.correlation_id
+            or f"mnq-research-{datetime.now(UTC).isoformat()}"
+        ),
+        force=request.force_requeue,
+        authorized_live_smoke=request.authorized_live_smoke,
+    )
     return {
-        "created": created, "run_id": run["run_id"], "job_id": job["job_id"],
-        "status": run["status"], "trading_actions": "not_supported",
+        "created": bool(parent.get("created", True)),
+        "run_id": parent["parent_run_id"],
+        "parent_run_id": parent["parent_run_id"],
+        "job_id": None,
+        "child_job_ids": parent["child_job_ids"],
+        "manifest_id": manifest["manifest_id"],
+        "status": parent["status"],
+        "poll_url": f"/market-research/mnq/runs/{parent['parent_run_id']}",
+        "wait_for_revision": request.wait_for_revision,
+        "async_contract": {
+            "polling": "available",
+            "wait_for_revision": "contract_reserved",
+            "callback_webhook": "future_optional",
+            "sse_telemetry": "future_optional_structured_events_only",
+        },
+        "trading_actions": "not_supported",
     }
 
 
@@ -168,6 +175,16 @@ async def mnq_market_research_run(
     run_id: str,
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
+    if run_id.startswith("prun-"):
+        try:
+            return ParallelResearchCoordinator(
+                enrichment_orchestrator.settings
+            ).reconcile_parent(run_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=404,
+                detail="Market research parent run not found",
+            ) from None
     run = ResearchRuntimeRepository(enrichment_orchestrator.settings).get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Market research run not found")
@@ -257,6 +274,10 @@ async def market_context_mnq(
         stored = snapshots.latest("MNQ")
         if stored is not None:
             return stored["debug_payload"] if view == "debug" else stored["consumer_payload"]
+        raise HTTPException(
+            status_code=404,
+            detail="No immutable market-context snapshot is available",
+        )
     diagnostics = DiagnosticsService(
         settings,
         macro_service=macro_service,

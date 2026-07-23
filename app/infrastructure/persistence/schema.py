@@ -817,6 +817,163 @@ CREATE INDEX IF NOT EXISTS idx_market_context_snapshots_audit
   ON market_context_snapshots(symbol, audit_status, revision DESC);
 """
 
+GAP_AWARE_PARALLEL_RESEARCH_SCHEMA = """
+ALTER TABLE ai_research_jobs ADD COLUMN parent_job_id TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN parent_run_id TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN specialized_topic TEXT NULL;
+ALTER TABLE ai_research_jobs ADD COLUMN child_ordinal INTEGER NULL;
+
+ALTER TABLE research_runs ADD COLUMN parent_run_id TEXT NULL;
+ALTER TABLE research_runs ADD COLUMN is_parent INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN planned_query_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN deduplicated_search_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN discovered_url_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN acquisition_attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN fetched_source_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN verified_source_count INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE market_context_snapshots ADD COLUMN research_run_id TEXT NULL;
+ALTER TABLE market_context_snapshots ADD COLUMN parent_run_id TEXT NULL;
+ALTER TABLE market_context_snapshots
+  ADD COLUMN research_link_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED';
+
+ALTER TABLE research_sources ADD COLUMN stage_status TEXT NULL;
+ALTER TABLE research_sources ADD COLUMN stage_error TEXT NULL;
+ALTER TABLE research_sources ADD COLUMN http_fetched_at TEXT NULL;
+ALTER TABLE research_sources ADD COLUMN content_extracted_at TEXT NULL;
+
+ALTER TABLE research_claims ADD COLUMN event_type TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN event_start_at TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN event_end_at TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN decision_at TEXT NULL;
+ALTER TABLE research_claims ADD COLUMN confirmation_status TEXT NULL;
+
+ALTER TABLE economic_events_history
+  ADD COLUMN temporal_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE economic_events_history ADD COLUMN temporal_invalid_reason TEXT NULL;
+ALTER TABLE market_facts
+  ADD COLUMN temporal_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE market_facts ADD COLUMN temporal_invalid_reason TEXT NULL;
+
+CREATE TABLE IF NOT EXISTS research_parent_runs (
+  parent_run_id TEXT PRIMARY KEY,
+  parent_job_id TEXT NULL,
+  symbol TEXT NOT NULL,
+  status TEXT NOT NULL,
+  snapshot_id TEXT NULL,
+  manifest_id TEXT NOT NULL,
+  requested_backend TEXT NOT NULL,
+  concurrency_limit INTEGER NOT NULL,
+  expected_child_count INTEGER NOT NULL DEFAULT 0,
+  terminal_child_count INTEGER NOT NULL DEFAULT 0,
+  checkpoint_json TEXT NOT NULL DEFAULT '{}',
+  telemetry_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  started_at TEXT NULL,
+  completed_at TEXT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_gap_manifests (
+  manifest_id TEXT PRIMARY KEY,
+  parent_run_id TEXT NULL,
+  symbol TEXT NOT NULL,
+  source_snapshot_id TEXT NULL,
+  generated_at TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  manifest_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_gap_items (
+  manifest_id TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  applicability TEXT NOT NULL,
+  deterministic_status TEXT NOT NULL,
+  freshness TEXT NOT NULL,
+  data_as_of TEXT NULL,
+  valid_until TEXT NULL,
+  completeness REAL NOT NULL,
+  missing_fields_json TEXT NOT NULL DEFAULT '[]',
+  source_lineage_json TEXT NOT NULL DEFAULT '[]',
+  required_action TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  PRIMARY KEY(manifest_id,topic),
+  FOREIGN KEY(manifest_id) REFERENCES research_gap_manifests(manifest_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_parent_children (
+  parent_run_id TEXT NOT NULL,
+  child_job_id TEXT NOT NULL,
+  child_run_id TEXT NULL,
+  topic TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  result_checksum TEXT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(parent_run_id,child_job_id),
+  FOREIGN KEY(parent_run_id) REFERENCES research_parent_runs(parent_run_id),
+  FOREIGN KEY(child_job_id) REFERENCES ai_research_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS temporal_quarantine (
+  quarantine_id TEXT PRIMARY KEY,
+  entity_table TEXT NOT NULL,
+  entity_key TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  timestamp_field TEXT NOT NULL,
+  timestamp_value TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(entity_table,entity_key,timestamp_field,reason_code)
+);
+
+CREATE TABLE IF NOT EXISTS news_research_candidate_decisions (
+  candidate_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  canonical_url TEXT NULL,
+  source_domain TEXT NULL,
+  article_status TEXT NOT NULL,
+  claim_verification_status TEXT NOT NULL,
+  confirmation_status TEXT NOT NULL,
+  rejection_reason TEXT NULL,
+  decision_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS market_context_components (
+  symbol TEXT NOT NULL,
+  component_name TEXT NOT NULL,
+  source_snapshot_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL,
+  data_as_of TEXT NULL,
+  valid_until TEXT NULL,
+  component_checksum TEXT NOT NULL,
+  component_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(symbol,component_name,source_snapshot_id),
+  FOREIGN KEY(source_snapshot_id) REFERENCES market_context_snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_parent_children_status
+  ON research_parent_children(parent_run_id,status,ordinal);
+CREATE INDEX IF NOT EXISTS idx_gap_items_action
+  ON research_gap_items(manifest_id,required_action,topic);
+CREATE INDEX IF NOT EXISTS idx_temporal_quarantine_entity
+  ON temporal_quarantine(entity_table,entity_key);
+CREATE INDEX IF NOT EXISTS idx_news_candidate_decisions_run
+  ON news_research_candidate_decisions(run_id,article_status,rejection_reason);
+CREATE INDEX IF NOT EXISTS idx_market_context_components_latest
+  ON market_context_components(symbol,component_name,source_revision DESC);
+CREATE INDEX IF NOT EXISTS idx_snapshot_exact_research
+  ON market_context_snapshots(research_run_id,parent_run_id,revision DESC);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -834,4 +991,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("013_research_source_gateway_and_backend_invocations", RESEARCH_SOURCE_GATEWAY_SCHEMA),
     ("014_research_semantic_lifecycle", RESEARCH_SEMANTIC_LIFECYCLE_SCHEMA),
     ("015_atomic_research_persistence_and_quarantine", ATOMIC_RESEARCH_PERSISTENCE_SCHEMA),
+    ("016_gap_aware_parallel_research_and_temporal_audit", GAP_AWARE_PARALLEL_RESEARCH_SCHEMA),
 )
