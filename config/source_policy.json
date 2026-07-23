@@ -1,5 +1,5 @@
 {
-  "policy_version": "source-policy-v1",
+  "policy_version": "source-policy-v2",
   "default_unknown_tier": 5,
   "forbidden_domains": [],
   "issuer_official_domains": ["apple.com", "microsoft.com", "nvidia.com", "amazon.com", "abc.xyz", "meta.com", "tesla.com"],
@@ -23,6 +23,7 @@
     {"domain": "bls.gov", "publisher": "U.S. Bureau of Labor Statistics", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
     {"domain": "bea.gov", "publisher": "U.S. Bureau of Economic Analysis", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
     {"domain": "federalreserve.gov", "publisher": "Federal Reserve", "tier": 1, "data_types": ["actual", "event", "speech", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
+    {"domain": "fred.stlouisfed.org", "publisher": "Federal Reserve Bank of St. Louis", "tier": 1, "data_types": ["actual", "event", "market", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
     {"domain": "treasury.gov", "publisher": "U.S. Treasury", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
     {"domain": "census.gov", "publisher": "U.S. Census Bureau", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
     {"domain": "eia.gov", "publisher": "U.S. Energy Information Administration", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},

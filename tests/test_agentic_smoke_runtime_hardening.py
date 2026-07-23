@@ -224,12 +224,8 @@ def test_relative_workspace_is_canonical_once_for_cwd_and_all_codex_paths(
     cd_path = Path(command[command.index("--cd") + 1])
     assert result["topics"] == ["canonical"]
     assert cd_path == observed["cwd"] == observed["cwd"].resolve()
-    assert observed["schema"].relative_to(observed["cwd"]).parts == (
-        "plan_output_schema.json",
-    )
-    assert observed["output"].relative_to(observed["cwd"]).parts == (
-        "plan_output.json",
-    )
+    assert observed["schema"].relative_to(observed["cwd"]).parts == ("plan_output_schema.json",)
+    assert observed["output"].relative_to(observed["cwd"]).parts == ("plan_output.json",)
 
 
 def test_isolated_command_rejects_relative_divergent_and_traversing_paths(
@@ -315,9 +311,7 @@ def test_capability_contract_canonicalizes_relative_workspace_root(
         return subprocess.CompletedProcess(command, 0, f"exec --search {joined}", "")
 
     report = AIResearchCapabilityService(cfg, runner=runner).probe(persist=False)
-    probe = (
-        tmp_path / "relative-capability" / "capability-offline-probe"
-    ).resolve()
+    probe = (tmp_path / "relative-capability" / "capability-offline-probe").resolve()
     assert report["status"] == "READY_TO_SMOKE"
     assert report["isolated_command_constructed"] is True
     assert probe.is_absolute()
@@ -380,10 +374,7 @@ def test_executor_maps_windows_os_error_3_to_non_retryable_path_invalid(
     monkeypatch.setattr(
         "app.services.ai_research_job_executor.subprocess.Popen",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            OSError(
-                "Error: Impossibile trovare il percorso specificato. "
-                "(os error 3)"
-            )
+            OSError("Error: Impossibile trovare il percorso specificato. (os error 3)")
         ),
     )
     monkeypatch.setattr(
@@ -430,9 +421,9 @@ def test_all_step_schemas_are_closed_bounded_and_exclude_ai_actual() -> None:
     validate_output_schema(legacy)
     actual_nodes = [
         legacy["properties"]["results"]["items"]["properties"]["actual"],
-        legacy["properties"]["results"]["items"]["properties"]["metrics"]["items"][
-            "properties"
-        ]["actual"],
+        legacy["properties"]["results"]["items"]["properties"]["metrics"]["items"]["properties"][
+            "actual"
+        ],
     ]
     assert actual_nodes == [{"type": "null"}, {"type": "null"}]
 
@@ -490,7 +481,7 @@ def test_cli_failure_keeps_redacted_stderr_jsonl_and_classification(
     stdout = json.dumps(
         {
             "type": "turn.failed",
-            "error": f'authorization: Bearer {secret}',
+            "error": f"authorization: Bearer {secret}",
         }
     )
     monkeypatch.setattr(
@@ -806,7 +797,7 @@ def test_additive_migration_from_schema_10_preserves_rows_and_repairs_run(
         conn.commit()
 
     result = migrate_database(database)
-    assert result["schema_version"] == 12
+    assert result["schema_version"] == 13
     assert result["reconciled_research_runs"] == 1
     with connect_sqlite(database) as conn:
         job = conn.execute(
@@ -816,8 +807,7 @@ def test_additive_migration_from_schema_10_preserves_rows_and_repairs_run(
             "SELECT status,completed_at FROM research_runs WHERE run_id='rrun-preserved'"
         ).fetchone()
         attempt_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(ai_research_job_attempts)")
+            row["name"] for row in conn.execute("PRAGMA table_info(ai_research_job_attempts)")
         }
     assert job["job_id"] == "airj-preserved"
     assert run["status"] == "FAILED" and run["completed_at"]
@@ -831,11 +821,7 @@ def test_smoke_polling_helper_fails_fast_on_terminal_job(tmp_path: Path) -> None
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell is unavailable")
-    helper = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "market_research_smoke_helpers.ps1"
-    )
+    helper = Path(__file__).resolve().parents[1] / "scripts" / "market_research_smoke_helpers.ps1"
     command = (
         f". '{helper}'; "
         "Get-SmokePollingDecision -RunStatus RUNNING -JobStatus FAILED "
@@ -927,9 +913,7 @@ catch {{
     assert (output / "capabilities.json").is_file()
     assert (output / "queued.json").is_file()
     assert caught_error.read_text(encoding="utf-8").startswith("forced failure")
-    raw_report = (output / "failure-report.json").read_text(
-        encoding="utf-8-sig"
-    ).strip()
+    raw_report = (output / "failure-report.json").read_text(encoding="utf-8-sig").strip()
     report = json.loads(raw_report)
     assert Path(report["report_path"]) == (output / "failure-report.json").resolve()
     assert "super-secret-market-payload" not in raw_report
@@ -938,9 +922,7 @@ catch {{
     assert "\n" not in raw_report and "\r" not in raw_report
     script_text = script.read_text(encoding="utf-8")
     catch_body = script_text[script_text.index("catch {") :]
-    assert catch_body.index("Write-SmokeFailureReport") < catch_body.rindex(
-        "\n    throw\n"
-    )
+    assert catch_body.index("Write-SmokeFailureReport") < catch_body.rindex("\n    throw\n")
 
 
 def test_smoke_failure_report_contains_complete_budget_diagnostic(
@@ -949,11 +931,7 @@ def test_smoke_failure_report_contains_complete_budget_diagnostic(
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell is unavailable")
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "smoke_test_market_research.ps1"
-    )
+    script = Path(__file__).resolve().parents[1] / "scripts" / "smoke_test_market_research.ps1"
     output = tmp_path / "budget-failure"
     command = f"""
 function global:Invoke-RestMethod {{
@@ -1053,9 +1031,7 @@ catch {{
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    report = json.loads(
-        (output / "failure-report.json").read_text(encoding="utf-8-sig")
-    )
+    report = json.loads((output / "failure-report.json").read_text(encoding="utf-8-sig"))
     assert report["error_category"] == "BUDGET_EXCEEDED"
     assert report["resource"] == "searches"
     assert report["configured_limit"] == 8

@@ -53,6 +53,20 @@ def normalize_codex_event(
     usage = _usage(event, item)
     envelope = {
         "raw_event_type": raw_event_type,
+        "raw_event_digest": hashlib.sha256(
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "raw_shape": {
+            "event_keys": sorted(str(key)[:80] for key in event)[:40],
+            "item_keys": sorted(str(key)[:80] for key in item)[:40],
+        },
+        "provider_payload": _provider_summary(item),
         "lifecycle": lifecycle,
         "item_id": item_id,
         "item_type": item_type,
@@ -79,19 +93,13 @@ def normalize_codex_event(
             80,
         ),
         "usage": usage,
-        "counts_usage": bool(
-            operational_identity
-            and semantic_action
-            and lifecycle == "completed"
-        ),
+        "counts_usage": bool(operational_identity and semantic_action and lifecycle == "completed"),
         "discovered_urls": urls[:20] if semantic_action == "search" else [],
         "content_hash": _bounded_text(
             item.get("content_hash") or item.get("content_checksum"),
             128,
         ),
-        "http_status": _bounded_status(
-            item.get("http_status") or item.get("status_code")
-        ),
+        "http_status": _bounded_status(item.get("http_status") or item.get("status_code")),
     }
     return [envelope]
 
@@ -109,9 +117,12 @@ def normalize_usage(candidate: Any) -> dict[str, Any]:
         if isinstance(candidate.get("output_tokens_details"), dict)
         else {}
     )
+    input_tokens = max(int(candidate.get("input_tokens") or 0), 0)
+    output_tokens = max(int(candidate.get("output_tokens") or 0), 0)
+    reported_total = max(int(candidate.get("total_tokens") or 0), 0)
     normalized: dict[str, Any] = {
-        "input_tokens": max(int(candidate.get("input_tokens") or 0), 0),
-        "output_tokens": max(int(candidate.get("output_tokens") or 0), 0),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "cached_tokens": max(
             int(
                 candidate.get("cached_tokens")
@@ -122,14 +133,10 @@ def normalize_usage(candidate: Any) -> dict[str, Any]:
             0,
         ),
         "reasoning_tokens": max(
-            int(
-                candidate.get("reasoning_tokens")
-                or output_details.get("reasoning_tokens")
-                or 0
-            ),
+            int(candidate.get("reasoning_tokens") or output_details.get("reasoning_tokens") or 0),
             0,
         ),
-        "total_tokens": max(int(candidate.get("total_tokens") or 0), 0),
+        "total_tokens": reported_total or input_tokens + output_tokens,
     }
     for key in ("cost", "cost_usd", "total_cost_usd"):
         if candidate.get(key) is not None:
@@ -186,8 +193,7 @@ class ResearchLoopDetected(RuntimeError):
                 "retryable": False,
                 "retry_classification": self.retry_classification,
                 "fingerprints": [
-                    str(item.get("tool_action_fingerprint") or "")[:64]
-                    for item in evidence[-12:]
+                    str(item.get("tool_action_fingerprint") or "")[:64] for item in evidence[-12:]
                 ],
                 "loop_evidence": [_compact_event(item) for item in evidence[-12:]],
                 "timestamp": datetime.now(UTC).replace(microsecond=0).isoformat(),
@@ -205,12 +211,8 @@ class ProgressLoopGuard:
         known_sources: list[str] | None = None,
     ) -> None:
         self.settings = settings
-        self.known_queries = {
-            _normalize_text(value) for value in known_queries or [] if value
-        }
-        self.known_sources = {
-            _normalize_url(value) for value in known_sources or [] if value
-        }
+        self.known_queries = {_normalize_text(value) for value in known_queries or [] if value}
+        self.known_sources = {_normalize_url(value) for value in known_sources or [] if value}
         self.recent: deque[dict[str, Any]] = deque(
             maxlen=max(settings.research_loop_cycle_window, 4)
             * max(settings.research_loop_cycle_repetitions, 2)
@@ -247,15 +249,11 @@ class ProgressLoopGuard:
         if self.tool_calls > self.settings.research_emergency_max_tool_actions:
             return progress, "emergency_tool_action_limit"
         if (
-            self.signature_counts[signature]
-            >= self.settings.research_loop_repeat_action_threshold
+            self.signature_counts[signature] >= self.settings.research_loop_repeat_action_threshold
             and not progress
         ):
             return progress, "repeated_action_without_progress"
-        if (
-            self.no_progress_actions
-            >= self.settings.research_loop_no_progress_action_threshold
-        ):
+        if self.no_progress_actions >= self.settings.research_loop_no_progress_action_threshold:
             return progress, "no_progress_action_window"
         if self._cyclic():
             return progress, "cyclic_action_sequence"
@@ -282,13 +280,9 @@ class ProgressLoopGuard:
     def _is_progress(self, envelope: dict[str, Any]) -> bool:
         action = str(envelope.get("semantic_action") or "")
         query = _normalize_text(envelope.get("query"))
-        source = _normalize_url(
-            envelope.get("canonical_url") or envelope.get("source_url")
-        )
+        source = _normalize_url(envelope.get("canonical_url") or envelope.get("source_url"))
         discovered = {
-            _normalize_url(value)
-            for value in envelope.get("discovered_urls") or []
-            if value
+            _normalize_url(value) for value in envelope.get("discovered_urls") or [] if value
         }
         new_discovered = discovered - self.known_sources
         if new_discovered:
@@ -331,29 +325,19 @@ def _semantic_action(
     combined = f"{item_type} {raw_event_type}".lower()
     phase = step_name.upper()
     url_only = bool(query and _URL_RE.fullmatch(query.strip()))
-    if any(
-        token in combined
-        for token in ("web_fetch", "fetch_url", "http_fetch", "browser.open")
-    ):
+    if any(token in combined for token in ("web_fetch", "fetch_url", "http_fetch", "browser.open")):
         return "fetch"
-    if any(
-        token in combined
-        for token in ("web_open", "open_source", "source.open", "open_url")
-    ):
+    if any(token in combined for token in ("web_open", "open_source", "source.open", "open_url")):
         return "open_source"
     if any(
-        token in combined
-        for token in ("verify_source", "source.verify", "server_source_verified")
+        token in combined for token in ("verify_source", "source.verify", "server_source_verified")
     ):
         return "verify_source"
-    if any(
-        token in combined
-        for token in ("web_search", "search_query", "source.search")
-    ):
+    if any(token in combined for token in ("web_search", "search_query", "source.search")):
+        if phase == "CROSS_CHECK" and url_only:
+            return "verify_source"
         if url_only or (primary_url and phase == "OPEN_SOURCE"):
             return "open_source"
-        if url_only or (primary_url and phase == "CROSS_CHECK" and not query):
-            return "verify_source"
         return "search"
     return None
 
@@ -407,6 +391,47 @@ def _event_urls(value: Any) -> list[str]:
     return sorted(found)
 
 
+def _provider_summary(item: dict[str, Any]) -> dict[str, Any]:
+    """Retain bounded operational fields while excluding messages and page content."""
+
+    allowed_scalar = {
+        "action",
+        "id",
+        "name",
+        "query",
+        "search_query",
+        "status",
+        "status_code",
+        "http_status",
+        "title",
+        "type",
+        "url",
+        "source_url",
+        "canonical_url",
+        "redirect_url",
+        "content_hash",
+        "content_checksum",
+    }
+    summary: dict[str, Any] = {}
+    for key in allowed_scalar:
+        value = item.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            summary[key] = str(value)[:1000] if isinstance(value, str) else value
+        elif isinstance(value, dict):
+            summary[key] = {
+                str(child_key)[:80]: (
+                    str(child_value)[:1000] if isinstance(child_value, str) else child_value
+                )
+                for child_key, child_value in list(value.items())[:20]
+                if isinstance(child_value, (str, int, float, bool))
+                and str(child_key).lower() not in {"content", "text", "message", "prompt", "body"}
+            }
+    urls = _event_urls(item)
+    if urls:
+        summary["urls"] = urls[:20]
+    return summary
+
+
 def _legacy_event_type(semantic_action: str | None) -> str:
     if semantic_action == "search":
         return "search"
@@ -421,9 +446,7 @@ def _semantic_signature(envelope: dict[str, Any]) -> str:
             str(envelope.get("phase") or ""),
             str(envelope.get("semantic_action") or ""),
             _normalize_text(envelope.get("query")),
-            _normalize_url(
-                envelope.get("canonical_url") or envelope.get("source_url")
-            ),
+            _normalize_url(envelope.get("canonical_url") or envelope.get("source_url")),
             str(envelope.get("status") or ""),
         )
     )

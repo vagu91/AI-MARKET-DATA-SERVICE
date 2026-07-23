@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread_redacted"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"call_search_redacted_1","type":"web_search","query":"site:bls.gov OR site:bea.gov July 23 2026 macro releases","action":{"type":"search","query":"site:bls.gov OR site:bea.gov July 23 2026 macro releases"}}}
+{"type":"item.completed","item":{"id":"call_open_redacted_1","type":"web_search","query":"https://www.bea.gov/news/schedule/","action":{"type":"open_page","url":"https://www.bea.gov/news/schedule/"}}}
+{"type":"item.completed","item":{"id":"message_redacted","type":"agent_message","text":"[redacted structured response]"}}
+{"type":"turn.completed","usage":{"input_tokens":587707,"cached_input_tokens":382464,"output_tokens":1646}}

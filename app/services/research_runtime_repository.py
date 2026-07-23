@@ -38,7 +38,9 @@ class ResearchRuntimeRepository:
         self.facts = facts or MarketFactRepository(settings)
         migrate_database(settings.database_path)
 
-    def ensure_run(self, job: dict[str, Any], profile_id: str, prompt_version: str) -> dict[str, Any]:
+    def ensure_run(
+        self, job: dict[str, Any], profile_id: str, prompt_version: str
+    ) -> dict[str, Any]:
         now = _now()
         request = job.get("request_payload") or {}
         fingerprint = str(job.get("input_fingerprint") or _checksum(request))
@@ -46,7 +48,9 @@ class ResearchRuntimeRepository:
         required_topics = (
             sorted({str(item) for item in request.get("pending_fields") or []})
             if profile_id == "EVENT_MISSING_FIELDS"
-            else list(profile.required_topics) if profile else []
+            else list(profile.required_topics)
+            if profile
+            else []
         )
         run_id = f"rrun-{uuid.uuid4()}"
         with connect_sqlite(self.settings.database_path) as conn:
@@ -58,13 +62,24 @@ class ResearchRuntimeRepository:
                 ) VALUES (?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)
                 """,
                 (
-                    run_id, job["job_id"], job.get("symbol") or "MNQ", job.get("event_key"),
-                    profile_id, prompt_version, job.get("policy_version") or self.policy.policy_version,
-                    fingerprint, _json(request), _json(required_topics), now, now,
+                    run_id,
+                    job["job_id"],
+                    job.get("symbol") or "MNQ",
+                    job.get("event_key"),
+                    profile_id,
+                    prompt_version,
+                    job.get("policy_version") or self.policy.policy_version,
+                    fingerprint,
+                    _json(request),
+                    _json(required_topics),
+                    now,
+                    now,
                 ),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM research_runs WHERE job_id=?", (job["job_id"],)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM research_runs WHERE job_id=?", (job["job_id"],)
+            ).fetchone()
         return self._run_row(row)
 
     def ensure_effective_budget(
@@ -100,9 +115,7 @@ class ResearchRuntimeRepository:
     ) -> dict[str, int]:
         today = datetime.now(UTC).date().isoformat()
         exclusion = " AND run_id!=?" if exclude_run_id else ""
-        values: tuple[Any, ...] = (
-            (today, exclude_run_id) if exclude_run_id else (today,)
-        )
+        values: tuple[Any, ...] = (today, exclude_run_id) if exclude_run_id else (today,)
         with connect_sqlite(self.settings.database_path) as conn:
             usage = conn.execute(
                 f"""
@@ -141,7 +154,8 @@ class ResearchRuntimeRepository:
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM research_run_steps WHERE run_id=? AND step_name=?", (run_id, step_name)
+                "SELECT * FROM research_run_steps WHERE run_id=? AND step_name=?",
+                (run_id, step_name),
             ).fetchone()
             if row is not None and row["status"] == "COMPLETED":
                 conn.commit()
@@ -155,7 +169,17 @@ class ResearchRuntimeRepository:
                       backend,tool,started_at
                     ) VALUES (?,?,?,?,'RUNNING',1,?,?,?,?,?)
                     """,
-                    (step_id, run_id, step_name, ordinal, _checksum(input_payload), input_json, backend, tool, now),
+                    (
+                        step_id,
+                        run_id,
+                        step_name,
+                        ordinal,
+                        _checksum(input_payload),
+                        input_json,
+                        backend,
+                        tool,
+                        now,
+                    ),
                 )
             else:
                 conn.execute(
@@ -172,7 +196,8 @@ class ResearchRuntimeRepository:
                 (now, now, run_id),
             )
             restored = conn.execute(
-                "SELECT * FROM research_run_steps WHERE run_id=? AND step_name=?", (run_id, step_name)
+                "SELECT * FROM research_run_steps WHERE run_id=? AND step_name=?",
+                (run_id, step_name),
             ).fetchone()
             conn.execute(
                 """
@@ -191,7 +216,9 @@ class ResearchRuntimeRepository:
             conn.commit()
         return self._step_row(restored), True
 
-    def complete_step(self, step_id: str, output: dict[str, Any], *, source_domains: list[str] | None = None) -> dict[str, Any]:
+    def complete_step(
+        self, step_id: str, output: dict[str, Any], *, source_domains: list[str] | None = None
+    ) -> dict[str, Any]:
         now = _now()
         output_json = _json(output)
         with connect_sqlite(self.settings.database_path) as conn:
@@ -201,7 +228,14 @@ class ResearchRuntimeRepository:
                   source_domains_json=?,completed_at=?,duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER)
                 WHERE step_id=?
                 """,
-                (_checksum(output), output_json, _json(sorted(set(source_domains or []))), now, now, step_id),
+                (
+                    _checksum(output),
+                    output_json,
+                    _json(sorted(set(source_domains or []))),
+                    now,
+                    now,
+                    step_id,
+                ),
             )
             conn.execute(
                 """
@@ -214,7 +248,9 @@ class ResearchRuntimeRepository:
                 (now, step_id, step_id),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM research_run_steps WHERE step_id=?", (step_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM research_run_steps WHERE step_id=?", (step_id,)
+            ).fetchone()
         return self._step_row(row)
 
     def fail_step(
@@ -263,7 +299,10 @@ class ResearchRuntimeRepository:
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             run_row = conn.execute(
-                "SELECT job_id,usage_json,source_domains_json FROM research_runs WHERE run_id=?",
+                """
+                SELECT job_id,usage_json,cost_json,source_domains_json
+                FROM research_runs WHERE run_id=?
+                """,
                 (run_id,),
             ).fetchone()
             step_row = conn.execute(
@@ -286,7 +325,10 @@ class ResearchRuntimeRepository:
                 normalized = {
                     **normalized,
                     "source_url": _canonical_url(str(event.get("source_url") or "")) or None,
-                    "canonical_url": _canonical_url(str(event.get("canonical_url") or event.get("source_url") or "")) or None,
+                    "canonical_url": _canonical_url(
+                        str(event.get("canonical_url") or event.get("source_url") or "")
+                    )
+                    or None,
                 }
                 event_seed = "|".join(
                     (
@@ -296,10 +338,7 @@ class ResearchRuntimeRepository:
                         str(normalized["lifecycle"]),
                     )
                 )
-                event_id = (
-                    "rtool-"
-                    f"{hashlib.sha256(event_seed.encode()).hexdigest()[:24]}"
-                )
+                event_id = f"rtool-{hashlib.sha256(event_seed.encode()).hexdigest()[:24]}"
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO research_tool_events(
@@ -310,17 +349,19 @@ class ResearchRuntimeRepository:
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        event_id, run_id, step_id,
-                        str(normalized.get("event_type") or "unknown"), normalized.get("source_url"),
-                        normalized.get("canonical_url"), normalized.get("redirect_url"),
-                        normalized["observed_at"], normalized.get("content_hash"),
+                        event_id,
+                        run_id,
+                        step_id,
+                        str(normalized.get("event_type") or "unknown"),
+                        normalized.get("source_url"),
+                        normalized.get("canonical_url"),
+                        normalized.get("redirect_url"),
+                        normalized["observed_at"],
+                        normalized.get("content_hash"),
                         normalized.get("http_status"),
-                        (
-                            _json(normalized["usage"])
-                            if normalized.get("usage")
-                            else None
-                        ),
-                        _json(normalized), now,
+                        (_json(normalized["usage"]) if normalized.get("usage") else None),
+                        _json(normalized),
+                        now,
                         normalized.get("raw_event_type"),
                         normalized.get("lifecycle"),
                         normalized.get("item_id"),
@@ -367,7 +408,9 @@ class ResearchRuntimeRepository:
                 json.loads(run_row["usage_json"] or "{}"),
                 usage,
             )
-            cost = _provided_cost(merged_usage)
+            cost = _provided_cost(merged_usage) or (
+                json.loads(run_row["cost_json"] or "{}") or None
+            )
             domains = set(json.loads(run_row["source_domains_json"] or "[]"))
             domains.update(
                 self.policy.domain(str(item.get("canonical_url") or ""))
@@ -403,11 +446,7 @@ class ResearchRuntimeRepository:
                 """,
                 (now,),
             ).fetchone()
-            existing_telemetry = (
-                json.loads(step_row["telemetry_json"] or "[]")
-                if step_row
-                else []
-            )
+            existing_telemetry = json.loads(step_row["telemetry_json"] or "[]") if step_row else []
             conn.execute(
                 "UPDATE research_run_steps SET telemetry_json=? WHERE step_id=?",
                 (
@@ -422,9 +461,7 @@ class ResearchRuntimeRepository:
             "daily_search_count": int(daily["searches"] or 0),
             "daily_opened_source_count": int(daily["opened"] or 0),
             "raw_event_count": int(counts["raw_events"] or 0),
-            "normalized_action_count": int(
-                counts["normalized_actions"] or 0
-            ),
+            "normalized_action_count": int(counts["normalized_actions"] or 0),
             "deduplicated_tool_call_count": int(counts["tool_calls"] or 0),
             "event_inserted": bool(inserted_events),
             "inserted_events": inserted_events,
@@ -483,8 +520,7 @@ class ResearchRuntimeRepository:
             "checkpointed": True,
             "next_step": str(checkpoint.get("next_step") or "")[:80],
             "completed_steps": [
-                str(value)[:80]
-                for value in checkpoint.get("completed_steps") or []
+                str(value)[:80] for value in checkpoint.get("completed_steps") or []
             ][-20:],
             "progress": checkpoint.get("progress") or {},
             "checkpointed_at": _now(),
@@ -556,6 +592,334 @@ class ResearchRuntimeRepository:
             output.append(item)
         return output
 
+    def persist_research_source(
+        self,
+        run_id: str,
+        source: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _now()
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO research_sources(
+                  source_id,run_id,requested_url,final_url,canonical_url,source_domain,
+                  source_tier,publisher,title,fetch_status,verification_status,
+                  rejection_reason,http_status,content_type,retrieved_at,content_sha256,
+                  content_bytes,content_text,redirect_chain_json,duplicate_of_source_id,
+                  acquisition_backend,fetch_duration_ms,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                  final_url=excluded.final_url,
+                  canonical_url=excluded.canonical_url,
+                  source_domain=excluded.source_domain,
+                  source_tier=excluded.source_tier,
+                  publisher=excluded.publisher,
+                  title=excluded.title,
+                  fetch_status=excluded.fetch_status,
+                  rejection_reason=excluded.rejection_reason,
+                  http_status=excluded.http_status,
+                  content_type=excluded.content_type,
+                  retrieved_at=excluded.retrieved_at,
+                  content_sha256=excluded.content_sha256,
+                  content_bytes=excluded.content_bytes,
+                  content_text=excluded.content_text,
+                  redirect_chain_json=excluded.redirect_chain_json,
+                  duplicate_of_source_id=excluded.duplicate_of_source_id,
+                  acquisition_backend=excluded.acquisition_backend,
+                  fetch_duration_ms=excluded.fetch_duration_ms,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    source["source_id"],
+                    run_id,
+                    str(source.get("requested_url") or "")[:2048],
+                    str(source.get("final_url") or "")[:2048] or None,
+                    str(source.get("canonical_url") or "")[:2048] or None,
+                    str(source.get("source_domain") or "")[:255],
+                    source.get("source_tier"),
+                    str(source.get("publisher") or "")[:200] or None,
+                    str(source.get("title") or "")[:500] or None,
+                    str(source.get("fetch_status") or "REJECTED")[:40],
+                    str(source.get("verification_status") or "UNVERIFIED")[:40],
+                    str(source.get("rejection_reason") or "")[:300] or None,
+                    source.get("http_status"),
+                    str(source.get("content_type") or "")[:120] or None,
+                    str(source.get("retrieved_at") or now)[:80],
+                    str(source.get("content_sha256") or "")[:128] or None,
+                    int(source.get("content_bytes") or 0),
+                    str(source.get("content_text") or "")[
+                        : self.settings.research_gateway_max_text_chars
+                    ]
+                    or None,
+                    _json(list(source.get("redirect_chain") or [])[:10]),
+                    str(source.get("duplicate_of_source_id") or "")[:80] or None,
+                    str(source.get("acquisition_backend") or "service_http_gateway")[:120],
+                    int(source.get("fetch_duration_ms") or 0),
+                    now,
+                    now,
+                ),
+            )
+            domain = str(source.get("source_domain") or "")
+            if source.get("fetch_status") == "FETCHED" and domain:
+                run_row = conn.execute(
+                    "SELECT source_domains_json FROM research_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                domains = set(json.loads(run_row["source_domains_json"] or "[]"))
+                domains.add(domain)
+                conn.execute(
+                    """
+                    UPDATE research_runs
+                    SET source_domains_json=?,updated_at=?
+                    WHERE run_id=?
+                    """,
+                    (_json(sorted(domains)), now, run_id),
+                )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM research_sources WHERE source_id=?",
+                (source["source_id"],),
+            ).fetchone()
+        return self._research_source_row(row)
+
+    def research_sources(self, run_id: str) -> list[dict[str, Any]]:
+        with connect_sqlite(self.settings.database_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM research_sources
+                WHERE run_id=? ORDER BY created_at,source_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [self._research_source_row(row) for row in rows]
+
+    def research_source_for_url(
+        self,
+        run_id: str,
+        url: str,
+    ) -> dict[str, Any] | None:
+        canonical = _canonical_url(url)
+        if not canonical:
+            return None
+        with connect_sqlite(self.settings.database_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM research_sources
+                WHERE run_id=?
+                ORDER BY
+                  CASE WHEN verification_status='VERIFIED' THEN 0
+                       WHEN fetch_status='FETCHED' THEN 1 ELSE 2 END,
+                  created_at
+                """,
+                (run_id,),
+            ).fetchall()
+        for row in rows:
+            restored = self._research_source_row(row)
+            candidates = {
+                _canonical_url(str(restored.get(key) or ""))
+                for key in ("requested_url", "final_url", "canonical_url")
+            }
+            if canonical in candidates:
+                return restored
+        return None
+
+    def research_source_for_hash(
+        self,
+        run_id: str,
+        content_hash: str,
+    ) -> dict[str, Any] | None:
+        if not content_hash:
+            return None
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM research_sources
+                WHERE run_id=? AND content_sha256=? AND fetch_status='FETCHED'
+                ORDER BY created_at LIMIT 1
+                """,
+                (run_id, content_hash),
+            ).fetchone()
+        return self._research_source_row(row) if row else None
+
+    def record_evidence_verification(
+        self,
+        run_id: str,
+        verification: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _now()
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO research_evidence_verifications(
+                  verification_id,run_id,claim_ref,source_id,evidence_url,status,
+                  reason,match_method,match_score,evidence_anchor,
+                  evidence_token_count,matched_token_count,
+                  verification_duration_ms,created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id,claim_ref,evidence_url,evidence_anchor)
+                DO UPDATE SET
+                  source_id=excluded.source_id,
+                  status=excluded.status,
+                  reason=excluded.reason,
+                  match_method=excluded.match_method,
+                  match_score=excluded.match_score,
+                  evidence_token_count=excluded.evidence_token_count,
+                  matched_token_count=excluded.matched_token_count,
+                  verification_duration_ms=excluded.verification_duration_ms
+                """,
+                (
+                    verification["verification_id"],
+                    run_id,
+                    str(verification.get("claim_ref") or "")[:120],
+                    verification.get("source_id"),
+                    str(verification.get("evidence_url") or "")[:2048],
+                    str(verification.get("status") or "REJECTED")[:40],
+                    str(verification.get("reason") or "")[:300],
+                    str(verification.get("match_method") or "")[:80] or None,
+                    float(verification.get("match_score") or 0),
+                    str(verification.get("evidence_anchor") or "")[:1000],
+                    int(verification.get("evidence_token_count") or 0),
+                    int(verification.get("matched_token_count") or 0),
+                    int(verification.get("verification_duration_ms") or 0),
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT * FROM research_evidence_verifications
+                WHERE run_id=? AND claim_ref=? AND evidence_url=?
+                  AND evidence_anchor=?
+                """,
+                (
+                    run_id,
+                    str(verification.get("claim_ref") or "")[:120],
+                    str(verification.get("evidence_url") or "")[:2048],
+                    str(verification.get("evidence_anchor") or "")[:1000],
+                ),
+            ).fetchone()
+        return dict(row)
+
+    def mark_research_source_verified(
+        self,
+        source_id: str,
+        verification: dict[str, Any],
+    ) -> None:
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                UPDATE research_sources
+                SET verification_status='VERIFIED',updated_at=?
+                WHERE source_id=? AND fetch_status='FETCHED'
+                """,
+                (_now(), source_id),
+            )
+            conn.commit()
+
+    def record_backend_invocation(
+        self,
+        run_id: str,
+        invocation: Any,
+    ) -> dict[str, Any]:
+        usage = dict(invocation.usage or {})
+        total = int(usage.get("total_tokens") or 0)
+        if total <= 0:
+            total = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+        provided_cost = _provided_cost(usage)
+        cost = {"total_cost_usd": _cost_value(provided_cost)} if provided_cost else None
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO research_backend_invocations(
+                  invocation_id,run_id,backend,purpose,model,input_tokens,
+                  output_tokens,cached_tokens,reasoning_tokens,total_tokens,
+                  cost_json,duration_ms,output_checksum,output_json,created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    invocation.invocation_id,
+                    run_id,
+                    str(invocation.backend)[:120],
+                    str(invocation.purpose)[:120],
+                    str(invocation.model or "")[:120] or None,
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    int(usage.get("cached_tokens") or 0),
+                    int(usage.get("reasoning_tokens") or 0),
+                    total,
+                    _json(cost) if cost else None,
+                    int(invocation.duration_ms or 0),
+                    _checksum(invocation.payload),
+                    _json(invocation.payload),
+                    _now(),
+                ),
+            )
+            totals = conn.execute(
+                """
+                SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,
+                       COALESCE(SUM(output_tokens),0) AS output_tokens,
+                       COALESCE(SUM(cached_tokens),0) AS cached_tokens,
+                       COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
+                       COALESCE(SUM(total_tokens),0) AS total_tokens
+                FROM research_backend_invocations WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchone()
+            merged_usage = {key: int(totals[key] or 0) for key in totals.keys()}
+            cost_rows = conn.execute(
+                """
+                SELECT cost_json FROM research_backend_invocations
+                WHERE run_id=? AND cost_json IS NOT NULL
+                """,
+                (run_id,),
+            ).fetchall()
+            aggregate_cost = (
+                {
+                    "total_cost_usd": sum(
+                        _cost_value(json.loads(row["cost_json"] or "{}")) for row in cost_rows
+                    )
+                }
+                if cost_rows
+                else None
+            )
+            conn.execute(
+                """
+                UPDATE research_runs
+                SET usage_json=?,cost_json=?,updated_at=?
+                WHERE run_id=?
+                """,
+                (
+                    _json(merged_usage),
+                    _json(aggregate_cost) if aggregate_cost else None,
+                    _now(),
+                    run_id,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT * FROM research_backend_invocations
+                WHERE invocation_id=?
+                """,
+                (invocation.invocation_id,),
+            ).fetchone()
+        return self._backend_invocation_row(row)
+
+    def latest_backend_invocation(
+        self,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM research_backend_invocations
+                WHERE run_id=? ORDER BY created_at DESC LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        return self._backend_invocation_row(row) if row else None
+
     def persist_claims(
         self,
         run: dict[str, Any],
@@ -566,21 +930,23 @@ class ResearchRuntimeRepository:
         evidence_count = 0
         read_back_count = 0
         observed_sources = self.observed_sources(str(run["run_id"]))
+        acquired_sources = self.research_sources(str(run["run_id"]))
         current_run = self.get_run(str(run["run_id"])) or run
         source_domains: set[str] = set(current_run.get("source_domains") or [])
         source_domains.update(
-            self.policy.domain(
-                str(item.get("canonical_url") or item.get("source_url") or "")
-            )
+            self.policy.domain(str(item.get("canonical_url") or item.get("source_url") or ""))
             for item in observed_sources
-            if self.policy.rule_for(
-                str(item.get("canonical_url") or item.get("source_url") or "")
-            )
+            if self.policy.rule_for(str(item.get("canonical_url") or item.get("source_url") or ""))
             is not None
         )
         source_domains.discard("")
         for claim in claims:
-            restored, evidence_rows = self._persist_claim(run, claim, observed_sources)
+            restored, evidence_rows = self._persist_claim(
+                run,
+                claim,
+                observed_sources,
+                acquired_sources,
+            )
             evidence_count += len(evidence_rows)
             source_domains.update(row["source_domain"] for row in evidence_rows)
             if restored["validation_status"] == "accepted":
@@ -601,20 +967,24 @@ class ResearchRuntimeRepository:
         coverage_score = len(resolved_topics) / max(len(required_topics), 1)
         data_claim_count = sum(1 for item in accepted if not _is_not_applicable(item))
         status = (
-            "NO_DATA" if data_claim_count == 0
-            else "PARTIAL" if missing_topics
-            else "SUCCEEDED"
+            "NO_DATA" if data_claim_count == 0 else "PARTIAL" if missing_topics else "SUCCEEDED"
         )
         blocking_gaps = [f"missing_topic:{item}" for item in sorted(missing_topics)]
         now = _now()
         result_payload = {
-            "accepted_claims": accepted, "rejected_claims": rejected,
-            "accepted_count": len(accepted), "candidate_count": len(claims),
-            "persisted_count": len(accepted), "read_back_count": read_back_count,
-            "evidence_count": evidence_count, "source_domains": sorted(source_domains),
-            "required_topics": sorted(required_topics), "completed_topics": sorted(completed_topics),
+            "accepted_claims": accepted,
+            "rejected_claims": rejected,
+            "accepted_count": len(accepted),
+            "candidate_count": len(claims),
+            "persisted_count": len(accepted),
+            "read_back_count": read_back_count,
+            "evidence_count": evidence_count,
+            "source_domains": sorted(source_domains),
+            "required_topics": sorted(required_topics),
+            "completed_topics": sorted(completed_topics),
             "valid_not_applicable_topics": sorted(not_applicable_topics),
-            "missing_topics": sorted(missing_topics), "blocking_gaps": blocking_gaps,
+            "missing_topics": sorted(missing_topics),
+            "blocking_gaps": blocking_gaps,
             "coverage_score": coverage_score,
         }
         with connect_sqlite(self.settings.database_path) as conn:
@@ -625,11 +995,16 @@ class ResearchRuntimeRepository:
                 WHERE run_id=?
                 """,
                 (
-                    status, _json(result_payload),
-                    coverage_score, _json(sorted(source_domains)),
-                    _json(sorted(completed_topics)), _json(sorted(missing_topics)),
+                    status,
+                    _json(result_payload),
+                    coverage_score,
+                    _json(sorted(source_domains)),
+                    _json(sorted(completed_topics)),
+                    _json(sorted(missing_topics)),
                     _json([warning for item in rejected for warning in item.get("warnings") or []]),
-                    now, now, run["run_id"],
+                    now,
+                    now,
+                    run["run_id"],
                 ),
             )
             conn.execute(
@@ -641,16 +1016,28 @@ class ResearchRuntimeRepository:
             )
             conn.commit()
         return {
-            "status": status, **result_payload,
-            "results": [self._claim_result(item) for item in accepted if item["field_semantics"] in {
-                "forecast", "consensus", "previous", "outcome", "transcript_url",
-            }],
+            "status": status,
+            **result_payload,
+            "results": [
+                self._claim_result(item)
+                for item in accepted
+                if item["field_semantics"]
+                in {
+                    "forecast",
+                    "consensus",
+                    "previous",
+                    "outcome",
+                    "transcript_url",
+                }
+            ],
         }
 
     def finish_run(self, run_id: str, status: str, result: dict[str, Any]) -> dict[str, Any]:
         now = _now()
         with connect_sqlite(self.settings.database_path) as conn:
-            existing = conn.execute("SELECT result_json FROM research_runs WHERE run_id=?", (run_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT result_json FROM research_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
             merged = {**(json.loads(existing["result_json"] or "{}") if existing else {}), **result}
             conn.execute(
                 "UPDATE research_runs SET status=?,result_json=?,completed_at=?,updated_at=? WHERE run_id=?",
@@ -697,7 +1084,8 @@ class ResearchRuntimeRepository:
     def evidence_for_claim(self, claim_id: str) -> list[dict[str, Any]]:
         with connect_sqlite(self.settings.database_path) as conn:
             rows = conn.execute(
-                "SELECT * FROM research_evidence WHERE claim_id=? ORDER BY source_tier,source_domain", (claim_id,)
+                "SELECT * FROM research_evidence WHERE claim_id=? ORDER BY source_tier,source_domain",
+                (claim_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -706,11 +1094,19 @@ class ResearchRuntimeRepository:
         run: dict[str, Any],
         claim: dict[str, Any],
         observed_sources: list[dict[str, Any]],
+        acquired_sources: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         now = _now()
-        semantics = str(claim.get("field_semantics") or claim.get("field") or "exploratory_context").lower()
+        semantics = str(
+            claim.get("field_semantics") or claim.get("field") or "exploratory_context"
+        ).lower()
         evidence_input = [item for item in claim.get("evidence") or [] if isinstance(item, dict)]
-        evidence_rows, warnings = self._validated_evidence(semantics, evidence_input, observed_sources)
+        evidence_rows, warnings = self._validated_evidence(
+            semantics,
+            evidence_input,
+            observed_sources,
+            acquired_sources,
+        )
         semantic_policy = self.policy.semantic_policy(semantics)
         groups = {row["independent_source_group"] for row in evidence_rows}
         required = int(semantic_policy.get("required_confirmations") or 1)
@@ -729,7 +1125,9 @@ class ResearchRuntimeRepository:
         claim_payload = {**claim, "field_semantics": semantics, "warnings": sorted(set(warnings))}
         checksum = _checksum(claim_payload)
         claim_seed = f"{run['run_id']}|{checksum}"
-        claim_id = str(claim.get("claim_id") or f"claim-{hashlib.sha256(claim_seed.encode()).hexdigest()[:24]}")
+        claim_id = str(
+            claim.get("claim_id") or f"claim-{hashlib.sha256(claim_seed.encode()).hexdigest()[:24]}"
+        )
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute(
                 """
@@ -740,20 +1138,38 @@ class ResearchRuntimeRepository:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    claim_id, run["run_id"], str(claim.get("topic") or semantics), semantics,
-                    _json(claim.get("value")), claim.get("metric_id"), claim.get("period"),
-                    claim.get("frequency"), claim.get("unit"), claim.get("event_key") or run.get("event_key"),
-                    claim.get("symbol") or run.get("symbol"), claim.get("valid_from"), claim.get("valid_until"),
-                    claim.get("published_at"), claim.get("retrieved_at") or now,
+                    claim_id,
+                    run["run_id"],
+                    str(claim.get("topic") or semantics),
+                    semantics,
+                    _json(claim.get("value")),
+                    claim.get("metric_id"),
+                    claim.get("period"),
+                    claim.get("frequency"),
+                    claim.get("unit"),
+                    claim.get("event_key") or run.get("event_key"),
+                    claim.get("symbol") or run.get("symbol"),
+                    claim.get("valid_from"),
+                    claim.get("valid_until"),
+                    claim.get("published_at"),
+                    claim.get("retrieved_at") or now,
                     min(
                         float(claim.get("confidence") or 0),
                         float(semantic_policy.get("max_reliability") or 1.0),
-                    ), validation, _json(sorted(set(warnings))),
-                    run["policy_version"], run["prompt_version"], _json(claim_payload), checksum, now,
+                    ),
+                    validation,
+                    _json(sorted(set(warnings))),
+                    run["policy_version"],
+                    run["prompt_version"],
+                    _json(claim_payload),
+                    checksum,
+                    now,
                 ),
             )
             for evidence in evidence_rows:
-                evidence_seed = f"{claim_id}|{evidence['canonical_url']}|{evidence['content_checksum']}"
+                evidence_seed = (
+                    f"{claim_id}|{evidence['canonical_url']}|{evidence['content_checksum']}"
+                )
                 evidence_id = f"evidence-{hashlib.sha256(evidence_seed.encode()).hexdigest()[:24]}"
                 conn.execute(
                     """
@@ -761,22 +1177,41 @@ class ResearchRuntimeRepository:
                       evidence_id,claim_id,query_text,source_url,canonical_url,publisher,source_domain,
                       source_tier,evidence_text,published_at,retrieved_at,redirect_url,source_status,
                       independent_source_group,content_checksum,policy_version,created_at,
-                      source_content_hash,tool_event_id
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      source_content_hash,tool_event_id,source_id,verification_id,
+                      verification_method,verification_reason,verification_score
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        evidence_id, claim_id, evidence.get("query"), evidence["source_url"],
-                        evidence["canonical_url"], evidence.get("publisher"), evidence["source_domain"],
-                        evidence["source_tier"], evidence["evidence_text"], evidence.get("published_at"),
-                        evidence["retrieved_at"], evidence.get("redirect_url"), evidence.get("source_status"),
-                        evidence["independent_source_group"], evidence["content_checksum"],
-                        run["policy_version"], now,
+                        evidence_id,
+                        claim_id,
+                        evidence.get("query"),
+                        evidence["source_url"],
+                        evidence["canonical_url"],
+                        evidence.get("publisher"),
+                        evidence["source_domain"],
+                        evidence["source_tier"],
+                        evidence["evidence_text"],
+                        evidence.get("published_at"),
+                        evidence["retrieved_at"],
+                        evidence.get("redirect_url"),
+                        evidence.get("source_status"),
+                        evidence["independent_source_group"],
+                        evidence["content_checksum"],
+                        run["policy_version"],
+                        now,
                         evidence.get("source_content_hash"),
                         evidence.get("tool_event_id"),
+                        evidence.get("source_id"),
+                        evidence.get("verification_id"),
+                        evidence.get("verification_method"),
+                        evidence.get("verification_reason"),
+                        evidence.get("verification_score"),
                     ),
                 )
             conn.commit()
-            row = conn.execute("SELECT * FROM research_claims WHERE claim_id=?", (claim_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM research_claims WHERE claim_id=?", (claim_id,)
+            ).fetchone()
         restored = dict(row)
         restored["value"] = json.loads(restored.pop("value_json") or "null")
         restored["warnings"] = json.loads(restored.pop("warnings_json") or "[]")
@@ -784,8 +1219,11 @@ class ResearchRuntimeRepository:
         logger.info(
             "research_claim_policy_validated",
             extra={
-                "run_id": run["run_id"], "claim_id": claim_id, "field_semantics": semantics,
-                "validation_status": validation, "evidence_count": len(evidence_rows),
+                "run_id": run["run_id"],
+                "claim_id": claim_id,
+                "field_semantics": semantics,
+                "validation_status": validation,
+                "evidence_count": len(evidence_rows),
             },
         )
         return restored, evidence_rows
@@ -795,6 +1233,7 @@ class ResearchRuntimeRepository:
         semantics: str,
         items: list[dict[str, Any]],
         observed_sources: list[dict[str, Any]],
+        acquired_sources: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[str]]:
         rows: list[dict[str, Any]] = []
         warnings: list[str] = []
@@ -815,14 +1254,41 @@ class ResearchRuntimeRepository:
                 warnings.append("source_tier_not_allowed_for_semantics")
                 continue
             domain = self.policy.domain(url)
+            service_verification = (
+                item.get("_service_verification")
+                if isinstance(item.get("_service_verification"), dict)
+                else {}
+            )
+            acquired = _matching_acquired_source(
+                url,
+                acquired_sources,
+                source_id=service_verification.get("source_id"),
+            )
             observation = _matching_observation(url, observed_sources)
-            if observation is None:
-                warnings.append("source_not_observed_or_opened")
-                continue
-            observed_payload = observation.get("payload") or {}
-            if not observation.get("content_hash") and observed_payload.get("evidence_text_verified") is not True:
-                warnings.append("observed_source_content_not_verified")
-                continue
+            if service_verification:
+                if service_verification.get("accepted") is not True:
+                    warnings.append(
+                        str(service_verification.get("reason") or "evidence_verification_rejected")
+                    )
+                    continue
+                if (
+                    acquired is None
+                    or acquired.get("fetch_status") != "FETCHED"
+                    or not acquired.get("content_sha256")
+                ):
+                    warnings.append("verified_source_acquisition_missing")
+                    continue
+            else:
+                if observation is None:
+                    warnings.append("source_not_observed_or_opened")
+                    continue
+                observed_payload = observation.get("payload") or {}
+                if (
+                    not observation.get("content_hash")
+                    and observed_payload.get("evidence_text_verified") is not True
+                ):
+                    warnings.append("observed_source_content_not_verified")
+                    continue
             content_checksum = hashlib.sha256(evidence_text.lower().encode("utf-8")).hexdigest()
             key = (url, content_checksum)
             if key in seen:
@@ -838,16 +1304,39 @@ class ResearchRuntimeRepository:
             if published and ttl_minutes and published < now - timedelta(minutes=ttl_minutes):
                 warnings.append("stale_evidence")
                 continue
-            rows.append({
-                "query": item.get("query"), "source_url": str(item.get("source_url") or url),
-                "canonical_url": url, "publisher": rule.get("publisher") or item.get("publisher"),
-                "source_domain": domain, "source_tier": tier, "evidence_text": evidence_text,
-                "published_at": item.get("published_at"), "retrieved_at": item.get("retrieved_at") or _now(),
-                "redirect_url": observation.get("redirect_url"), "source_status": "VERIFIED",
-                "independent_source_group": f"domain:{domain}", "content_checksum": content_checksum,
-                "source_content_hash": observation.get("content_hash"),
-                "tool_event_id": observation.get("event_id"),
-            })
+            rows.append(
+                {
+                    "query": item.get("query"),
+                    "source_url": str(item.get("source_url") or url),
+                    "canonical_url": url,
+                    "publisher": rule.get("publisher") or item.get("publisher"),
+                    "source_domain": domain,
+                    "source_tier": tier,
+                    "evidence_text": evidence_text,
+                    "published_at": item.get("published_at"),
+                    "retrieved_at": item.get("retrieved_at") or _now(),
+                    "redirect_url": (
+                        (acquired or {}).get("final_url")
+                        if acquired
+                        and (acquired or {}).get("final_url")
+                        != (acquired or {}).get("requested_url")
+                        else (observation or {}).get("redirect_url")
+                    ),
+                    "source_status": "VERIFIED",
+                    "independent_source_group": f"domain:{domain}",
+                    "content_checksum": content_checksum,
+                    "source_content_hash": (
+                        (acquired or {}).get("content_sha256")
+                        or (observation or {}).get("content_hash")
+                    ),
+                    "tool_event_id": (observation or {}).get("event_id"),
+                    "source_id": (acquired or {}).get("source_id"),
+                    "verification_id": service_verification.get("verification_id"),
+                    "verification_method": service_verification.get("match_method"),
+                    "verification_reason": service_verification.get("reason"),
+                    "verification_score": service_verification.get("match_score"),
+                }
+            )
             logger.info(
                 "research_source_opened_and_verified",
                 extra={"source_domain": domain, "source_tier": tier, "field_semantics": semantics},
@@ -863,49 +1352,100 @@ class ResearchRuntimeRepository:
     def _project_and_read_back(self, claim: dict[str, Any], evidence: list[dict[str, Any]]) -> bool:
         primary = min(evidence, key=lambda item: item["source_tier"])
         fact_key = f"research:{claim['claim_id']}"
-        self.facts.upsert_fact({
-            "fact_key": fact_key, "fact_type": "agentic_research_claim",
-            "symbol": claim.get("symbol") or "MNQ", "category": claim.get("topic"),
-            "event_name": claim.get("field_semantics"), "period": claim.get("period"),
-            "value": _json(claim.get("value")), "unit": claim.get("unit"),
-            "source": primary.get("publisher"), "source_url": primary["canonical_url"],
-            "provider_type": "AI_RESEARCHER_CODEX_CLI", "reliability": 0.0,
-            "confidence": claim.get("confidence") or 0, "retrieved_at": claim.get("retrieved_at"),
-            "valid_from": claim.get("valid_from"), "valid_until": claim.get("valid_until"),
-            "status": "active", "raw_payload_json": claim.get("payload"),
-            "warnings_json": claim.get("warnings"), "policy_version": claim.get("policy_version"),
-            "source_tier": primary["source_tier"], "source_classification": _classification(primary["source_tier"]),
-            "canonical_url": primary["canonical_url"], "canonical_event_key": claim.get("event_key"),
-        })
+        self.facts.upsert_fact(
+            {
+                "fact_key": fact_key,
+                "fact_type": "agentic_research_claim",
+                "symbol": claim.get("symbol") or "MNQ",
+                "category": claim.get("topic"),
+                "event_name": claim.get("field_semantics"),
+                "period": claim.get("period"),
+                "value": _json(claim.get("value")),
+                "unit": claim.get("unit"),
+                "source": primary.get("publisher"),
+                "source_url": primary["canonical_url"],
+                "provider_type": "AI_RESEARCHER_CODEX_CLI",
+                "reliability": 0.0,
+                "confidence": claim.get("confidence") or 0,
+                "retrieved_at": claim.get("retrieved_at"),
+                "valid_from": claim.get("valid_from"),
+                "valid_until": claim.get("valid_until"),
+                "status": "active",
+                "raw_payload_json": claim.get("payload"),
+                "warnings_json": claim.get("warnings"),
+                "policy_version": claim.get("policy_version"),
+                "source_tier": primary["source_tier"],
+                "source_classification": _classification(primary["source_tier"]),
+                "canonical_url": primary["canonical_url"],
+                "canonical_event_key": claim.get("event_key"),
+            }
+        )
         return self.facts.get_fact(fact_key) is not None
 
     def _claim_result(self, claim: dict[str, Any]) -> dict[str, Any]:
         evidence = self.evidence_for_claim(claim["claim_id"])
         primary = min(evidence, key=lambda item: item["source_tier"])
-        independent_domains = sorted({
-            min(item["source_domain"] for item in evidence if item["independent_source_group"] == group)
-            for group in {item["independent_source_group"] for item in evidence}
-        })
+        independent_domains = sorted(
+            {
+                min(
+                    item["source_domain"]
+                    for item in evidence
+                    if item["independent_source_group"] == group
+                )
+                for group in {item["independent_source_group"] for item in evidence}
+            }
+        )
         return {
-            "field": claim["field_semantics"], "field_semantics": claim["field_semantics"],
-            "value": claim["value"], "metric_id": claim.get("metric_id"), "period": claim.get("period"),
-            "frequency": claim.get("frequency"), "unit": claim.get("unit"),
-            "source": primary.get("publisher"), "publisher": primary.get("publisher"),
-            "source_url": primary["canonical_url"], "canonical_url": primary["canonical_url"],
-            "evidence_text": primary["evidence_text"], "published_at": primary.get("published_at"),
-            "retrieved_at": primary["retrieved_at"], "confidence": claim.get("confidence") or 0,
+            "field": claim["field_semantics"],
+            "field_semantics": claim["field_semantics"],
+            "value": claim["value"],
+            "metric_id": claim.get("metric_id"),
+            "period": claim.get("period"),
+            "frequency": claim.get("frequency"),
+            "unit": claim.get("unit"),
+            "source": primary.get("publisher"),
+            "publisher": primary.get("publisher"),
+            "source_url": primary["canonical_url"],
+            "canonical_url": primary["canonical_url"],
+            "evidence_text": primary["evidence_text"],
+            "published_at": primary.get("published_at"),
+            "retrieved_at": primary["retrieved_at"],
+            "confidence": claim.get("confidence") or 0,
             "reliability": 0.0,
             "verified_independent_domains": independent_domains,
         }
 
     @staticmethod
+    def _research_source_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["redirect_chain"] = json.loads(data.pop("redirect_chain_json") or "[]")
+        return data
+
+    @staticmethod
+    def _backend_invocation_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        data["cost"] = json.loads(data.pop("cost_json") or "null")
+        data["output"] = json.loads(data.pop("output_json") or "{}")
+        return data
+
+    @staticmethod
     def _run_row(row: Any) -> dict[str, Any]:
         data = dict(row)
         for key in (
-            "request_json", "result_json", "required_topics_json", "completed_topics_json",
-            "missing_topics_json", "blocking_gaps_json", "non_blocking_gaps_json",
-            "source_domains_json", "warnings_json", "valid_not_applicable_topics_json",
-            "usage_json", "cost_json", "metrics_json", "checkpoint_json",
+            "request_json",
+            "result_json",
+            "required_topics_json",
+            "completed_topics_json",
+            "missing_topics_json",
+            "blocking_gaps_json",
+            "non_blocking_gaps_json",
+            "source_domains_json",
+            "warnings_json",
+            "valid_not_applicable_topics_json",
+            "usage_json",
+            "cost_json",
+            "metrics_json",
+            "checkpoint_json",
             "threshold_warnings_json",
         ):
             data[key.removesuffix("_json")] = json.loads(
@@ -973,8 +1513,7 @@ def _event_envelope(
             "search"
             if event.get("event_type") == "search"
             else "open_source"
-            if event.get("event_type")
-            in {"open_source", "server_source_verified"}
+            if event.get("event_type") in {"open_source", "server_source_verified"}
             else "non_operational"
         )
     )
@@ -988,19 +1527,12 @@ def _event_envelope(
     fingerprint = str(
         event.get("tool_action_fingerprint")
         or action_fingerprint(
-            item_id=(
-                str(event["item_id"]) if event.get("item_id") else None
-            ),
+            item_id=(str(event["item_id"]) if event.get("item_id") else None),
             item_type=item_type,
             phase=phase,
             semantic_action=semantic_action,
             query=str(event.get("query") or "") or None,
-            source_url=str(
-                event.get("canonical_url")
-                or event.get("source_url")
-                or ""
-            )
-            or None,
+            source_url=str(event.get("canonical_url") or event.get("source_url") or "") or None,
         )
     )
     operational = bool(
@@ -1010,19 +1542,24 @@ def _event_envelope(
         or event.get("source_url")
     )
     return {
-        "raw_event_type": str(
-            event.get("raw_event_type")
-            or f"legacy.{lifecycle}"
-        )[:120],
+        "raw_event_type": str(event.get("raw_event_type") or f"legacy.{lifecycle}")[:120],
+        "raw_event_digest": str(event.get("raw_event_digest") or "")[:64] or None,
+        "raw_shape": {
+            "event_keys": [
+                str(value)[:80] for value in (event.get("raw_shape") or {}).get("event_keys", [])
+            ][:40],
+            "item_keys": [
+                str(value)[:80] for value in (event.get("raw_shape") or {}).get("item_keys", [])
+            ][:40],
+        },
+        "provider_payload": event.get("provider_payload") or {},
         "lifecycle": lifecycle[:40],
         "item_id": str(event.get("item_id") or "")[:200] or None,
         "item_type": item_type[:120],
         "phase": str(event.get("phase") or phase)[:80],
         "run_id": run_id,
         "job_id": job_id,
-        "provider_tool_type": str(
-            event.get("provider_tool_type") or item_type
-        )[:120],
+        "provider_tool_type": str(event.get("provider_tool_type") or item_type)[:120],
         "semantic_action": semantic_action[:80],
         "event_type": (
             "search"
@@ -1034,9 +1571,7 @@ def _event_envelope(
         "observed_at": str(event.get("observed_at") or observed_at)[:80],
         "query": str(event.get("query") or "")[:1000] or None,
         "source_url": str(event.get("source_url") or "")[:2048] or None,
-        "canonical_url": str(
-            event.get("canonical_url") or event.get("source_url") or ""
-        )[:2048]
+        "canonical_url": str(event.get("canonical_url") or event.get("source_url") or "")[:2048]
         or None,
         "redirect_url": str(event.get("redirect_url") or "")[:2048] or None,
         "tool_action_fingerprint": fingerprint[:64],
@@ -1056,11 +1591,7 @@ def _event_envelope(
         "counts_usage": bool(
             event.get("counts_usage")
             if event.get("counts_usage") is not None
-            else (
-                operational
-                and lifecycle == "completed"
-                and semantic_action != "non_operational"
-            )
+            else (operational and lifecycle == "completed" and semantic_action != "non_operational")
         ),
         "discovered_urls": [
             str(value)[:2048]
@@ -1106,6 +1637,13 @@ def _provided_cost(usage: dict[str, Any]) -> dict[str, float] | None:
     return provided or None
 
 
+def _cost_value(cost: dict[str, Any]) -> float:
+    for key in ("total_cost_usd", "cost_usd", "cost"):
+        if cost.get(key) is not None:
+            return max(float(cost[key]), 0.0)
+    return 0.0
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1117,13 +1655,25 @@ def _checksum(value: Any) -> str:
 def _canonical_url(value: str) -> str:
     try:
         parts = urlsplit(value.strip())
-        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, ""))
     except ValueError:
         return ""
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path or "/",
+            parts.query,
+            "",
+        )
+    )
 
 
 def _classification(tier: int) -> str:
-    return {1: "OFFICIAL", 2: "PRIMARY_MARKET", 3: "FINANCIAL_MEDIA", 4: "CALENDAR_CONSENSUS"}.get(tier, "SECONDARY_CONTEXT")
+    return {1: "OFFICIAL", 2: "PRIMARY_MARKET", 3: "FINANCIAL_MEDIA", 4: "CALENDAR_CONSENSUS"}.get(
+        tier, "SECONDARY_CONTEXT"
+    )
 
 
 def _matching_observation(url: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1136,6 +1686,30 @@ def _matching_observation(url: str, observations: list[dict[str, Any]]) -> dict[
         }
         if canonical in candidates:
             return observation
+    return None
+
+
+def _matching_acquired_source(
+    url: str,
+    sources: list[dict[str, Any]],
+    *,
+    source_id: Any = None,
+) -> dict[str, Any] | None:
+    if source_id:
+        direct = next(
+            (source for source in sources if str(source.get("source_id") or "") == str(source_id)),
+            None,
+        )
+        if direct is not None:
+            return direct
+    canonical = _canonical_url(url)
+    for source in sources:
+        candidates = {
+            _canonical_url(str(source.get(key) or ""))
+            for key in ("requested_url", "final_url", "canonical_url")
+        }
+        if canonical and canonical in candidates:
+            return source
     return None
 
 

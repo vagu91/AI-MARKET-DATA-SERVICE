@@ -21,7 +21,7 @@ The worker is independent from the APScheduler switch. HTTP always returns witho
 
 ## Storage
 
-Migration 7 adds `ai_research_jobs`, `ai_research_job_attempts`, `market_context_snapshots`, and `event_value_candidates`, plus lineage/lifecycle columns on existing event, fact, and news tables. Migration 8 adds job generation/scope/snapshot linkage and the snapshot-job join table. Migration 9 adds semantic-actual columns plus capability reports, research runs/steps, atomic claims/evidence and scheduler decisions. Migration 10 adds persistent official-feed retry deadlines, observed tool events, evidence content hashes, server-computed topic completeness and usage/cost fields. Migration 11 adds redacted job/attempt/step diagnostics and `research_step_attempts`, preserving every retry of a failed step. All migrations are additive and preserve schema-6/schema-8/schema-9/schema-10 data.
+Migration 7 adds `ai_research_jobs`, `ai_research_job_attempts`, `market_context_snapshots`, and `event_value_candidates`, plus lineage/lifecycle columns on existing event, fact, and news tables. Migration 8 adds job generation/scope/snapshot linkage and the snapshot-job join table. Migration 9 adds semantic-actual columns plus capability reports, research runs/steps, atomic claims/evidence and scheduler decisions. Migration 10 adds persistent official-feed retry deadlines, observed tool events, evidence content hashes, server-computed topic completeness and usage/cost fields. Migration 11 adds redacted job/attempt/step diagnostics and `research_step_attempts`, preserving every retry of a failed step. Migration 12 adds lifecycle-aware tool telemetry, metrics and checkpoints. Migration 13 adds acquired sources, evidence-verification decisions and backend invocation usage. All migrations are additive and preserve every supported earlier schema.
 
 Candidate actuals retain `event_metric_id`, `source_series_id`, transformation, SA/NSA variant, frequency, unit, reference period, release vintage, observation lineage and official canonical URL. Raw macro levels are never promoted directly to event actuals. Surprise is calculated only when metric, period, frequency, unit and seasonal adjustment match the forecast/consensus baseline; incompatibility is persisted as a structured warning and remains fail-closed for full analysis.
 
@@ -61,6 +61,38 @@ events remain observable but do not increment counters. A URL-only `web_search`
 is an `open_source` action during `OPEN_SOURCE` and an open/verify action during
 `CROSS_CHECK`, rather than an economic search.
 
+The production backend contract now performs one bounded agentic invocation per
+logical run. The backend may plan, search, propose HTTPS acquisition requests and
+return candidate claims with short evidence anchors, but it cannot assert source
+state or trust. The full database payload and prior responses are not replayed;
+the prompt contains only a bounded inventory and required context. The logical
+`PLAN -> SEARCH -> OPEN_SOURCE -> EXTRACT -> CROSS_CHECK -> VALIDATE` steps remain
+persisted. `OPEN_SOURCE`, evidence matching, confirmation grouping and final
+validation are service operations. The `ResearchBackend` contract is independent
+of the Codex CLI and can be implemented by a future OpenAI API backend without
+moving acquisition, policy or persistence into that backend.
+
+The Research Source Gateway accepts only policy-authorized HTTPS URLs. It rejects
+userinfo, non-standard ports, traversal and DNS targets that are private,
+loopback, link-local, reserved, multicast or otherwise non-global. Every redirect
+is revalidated. Time, redirect count, response bytes, extracted text and sources
+per run have independent emergency bounds. HTML, plain text, JSON and PDF are
+normalized; scripts and other hidden HTML are excluded. Each attempt, including
+HTTP failures, unsupported content, dynamic pages without usable static text and
+timeouts, is persisted with original/final/canonical URL, content type, status,
+timestamp, SHA-256 where available and a bounded rejection reason. URL and
+content duplicates retain lineage.
+
+Evidence verification uses Unicode NFKC normalization, whitespace and punctuation
+normalization, exact normalized matching when available, then a strict bounded
+token-window match with an explicit threshold. Every acceptance or rejection
+persists its anchor, method, score and reason. Model-declared evidence never
+bypasses this decision. Confirmation counts come from the semantic policy:
+official Tier-1 outcomes can require one verified source, while news and
+secondary-source semantics retain their configured independent confirmation
+count. Identical syndicated content is one group. Numeric official actuals remain
+exclusive to deterministic official resolvers.
+
 `AI_MARKET_RESEARCH_BUDGET_MODE=observe` is the initial default. Per-run and daily
 search/open values are telemetry thresholds: overshoot records a compact warning
 and execution continues while it produces new sources, claims or phase progress.
@@ -88,11 +120,13 @@ verification, or valid cached lineage can establish them. Claims referencing
 unobserved or unverified evidence are rejected. Source domains are derived from
 policy-valid observed canonical URLs.
 
-Per-run metrics include raw/normalized/deduplicated action counts, token fields,
-searches/opens/new sources, extracted/accepted/rejected claims, phase durations,
-tokens and cost per accepted claim, searches per new source, warnings, loops and
-continuations. Monetary cost is `cost_unavailable` unless the runtime actually
-provides it.
+Per-run metrics include raw/normalized/deduplicated action counts, model-declared,
+observed, discovered, fetched, verified and rejected sources, rejection reasons,
+token fields per unique backend invocation, extracted/accepted/rejected claims,
+AI/fetch/verification/persistence durations, tokens and cost per accepted claim,
+searches per new source, warnings, loops and continuations. Replayed invocation
+IDs are idempotent, and cached/reasoning token fields remain separate. Monetary
+cost is `cost_unavailable` unless the runtime actually provides it.
 
 | Failure category | Retry |
 | --- | --- |

@@ -161,18 +161,8 @@ def test_observe_daily_threshold_does_not_zero_per_run_capacity(
     assert budget["daily_opened_sources_remaining"] == 0
     budget["remaining_searches"] = 0
     budget["remaining_opened_sources"] = 0
-    assert (
-        step_output_schema("SEARCH", budget)["properties"]["searches"][
-            "maxItems"
-        ]
-        == 2
-    )
-    assert (
-        step_output_schema("OPEN_SOURCE", budget)["properties"]["sources"][
-            "maxItems"
-        ]
-        == 2
-    )
+    assert step_output_schema("SEARCH", budget)["properties"]["searches"]["maxItems"] == 2
+    assert step_output_schema("OPEN_SOURCE", budget)["properties"]["sources"]["maxItems"] == 2
 
 
 def test_raw_fixture_normalizes_lifecycle_and_empty_events() -> None:
@@ -195,9 +185,7 @@ def test_raw_fixture_normalizes_lifecycle_and_empty_events() -> None:
         "completed",
     ]
     assert envelopes[0]["item_id"] == "search-1"
-    assert envelopes[0]["tool_action_fingerprint"] == envelopes[1][
-        "tool_action_fingerprint"
-    ]
+    assert envelopes[0]["tool_action_fingerprint"] == envelopes[1]["tool_action_fingerprint"]
     assert envelopes[1]["semantic_action"] == "search"
     assert envelopes[0]["counts_usage"] is False
     assert envelopes[1]["counts_usage"] is True
@@ -291,11 +279,7 @@ def test_phase_aware_url_classification_and_failed_action() -> None:
         )
     ]
 
-    terminal_open = [
-        item
-        for item in open_events
-        if item["lifecycle"] == "completed"
-    ]
+    terminal_open = [item for item in open_events if item["lifecycle"] == "completed"]
     assert [item["semantic_action"] for item in terminal_open] == [
         "open_source",
         "fetch",
@@ -382,9 +366,7 @@ def test_declared_sources_are_reconciled_and_claims_fail_closed(
                 "confidence": 0.8,
                 "evidence": [
                     {
-                        "source_url": (
-                            "https://www.bls.gov/news.release/cpi.nr0.htm"
-                        ),
+                        "source_url": ("https://www.bls.gov/news.release/cpi.nr0.htm"),
                         "canonical_url": None,
                         "publisher": "BLS",
                         "evidence_text": "Observed and verified CPI source.",
@@ -412,15 +394,11 @@ def test_declared_sources_are_reconciled_and_claims_fail_closed(
         ],
     )
     restored = repository.get_run(run["run_id"])
-    linked_evidence = repository.evidence_for_claim(
-        persisted["accepted_claims"][0]["claim_id"]
-    )
+    linked_evidence = repository.evidence_for_claim(persisted["accepted_claims"][0]["claim_id"])
 
     assert persisted["accepted_count"] == 1
     assert len(persisted["rejected_claims"]) == 1
-    assert "source_not_observed_or_opened" in persisted["rejected_claims"][0][
-        "warnings"
-    ]
+    assert "source_not_observed_or_opened" in persisted["rejected_claims"][0]["warnings"]
     assert restored["source_domains"] == ["bls.gov"]
     assert linked_evidence[0]["tool_event_id"].startswith("rtool-")
 
@@ -437,11 +415,7 @@ def _search_events(count: int, *, repeated: bool = False) -> list[dict[str, Any]
                         "id": f"search-{index}",
                         "type": "web_search",
                         "query": query,
-                        "urls": (
-                            []
-                            if repeated
-                            else [f"https://example.com/new-{index}"]
-                        ),
+                        "urls": ([] if repeated else [f"https://example.com/new-{index}"]),
                     },
                 },
                 step_name="SEARCH",
@@ -455,9 +429,7 @@ def test_observe_mode_exceeds_threshold_but_continues_with_metrics(
 ) -> None:
     cfg = settings(tmp_path, research_max_searches=2)
     job = enqueue(cfg, "observe-threshold")
-    executor = PhaseEventsExecutor(
-        events_by_step={"SEARCH": _search_events(4)}
-    )
+    executor = PhaseEventsExecutor(events_by_step={"SEARCH": _search_events(4)})
 
     result = AgenticResearchRuntime(
         cfg,
@@ -499,9 +471,7 @@ def test_enforce_mode_uses_deduplicated_terminal_actions(
     second = _search_events(1)
     second[0]["item_id"] = "second-action"
     second[0]["tool_action_fingerprint"] = "f" * 64
-    executor = PhaseEventsExecutor(
-        events_by_step={"SEARCH": [*lifecycle, *second]}
-    )
+    executor = PhaseEventsExecutor(events_by_step={"SEARCH": [*lifecycle, *second]})
 
     with pytest.raises(ResearchBudgetExceeded) as raised:
         AgenticResearchRuntime(cfg, verifier=NoopVerifier()).run(
@@ -527,9 +497,7 @@ def test_progress_loop_guard_stops_real_loop_but_allows_new_sources(
         research_loop_no_progress_action_threshold=5,
     )
     loop_job = enqueue(loop_cfg, "loop")
-    loop_executor = PhaseEventsExecutor(
-        events_by_step={"SEARCH": _search_events(3, repeated=True)}
-    )
+    loop_executor = PhaseEventsExecutor(events_by_step={"SEARCH": _search_events(3, repeated=True)})
     with pytest.raises(ResearchLoopDetected):
         AgenticResearchRuntime(loop_cfg, verifier=NoopVerifier()).run(
             loop_job,
@@ -553,9 +521,7 @@ def test_progress_loop_guard_stops_real_loop_but_allows_new_sources(
     ).run(
         progress_job,
         tmp_path / "progress-work",
-        PhaseEventsExecutor(
-            events_by_step={"SEARCH": _search_events(8)}
-        ),
+        PhaseEventsExecutor(events_by_step={"SEARCH": _search_events(8)}),
         30,
     )
     assert progress_result["status"] == "NO_DATA"
@@ -647,9 +613,7 @@ def test_worker_treats_checkpoint_as_continuation_not_failure(
     assert restored["status"] == "RETRY_SCHEDULED"
     assert restored["last_error"] is None
     assert restored["attempt_history"][0]["status"] == "CHECKPOINTED"
-    assert restored["attempt_history"][0]["retry_classification"] == (
-        "CONTINUATION"
-    )
+    assert restored["attempt_history"][0]["retry_classification"] == ("CONTINUATION")
     assert run["status"] == "RETRY_SCHEDULED"
     assert run["continuation_count"] == 1
 
@@ -663,9 +627,7 @@ def test_worker_closes_real_loop_with_explicit_terminal_status(
         research_loop_no_progress_action_threshold=5,
     )
     job = enqueue(cfg, "worker-loop")
-    executor = PhaseEventsExecutor(
-        events_by_step={"SEARCH": _search_events(3, repeated=True)}
-    )
+    executor = PhaseEventsExecutor(events_by_step={"SEARCH": _search_events(3, repeated=True)})
     worker = AIResearchWorker(
         cfg,
         executor=executor,
@@ -738,9 +700,7 @@ def test_migration_12_is_additive_from_schema_11(tmp_path: Path) -> None:
             """
         )
         for version, (name, sql) in enumerate(MIGRATIONS[:11], start=1):
-            for statement in [
-                value.strip() for value in sql.split(";") if value.strip()
-            ]:
+            for statement in [value.strip() for value in sql.split(";") if value.strip()]:
                 conn.execute(statement)
             conn.execute(
                 "INSERT INTO schema_migrations VALUES (?,?,?)",
@@ -764,22 +724,17 @@ def test_migration_12_is_additive_from_schema_11(tmp_path: Path) -> None:
     result = migrate_database(database)
     with connect_sqlite(database) as conn:
         event_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(research_tool_events)")
+            row["name"] for row in conn.execute("PRAGMA table_info(research_tool_events)")
         }
-        run_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(research_runs)")
-        }
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(research_runs)")}
         evidence_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(research_evidence)")
+            row["name"] for row in conn.execute("PRAGMA table_info(research_evidence)")
         }
         preserved = conn.execute(
             "SELECT job_id FROM ai_research_jobs WHERE job_id='job-v11'"
         ).fetchone()
 
-    assert result["schema_version"] == 12
+    assert result["schema_version"] == 13
     assert {
         "raw_event_type",
         "lifecycle",

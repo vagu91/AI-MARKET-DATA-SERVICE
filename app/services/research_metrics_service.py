@@ -87,6 +87,44 @@ class ResearchMetricsService:
                 """,
                 (run_id,),
             ).fetchone()[0]
+            source_stats = conn.execute(
+                """
+                SELECT COUNT(*) AS discovered,
+                       SUM(CASE WHEN fetch_status='FETCHED' THEN 1 ELSE 0 END)
+                         AS fetched,
+                       SUM(CASE WHEN verification_status='VERIFIED' THEN 1 ELSE 0 END)
+                         AS verified,
+                       SUM(CASE WHEN fetch_status='REJECTED' THEN 1 ELSE 0 END)
+                         AS rejected,
+                       COALESCE(SUM(fetch_duration_ms),0) AS fetch_duration_ms
+                FROM research_sources WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchone()
+            verification_stats = conn.execute(
+                """
+                SELECT status,reason,COUNT(*) AS count,
+                       COALESCE(SUM(verification_duration_ms),0) AS duration_ms
+                FROM research_evidence_verifications
+                WHERE run_id=? GROUP BY status,reason
+                ORDER BY status,reason
+                """,
+                (run_id,),
+            ).fetchall()
+            invocation_stats = conn.execute(
+                """
+                SELECT COUNT(*) AS invocation_count,
+                       GROUP_CONCAT(DISTINCT backend) AS backends,
+                       COALESCE(SUM(input_tokens),0) AS input_tokens,
+                       COALESCE(SUM(output_tokens),0) AS output_tokens,
+                       COALESCE(SUM(cached_tokens),0) AS cached_tokens,
+                       COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
+                       COALESCE(SUM(total_tokens),0) AS total_tokens,
+                       COALESCE(SUM(duration_ms),0) AS duration_ms
+                FROM research_backend_invocations WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchone()
         usage = json.loads(run["usage_json"] or "{}")
         cost = json.loads(run["cost_json"] or "{}")
         request = json.loads(run["request_json"] or "{}")
@@ -95,12 +133,15 @@ class ResearchMetricsService:
             int(claims["extracted"] or 0),
             _declared_claims(steps),
         )
-        token_total = sum(
-            int(usage.get(key) or 0)
-            for key in ("input_tokens", "output_tokens")
+        token_total = int(usage.get("total_tokens") or 0) or sum(
+            int(usage.get(key) or 0) for key in ("input_tokens", "output_tokens")
         )
         declared_sources = _declared_sources(steps)
         observed_sources = int(tool["new_sources"] or 0)
+        gateway_discovered = int(source_stats["discovered"] or 0)
+        gateway_fetched = int(source_stats["fetched"] or 0)
+        gateway_verified = int(source_stats["verified"] or 0)
+        gateway_rejected = int(source_stats["rejected"] or 0)
         metrics = {
             "budget_mode": (
                 (request.get("effective_budget") or {}).get("budget_mode")
@@ -120,52 +161,65 @@ class ResearchMetricsService:
                 "output_tokens": int(usage.get("output_tokens") or 0),
                 "cached_tokens": int(usage.get("cached_tokens") or 0),
                 "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
-                "total_tokens": int(
-                    usage.get("total_tokens") or token_total
-                ),
+                "total_tokens": int(usage.get("total_tokens") or token_total),
             },
             "cost": cost or None,
             "cost_status": "available" if cost else "cost_unavailable",
             "phase_duration_ms": {
-                str(step["step_name"]): int(step["duration_ms"] or 0)
-                for step in steps
+                str(step["step_name"]): int(step["duration_ms"] or 0) for step in steps
             },
-            "tokens_per_accepted_claim": (
-                token_total / accepted if accepted else None
-            ),
+            "duration_ms": {
+                "ai": int(invocation_stats["duration_ms"] or 0),
+                "fetch": int(source_stats["fetch_duration_ms"] or 0),
+                "verification": sum(int(row["duration_ms"] or 0) for row in verification_stats),
+                "persistence": sum(
+                    int(step["duration_ms"] or 0)
+                    for step in steps
+                    if str(step["step_name"]) in {"PERSIST", "READ_BACK", "MATERIALIZE"}
+                ),
+            },
+            "backend": {
+                "used": sorted(
+                    {value for value in str(invocation_stats["backends"] or "").split(",") if value}
+                ),
+                "invocations": int(invocation_stats["invocation_count"] or 0),
+            },
+            "tokens_per_accepted_claim": (token_total / accepted if accepted else None),
             "cost_per_accepted_claim": (
-                _cost_value(cost) / accepted
-                if cost and accepted
-                else None
+                _cost_value(cost) / accepted if cost and accepted else None
             ),
             "searches_per_new_source": (
-                int(tool["searches"] or 0) / observed_sources
-                if observed_sources
-                else None
+                int(tool["searches"] or 0) / observed_sources if observed_sources else None
             ),
-            "threshold_warnings": json.loads(
-                run["threshold_warnings_json"] or "[]"
-            ),
+            "threshold_warnings": json.loads(run["threshold_warnings_json"] or "[]"),
             "loop_detections": int(run["loop_detection_count"] or 0),
             "continuation_count": int(run["continuation_count"] or 0),
             "checkpoint": json.loads(run["checkpoint_json"] or "{}"),
             "progress": {
-                "completed_phases": sum(
-                    1 for step in steps if step["status"] == "COMPLETED"
-                ),
+                "completed_phases": sum(1 for step in steps if step["status"] == "COMPLETED"),
                 "recorded_phases": len(steps),
-                "latest_phase": (
-                    str(steps[-1]["step_name"]) if steps else None
-                ),
+                "latest_phase": (str(steps[-1]["step_name"]) if steps else None),
             },
             "sources": {
                 "model_declared": declared_sources,
                 "observed": observed_sources,
-                "verified": int(verified_sources or 0),
+                "discovered": gateway_discovered,
+                "fetched": gateway_fetched,
+                "verified": max(int(verified_sources or 0), gateway_verified),
+                "rejected": gateway_rejected,
                 "unverified": max(
-                    declared_sources - int(verified_sources or 0),
+                    gateway_discovered - gateway_verified,
                     0,
                 ),
+                "rejection_reasons": [
+                    {
+                        "status": str(row["status"]),
+                        "reason": str(row["reason"]),
+                        "count": int(row["count"] or 0),
+                    }
+                    for row in verification_stats
+                    if str(row["status"]) == "REJECTED"
+                ],
             },
         }
         if persist:
@@ -188,15 +242,15 @@ class ResearchMetricsService:
 
 def _declared_sources(steps: list[Any]) -> int:
     for step in steps:
-        if str(step["step_name"]) != "OPEN_SOURCE":
+        if str(step["step_name"]) not in {"SEARCH", "OPEN_SOURCE"}:
             continue
         try:
             output = json.loads(step["output_json"] or "{}")
         except json.JSONDecodeError:
-            return 0
-        return len(
-            [item for item in output.get("sources") or [] if isinstance(item, dict)]
-        )
+            continue
+        count = len([item for item in output.get("sources") or [] if isinstance(item, dict)])
+        if count:
+            return count
     return 0
 
 
@@ -208,9 +262,7 @@ def _declared_claims(steps: list[Any]) -> int:
             output = json.loads(step["output_json"] or "{}")
         except json.JSONDecodeError:
             return 0
-        return len(
-            [item for item in output.get("claims") or [] if isinstance(item, dict)]
-        )
+        return len([item for item in output.get("claims") or [] if isinstance(item, dict)])
     return 0
 
 
