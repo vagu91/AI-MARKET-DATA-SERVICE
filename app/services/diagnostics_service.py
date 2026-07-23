@@ -293,6 +293,7 @@ class DiagnosticsService:
             enriched,
             [investing_payload, xtb_payload],
             now=now,
+            temporal_validation=self.facts.temporal_validation,
         )
         for event in enriched:
             self.facts.upsert_economic_event(

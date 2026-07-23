@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,6 +51,15 @@ def migrate_database(path: Path) -> dict[str, object]:
             if "016_gap_aware_parallel_research_and_temporal_audit" in applied
             else 0
         )
+        temporal_reconciliation = (
+            _reconcile_temporal_quarantine(conn)
+            if "017_temporal_quarantine_runtime_reconciliation" in applied
+            else {
+                "scanned_count": 0,
+                "quarantined_count": 0,
+                "errors": [],
+            }
+        )
         reconciled_research_runs = _reconcile_research_run_lifecycle(conn)
         conn.commit()
     return {
@@ -58,6 +68,7 @@ def migrate_database(path: Path) -> dict[str, object]:
         "schema_version": len(MIGRATIONS),
         "legacy_event_enrichment_facts_migrated": legacy_event_enrichment_facts_migrated,
         "market_context_components_backfilled": market_context_components_backfilled,
+        "temporal_reconciliation": temporal_reconciliation,
         "reconciled_research_runs": reconciled_research_runs,
     }
 
@@ -139,6 +150,134 @@ def _component_valid_until(value: object) -> str | None:
         candidate = value.get("valid_until") or value.get("fresh_until")
         return str(candidate) if candidate else None
     return None
+
+
+def _reconcile_temporal_quarantine(conn: sqlite3.Connection) -> dict[str, object]:
+    from app.services.temporal_validation_service import (
+        QUARANTINED_STATUS,
+        TemporalPolicy,
+        quarantine_details,
+        quarantine_identity,
+    )
+
+    started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    policy = TemporalPolicy(clock=lambda: datetime.now(UTC))
+    rows = conn.execute(
+        "SELECT * FROM economic_events_history ORDER BY id"
+    ).fetchall()
+    quarantined_count = 0
+    errors: list[dict[str, str]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            raw = json.loads(str(row["raw_payload_json"] or "{}"))
+            if isinstance(raw, dict):
+                record = {**raw, **record}
+        except (TypeError, ValueError):
+            pass
+        try:
+            decision = policy.evaluate(record, domain="macro_calendar")
+            if decision.accepted:
+                continue
+            entity_key = str(row["event_key"])
+            reason = str(decision.reason_code or "TEMPORALLY_INVALID")
+            field = str(decision.timestamp_field or "unknown")
+            value = str(decision.timestamp_value or record.get(field) or "")
+            quarantine_id = quarantine_identity(
+                entity_table="economic_events_history",
+                entity_key=entity_key,
+                timestamp_field=field,
+                reason_code=reason,
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO temporal_quarantine(
+                  quarantine_id,entity_table,entity_key,domain,timestamp_field,
+                  timestamp_value,reason_code,detected_at,details_json
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(entity_table,entity_key,timestamp_field,reason_code)
+                DO NOTHING
+                """,
+                (
+                    quarantine_id,
+                    "economic_events_history",
+                    entity_key,
+                    "macro_calendar",
+                    field,
+                    value,
+                    reason,
+                    started_at,
+                    json.dumps(
+                        quarantine_details(record),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE economic_events_history
+                SET temporal_audit_status=?,
+                    temporal_status=?,
+                    status=?,
+                    temporal_invalid_reason=?
+                WHERE id=?
+                """,
+                (
+                    QUARANTINED_STATUS,
+                    QUARANTINED_STATUS,
+                    QUARANTINED_STATUS,
+                    reason,
+                    row["id"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE market_facts
+                SET temporal_audit_status=?,
+                    temporal_invalid_reason=?
+                WHERE canonical_event_key=?
+                """,
+                (
+                    QUARANTINED_STATUS,
+                    reason,
+                    row["canonical_event_key"],
+                ),
+            )
+            quarantined_count += int(cursor.rowcount or 0)
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            errors.append(
+                {
+                    "entity_key": str(row["event_key"]),
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:300],
+                }
+            )
+    completed_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    conn.execute(
+        """
+        INSERT INTO temporal_reconciliation_runs(
+          reconciliation_id,source_schema_version,scanned_count,
+          quarantined_count,errors_json,started_at,completed_at
+        ) VALUES (?,?,?,?,?,?,?)
+        """,
+        (
+            f"trr-{uuid.uuid4()}",
+            16,
+            len(rows),
+            quarantined_count,
+            json.dumps(errors, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            started_at,
+            completed_at,
+        ),
+    )
+    return {
+        "scanned_count": len(rows),
+        "quarantined_count": quarantined_count,
+        "errors": errors,
+    }
 
 
 def _migrate_legacy_cache_entries(conn: sqlite3.Connection) -> None:

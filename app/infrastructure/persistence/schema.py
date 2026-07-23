@@ -974,6 +974,23 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_exact_research
   ON market_context_snapshots(research_run_id,parent_run_id,revision DESC);
 """
 
+TEMPORAL_QUARANTINE_RUNTIME_SCHEMA = """
+CREATE TABLE IF NOT EXISTS temporal_reconciliation_runs (
+  reconciliation_id TEXT PRIMARY KEY,
+  source_schema_version INTEGER NOT NULL,
+  scanned_count INTEGER NOT NULL DEFAULT 0,
+  quarantined_count INTEGER NOT NULL DEFAULT 0,
+  errors_json TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_temporal_quarantine_domain_reason
+  ON temporal_quarantine(domain,reason_code,detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_economic_events_temporal_audit
+  ON economic_events_history(temporal_audit_status,temporal_status,release_at);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -992,4 +1009,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("014_research_semantic_lifecycle", RESEARCH_SEMANTIC_LIFECYCLE_SCHEMA),
     ("015_atomic_research_persistence_and_quarantine", ATOMIC_RESEARCH_PERSISTENCE_SCHEMA),
     ("016_gap_aware_parallel_research_and_temporal_audit", GAP_AWARE_PARALLEL_RESEARCH_SCHEMA),
+    ("017_temporal_quarantine_runtime_reconciliation", TEMPORAL_QUARANTINE_RUNTIME_SCHEMA),
 )

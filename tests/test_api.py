@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from datetime import UTC, datetime, timedelta
 
 from app.api.deps import get_event_service, get_event_window_service, get_macro_service, get_nasdaq_data_service
 from app.main import app
@@ -189,14 +190,20 @@ def test_events_and_market_context_include_enrichment(monkeypatch) -> None:
 
 
 def event_payload() -> dict:
+    release = datetime.now(UTC).replace(
+        hour=12,
+        minute=30,
+        second=0,
+        microsecond=0,
+    )
     return {
         "event_id": "evt-cpi",
         "name": "Consumer Price Index",
         "country": "US",
         "category": "CPI",
-        "date": "2099-07-14",
-        "time_utc": "2099-07-14T12:30:00+00:00",
-        "time_local": "2099-07-14T14:30:00+02:00",
+        "date": release.date().isoformat(),
+        "time_utc": release.isoformat(),
+        "time_local": (release + timedelta(hours=2)).isoformat(),
         "impact": "HIGH",
         "source": "BLS",
         "source_url": "https://bls.test",
@@ -212,7 +219,7 @@ def event_payload() -> dict:
             "source": "DailyFX Economic Calendar",
             "source_url": "https://dailyfx.test/calendar",
             "provider_type": "SCRAPER",
-            "retrieved_at": "2099-07-14T11:00:00+00:00",
+            "retrieved_at": (release - timedelta(hours=1)).isoformat(),
             "reliability": 0.56,
             "matched_by": "country_date_time_category_keywords",
             "warnings": [],

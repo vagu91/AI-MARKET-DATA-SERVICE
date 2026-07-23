@@ -346,6 +346,11 @@ class Settings(BaseSettings):
         ge=1,
         validation_alias="AI_MARKET_RESEARCH_MACRO_HORIZON_DAYS",
     )
+    economic_event_max_future_days: int = Field(
+        default=550,
+        ge=1,
+        validation_alias="AI_MARKET_ECONOMIC_EVENT_MAX_FUTURE_DAYS",
+    )
     research_earnings_horizon_days: int = Field(
         default=400,
         ge=1,

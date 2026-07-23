@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -127,9 +127,10 @@ def test_consumer_contract_is_compact_and_excludes_debug_blocks() -> None:
 
 
 def test_consumer_aggregates_optional_enrichment_warnings_and_keeps_debug_details() -> None:
+    generated_at = datetime.now(UTC).replace(microsecond=0)
     full = {
         "symbol": "MNQ",
-        "generated_at_utc": "2099-01-01T00:00:00Z",
+        "generated_at_utc": generated_at.isoformat(),
         "macro_snapshot": {"rates_and_yields": {"DGS2": {"value": 3.5, "source": "FRED"}}},
         "data_quality": {
             "overall_data_quality": {"freshness_score": 0.9, "reliability_score": 0.8},
@@ -140,13 +141,13 @@ def test_consumer_aggregates_optional_enrichment_warnings_and_keeps_debug_detail
                 {
                     "event_id": "cpi",
                     "impact": "HIGH",
-                    "time_utc": "2099-01-02T12:30:00Z",
+                    "time_utc": (generated_at + timedelta(days=1)).isoformat(),
                     "enrichment": {"warnings": ["optional_enrichment_timeout"], "provider": "slow"},
                 },
                 {
                     "event_id": "nfp",
                     "impact": "HIGH",
-                    "time_utc": "2099-01-03T12:30:00Z",
+                    "time_utc": (generated_at + timedelta(days=2)).isoformat(),
                     "enrichment": {"warnings": ["optional_enrichment_timeout"]},
                 },
             ],

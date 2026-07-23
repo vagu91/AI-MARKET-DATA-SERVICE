@@ -12,6 +12,7 @@ from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.data_freshness_service import parse_datetime
 from app.services.source_policy_service import SourcePolicyService
+from app.services.temporal_validation_service import TemporalValidationService
 
 
 MNQ_TOPICS = (
@@ -68,6 +69,10 @@ class ResearchGapManifestBuilder:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.policy = SourcePolicyService(settings.source_policy_path)
         migrate_database(settings.database_path)
+        self.temporal_validation = TemporalValidationService(
+            settings,
+            clock=self.clock,
+        )
 
     def build(
         self,
@@ -77,7 +82,10 @@ class ResearchGapManifestBuilder:
         persist: bool = True,
     ) -> dict[str, Any]:
         now = _aware(self.clock()).replace(microsecond=0)
-        context = dict(components or ((snapshot or {}).get("debug_payload") or {}))
+        context = self.temporal_validation.sanitize_payload(
+            dict(components or ((snapshot or {}).get("debug_payload") or {})),
+            entity_table="research_gap_manifest_input",
+        )
         items = [
             self._evaluate_topic(topic, context, now)
             for topic in MNQ_TOPICS
@@ -300,6 +308,19 @@ def _topic_value(topic: str, context: dict[str, Any]) -> Any:
 def _completeness(topic: str, value: Any) -> tuple[float, list[str]]:
     if not _has_data(value):
         return 0.0, ["current_data"]
+    if topic == "macro_events" and isinstance(value, dict):
+        active_events = [
+            item
+            for section in (
+                "critical_macro_events",
+                "fed_communications",
+                "other_economic_events",
+            )
+            for item in (value.get(section) or [])
+            if isinstance(item, dict)
+        ]
+        if not active_events:
+            return 0.0, ["current_events"]
     required = {
         "vix_risk": ("vix", "vvix", "skew", "term_structure", "put_call"),
         "cot_positioning": ("report_date",),

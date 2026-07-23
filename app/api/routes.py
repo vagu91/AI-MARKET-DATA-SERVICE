@@ -325,8 +325,13 @@ async def market_context_mnq(
     candidates = EventValueCandidateRepository(settings)
     candidates.persist_provider_payload(investing_payload)
     candidates.persist_provider_payload(xtb_payload)
-    upcoming = reconcile_calendar_events(upcoming, [investing_payload, xtb_payload], now=now)
     facts_repository = MarketFactRepository(enrichment_orchestrator.settings)
+    upcoming = reconcile_calendar_events(
+        upcoming,
+        [investing_payload, xtb_payload],
+        now=now,
+        temporal_validation=facts_repository.temporal_validation,
+    )
     for event in upcoming:
         facts_repository.upsert_economic_event(
             event,

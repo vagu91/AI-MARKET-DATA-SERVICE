@@ -9,6 +9,11 @@ from typing import Any, Iterable
 from app.models.common import Impact, ProviderType
 from app.models.events import EconomicEvent, EventEnrichment
 from app.services.data_freshness_service import parse_datetime
+from app.services.temporal_validation_service import (
+    QUARANTINED_STATUS,
+    TemporalPolicy,
+    TemporalValidationService,
+)
 
 
 SPEECH_TOKENS = ("speech", "testimony", "testifies", "conference", "remarks", "press conference")
@@ -39,15 +44,24 @@ def canonical_event_key(event: dict[str, Any] | EconomicEvent) -> str:
     return f"event:{hashlib.sha256(stable.encode('utf-8')).hexdigest()[:24]}"
 
 
-def temporal_event_state(event: dict[str, Any] | EconomicEvent, *, now: datetime | None = None) -> dict[str, Any]:
+def temporal_event_state(
+    event: dict[str, Any] | EconomicEvent,
+    *,
+    now: datetime | None = None,
+    policy: TemporalPolicy | None = None,
+) -> dict[str, Any]:
     item = event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event)
     now = _aware(now or datetime.now(UTC))
+    policy = policy or TemporalPolicy(clock=lambda: now)
+    decision = policy.evaluate(item, domain="macro_calendar")
     release = parse_datetime(item.get("release_at") or item.get("time_utc"))
     event_kind = "scheduled_speech" if _is_speech(item) else "scheduled_event"
     enrichment = item.get("enrichment") if isinstance(item.get("enrichment"), dict) else {}
     actual = item.get("actual") if item.get("actual") not in (None, "") else enrichment.get("actual")
     outcome = item.get("outcome") or enrichment.get("outcome") or (enrichment.get("summary") or {}).get("outcome")
-    if release is None or now < release:
+    if not decision.accepted:
+        status = QUARANTINED_STATUS
+    elif release is None or now < release:
         status = "PRE_RELEASE"
         actual = None
     elif event_kind == "scheduled_speech":
@@ -62,12 +76,18 @@ def temporal_event_state(event: dict[str, Any] | EconomicEvent, *, now: datetime
         "release_at": release.isoformat() if release else None,
         "actual": actual,
         "outcome": outcome,
+        "temporal_invalid_reason": decision.reason_code,
     }
 
 
-def annotate_event(event: EconomicEvent, *, now: datetime | None = None) -> EconomicEvent:
+def annotate_event(
+    event: EconomicEvent,
+    *,
+    now: datetime | None = None,
+    policy: TemporalPolicy | None = None,
+) -> EconomicEvent:
     updated = event.model_copy(deep=True)
-    state = temporal_event_state(updated, now=now)
+    state = temporal_event_state(updated, now=now, policy=policy)
     if state["temporal_status"] == "PRE_RELEASE":
         updated.actual = None
         updated.enrichment.actual = None
@@ -83,12 +103,26 @@ def reconcile_calendar_events(
     provider_payloads: Iterable[dict[str, Any]],
     *,
     now: datetime | None = None,
+    temporal_validation: TemporalValidationService | None = None,
 ) -> list[EconomicEvent]:
     """Merge compatible calendar rows by canonical identity; never promote aggregator actuals."""
     now = _aware(now or datetime.now(UTC))
+    policy = (
+        temporal_validation.policy
+        if temporal_validation is not None
+        else TemporalPolicy(clock=lambda: now)
+    )
     selected: dict[str, EconomicEvent] = {}
     for event in events:
-        annotated = annotate_event(event, now=now)
+        raw_event = event.model_dump(mode="json")
+        if not policy.evaluate(raw_event, domain="macro_calendar").accepted:
+            if temporal_validation is not None:
+                temporal_validation.quarantine_if_invalid(
+                    raw_event,
+                    entity_table="provider_ingestion",
+                )
+            continue
+        annotated = annotate_event(event, now=now, policy=policy)
         selected[canonical_event_key(annotated)] = annotated
     for payload in provider_payloads:
         source = str(payload.get("source") or payload.get("provider") or "calendar_provider")
@@ -96,7 +130,20 @@ def reconcile_calendar_events(
         for row in payload.get("items") or payload.get("events") or []:
             if not isinstance(row, dict) or str(row.get("country") or row.get("country_code") or "US").upper() != "US":
                 continue
-            normalized = _provider_event(row, source=source, source_url=source_url, now=now)
+            if not policy.evaluate(row, domain="macro_calendar").accepted:
+                if temporal_validation is not None:
+                    temporal_validation.quarantine_if_invalid(
+                        row,
+                        entity_table="provider_ingestion",
+                    )
+                continue
+            normalized = _provider_event(
+                row,
+                source=source,
+                source_url=source_url,
+                now=now,
+                policy=policy,
+            )
             key = canonical_event_key(normalized)
             current = selected.get(key)
             if current is None:
@@ -114,7 +161,14 @@ def reconcile_calendar_events(
     return sorted(selected.values(), key=lambda event: (event.time_utc or datetime.combine(datetime.fromisoformat(event.date).date(), time.max, UTC), event.name))
 
 
-def _provider_event(row: dict[str, Any], *, source: str, source_url: str, now: datetime) -> EconomicEvent:
+def _provider_event(
+    row: dict[str, Any],
+    *,
+    source: str,
+    source_url: str,
+    now: datetime,
+    policy: TemporalPolicy,
+) -> EconomicEvent:
     release = parse_datetime(row.get("release_at") or row.get("time_utc"))
     date_value = str(row.get("date") or (release.date().isoformat() if release else now.date().isoformat()))
     impact_text = str(row.get("impact") or "MEDIUM").upper()
@@ -169,7 +223,7 @@ def _provider_event(row: dict[str, Any], *, source: str, source_url: str, now: d
             field_lineage=field_lineage,
         ),
     )
-    return annotate_event(event, now=now)
+    return annotate_event(event, now=now, policy=policy)
 
 
 def _merge_candidate(

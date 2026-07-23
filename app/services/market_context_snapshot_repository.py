@@ -9,12 +9,14 @@ from typing import Any
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
+from app.services.temporal_validation_service import TemporalValidationService
 
 
 class MarketContextSnapshotRepository:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         migrate_database(settings.database_path)
+        self.temporal_validation = TemporalValidationService(settings)
 
     def save_next(
         self,
@@ -32,13 +34,21 @@ class MarketContextSnapshotRepository:
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         snapshot_id = f"mcs-{uuid.uuid4()}"
         symbol = symbol.upper()
+        debug = self.temporal_validation.sanitize_payload(
+            dict(debug_payload),
+            entity_table="market_context_snapshot_input",
+        )
+        audit = dict(debug.get("audit") or {})
+        audit["temporal_quarantine"] = (
+            self.temporal_validation.quarantine_read_model()
+        )
+        debug["audit"] = audit
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             revision = int(conn.execute(
                 "SELECT COALESCE(MAX(revision),0)+1 AS revision FROM market_context_snapshots WHERE symbol=?",
                 (symbol,),
             ).fetchone()["revision"])
-            debug = dict(debug_payload)
             research = self._exact_research_projection(
                 conn,
                 research_run_id=research_run_id,

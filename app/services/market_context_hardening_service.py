@@ -17,6 +17,7 @@ from app.services.market_session_service import (
     is_market_closed,
     last_market_session_date,
 )
+from app.services.temporal_validation_service import TemporalValidationService
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,10 @@ def harden_market_context(
 ) -> dict[str, Any]:
     settings = settings or Settings(_env_file=None)
     now = _aware(now or datetime.now(UTC))
+    full = TemporalValidationService(settings).sanitize_payload(
+        full,
+        entity_table="market_context_input",
+    )
     context_date = now.astimezone(NEW_YORK).date().isoformat()
     existing_hardening = ((full.get("metadata") or {}).get("hardening") or {})
     if (

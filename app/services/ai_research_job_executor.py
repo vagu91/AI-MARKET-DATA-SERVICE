@@ -35,6 +35,7 @@ from app.services.research_tool_telemetry import (
     normalize_codex_event,
     normalize_usage,
 )
+from app.services.temporal_validation_service import TemporalValidationService
 
 
 class PersistentAIJobExecutor:
@@ -44,6 +45,7 @@ class PersistentAIJobExecutor:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.temporal_validation = TemporalValidationService(settings)
         self._lock = threading.Lock()
         self._active: dict[int, subprocess.Popen[str]] = {}
 
@@ -122,9 +124,13 @@ class PersistentAIJobExecutor:
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         output_path = workspace / f"{step_name.lower()}_output.json"
         profile = profile_for_job(str(job["job_type"]))
+        sanitized_request = self.temporal_validation.sanitize_payload(
+            job.get("request_payload") or {},
+            entity_table="research_prompt_input",
+        )
         profile_payload = context.get("profile") or prompt_context(
             profile,
-            job.get("request_payload") or {},
+            sanitized_request,
             effective_budget,
         )
         prompt = build_step_prompt(
