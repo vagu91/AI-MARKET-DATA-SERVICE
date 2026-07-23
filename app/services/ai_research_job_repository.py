@@ -135,7 +135,7 @@ class AIResearchJobRepository:
     ) -> list[dict[str, Any]]:
         if view not in {"full", "compact"}:
             raise ValueError("unsupported_latest_jobs_view")
-        clauses: list[str] = []
+        clauses: list[str] = ["source_audit_status='ACTIVE'"]
         values: list[Any] = []
         if symbol:
             clauses.append("symbol=?")
@@ -171,14 +171,22 @@ class AIResearchJobRepository:
     def status(self) -> dict[str, Any]:
         with connect_sqlite(self.settings.database_path) as conn:
             counts = conn.execute(
-                "SELECT status,COUNT(*) AS count FROM ai_research_jobs GROUP BY status"
+                """
+                SELECT status,COUNT(*) AS count FROM ai_research_jobs
+                WHERE source_audit_status='ACTIVE' GROUP BY status
+                """
             ).fetchall()
             latest = conn.execute(
                 "SELECT job_id,status,job_type,correlation_id,created_at,completed_at,last_error "
-                "FROM ai_research_jobs ORDER BY created_at DESC LIMIT 1"
+                "FROM ai_research_jobs WHERE source_audit_status='ACTIVE' "
+                "ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
             oldest = conn.execute(
-                "SELECT MIN(created_at) oldest FROM ai_research_jobs WHERE status IN ('PENDING','RUNNING','RETRY_SCHEDULED')"
+                """
+                SELECT MIN(created_at) oldest FROM ai_research_jobs
+                WHERE status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
+                  AND source_audit_status='ACTIVE'
+                """
             ).fetchone()["oldest"]
             run_metrics = conn.execute(
                 """
@@ -199,7 +207,8 @@ class AIResearchJobRepository:
             unique_domains = conn.execute(
                 """
                 SELECT COUNT(DISTINCT source_domain)
-                FROM research_evidence WHERE audit_status='ACTIVE'
+                FROM research_evidence
+                WHERE audit_status='ACTIVE' AND source_audit_status='ACTIVE'
                 """
             ).fetchone()[0]
             usage_metrics = conn.execute(
@@ -376,6 +385,7 @@ class AIResearchJobRepository:
                 SELECT * FROM ai_research_jobs
                 WHERE (status='PENDING'
                    OR (status='RETRY_SCHEDULED' AND (next_retry_at IS NULL OR next_retry_at<=?)))
+                   AND source_audit_status='ACTIVE'
                    {type_clause}
                    {smoke_clause}
                 ORDER BY priority ASC,created_at ASC

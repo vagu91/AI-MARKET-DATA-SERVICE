@@ -44,9 +44,14 @@ from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.temporal_validation_service import TemporalValidationService
+from app.infrastructure.persistence.database_safety import assert_test_database_isolated
 
 
 def build_application_state(settings: Settings) -> dict[str, Any]:
+    assert_test_database_isolated(
+        settings.database_path,
+        environment=settings.environment,
+    )
     cache = ProviderCacheRepository(settings.database_path)
     init_market_db(settings)
 

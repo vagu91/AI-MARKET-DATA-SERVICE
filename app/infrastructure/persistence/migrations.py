@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.schema import MIGRATIONS
+from app.services.source_policy_service import SourcePolicyService
 
 
 def migrate_database(path: Path) -> dict[str, object]:
@@ -60,6 +62,15 @@ def migrate_database(path: Path) -> dict[str, object]:
                 "errors": [],
             }
         )
+        source_reconciliation = (
+            _reconcile_invalid_sources(conn)
+            if "018_invalid_source_quarantine_and_reconciliation" in applied
+            else {
+                "scanned_count": 0,
+                "quarantined_count": 0,
+                "errors": [],
+            }
+        )
         reconciled_research_runs = _reconcile_research_run_lifecycle(conn)
         conn.commit()
     return {
@@ -69,7 +80,170 @@ def migrate_database(path: Path) -> dict[str, object]:
         "legacy_event_enrichment_facts_migrated": legacy_event_enrichment_facts_migrated,
         "market_context_components_backfilled": market_context_components_backfilled,
         "temporal_reconciliation": temporal_reconciliation,
+        "source_reconciliation": source_reconciliation,
         "reconciled_research_runs": reconciled_research_runs,
+    }
+
+
+_SOURCE_AUDIT_TABLES = {
+    "economic_events_history": ("event_key",),
+    "market_facts": ("fact_key",),
+    "market_news": ("news_key",),
+    "research_evidence": ("evidence_id",),
+    "market_context_snapshots": ("snapshot_id",),
+    "ai_research_jobs": ("job_id",),
+    "research_sources": ("source_id",),
+    "research_claims": ("claim_id",),
+    "research_runs": ("run_id",),
+    "market_context_components": (
+        "symbol",
+        "component_name",
+        "source_snapshot_id",
+    ),
+}
+
+
+def _reconcile_invalid_sources(conn: sqlite3.Connection) -> dict[str, object]:
+    policy = SourcePolicyService()
+    now = datetime.now(UTC).replace(microsecond=0).isoformat()
+    scanned = 0
+    quarantined_entities: set[tuple[str, str]] = set()
+    errors: list[str] = []
+    for table, key_columns in _SOURCE_AUDIT_TABLES.items():
+        try:
+            columns = [str(row["name"]) for row in conn.execute(f'PRAGMA table_info("{table}")')]
+            scan_columns = [
+                column
+                for column in columns
+                if any(
+                    token in column.lower()
+                    for token in (
+                        "source",
+                        "url",
+                        "payload",
+                        "lineage",
+                        "evidence",
+                        "input_json",
+                        "result_json",
+                        "component_json",
+                    )
+                )
+                and column not in {"source_audit_status", "source_invalid_reason"}
+            ]
+            reliability_columns = [
+                column
+                for column in ("reliability", "official_reliability", "is_official")
+                if column in columns
+            ]
+            selected = list(
+                dict.fromkeys(
+                    [
+                        *key_columns,
+                        "source_audit_status",
+                        *scan_columns,
+                        *reliability_columns,
+                    ]
+                )
+            )
+            selected_sql = ",".join(f'"{column}"' for column in selected)
+            rows = conn.execute(
+                f'SELECT {selected_sql} FROM "{table}"'
+            ).fetchall()
+            for row in rows:
+                scanned += 1
+                entity_key = "|".join(str(row[column]) for column in key_columns)
+                invalid: dict[tuple[str, str], tuple[object, str]] = {}
+                for column in scan_columns:
+                    for url in _extract_http_urls(row[column]):
+                        validation = policy.validate_url(url)
+                        if not validation.accepted:
+                            invalid[(validation.url, str(validation.reason_code))] = (
+                                validation,
+                                column,
+                            )
+                if not invalid:
+                    continue
+                previous_status = str(row["source_audit_status"] or "ACTIVE")
+                first_reason = next(iter(invalid))[1]
+                update_columns = [
+                    "source_audit_status=?",
+                    "source_invalid_reason=?",
+                    *[f'"{column}"=0' for column in reliability_columns],
+                ]
+                conn.execute(
+                    f'UPDATE "{table}" SET {",".join(update_columns)} '
+                    + " WHERE "
+                    + " AND ".join(f'"{column}"=?' for column in key_columns),
+                    ("QUARANTINED", first_reason, *(row[column] for column in key_columns)),
+                )
+                quarantined_entities.add((table, entity_key))
+                for (url, reason), (validation, column) in invalid.items():
+                    lineage = {
+                        "source_field": column,
+                        "previous_source_audit_status": previous_status,
+                        "previous_reliability": {
+                            name: row[name] for name in reliability_columns
+                        },
+                    }
+                    if "field_lineage_json" in columns and row["field_lineage_json"]:
+                        lineage["field_lineage_json"] = str(row["field_lineage_json"])
+                    quarantine_id = hashlib.sha256(
+                        f"{table}|{entity_key}|{url}|{reason}".encode("utf-8")
+                    ).hexdigest()
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO source_quarantine(
+                          quarantine_id,entity_table,entity_key,source_url,source_domain,
+                          reason_code,previous_status,lineage_json,detected_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            quarantine_id,
+                            table,
+                            entity_key,
+                            url,
+                            validation.domain,
+                            reason,
+                            previous_status,
+                            json.dumps(lineage, ensure_ascii=False, sort_keys=True),
+                            now,
+                        ),
+                    )
+        except (sqlite3.DatabaseError, KeyError, TypeError, ValueError) as exc:
+            errors.append(f"{table}:{type(exc).__name__}:{exc}"[:500])
+    reconciliation_id = hashlib.sha256(
+        f"018|{scanned}|{len(quarantined_entities)}|{now}".encode("utf-8")
+    ).hexdigest()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO source_reconciliation_runs(
+          reconciliation_id,source_schema_version,scanned_count,quarantined_count,
+          errors_json,started_at,completed_at
+        ) VALUES (?,?,?,?,?,?,?)
+        """,
+        (
+            reconciliation_id,
+            17,
+            scanned,
+            len(quarantined_entities),
+            json.dumps(errors, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    return {
+        "scanned_count": scanned,
+        "quarantined_count": len(quarantined_entities),
+        "errors": errors,
+    }
+
+
+def _extract_http_urls(value: object) -> set[str]:
+    if value in (None, ""):
+        return set()
+    return {
+        match.rstrip(".,);]")
+        for match in re.findall(r"https?://[^\s\"'<>]+", str(value), flags=re.IGNORECASE)
     }
 
 

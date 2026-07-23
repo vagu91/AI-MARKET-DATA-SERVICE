@@ -991,6 +991,73 @@ CREATE INDEX IF NOT EXISTS idx_economic_events_temporal_audit
   ON economic_events_history(temporal_audit_status,temporal_status,release_at);
 """
 
+SOURCE_QUARANTINE_SCHEMA = """
+ALTER TABLE economic_events_history
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE economic_events_history ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE market_facts
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE market_facts ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE market_news
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE market_news ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE research_evidence
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE research_evidence ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE market_context_snapshots
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE market_context_snapshots ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE ai_research_jobs
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE ai_research_jobs ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE research_sources
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE research_sources ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE research_claims
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE research_claims ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE research_runs
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE research_runs ADD COLUMN source_invalid_reason TEXT NULL;
+ALTER TABLE market_context_components
+  ADD COLUMN source_audit_status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE market_context_components ADD COLUMN source_invalid_reason TEXT NULL;
+
+CREATE TABLE IF NOT EXISTS source_quarantine (
+  quarantine_id TEXT PRIMARY KEY,
+  entity_table TEXT NOT NULL,
+  entity_key TEXT NOT NULL,
+  source_url TEXT NOT NULL,
+  source_domain TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  previous_status TEXT NULL,
+  lineage_json TEXT NOT NULL DEFAULT '{}',
+  detected_at TEXT NOT NULL,
+  UNIQUE(entity_table,entity_key,source_url,reason_code)
+);
+
+CREATE TABLE IF NOT EXISTS source_reconciliation_runs (
+  reconciliation_id TEXT PRIMARY KEY,
+  source_schema_version INTEGER NOT NULL,
+  scanned_count INTEGER NOT NULL DEFAULT 0,
+  quarantined_count INTEGER NOT NULL DEFAULT 0,
+  errors_json TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_quarantine_reason
+  ON source_quarantine(reason_code,source_domain,detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_source_audit
+  ON economic_events_history(source_audit_status,release_at);
+CREATE INDEX IF NOT EXISTS idx_facts_source_audit
+  ON market_facts(source_audit_status,status,updated_at);
+CREATE INDEX IF NOT EXISTS idx_evidence_source_audit
+  ON research_evidence(source_audit_status,claim_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_source_audit
+  ON market_context_snapshots(symbol,source_audit_status,revision DESC);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -1010,4 +1077,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("015_atomic_research_persistence_and_quarantine", ATOMIC_RESEARCH_PERSISTENCE_SCHEMA),
     ("016_gap_aware_parallel_research_and_temporal_audit", GAP_AWARE_PARALLEL_RESEARCH_SCHEMA),
     ("017_temporal_quarantine_runtime_reconciliation", TEMPORAL_QUARANTINE_RUNTIME_SCHEMA),
+    ("018_invalid_source_quarantine_and_reconciliation", SOURCE_QUARANTINE_SCHEMA),
 )

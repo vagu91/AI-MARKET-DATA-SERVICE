@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from app.infrastructure.persistence.schema import MIGRATIONS
+from app.infrastructure.persistence.database_safety import (
+    DEFAULT_OPERATIONAL_DATABASE,
+    assert_test_database_isolated,
+    is_test_process,
+)
 
 
 def ensure_parent_dir(path: Path) -> None:
@@ -13,6 +18,8 @@ def ensure_parent_dir(path: Path) -> None:
 
 
 def connect_sqlite(path: Path, *, timeout_seconds: float = 30.0) -> sqlite3.Connection:
+    if is_test_process() and Path(path).resolve() == DEFAULT_OPERATIONAL_DATABASE.resolve():
+        assert_test_database_isolated(path)
     ensure_parent_dir(path)
     conn = sqlite3.connect(path, timeout=timeout_seconds)
     conn.row_factory = sqlite3.Row

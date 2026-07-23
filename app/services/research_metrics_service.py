@@ -87,6 +87,7 @@ class ResearchMetricsService:
                   SELECT claim_id FROM research_claims
                   WHERE research_run_id=? AND materialization_status!='ORPHANED'
                 ) AND source_status='VERIFIED' AND audit_status='ACTIVE'
+                  AND source_audit_status='ACTIVE'
                 """,
                 (run_id,),
             ).fetchone()[0]
@@ -151,6 +152,7 @@ class ResearchMetricsService:
                 WHERE c.research_run_id=? AND c.validation_status='accepted'
                   AND c.materialization_status!='ORPHANED'
                   AND e.audit_status='ACTIVE'
+                  AND e.source_audit_status='ACTIVE'
                 """,
                 (run_id,),
             ).fetchall()

@@ -5,6 +5,7 @@ from typing import Any
 
 from app.core.text_normalization import normalize_text
 from app.services.data_freshness_service import parse_datetime
+from app.services.source_policy_service import SourcePolicyService
 
 
 OFFICIAL_SOURCE_KEYWORDS = {
@@ -245,27 +246,10 @@ def parse_retry_seconds(value: str | None) -> list[int]:
 
 
 def classify_source(source: Any, source_url: Any = None) -> dict[str, Any]:
-    text = f"{source or ''} {source_url or ''}".upper()
-    if any(token in text for token in NON_OFFICIAL_PUBLISHERS):
-        is_official = False
-        source_classification = "market_source"
-    else:
-        official_key = next(
-            (
-                key
-                for key, tokens in OFFICIAL_SOURCE_KEYWORDS.items()
-                if any(token.upper() in text for token in tokens)
-            ),
-            None,
-        )
-        is_official = official_key is not None
-        source_classification = "official_source" if is_official else (
-            "market_source" if any(token in text for token in MARKET_SOURCE_KEYWORDS) else "other_source"
-        )
-    return {
-        "is_official_source": is_official,
-        "source_classification": source_classification,
-    }
+    return SourcePolicyService().provenance(
+        source=str(source or "") or None,
+        source_url=str(source_url or "") or None,
+    )
 
 
 def clean_text(value: Any) -> Any:

@@ -14,7 +14,8 @@ from app.services.refresh_policy_service import RefreshPolicyService
 from app.services.status_model import normalize_status
 
 
-def test_settings_default_to_single_operational_database() -> None:
+def test_settings_default_to_single_operational_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AI_MARKET_DATABASE_PATH", raising=False)
     settings = Settings(_env_file=None)
     assert settings.database_path == Path("data/market_data_service.sqlite")
     assert not hasattr(settings, "canonical_store_db_path")
