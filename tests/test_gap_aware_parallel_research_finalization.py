@@ -101,6 +101,9 @@ def full_context(*, missing: str | None = None) -> dict[str, Any]:
             "data_as_of": stamp,
             "valid_until": valid,
             "report_date": "2026-07-21",
+            "contract_code": "209742",
+            "open_interest": 1000,
+            "asset_managers": {"long": 600, "short": 400, "spread": 0},
             "net_position": 10,
         },
         "nasdaq_context": {
@@ -720,7 +723,7 @@ def test_25_schema_15_migrates_to_17_with_data_preserved(tmp_path: Path) -> None
         row = migrated.execute(
             "SELECT snapshot_id,research_link_status FROM market_context_snapshots"
         ).fetchone()
-    assert result["schema_version"] == 19
+    assert result["schema_version"] == 20
     assert row["snapshot_id"] == "legacy"
     assert row["research_link_status"] == "NOT_REQUIRED"
 

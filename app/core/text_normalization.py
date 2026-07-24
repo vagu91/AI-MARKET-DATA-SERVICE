@@ -44,6 +44,18 @@ def normalize_text(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     text = html.unescape(value)
+    # Seen in the immutable 2026-07-24 smoke payload: UTF-8 punctuation
+    # decoded through a non-Western single-byte mapping.  Repair only these
+    # exact byte-shaped sequences so valid Unicode remains untouched.
+    text = (
+        text.replace("ā\u0080\u0099", "'")
+        .replace("ā\u0080\u0098", "'")
+        .replace("ā\u0080\u009c", '"')
+        .replace("ā\u0080\u009d", '"')
+        .replace("ā\u0080\u0093", "-")
+        .replace("ā\u0080\u0094", "-")
+        .replace("ā\u0080\u00a6", "...")
+    )
     for _ in range(3):
         fixed = _fix_mojibake(text)
         if fixed == text:

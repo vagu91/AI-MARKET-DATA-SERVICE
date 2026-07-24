@@ -59,6 +59,7 @@ class ParallelResearchCoordinator:
             str(item["topic"]): item
             for item in manifest.get("items") or []
             if item.get("required_action") == "AGENT_RESEARCH"
+            and item.get("ai_eligible", True)
         }
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -68,8 +69,11 @@ class ParallelResearchCoordinator:
                   parent_run_id,parent_job_id,symbol,status,snapshot_id,manifest_id,
                   requested_backend,concurrency_limit,expected_child_count,
                   terminal_child_count,checkpoint_json,telemetry_json,created_at,
-                  started_at,completed_at,updated_at
-                ) VALUES (?,NULL,'MNQ',?,NULL,?,?,?,?,0,'{}','{}',?,?,?,?)
+                  started_at,completed_at,updated_at,execution_status,
+                  execution_complete,data_outcome,coverage_complete,coverage_score,
+                  missing_topics_json,blocking_gaps_json,policy_no_data_topics_json,
+                  ready_for_trading_context
+                ) VALUES (?,NULL,'MNQ',?,NULL,?,?,?,?,0,'{}','{}',?,?,?,?,?,?,?,?,?,'[]','[]','[]',0)
                 """,
                 (
                     parent_run_id,
@@ -82,6 +86,11 @@ class ParallelResearchCoordinator:
                     now if items else None,
                     now if not items else None,
                     now,
+                    "PENDING" if items else "SUCCEEDED",
+                    0 if items else 1,
+                    "PENDING" if items else "COMPLETE",
+                    0 if items else 1,
+                    0.0 if items else 1.0,
                 ),
             )
             conn.execute(
@@ -225,6 +234,48 @@ class ParallelResearchCoordinator:
                 )
             parent_status = _parent_status(statuses)
             terminal_count = sum(status in TERMINAL_JOB_STATUSES for status in statuses)
+            execution_complete = bool(statuses) and terminal_count == len(statuses)
+            if not statuses:
+                execution_complete = True
+            completed_topics = {
+                str(child["topic"])
+                for child, status in zip(children, statuses, strict=True)
+                if status == "SUCCEEDED"
+            }
+            required_topics = {str(child["topic"]) for child in children}
+            missing_topics = sorted(required_topics - completed_topics)
+            coverage_score = (
+                len(completed_topics) / len(required_topics)
+                if required_topics
+                else 1.0
+            )
+            policy_no_data_topics = sorted(
+                str(child["topic"])
+                for child, status in zip(children, statuses, strict=True)
+                if status == "NO_DATA"
+            )
+            failed_topic_set = {
+                str(child["topic"])
+                for child, status in zip(children, statuses, strict=True)
+                if status == "FAILED"
+            }
+            blocking_gaps = [
+                (
+                    f"failed_topic:{topic}"
+                    if topic in failed_topic_set
+                    else f"missing_topic:{topic}"
+                )
+                for topic in missing_topics
+            ]
+            coverage_complete = not missing_topics
+            data_outcome = (
+                "COMPLETE"
+                if coverage_complete
+                else "NO_DATA"
+                if policy_no_data_topics
+                and len(policy_no_data_topics) == len(required_topics)
+                else "PARTIAL"
+            )
             completed_at = (
                 str(parent["completed_at"] or now)
                 if parent_status in {"SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED"}
@@ -251,7 +302,11 @@ class ParallelResearchCoordinator:
                       WHEN ? IS NULL THEN completed_at
                       ELSE COALESCE(completed_at,?)
                     END,
-                    checkpoint_json=?,telemetry_json=?,updated_at=?
+                    checkpoint_json=?,telemetry_json=?,updated_at=?,
+                    execution_status=?,execution_complete=?,data_outcome=?,
+                    coverage_complete=?,coverage_score=?,missing_topics_json=?,
+                    blocking_gaps_json=?,policy_no_data_topics_json=?,
+                    ready_for_trading_context=?
                 WHERE parent_run_id=?
                   AND (
                     status!=?
@@ -270,6 +325,15 @@ class ParallelResearchCoordinator:
                     checkpoint_json,
                     telemetry_json,
                     now,
+                    parent_status,
+                    int(execution_complete),
+                    data_outcome,
+                    int(coverage_complete),
+                    coverage_score,
+                    json.dumps(missing_topics, separators=(",", ":")),
+                    json.dumps(blocking_gaps, separators=(",", ":")),
+                    json.dumps(policy_no_data_topics, separators=(",", ":")),
+                    0,
                     parent_run_id,
                     parent_status,
                     terminal_count,
@@ -323,6 +387,20 @@ class ParallelResearchCoordinator:
         output.update(
             {
                 "research_status": output["status"],
+                "execution_status": output.get("execution_status") or output["status"],
+                "execution_complete": bool(output.get("execution_complete")),
+                "data_outcome": output.get("data_outcome") or "NO_DATA",
+                "coverage_complete": bool(output.get("coverage_complete")),
+                "coverage_score": float(output.get("coverage_score") or 0),
+                "missing_topics": _load_json_list(
+                    output.get("missing_topics_json")
+                ),
+                "policy_no_data_topics": _load_json_list(
+                    output.get("policy_no_data_topics_json")
+                ),
+                "ready_for_trading_context": bool(
+                    output.get("ready_for_trading_context")
+                ),
                 "snapshot_status": (
                     "MATERIALIZING"
                     if output.get("snapshot_id") == "MATERIALIZING"
@@ -332,7 +410,10 @@ class ParallelResearchCoordinator:
                 ),
                 "required_topics": required_topics,
                 "failed_topics": failed_topics,
-                "blocking_gaps": [f"failed_topic:{topic}" for topic in failed_topics],
+                "blocking_gaps": _load_json_list(
+                    output.get("blocking_gaps_json")
+                )
+                or [f"failed_topic:{topic}" for topic in failed_topics],
                 **counts,
             }
         )
@@ -496,6 +577,9 @@ def _aggregate_parent_telemetry(
     rejection_reasons: dict[tuple[str, str], int] = {}
     child_statuses: list[dict[str, Any]] = []
     costs: list[float] = []
+    budget_modes: set[str] = set()
+    continuation_count = 0
+    billing_bases: list[Any] = []
     for index, child in enumerate(children):
         metrics = _load_json_object(child.get("metrics_json"))
         metrics_usage = metrics.get("usage") if isinstance(metrics.get("usage"), dict) else {}
@@ -511,28 +595,36 @@ def _aggregate_parent_telemetry(
             usage[key] += int(metrics_usage.get(key) or 0)
         warnings.update(str(item) for item in metrics.get("threshold_warnings") or [] if item)
         warnings.update(str(item) for item in _load_json_list(child.get("warnings_json")) if item)
+        if metrics.get("budget_mode") is not None:
+            budget_modes.add(str(metrics["budget_mode"]))
+        continuation_count += int(metrics.get("continuation_count") or 0)
+        if metrics.get("billing_basis") is not None:
+            billing_bases.append(metrics["billing_basis"])
         for item in sources.get("rejection_reasons") or []:
             if not isinstance(item, dict):
                 continue
             key = (str(item.get("status") or "REJECTED"), str(item.get("reason") or "unknown"))
             rejection_reasons[key] = rejection_reasons.get(key, 0) + int(item.get("count") or 0)
-        cost = _load_json_object(child.get("cost_json"))
-        if cost.get("total_cost_usd") is not None:
-            costs.append(float(cost["total_cost_usd"]))
+        metric_cost = metrics.get("cost")
+        if isinstance(metric_cost, (int, float)):
+            costs.append(float(metric_cost))
+        elif isinstance(metric_cost, dict) and metric_cost.get("total_cost_usd") is not None:
+            costs.append(float(metric_cost["total_cost_usd"]))
         child_statuses.append(
             {
                 "topic": child.get("topic"),
                 "job_id": child.get("child_job_id"),
                 "run_id": child.get("child_run_id"),
                 "status": statuses[index],
-                "warning_count": len(metrics.get("threshold_warnings") or []),
+                "warning_count": int(metrics.get("warning_count") or 0),
                 "last_error": child.get("last_error"),
-                "duration_ms": sum(
-                    int(value or 0)
-                    for value in (
-                        metrics.get("phase_duration_ms") or {}
-                    ).values()
+                "duration_ms": int(
+                    (metrics.get("duration_ms") or {}).get("exclusive_total")
+                    or 0
                 ),
+                "wall_clock_ms": (
+                    metrics.get("duration_ms") or {}
+                ).get("wall_clock"),
                 "backend_invocations": int(
                     (metrics.get("backend") or {}).get("completed") or 0
                 ),
@@ -569,15 +661,32 @@ def _aggregate_parent_telemetry(
         placeholders = ",".join("?" for _ in run_ids)
         invocation_row = conn.execute(
             f"""
-            SELECT COUNT(DISTINCT invocation_id) AS attempted,
-                   COUNT(DISTINCT CASE WHEN lifecycle_status='COMPLETED'
-                                      THEN invocation_id END) AS completed,
-                   COUNT(DISTINCT CASE WHEN lifecycle_status='ABORTED'
-                                      THEN invocation_id END) AS aborted,
-                   COUNT(DISTINCT CASE WHEN usage_status='UNAVAILABLE'
-                                       THEN invocation_id END) AS usage_unavailable
-            FROM research_backend_invocations
-            WHERE run_id IN ({placeholders})
+            WITH deduplicated AS (
+              SELECT invocation_id,
+                     MAX(lifecycle_status) AS lifecycle_status,
+                     MAX(usage_status) AS usage_status,
+                     MAX(input_tokens) AS input_tokens,
+                     MAX(output_tokens) AS output_tokens,
+                     MAX(cached_tokens) AS cached_tokens,
+                     MAX(reasoning_tokens) AS reasoning_tokens,
+                     MAX(total_tokens) AS total_tokens
+              FROM research_backend_invocations
+              WHERE run_id IN ({placeholders})
+              GROUP BY invocation_id
+            )
+            SELECT COUNT(*) AS attempted,
+                   SUM(CASE WHEN lifecycle_status='COMPLETED' THEN 1 ELSE 0 END)
+                     AS completed,
+                   SUM(CASE WHEN lifecycle_status='ABORTED' THEN 1 ELSE 0 END)
+                     AS aborted,
+                   SUM(CASE WHEN usage_status='UNAVAILABLE' THEN 1 ELSE 0 END)
+                     AS usage_unavailable,
+                   COALESCE(SUM(input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(cached_tokens),0) AS cached_tokens,
+                   COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
+                   COALESCE(SUM(total_tokens),0) AS total_tokens
+            FROM deduplicated
             """,
             run_ids,
         ).fetchone()
@@ -585,6 +694,29 @@ def _aggregate_parent_telemetry(
             key: int(invocation_row[key] or 0)
             for key in invocation_counts
         }
+        if invocation_counts["attempted"]:
+            usage = {
+                key: int(invocation_row[key] or 0)
+                for key in usage
+            }
+        verified_from_evidence = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT e.canonical_url)
+                FROM research_evidence e
+                JOIN research_claims c ON c.claim_id=e.claim_id
+                WHERE c.research_run_id IN ({placeholders})
+                  AND c.validation_status='accepted'
+                  AND c.materialization_status!='ORPHANED'
+                  AND e.source_status='VERIFIED'
+                  AND e.audit_status='ACTIVE'
+                  AND e.source_audit_status='ACTIVE'
+                """,
+                run_ids,
+            ).fetchone()[0]
+        )
+        if verified_from_evidence:
+            totals["verified_sources"] = verified_from_evidence
     if invocation_counts["attempted"] == 0:
         completed_fallback = sum(
             int(
@@ -632,9 +764,18 @@ def _aggregate_parent_telemetry(
         ],
         **totals,
         "usage": usage,
+        "budget_mode": (
+            next(iter(budget_modes))
+            if len(budget_modes) == 1
+            else sorted(budget_modes)
+            if budget_modes
+            else str(parent.get("budget_mode") or "unknown")
+        ),
+        "continuation_count": continuation_count,
         "wall_clock_seconds": wall_clock_seconds,
         "cost": {"total_cost_usd": round(sum(costs), 10)} if costs else None,
         "cost_status": "available" if costs else "cost_unavailable",
+        "billing_basis": billing_bases or ["pricing_unavailable"],
         "warnings": sorted(warnings),
         "rejection_reasons": [
             {"status": key[0], "reason": key[1], "count": count}

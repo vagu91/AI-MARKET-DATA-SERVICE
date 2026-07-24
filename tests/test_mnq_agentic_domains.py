@@ -688,14 +688,14 @@ def test_no_trading_order_or_execution_endpoints_were_added() -> None:
     ]
 
 
-def test_schema_19_remains_compatible_without_additional_migration(
+def test_schema_20_remains_compatible_without_additional_migration(
     tmp_path: Path,
 ) -> None:
     cfg = settings(tmp_path)
     first = migrate_database(cfg.database_path)
     second = migrate_database(cfg.database_path)
-    assert len(MIGRATIONS) == 19
-    assert first["schema_version"] == second["schema_version"] == 19
+    assert len(MIGRATIONS) == 20
+    assert first["schema_version"] == second["schema_version"] == 20
     assert second["applied"] == []
 
 

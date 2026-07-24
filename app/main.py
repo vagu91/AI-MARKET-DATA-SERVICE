@@ -74,6 +74,17 @@ async def lifespan(app: FastAPI):
                     minutes=settings.ai_run_window_news_minutes, id="research_news_refresh",
                     max_instances=1, coalesce=True,
                 )
+            if settings.lifecycle_due_scanner_enabled:
+                scheduler.add_job(
+                    lambda: state["research_scheduler"].scan_due_items(
+                        owner="apscheduler-lifecycle-due-scanner"
+                    ),
+                    "interval",
+                    seconds=settings.lifecycle_due_scanner_interval_seconds,
+                    id="lifecycle_due_scanner",
+                    max_instances=1,
+                    coalesce=True,
+                )
         scheduler.add_job(
             lambda: run_database_maintenance(settings, dry_run=False),
             "interval",

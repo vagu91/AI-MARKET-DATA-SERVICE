@@ -25,7 +25,6 @@ from app.services.research_semantics import (
     semantic_validation_warnings,
 )
 from app.services.research_domain_contracts import (
-    DOMAIN_PROFILE_TOPICS,
     GAMMA_METRICS,
     domain_claim_warnings,
     enrich_domain_claim,
@@ -35,6 +34,10 @@ from app.services.source_policy_service import SourcePolicyService
 from app.services.research_tool_telemetry import (
     COUNTED_SOURCE_ACTIONS,
     action_fingerprint,
+)
+from app.services.event_driven_lifecycle_service import (
+    compute_datum_lifecycle,
+    persist_lifecycle_in_transaction,
 )
 
 
@@ -1251,10 +1254,18 @@ class ResearchRuntimeRepository:
 
             required_topics = {str(item) for item in run.get("required_topics") or []}
             completed_topics = {
-                _resolved_topic(run, item)
-                for item in accepted
-                if not is_not_applicable(item)
-            } & required_topics
+                topic
+                for topic in required_topics
+                if _minimum_topic_coverage(
+                    topic,
+                    [
+                        item
+                        for item in accepted
+                        if not is_not_applicable(item)
+                        and _resolved_topic(run, item) == topic
+                    ],
+                )
+            }
             not_applicable_topics = {
                 _resolved_topic(run, item)
                 for item in accepted
@@ -1288,12 +1299,69 @@ class ResearchRuntimeRepository:
                 "blocking_gaps": blocking_gaps,
                 "coverage_score": coverage_score,
             }
-            if status == "NO_DATA" and str(run.get("profile_id") or "") in (
-                DOMAIN_PROFILE_TOPICS
-            ):
+            if status == "NO_DATA":
                 no_data = no_data_contract(
                     searched_at=now,
                     sources_attempted=acquired_sources,
+                )
+                profile = PROFILES.get(str(run.get("profile_id") or ""))
+                request = (
+                    run.get("request")
+                    if isinstance(run.get("request"), dict)
+                    else {}
+                )
+                fields_attempted = sorted(
+                    {
+                        *list(profile.required_fields if profile else ()),
+                        *list(request.get("pending_fields") or []),
+                    }
+                )
+                topic = (
+                    next(iter(required_topics))
+                    if len(required_topics) == 1
+                    else str(run.get("profile_id") or "research").lower()
+                )
+                lifecycle = compute_datum_lifecycle(
+                    topic,
+                    f"MNQ:{topic}",
+                    {"refresh_reason": no_data["reason"]},
+                    settings=self.settings,
+                    now=self.now(),
+                    attempt_count=int(run.get("continuation_count") or 0),
+                    no_data=True,
+                    fields_attempted=fields_attempted,
+                    session_state=str(
+                        request.get("session_state")
+                        or request.get("market_session_status")
+                        or "unknown"
+                    ),
+                    triggering_event=str(
+                        request.get("trigger_name")
+                        or request.get("triggering_event")
+                        or "explicit_research"
+                    ),
+                    retry_class="NO_DATA",
+                    refresh_reason=no_data["reason"],
+                )
+                no_data.update(
+                    {
+                        "fields_attempted": fields_attempted,
+                        "next_retry_at": lifecycle.next_retry_at,
+                        "retry_class": lifecycle.retry_class,
+                        "negative_cache_key": lifecycle.negative_cache_key,
+                        "negative_cache_expires_at": (
+                            lifecycle.negative_cache_expires_at
+                        ),
+                        "session_state": lifecycle.session_state,
+                        "triggering_event": lifecycle.triggering_event,
+                    }
+                )
+                persist_lifecycle_in_transaction(
+                    conn,
+                    lifecycle,
+                    payload=no_data,
+                    work_status="BACKOFF",
+                    timestamp=now,
                 )
                 result_payload.update(
                     {
@@ -1302,6 +1370,15 @@ class ResearchRuntimeRepository:
                         "searched_at": no_data["searched_at"],
                         "sources_attempted": no_data["sources_attempted"],
                         "no_data_reason": no_data["reason"],
+                        "fields_attempted": no_data["fields_attempted"],
+                        "next_retry_at": no_data["next_retry_at"],
+                        "retry_class": no_data["retry_class"],
+                        "negative_cache_key": no_data["negative_cache_key"],
+                        "negative_cache_expires_at": no_data[
+                            "negative_cache_expires_at"
+                        ],
+                        "session_state": no_data["session_state"],
+                        "triggering_event": no_data["triggering_event"],
                     }
                 )
             results = [
@@ -2470,6 +2547,49 @@ def _resolved_topic(run: dict[str, Any], claim: dict[str, Any]) -> str:
     if str(run.get("profile_id") or "") == "EVENT_MISSING_FIELDS":
         return str(claim.get("field_semantics") or "")
     return str(claim.get("topic") or "")
+
+
+def _minimum_topic_coverage(
+    topic: str,
+    claims: list[dict[str, Any]],
+) -> bool:
+    if not claims:
+        return False
+    if topic != "cot_positioning":
+        return True
+    metric_ids = {
+        str(item.get("metric_id") or "").lower()
+        for item in claims
+    }
+    report_present = bool(
+        metric_ids & {"cot_report_date", "report_date"}
+    )
+    contract_present = bool(
+        metric_ids
+        & {"cot_contract", "contract_code", "contract_market_code"}
+    )
+    open_interest_present = bool(
+        metric_ids & {"cot_open_interest", "open_interest"}
+    )
+    long_groups = {
+        metric.removesuffix("_long")
+        for metric in metric_ids
+        if metric.endswith("_long")
+    }
+    short_groups = {
+        metric.removesuffix("_short")
+        for metric in metric_ids
+        if metric.endswith("_short")
+    }
+    group_positions_present = bool(long_groups & short_groups)
+    return all(
+        (
+            report_present,
+            contract_present,
+            open_interest_present,
+            group_positions_present,
+        )
+    )
 
 
 def _is_not_applicable(claim: dict[str, Any]) -> bool:

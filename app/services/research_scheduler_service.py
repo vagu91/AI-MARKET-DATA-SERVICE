@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
@@ -18,15 +18,157 @@ from app.services.temporal_domain_service import canonical_event_key
 from app.services.data_freshness_service import parse_datetime
 from app.services.research_gap_manifest import ResearchGapManifestBuilder
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
+from app.services.event_driven_lifecycle_service import (
+    LifecycleRepository,
+    TRIGGER_CLASS_BY_ENTITY,
+)
 
 
 class ResearchSchedulerService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.jobs = AIResearchJobRepository(settings)
         self.service = AIResearchJobService(settings, repository=self.jobs)
         self.snapshots = MarketContextSnapshotRepository(settings)
+        self.lifecycle = LifecycleRepository(settings, clock=self.clock)
         migrate_database(settings.database_path)
+
+    def scan_due_items(
+        self,
+        *,
+        owner: str,
+        resolver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        ai_enqueue: Callable[[list[dict[str, Any]]], Any] | None = None,
+        trigger_type: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Lease due work, run resolvers first, and enqueue AI once for residuals."""
+        if not self.settings.lifecycle_due_scanner_enabled and not force:
+            return {
+                "status": "DISABLED",
+                "provider_calls": 0,
+                "ai_invocations": 0,
+                "claimed": 0,
+            }
+        now = self.clock()
+        claimed = self.lifecycle.claim_due(owner=owner, now=now)
+        explicit_trigger_class = TRIGGER_CLASS_BY_ENTITY.get(
+            str(trigger_type or "").lower()
+        )
+        has_trigger = explicit_trigger_class == "TRIGGER" or any(
+            item.get("trigger_class") == "TRIGGER" for item in claimed
+        )
+        provider_calls = 0
+        resolved: list[str] = []
+        residual: list[dict[str, Any]] = []
+        ai_eligible: list[dict[str, Any]] = []
+        deferred: list[str] = []
+        for item in claimed:
+            item_id = str(item["item_id"])
+            if (
+                item.get("trigger_class") == "REFRESH_ON_TRIGGER"
+                and not has_trigger
+            ):
+                self.lifecycle.transition(
+                    item_id,
+                    owner=owner,
+                    work_status="READY",
+                    refresh_reason="waiting_for_material_trigger",
+                    next_refresh_at=(
+                        now
+                        + timedelta(
+                            seconds=int(
+                                self.settings.lifecycle_due_scanner_interval_seconds
+                            )
+                        )
+                    ).isoformat(),
+                    now=now,
+                )
+                deferred.append(item_id)
+                continue
+            provider_result = (
+                resolver(item)
+                if resolver is not None
+                else {"status": "NOT_CONFIGURED"}
+            )
+            provider_calls += int(resolver is not None)
+            if str(provider_result.get("status") or "").upper() in {
+                "RESOLVED",
+                "FRESH",
+                "NOT_REQUIRED",
+            }:
+                self.lifecycle.complete(
+                    item_id,
+                    owner=owner,
+                    next_refresh_at=provider_result.get("next_refresh_at"),
+                    now=now,
+                )
+                resolved.append(item_id)
+                continue
+            provider_status = str(
+                provider_result.get("status") or "NOT_CONFIGURED"
+            ).upper()
+            unresolved = {
+                **item,
+                "provider_resolver_status": provider_status,
+            }
+            residual.append(unresolved)
+            if (
+                resolver is not None
+                and provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
+                and provider_result.get("ai_eligible", True) is True
+            ):
+                ai_eligible.append(unresolved)
+        ai_invocations = 0
+        enqueue_result: Any = None
+        if ai_eligible and ai_enqueue is not None:
+            enqueue_result = ai_enqueue(ai_eligible)
+            ai_invocations = 1
+            for item in ai_eligible:
+                self.lifecycle.transition(
+                    str(item["item_id"]),
+                    owner=owner,
+                    work_status="QUEUED",
+                    refresh_reason="provider_exhausted_ai_queued",
+                    now=now,
+                )
+        else:
+            for item in residual:
+                if item in ai_eligible and ai_enqueue is not None:
+                    continue
+                self.lifecycle.transition(
+                    str(item["item_id"]),
+                    owner=owner,
+                    work_status="READY",
+                    refresh_reason="provider_unresolved_ai_not_configured",
+                    next_refresh_at=(
+                        now
+                        + timedelta(
+                            seconds=int(
+                                self.settings.lifecycle_due_scanner_interval_seconds
+                            )
+                        )
+                    ).isoformat(),
+                    now=now,
+                )
+        return {
+            "status": "COMPLETED",
+            "claimed": len(claimed),
+            "provider_calls": provider_calls,
+            "resolved": resolved,
+            "deferred": deferred,
+            "residual_count": len(residual),
+            "ai_eligible_count": len(ai_eligible),
+            "ai_invocations": ai_invocations,
+            "enqueue_result": enqueue_result,
+            "coalesced": len(ai_eligible) > 1,
+        }
 
     def evaluate(self, trigger_name: str, *, force: bool = False) -> dict[str, Any]:
         snapshot = self.snapshots.latest("MNQ")

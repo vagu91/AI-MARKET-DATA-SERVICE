@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
+from app.services.observability_contract_service import ModelPricingService
 
 
 class ResearchMetricsService:
@@ -24,7 +25,8 @@ class ResearchMetricsService:
             run = conn.execute(
                 """
                 SELECT request_json,result_json,usage_json,cost_json,threshold_warnings_json,
-                       checkpoint_json,continuation_count,loop_detection_count
+                       checkpoint_json,continuation_count,loop_detection_count,
+                       started_at,completed_at,warnings_json
                 FROM research_runs WHERE run_id=?
                 """,
                 (run_id,),
@@ -72,6 +74,15 @@ class ResearchMetricsService:
                 """,
                 (run_id,),
             ).fetchone()
+            rejected_claim_rows = conn.execute(
+                """
+                SELECT claim_id,warnings_json FROM research_claims
+                WHERE research_run_id=? AND validation_status!='accepted'
+                  AND materialization_status!='ORPHANED'
+                ORDER BY claim_id
+                """,
+                (run_id,),
+            ).fetchall()
             steps = conn.execute(
                 """
                 SELECT step_name,status,duration_ms,output_json
@@ -117,6 +128,22 @@ class ResearchMetricsService:
             ).fetchall()
             invocation_stats = conn.execute(
                 """
+                WITH deduplicated AS (
+                  SELECT invocation_id,
+                         MAX(lifecycle_status) AS lifecycle_status,
+                         MAX(usage_status) AS usage_status,
+                         MAX(backend) AS backend,
+                         MAX(model) AS model,
+                         MAX(input_tokens) AS input_tokens,
+                         MAX(output_tokens) AS output_tokens,
+                         MAX(cached_tokens) AS cached_tokens,
+                         MAX(reasoning_tokens) AS reasoning_tokens,
+                         MAX(total_tokens) AS total_tokens,
+                         MAX(duration_ms) AS duration_ms
+                  FROM research_backend_invocations
+                  WHERE run_id=?
+                  GROUP BY invocation_id
+                )
                 SELECT COUNT(*) AS attempted_count,
                        SUM(CASE WHEN lifecycle_status='COMPLETED' THEN 1 ELSE 0 END)
                          AS completed_count,
@@ -125,13 +152,14 @@ class ResearchMetricsService:
                        SUM(CASE WHEN usage_status='UNAVAILABLE' THEN 1 ELSE 0 END)
                          AS usage_unavailable_count,
                        GROUP_CONCAT(DISTINCT backend) AS backends,
+                       GROUP_CONCAT(DISTINCT model) AS models,
                        COALESCE(SUM(input_tokens),0) AS input_tokens,
                        COALESCE(SUM(output_tokens),0) AS output_tokens,
                        COALESCE(SUM(cached_tokens),0) AS cached_tokens,
                        COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
                        COALESCE(SUM(total_tokens),0) AS total_tokens,
                        COALESCE(SUM(duration_ms),0) AS duration_ms
-                FROM research_backend_invocations WHERE run_id=?
+                FROM deduplicated
                 """,
                 (run_id,),
             ).fetchone()
@@ -180,9 +208,30 @@ class ResearchMetricsService:
             int(claims["extracted"] or 0),
             _declared_claims(steps),
         )
+        invocation_usage = {
+            key: int(invocation_stats[key] or 0)
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+                "total_tokens",
+            )
+        }
+        if int(invocation_stats["attempted_count"] or 0):
+            usage = invocation_usage
         token_total = int(usage.get("total_tokens") or 0) or sum(
             int(usage.get(key) or 0) for key in ("input_tokens", "output_tokens")
         )
+        claim_rejection_reasons: dict[str, int] = {}
+        warning_count = len(json.loads(run["warnings_json"] or "[]"))
+        for row in rejected_claim_rows:
+            claim_warnings = json.loads(row["warnings_json"] or "[]")
+            warning_count += len(claim_warnings)
+            primary_reason = str(claim_warnings[0] if claim_warnings else "unspecified")
+            claim_rejection_reasons[primary_reason] = (
+                claim_rejection_reasons.get(primary_reason, 0) + 1
+            )
         declared_sources = _declared_sources(steps)
         observed_sources = int(tool["new_sources"] or 0)
         gateway_discovered = int(source_stats["discovered"] or 0)
@@ -229,6 +278,73 @@ class ResearchMetricsService:
             acquisition_distribution[acquisition] = (
                 acquisition_distribution.get(acquisition, 0) + 1
             )
+        backend_values = sorted(
+            {
+                value
+                for value in str(invocation_stats["backends"] or "").split(",")
+                if value
+            }
+        )
+        model_values = sorted(
+            {
+                value
+                for value in str(invocation_stats["models"] or "").split(",")
+                if value
+            }
+        )
+        estimate = ModelPricingService(self.settings.model_pricing_path).estimate(
+            backend=backend_values[0] if len(backend_values) == 1 else "mixed",
+            model=model_values[0] if len(model_values) == 1 else None,
+            input_tokens=int(usage.get("input_tokens") or 0),
+            cached_tokens=int(usage.get("cached_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+        )
+        cost_contract = (
+            {
+                "cost": cost,
+                "cost_status": "actual",
+                "billing_basis": "backend_reported",
+            }
+            if cost
+            else estimate
+        )
+        if not cost and cost_contract["cost_status"] == "pricing_unavailable":
+            cost_contract["cost_status"] = "cost_unavailable"
+        exclusive_service_ms = sum(
+            int(step["duration_ms"] or 0)
+            for step in steps
+            if str(step["step_name"])
+            not in {
+                "PLAN",
+                "SEARCH",
+                "OPEN_SOURCE",
+                "VERIFY",
+                "PERSIST",
+                "READ_BACK",
+                "MATERIALIZE",
+            }
+        )
+        ai_ms = int(invocation_stats["duration_ms"] or 0)
+        fetch_ms = int(source_stats["fetch_duration_ms"] or 0)
+        verification_ms = sum(
+            int(row["duration_ms"] or 0) for row in verification_stats
+        )
+        persistence_ms = sum(
+            int(step["duration_ms"] or 0)
+            for step in steps
+            if str(step["step_name"]) in {"PERSIST", "READ_BACK", "MATERIALIZE"}
+        )
+        wall_clock_ms = None
+        if run["started_at"] and run["completed_at"]:
+            from datetime import datetime
+
+            started = datetime.fromisoformat(
+                str(run["started_at"]).replace("Z", "+00:00")
+            )
+            completed = datetime.fromisoformat(
+                str(run["completed_at"]).replace("Z", "+00:00")
+            )
+            wall_clock_ms = max(int((completed - started).total_seconds() * 1000), 0)
         metrics = {
             "budget_mode": (
                 (request.get("effective_budget") or {}).get("budget_mode")
@@ -250,26 +366,30 @@ class ResearchMetricsService:
                 "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
                 "total_tokens": int(usage.get("total_tokens") or token_total),
             },
-            "cost": cost or None,
-            "cost_status": "available" if cost else "cost_unavailable",
+            "cost": cost_contract.get("cost"),
+            "cost_status": cost_contract["cost_status"],
+            "billing_basis": cost_contract["billing_basis"],
             "no_data_reason": result.get("no_data_reason"),
             "phase_duration_ms": {
                 str(step["step_name"]): int(step["duration_ms"] or 0) for step in steps
             },
             "duration_ms": {
-                "ai": int(invocation_stats["duration_ms"] or 0),
-                "fetch": int(source_stats["fetch_duration_ms"] or 0),
-                "verification": sum(int(row["duration_ms"] or 0) for row in verification_stats),
-                "persistence": sum(
-                    int(step["duration_ms"] or 0)
-                    for step in steps
-                    if str(step["step_name"]) in {"PERSIST", "READ_BACK", "MATERIALIZE"}
+                "ai": ai_ms,
+                "fetch": fetch_ms,
+                "verification": verification_ms,
+                "persistence": persistence_ms,
+                "service_exclusive": exclusive_service_ms,
+                "exclusive_total": (
+                    ai_ms
+                    + fetch_ms
+                    + verification_ms
+                    + persistence_ms
+                    + exclusive_service_ms
                 ),
+                "wall_clock": wall_clock_ms,
             },
             "backend": {
-                "used": sorted(
-                    {value for value in str(invocation_stats["backends"] or "").split(",") if value}
-                ),
+                "used": backend_values,
                 "invocations": int(invocation_stats["completed_count"] or 0),
                 "attempted": int(invocation_stats["attempted_count"] or 0),
                 "completed": int(invocation_stats["completed_count"] or 0),
@@ -290,10 +410,7 @@ class ResearchMetricsService:
                 invocation_stats["completed_count"] or 0
             ),
             "fetched_sources": gateway_fetched,
-            "verified_sources": max(
-                int(verified_sources or 0),
-                gateway_verified,
-            ),
+            "verified_sources": int(verified_sources or 0),
             "accepted_claims": accepted,
             "rejected_claims": int(claims["rejected"] or 0),
             "input_tokens": int(usage.get("input_tokens") or 0),
@@ -312,6 +429,7 @@ class ResearchMetricsService:
                 int(tool["searches"] or 0) / observed_sources if observed_sources else None
             ),
             "threshold_warnings": json.loads(run["threshold_warnings_json"] or "[]"),
+            "warning_count": warning_count,
             "loop_detections": int(run["loop_detection_count"] or 0),
             "continuation_count": int(run["continuation_count"] or 0),
             "checkpoint": json.loads(run["checkpoint_json"] or "{}"),
@@ -325,13 +443,14 @@ class ResearchMetricsService:
                 "observed": observed_sources,
                 "discovered": gateway_discovered,
                 "fetched": gateway_fetched,
-                "verified": max(int(verified_sources or 0), gateway_verified),
+                "verified": int(verified_sources or 0),
+                "gateway_verified": gateway_verified,
                 "rejected": gateway_rejected,
                 "unverified": max(
                     gateway_discovered - gateway_verified,
                     0,
                 ),
-                "rejection_reasons": [
+                "gateway_rejection_reasons": [
                     {
                         "status": str(row["status"]),
                         "reason": str(row["reason"]),
@@ -339,6 +458,10 @@ class ResearchMetricsService:
                     }
                     for row in verification_stats
                     if str(row["status"]) == "REJECTED"
+                ],
+                "rejection_reasons": [
+                    {"status": "REJECTED", "reason": reason, "count": count}
+                    for reason, count in sorted(claim_rejection_reasons.items())
                 ],
                 "observed_source_domains": observed_domains,
                 "fetched_source_domains": fetched_domains,
