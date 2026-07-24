@@ -19,6 +19,18 @@ SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[_-]?key|apikey|token|secret|authorization|cookie)\s*[:=]\s*"
     r"(?:bearer\s+)?([A-Za-z0-9_\-./+=]{8,})"
 )
+SENSITIVE_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credentials",
+    "openai_api_key",
+    "password",
+    "registrationkey",
+    "secret",
+    "token",
+}
 
 
 def redact_sensitive(value: str) -> str:
@@ -40,5 +52,21 @@ def redact_payload(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_payload(item) for item in value)
     if isinstance(value, dict):
-        return {key: redact_payload(item) for key, item in value.items()}
+        return {
+            key: (
+                "<redacted>"
+                if _is_sensitive_key(key)
+                else redact_payload(item)
+            )
+            for key, item in value.items()
+        }
     return value
+
+
+def _is_sensitive_key(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+    return (
+        normalized in SENSITIVE_KEYS
+        or normalized.endswith(("_api_key", "_password", "_secret", "_token"))
+        or normalized.startswith(("authorization_", "cookie_"))
+    )

@@ -162,7 +162,7 @@ def test_official_observations_use_service_owned_identity_without_event_classifi
     repository, _job, run = make_run(cfg, profile_id, topic, f"{kind}-observation")
     result = repository.persist_claims(run, [observation_claim(kind)])
 
-    assert result["status"] == "SUCCEEDED"
+    assert result["status"] == ("PARTIAL" if kind == "cot" else "SUCCEEDED")
     assert result["accepted_count"] == result["persisted_count"] == result["read_back_count"] == 1
     projected = result["results"][0]
     assert projected["field_semantics"] == "current_market_context"
@@ -305,7 +305,8 @@ def test_failed_observation_projection_reconciliation_recovers_orphans_idempoten
     assert repository.reconcile_terminal_jobs() == 1
     assert repository.reconcile_terminal_jobs() == 0
     restored = repository.get_run(run["run_id"])
-    assert restored is not None and restored["status"] == "SUCCEEDED"
+    assert restored is not None
+    assert restored["status"] == ("PARTIAL" if kind == "cot" else "SUCCEEDED")
     assert set(restored["completed_topics"]).isdisjoint(restored["missing_topics"])
     projected = restored["result"]["results"][0]
     assert projected["observation_key"].startswith("observation:")

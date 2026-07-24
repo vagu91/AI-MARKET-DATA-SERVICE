@@ -76,6 +76,7 @@ def harden_market_context(
     output["event_windows"] = _event_window_status(
         output.get("event_windows") or {},
         events_today=output["events_today_context"],
+        now=now,
     )
     output["news_context"] = apply_news_semantics(
         output.get("news_context") or {},
@@ -713,8 +714,29 @@ def _news_digest_view(news: dict[str, Any], legacy: dict[str, Any]) -> dict[str,
     return digest
 
 
-def _event_window_status(windows: dict[str, Any], *, events_today: dict[str, Any]) -> dict[str, Any]:
+def _event_window_status(
+    windows: dict[str, Any],
+    *,
+    events_today: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
     output = dict(windows)
+    now = _aware(now or datetime.now(UTC))
+    legacy = dict(output.get("legacy") or {})
+    legacy_checked_at = parse_datetime(legacy.get("checked_at_utc"))
+    if legacy_checked_at and _aware(legacy_checked_at) > now + timedelta(days=2):
+        legacy.pop("checked_at_utc", None)
+        output["legacy"] = legacy
+        audit = dict(output.get("audit") or {})
+        audit["quarantined_future_timestamps"] = [
+            *list(audit.get("quarantined_future_timestamps") or []),
+            {
+                "path": "event_windows.legacy.checked_at_utc",
+                "value": legacy_checked_at.isoformat(),
+                "reason": "future_timestamp",
+            },
+        ]
+        output["audit"] = audit
     raw_active = list(output.get("active") or output.get("active_event_windows") or [])
     raw_upcoming = list(output.get("upcoming") or output.get("upcoming_event_windows") or [])
     active = [normalized for item in raw_active if (normalized := _scheduled_event(item)) is not None]

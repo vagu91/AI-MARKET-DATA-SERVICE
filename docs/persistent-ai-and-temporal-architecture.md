@@ -165,6 +165,24 @@ The compact job error contains only a stable error code. Redacted diagnostics re
 
 Optional pre-market, in-session, post-market, pre-event, post-release, speech, earnings, news and temporary-source retry triggers are disabled unless the general and research schedulers are enabled. Each trigger persists its input fingerprint and returns `NOT_REQUIRED` when inputs have not changed, the run window already ran, concurrency is full or the daily run budget is exhausted. Pre-event and post-release triggers enqueue event-scoped missing-field/official-actual work from the persisted snapshot rather than a generic timer-only job.
 
+The lifecycle due scanner is a third, independent opt-in and defaults to
+disabled. Its production APScheduler job is coroutine-safe and receives the
+application's deterministic resolver plus the persistent residual enqueue
+path. A missing deterministic provider returns `EXHAUSTED`/`NO_DATA` and
+reaches the residual persistent job path only when the mapped agent is enabled;
+disabled agents remain `NOT_REQUESTED`/`DISABLED`. Temporary provider errors
+create a negative-cache backoff and never invoke AI in the same scan. No path
+invents provider data.
+
+Central agent enablement is independent of all three scheduler/worker controls.
+The master `AI_MARKET_RESEARCH_AGENTS_ENABLED` switch dominates the 13
+per-topic flags documented in `.env.example`. Disabled optional topics remain
+readable from SQLite but appear as `NOT_REQUESTED`/`DISABLED`, are omitted from
+coverage and readiness denominators, and are summarized in the compact
+consumer as `disabled_optional_topics`. Re-enable a topic by changing its
+per-agent flag (and the master if needed), then restart the service in a
+separately authorized operational window.
+
 ## Lifecycle
 
 | Domain | Before occurrence | After occurrence, missing result | Complete |
@@ -206,6 +224,15 @@ Migration/startup reconciliation is idempotent. A terminal job linked to a `PEND
 No endpoint supports trade decisions or order submission. Job payloads returned by status endpoints contain structured requests/results but no environment secrets. Keep `AI_MARKET_AI_RESEARCH_WEB_ACCESS_ENABLED=false` unless web availability has been explicitly verified.
 
 The compact schema-2.1 AI-TRADER consumer exposes research status, coverage, topic/gap counts, verified driver references, evidence IDs and freshness only. Prompts, raw Codex output, complete documents and reasoning are not exposed. Redacted bounded diagnostics remain on job/run audit APIs. Existing `refresh=false` snapshots are returned without calls, enqueue or writes.
+
+`ready_for_trading_context` is a deterministic data-context policy, not an
+execution or trading decision. It requires terminal acceptable research,
+complete critical configured-topic coverage, no failed/looped child, no
+critical gap, verified sources for successful research, and no quarantined
+evidence. The debug projection reports every condition and failed reason.
+Disabled optional topics cannot make it false. There is still no delivery
+worker, trading advice, order, execution, or AI-TRADER mutation in this
+service.
 
 ## Authorized future smoke test
 

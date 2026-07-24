@@ -27,6 +27,7 @@ class EventService:
         self.enrichment_service = enrichment_service
         self.temporal_validation = temporal_validation
         self.last_enrichment_metadata: dict[str, object] = {}
+        self.last_provider_results: list[object] = []
 
     async def list_events(
         self,
@@ -36,8 +37,10 @@ class EventService:
         enrich: bool = True,
     ) -> list[EconomicEvent]:
         events: list[EconomicEvent] = []
+        self.last_provider_results = []
         for provider in self.providers:
             result = await provider.fetch_safe()
+            self.last_provider_results.append(result.metadata)
             if not isinstance(result.data, list):
                 continue
             for raw in result.data:

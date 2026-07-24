@@ -199,19 +199,39 @@ def _research(value: dict[str, Any]) -> dict[str, Any]:
     status = str(value.get("status") or "NOT_REQUIRED").upper()
     allowed = {"NOT_REQUIRED", "PENDING", "RUNNING", "PARTIAL", "SUCCEEDED", "NO_DATA", "FAILED"}
     normalized_status = status if status in allowed else "FAILED"
+    coverage_score = float(value.get("coverage_score") or 0)
+    missing_topics = list(value.get("missing_topics") or [])
+    blocking_gaps = list(value.get("blocking_gaps") or [])
+    execution_complete = bool(
+        value.get(
+            "execution_complete",
+            normalized_status in {"SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED"},
+        )
+    )
+    coverage_complete = bool(
+        value.get(
+            "coverage_complete",
+            coverage_score >= 1 and not missing_topics and not blocking_gaps,
+        )
+    )
     return {
         "status": normalized_status,
+        "execution_status": value.get("execution_status") or normalized_status,
+        "execution_complete": execution_complete,
+        "data_outcome": value.get("data_outcome")
+        or ("COMPLETE" if coverage_complete else "PARTIAL"),
+        "coverage_complete": coverage_complete,
         "run_id": value.get("run_id"),
         "job_id": value.get("job_id"),
         "parent_run_id": value.get("parent_run_id"),
         "snapshot_id": value.get("snapshot_id"),
         "started_at": value.get("started_at"), "completed_at": value.get("completed_at"),
         "data_as_of": value.get("data_as_of"), "fresh_until": value.get("fresh_until"),
-        "coverage_score": float(value.get("coverage_score") or 0),
+        "coverage_score": coverage_score,
         "required_topics": list(value.get("required_topics") or []),
         "completed_topics": list(value.get("completed_topics") or []),
-        "missing_topics": list(value.get("missing_topics") or []),
-        "blocking_gaps": list(value.get("blocking_gaps") or []),
+        "missing_topics": missing_topics,
+        "blocking_gaps": blocking_gaps,
         "non_blocking_gaps": list(value.get("non_blocking_gaps") or []),
         "claim_count": int(value.get("claim_count") or 0),
         "evidence_count": int(value.get("evidence_count") or 0),
@@ -219,9 +239,28 @@ def _research(value: dict[str, Any]) -> dict[str, Any]:
         "critical_evidence_references": list(value.get("critical_evidence_references") or [])[:8],
         "source_domains": list(value.get("source_domains") or [])[:12],
         "warnings": list(value.get("warnings") or [])[:12],
-        "research_complete": normalized_status in {"NOT_REQUIRED", "SUCCEEDED"},
-        "research_partial": normalized_status == "PARTIAL",
+        "policy_no_data_topics": list(
+            value.get("policy_no_data_topics") or []
+        ),
+        "disabled_optional_topics": list(
+            value.get("disabled_optional_topics") or []
+        ),
+        "readiness_debug": dict(value.get("readiness_debug") or {}),
+        "ready_for_trading_context": bool(
+            value.get("ready_for_trading_context")
+        ),
+        "research_complete": execution_complete and coverage_complete,
+        "research_partial": execution_complete and not coverage_complete,
         "research_unavailable": normalized_status in {"NO_DATA", "FAILED"},
+        "deprecated_fields": {
+            "research_complete": (
+                "deprecated compatibility alias; use execution_complete and "
+                "coverage_complete"
+            ),
+            "research_partial": (
+                "deprecated compatibility alias; use data_outcome"
+            ),
+        },
     }
 
 
@@ -457,7 +496,14 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
 
 def _earnings(full: dict[str, Any]) -> dict[str, Any]:
     earnings = (full.get("nasdaq_context") or {}).get("earnings") or {}
-    events = earnings.get("upcoming") or earnings.get("events") or []
+    events = (
+        earnings.get("upcoming")
+        or earnings.get("events")
+        or [
+            *(earnings.get("upcoming_mega_cap_earnings_14d") or []),
+            *(earnings.get("released_earnings") or []),
+        ]
+    )
     today = datetime.now(NEW_YORK).date()
     projected = [_earnings_event(item, today=today) for item in events[:50]]
     upcoming = [item for item in projected if item.get("temporal_status") == "PRE_RELEASE"][:20]

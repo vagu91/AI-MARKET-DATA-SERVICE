@@ -287,6 +287,9 @@ PROFILES: dict[str, ResearchProfile] = {
 
 JOB_PROFILE = {
     "MISSING_EVENT_RESEARCH": "EVENT_MISSING_FIELDS",
+    # This job is executed by the deterministic official-actual resolver, but
+    # remains explicit here because it shares the persistent job transport.
+    "RELEASE_ACTUAL_REFRESH": "EVENT_MISSING_FIELDS",
     "SPEECH_OUTCOME_REFRESH": "FED_SPEECH_OUTCOME",
     "EARNINGS_CONTEXT": "EARNINGS_CONTEXT",
     "NEWS_DRIVER_RESEARCH": "NEWS_DRIVER_RESEARCH",
@@ -311,7 +314,10 @@ JOB_PROFILE = {
 
 
 def profile_for_job(job_type: str) -> ResearchProfile:
-    return PROFILES[JOB_PROFILE.get(job_type, "MNQ_MARKET_RESEARCH")]
+    normalized = str(job_type or "").upper()
+    if normalized not in JOB_PROFILE:
+        raise ValueError(f"unmapped_research_job_type:{normalized}")
+    return PROFILES[JOB_PROFILE[normalized]]
 
 
 def prompt_context(

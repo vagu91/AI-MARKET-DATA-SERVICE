@@ -518,7 +518,14 @@ def test_parent_finalization_is_stable_and_aggregates_forensic_oracle(
     assert finalized["terminal_child_count"] == finalized["expected_child_count"] == 6
     assert finalized["required_topics"] == replay["parent"]["required_topics"]
     assert finalized["failed_topics"] == ["macro_events"]
-    assert finalized["blocking_gaps"] == ["failed_topic:macro_events"]
+    assert finalized["blocking_gaps"] == [
+        "missing_topic:cot_positioning",
+        "missing_topic:geopolitical_regulatory_risk",
+        "failed_topic:macro_events",
+        "missing_topic:mega_cap_semiconductors",
+        "missing_topic:nasdaq_100",
+        "missing_topic:vix_risk",
+    ]
     oracle = replay["telemetry_oracle"]
     for key in (
         "backend_invocations",
@@ -616,7 +623,7 @@ def test_cftc_and_cboe_structured_official_verification_is_deterministic() -> No
             "2026-07-14",
             "exact_normalized",
             None,
-            "SUCCEEDED",
+            "PARTIAL",
         ),
         (
             "COT_POSITIONING_RESEARCH",
@@ -627,7 +634,7 @@ def test_cftc_and_cboe_structured_official_verification_is_deterministic() -> No
             "-130338",
             "official_table_numeric",
             "-130338",
-            "SUCCEEDED",
+            "PARTIAL",
         ),
         (
             "COT_POSITIONING_RESEARCH",
@@ -743,13 +750,13 @@ def test_official_observation_policy_is_narrow_and_numeric_aware(
     result = repository.persist_claims(run, [claim])
 
     assert result["status"] == expected_status
-    assert result["accepted_count"] == (1 if expected_status == "SUCCEEDED" else 0)
+    assert result["accepted_count"] == (0 if expected_status == "NO_DATA" else 1)
     warnings = {
         warning
         for rejected in result["rejected_claims"]
         for warning in rejected["warnings"]
     }
-    if expected_status == "SUCCEEDED":
+    if expected_status != "NO_DATA":
         assert "published_at_required" not in warnings
     else:
         assert "official_numeric_value_mismatch" in warnings

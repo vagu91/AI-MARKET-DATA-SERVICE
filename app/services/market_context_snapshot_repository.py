@@ -10,12 +10,22 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.temporal_validation_service import TemporalValidationService
+from app.services.data_freshness_service import parse_datetime
 from app.services.source_policy_service import SourcePolicyService
 from app.infrastructure.persistence.database_safety import assert_test_database_isolated
 from app.services.research_domain_contracts import (
     DOMAIN_TOPICS,
     build_domain_projection,
 )
+from app.services.market_context_outbox_service import (
+    MarketContextOutboxRepository,
+)
+from app.services.event_driven_lifecycle_service import (
+    DatumLifecycle,
+    compute_datum_lifecycle,
+    persist_lifecycle_in_transaction,
+)
+from app.services.observability_contract_service import TelemetryRepository
 
 
 class MarketContextSnapshotRepository:
@@ -28,6 +38,8 @@ class MarketContextSnapshotRepository:
         migrate_database(settings.database_path)
         self.temporal_validation = TemporalValidationService(settings)
         self.source_policy = SourcePolicyService()
+        self.outbox = MarketContextOutboxRepository(settings)
+        self.telemetry = TelemetryRepository(settings)
         self.allow_test_reserved_sources = settings.environment.lower() == "test"
 
     def save_next(
@@ -41,6 +53,12 @@ class MarketContextSnapshotRepository:
         job_ids: list[str] | None = None,
         research_run_id: str | None = None,
         parent_run_id: str | None = None,
+        trigger_type: str | None = None,
+        trigger_entity: str | None = None,
+        trace_id: str | None = None,
+        correlation_id: str | None = None,
+        resolved_lifecycle: DatumLifecycle | None = None,
+        resolved_datum: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Allocate revision and persist both payloads in one SQLite write transaction."""
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -71,8 +89,19 @@ class MarketContextSnapshotRepository:
             "policy_version": self.source_policy.policy_version,
         }
         debug["audit"] = audit
+        outbox_event: dict[str, Any] | None = None
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                """
+                SELECT snapshot_id,debug_payload_json,consumer_payload_json
+                FROM market_context_snapshots
+                WHERE symbol=? AND audit_status='ACTIVE'
+                  AND source_audit_status='ACTIVE'
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
             revision = int(conn.execute(
                 "SELECT COALESCE(MAX(revision),0)+1 AS revision FROM market_context_snapshots WHERE symbol=?",
                 (symbol,),
@@ -86,6 +115,12 @@ class MarketContextSnapshotRepository:
             if research is not None:
                 research["snapshot_id"] = snapshot_id
                 debug["research"] = research
+                self._reconcile_research_claims(
+                    conn,
+                    debug,
+                    research_run_id=research_run_id,
+                    parent_run_id=parent_run_id,
+                )
                 for topic, projection in (
                     research.get("domains") or {}
                 ).items():
@@ -153,6 +188,36 @@ class MarketContextSnapshotRepository:
                     "LINKED" if research is not None else "NOT_REQUIRED",
                 ),
             )
+            if trigger_type:
+                outbox_event = self.outbox.emit_in_transaction(
+                    conn,
+                    trigger_type=trigger_type,
+                    trigger_entity=trigger_entity,
+                    snapshot_id=snapshot_id,
+                    snapshot_revision=revision,
+                    current_payload=consumer,
+                    previous_snapshot_id=(
+                        str(previous["snapshot_id"]) if previous else None
+                    ),
+                    previous_payload=(
+                        json.loads(previous["consumer_payload_json"] or "{}")
+                        if previous
+                        else None
+                    ),
+                    trace_id=trace_id,
+                    correlation_id=correlation_id,
+                    data_as_of=data_as_of,
+                    created_at=now,
+                )
+            if resolved_lifecycle is not None:
+                persist_lifecycle_in_transaction(
+                    conn,
+                    resolved_lifecycle,
+                    payload=dict(resolved_datum or {}),
+                    work_status="COMPLETED",
+                    timestamp=now,
+                )
+            self._persist_projected_lifecycle(conn, debug, timestamp=now)
             self._persist_components(
                 conn,
                 symbol=symbol,
@@ -172,6 +237,40 @@ class MarketContextSnapshotRepository:
                 )
                 conn.execute("UPDATE ai_research_jobs SET snapshot_id=? WHERE job_id=?", (snapshot_id, job_id))
             conn.commit()
+        if trigger_type:
+            telemetry_ids = {
+                "trace_id": trace_id,
+                "correlation_id": correlation_id,
+                "snapshot_id": snapshot_id,
+                "outbox_event_id": (
+                    outbox_event.get("event_id") if outbox_event else None
+                ),
+            }
+            self.telemetry.emit(
+                "material_diff",
+                identifiers=telemetry_ids,
+                decision_summary=(
+                    "material trigger produced snapshot section changes"
+                    if outbox_event
+                    else "trigger produced no material section changes"
+                ),
+                stop_reason="MATERIAL_CHANGE" if outbox_event else "NO_CHANGE",
+                payload={
+                    "status": "CHANGED" if outbox_event else "UNCHANGED",
+                    "reason": str(trigger_type),
+                },
+            )
+            if outbox_event:
+                self.telemetry.emit(
+                    "outbox_emission",
+                    identifiers=telemetry_ids,
+                    decision_summary="atomic market context outbox row committed",
+                    stop_reason="PENDING_DELIVERY",
+                    payload={
+                        "status": "PENDING",
+                        "reason": str(trigger_type),
+                    },
+                )
         restored = self.get(snapshot_id)
         if restored is None or restored["checksum"] != checksum:
             raise RuntimeError("market context snapshot read-back failed")
@@ -387,6 +486,17 @@ class MarketContextSnapshotRepository:
         }
         return {
             "status": str(run["status"]),
+            "execution_status": str(run["status"]),
+            "execution_complete": str(run["status"])
+            in {"SUCCEEDED", "PARTIAL", "NO_DATA"},
+            "data_outcome": (
+                "COMPLETE"
+                if float(run.get("coverage_score") or 0) >= 1
+                else "NO_DATA"
+                if str(run["status"]) == "NO_DATA"
+                else "PARTIAL"
+            ),
+            "coverage_complete": float(run.get("coverage_score") or 0) >= 1,
             "run_id": run_id,
             "job_id": str(run["job_id"]),
             "parent_run_id": run.get("parent_run_id"),
@@ -419,6 +529,11 @@ class MarketContextSnapshotRepository:
         parent_run_id: str,
         parent_status: str,
     ) -> dict[str, Any]:
+        parent = conn.execute(
+            "SELECT * FROM research_parent_runs WHERE parent_run_id=?",
+            (parent_run_id,),
+        ).fetchone()
+        parent_value = dict(parent) if parent is not None else {}
         projections = []
         for run_id in run_ids:
             row = conn.execute(
@@ -445,8 +560,23 @@ class MarketContextSnapshotRepository:
         completed = sorted(
             {topic for item in projections for topic in item["completed_topics"]}
         )
+        missing = sorted(set(required) - set(completed))
+        coverage_score = len(completed) / len(required) if required else 1.0
         return {
             "status": parent_status,
+            "execution_status": (
+                parent_value.get("execution_status") or parent_status
+            ),
+            "execution_complete": bool(
+                parent_value.get("execution_complete")
+            ),
+            "data_outcome": (
+                parent_value.get("data_outcome")
+                or ("COMPLETE" if not missing else "PARTIAL")
+            ),
+            "coverage_complete": bool(
+                parent_value.get("coverage_complete")
+            ),
             "run_id": parent_run_id,
             "job_id": None,
             "parent_run_id": parent_run_id,
@@ -467,19 +597,21 @@ class MarketContextSnapshotRepository:
                 (item["fresh_until"] for item in projections if item["fresh_until"]),
                 default=None,
             ),
-            "coverage_score": (
-                sum(item["coverage_score"] for item in projections) / len(projections)
-                if projections
-                else 0.0
-            ),
+            "coverage_score": coverage_score,
             "required_topics": required,
             "completed_topics": completed,
-            "missing_topics": sorted(set(required) - set(completed)),
+            "missing_topics": missing,
             "blocking_gaps": sorted(
                 {gap for item in projections for gap in item["blocking_gaps"]}
             ),
             "non_blocking_gaps": sorted(
                 {gap for item in projections for gap in item["non_blocking_gaps"]}
+            ),
+            "policy_no_data_topics": json.loads(
+                parent_value.get("policy_no_data_topics_json") or "[]"
+            ),
+            "ready_for_trading_context": bool(
+                parent_value.get("ready_for_trading_context")
             ),
             "claim_count": sum(item["claim_count"] for item in projections),
             "evidence_count": sum(item["evidence_count"] for item in projections),
@@ -564,6 +696,270 @@ class MarketContextSnapshotRepository:
             )
 
     @staticmethod
+    def _persist_projected_lifecycle(
+        conn: Any,
+        debug: dict[str, Any],
+        *,
+        timestamp: str,
+    ) -> None:
+        earnings = ((debug.get("nasdaq_context") or {}).get("earnings") or {})
+        for bucket in (
+            "upcoming",
+            "recent",
+            "items",
+            "events",
+            "upcoming_mega_cap_earnings_14d",
+            "released_earnings",
+        ):
+            for item in earnings.get(bucket) or []:
+                if not isinstance(item, dict):
+                    continue
+                lifecycle = item.get("lifecycle")
+                if not isinstance(lifecycle, dict):
+                    continue
+                contract = DatumLifecycle(**lifecycle)
+                persist_lifecycle_in_transaction(
+                    conn,
+                    contract,
+                    payload=item,
+                    work_status=(
+                        "READY"
+                        if contract.freshness_state in {
+                            "DUE",
+                            "AWAITING_ACTUAL",
+                        }
+                        else "IDLE"
+                    ),
+                    timestamp=timestamp,
+                )
+
+    def _reconcile_research_claims(
+        self,
+        conn: Any,
+        debug: dict[str, Any],
+        *,
+        research_run_id: str | None,
+        parent_run_id: str | None,
+    ) -> None:
+        run_ids: list[str] = []
+        if parent_run_id:
+            run_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT child_run_id FROM research_parent_children
+                    WHERE parent_run_id=? AND child_run_id IS NOT NULL
+                    ORDER BY ordinal
+                    """,
+                    (parent_run_id,),
+                ).fetchall()
+            ]
+        elif research_run_id:
+            run_ids = [research_run_id]
+        if not run_ids:
+            return
+        placeholders = ",".join("?" for _ in run_ids)
+        rows = conn.execute(
+            f"""
+            SELECT claim_id,topic,field_semantics,metric_id,event_key,symbol,
+                   issuer,event_at,release_at,valid_until,next_refresh_at,
+                   confirmation_status,value_json,payload_json
+            FROM research_claims
+            WHERE research_run_id IN ({placeholders})
+              AND validation_status='accepted'
+              AND materialization_status='MATERIALIZED'
+              AND source_audit_status='ACTIVE'
+            ORDER BY created_at,claim_id
+            """,
+            run_ids,
+        ).fetchall()
+        claims: list[dict[str, Any]] = []
+        for row in rows:
+            claim = dict(row)
+            claim["value"] = json.loads(claim.pop("value_json") or "null")
+            claim["payload"] = json.loads(claim.pop("payload_json") or "{}")
+            evidence_rows = conn.execute(
+                """
+                SELECT canonical_url,source_domain,source_tier,publisher,
+                       source_status,retrieved_at,published_at
+                FROM research_evidence
+                WHERE claim_id=? AND audit_status='ACTIVE'
+                  AND source_audit_status='ACTIVE'
+                ORDER BY source_tier,canonical_url
+                """,
+                (claim["claim_id"],),
+            ).fetchall()
+            claim["lineage"] = [dict(item) for item in evidence_rows]
+            claims.append(claim)
+        self._reconcile_earnings(debug, claims)
+        self._reconcile_cot(debug, claims)
+
+    def _reconcile_earnings(
+        self,
+        debug: dict[str, Any],
+        claims: list[dict[str, Any]],
+    ) -> None:
+        confirmations = [
+            claim
+            for claim in claims
+            if str(claim.get("field_semantics") or "").lower()
+            in {"earnings_schedule", "earnings", "guidance"}
+            or str(claim.get("topic") or "").lower() == "earnings_intelligence"
+        ]
+        earnings = ((debug.get("nasdaq_context") or {}).get("earnings") or {})
+        if not isinstance(earnings, dict):
+            return
+        for bucket in (
+            "upcoming",
+            "recent",
+            "items",
+            "events",
+            "upcoming_mega_cap_earnings_14d",
+            "released_earnings",
+        ):
+            items = earnings.get(bucket)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                match = next(
+                    (
+                        claim
+                        for claim in confirmations
+                        if _same_issuer_event(item, claim)
+                    ),
+                    None,
+                )
+                if match is None:
+                    continue
+                lineage = [
+                    *list(item.get("source_lineage") or []),
+                    *list(match.get("lineage") or []),
+                ]
+                deduplicated = {
+                    str(entry.get("canonical_url") or entry.get("source_domain")): entry
+                    for entry in lineage
+                    if isinstance(entry, dict)
+                }
+                item["source_lineage"] = list(deduplicated.values())
+                best = next(iter(item["source_lineage"]), {})
+                rule = self.source_policy.rule_for(
+                    best.get("canonical_url"),
+                    best.get("publisher"),
+                )
+                item["source_tier"] = best.get("source_tier")
+                if rule is not None:
+                    item["reliability"] = float(rule["base_reliability"])
+                item["event_at"] = match.get("event_at") or match.get("release_at")
+                item["valid_until"] = match.get("valid_until")
+                item["next_refresh_at"] = (
+                    match.get("next_refresh_at") or match.get("event_at")
+                )
+                item["confirmation_status"] = (
+                    match.get("confirmation_status") or "VERIFIED"
+                )
+                item["confirmation_claim_id"] = match.get("claim_id")
+                item["lifecycle"] = compute_datum_lifecycle(
+                    "earnings_schedule",
+                    (
+                        f"{item.get('ticker') or item.get('symbol') or item.get('issuer')}:"
+                        f"{str(item['event_at'])[:10]}"
+                    ),
+                    item,
+                    settings=self.settings,
+                    now=datetime.now(UTC),
+                    refresh_reason="verified_cross_child_reconciliation",
+                ).as_dict()
+
+    def _reconcile_cot(
+        self,
+        debug: dict[str, Any],
+        claims: list[dict[str, Any]],
+    ) -> None:
+        cot_claims = [
+            claim
+            for claim in claims
+            if str(claim.get("topic") or "").lower() == "cot_positioning"
+        ]
+        if not cot_claims:
+            return
+        values = {
+            str(claim.get("metric_id") or "").lower(): claim.get("value")
+            for claim in cot_claims
+            if claim.get("metric_id")
+        }
+        report_date = values.get("cot_report_date") or values.get("report_date")
+        contract_code = (
+            values.get("cot_contract")
+            or values.get("contract_code")
+            or values.get("market_code")
+        )
+        open_interest = values.get("open_interest") or values.get(
+            "cot_open_interest"
+        )
+        groups: dict[str, dict[str, Any]] = {}
+        for metric, value in values.items():
+            for group in ("asset_manager", "leveraged_fund", "dealer", "noncommercial"):
+                if group not in metric:
+                    continue
+                target = groups.setdefault(group, {})
+                for side in ("long", "short", "spread", "change"):
+                    if side in metric:
+                        target[side] = value
+        complete_groups = {
+            group: value
+            for group, value in groups.items()
+            if value.get("long") is not None and value.get("short") is not None
+        }
+        positioning = dict(debug.get("positioning") or {})
+        if report_date is None or contract_code is None or not complete_groups:
+            positioning.update(
+                {
+                    "status": "PARTIAL",
+                    "coverage_complete": False,
+                    "missing_fields": [
+                        field
+                        for field, present in (
+                            ("report_date", report_date is not None),
+                            ("contract_code", contract_code is not None),
+                            ("positions", bool(complete_groups)),
+                        )
+                        if not present
+                    ],
+                }
+            )
+            debug["positioning"] = positioning
+            return
+        positioning.update(
+            {
+                "status": "AVAILABLE",
+                "coverage_complete": True,
+                "report_date": report_date,
+                "contract_code": contract_code,
+                "open_interest": open_interest,
+                "asset_managers": complete_groups.get("asset_manager", {}),
+                "leveraged_funds": complete_groups.get("leveraged_fund", {}),
+                "dealers": complete_groups.get("dealer", {}),
+                "noncommercial": complete_groups.get("noncommercial", {}),
+                "source_lineage": [
+                    evidence
+                    for claim in cot_claims
+                    for evidence in claim.get("lineage") or []
+                ],
+            }
+        )
+        positioning["lifecycle"] = compute_datum_lifecycle(
+            "cot",
+            str(contract_code),
+            positioning,
+            settings=self.settings,
+            now=datetime.now(UTC),
+            refresh_reason="verified_cot_claim_projection",
+        ).as_dict()
+        debug["positioning"] = positioning
+
+    @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -603,3 +999,45 @@ class MarketContextSnapshotRepository:
         data["debug_payload"] = json.loads(data.pop("debug_payload_json"))
         data["consumer_payload"] = json.loads(data.pop("consumer_payload_json"))
         return data
+
+
+def _same_issuer_event(item: dict[str, Any], claim: dict[str, Any]) -> bool:
+    item_symbol = str(item.get("ticker") or item.get("symbol") or "").upper()
+    claim_symbol = str(
+        claim.get("symbol")
+        or (claim.get("payload") or {}).get("ticker")
+        or ""
+    ).upper()
+    item_issuer = _canonical_issuer(
+        item.get("issuer") or item.get("company") or item.get("company_name")
+    )
+    claim_issuer = _canonical_issuer(claim.get("issuer"))
+    identity_matches = bool(
+        (item_symbol and claim_symbol and _share_class_root(item_symbol) == _share_class_root(claim_symbol))
+        or (item_issuer and claim_issuer and item_issuer == claim_issuer)
+    )
+    if not identity_matches:
+        return False
+    item_time = parse_datetime(
+        item.get("event_at")
+        or item.get("earnings_date")
+        or item.get("date")
+    )
+    claim_time = parse_datetime(claim.get("event_at") or claim.get("release_at"))
+    return bool(
+        item_time is None
+        or claim_time is None
+        or item_time.date() == claim_time.date()
+    )
+
+
+def _canonical_issuer(value: Any) -> str:
+    text = "".join(character for character in str(value or "").upper() if character.isalnum())
+    for suffix in ("INCORPORATED", "CORPORATION", "COMPANY", "INC", "CORP", "LTD"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+    return text
+
+
+def _share_class_root(symbol: str) -> str:
+    return "GOOG" if symbol in {"GOOG", "GOOGL"} else symbol.split(".", 1)[0]

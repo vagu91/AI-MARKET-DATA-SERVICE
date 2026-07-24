@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
@@ -18,15 +18,507 @@ from app.services.temporal_domain_service import canonical_event_key
 from app.services.data_freshness_service import parse_datetime
 from app.services.research_gap_manifest import ResearchGapManifestBuilder
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
+from app.services.event_driven_lifecycle_service import (
+    DatumLifecycle,
+    LifecycleRepository,
+    TRIGGER_CLASS_BY_ENTITY,
+    compute_datum_lifecycle,
+)
+from app.services.research_agent_enablement import is_research_agent_enabled
+from app.services.research_gap_manifest import TOPIC_PROFILES
+from app.services.observability_contract_service import TelemetryRepository
 
 
 class ResearchSchedulerService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.jobs = AIResearchJobRepository(settings)
         self.service = AIResearchJobService(settings, repository=self.jobs)
         self.snapshots = MarketContextSnapshotRepository(settings)
+        self.lifecycle = LifecycleRepository(settings, clock=self.clock)
+        self.telemetry = TelemetryRepository(settings, clock=self.clock)
         migrate_database(settings.database_path)
+
+    def scan_due_items(
+        self,
+        *,
+        owner: str,
+        resolver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        ai_enqueue: Callable[[list[dict[str, Any]]], Any] | None = None,
+        trigger_type: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Lease due work, run resolvers first, and enqueue AI once for residuals."""
+        if not self.settings.lifecycle_due_scanner_enabled and not force:
+            return {
+                "status": "DISABLED",
+                "provider_calls": 0,
+                "ai_invocations": 0,
+                "claimed": 0,
+            }
+        now = self.clock()
+        claimed = self.lifecycle.claim_due(owner=owner, now=now)
+        self.telemetry.emit(
+            "lease",
+            identifiers={"correlation_id": owner},
+            decision_summary="lifecycle due scan leased bounded work",
+            payload={"status": "LEASED", "reason": f"claimed:{len(claimed)}"},
+        )
+        explicit_trigger_class = TRIGGER_CLASS_BY_ENTITY.get(
+            str(trigger_type or "").lower()
+        )
+        has_trigger = explicit_trigger_class == "TRIGGER" or any(
+            item.get("trigger_class") == "TRIGGER" for item in claimed
+        )
+        provider_calls = 0
+        resolved: list[str] = []
+        rematerialized: list[str] = []
+        residual: list[dict[str, Any]] = []
+        ai_eligible: list[dict[str, Any]] = []
+        ai_decisions: list[dict[str, str]] = []
+        deferred: list[str] = []
+        backoff: list[str] = []
+        item_outcomes: list[dict[str, str | None]] = []
+        effective_triggers: list[dict[str, str]] = []
+        for item in claimed:
+            item_id = str(item["item_id"])
+            effective_trigger_type = _effective_trigger_type(
+                item,
+                explicit_trigger_type=trigger_type,
+            )
+            trigger_correlation_id = f"lifecycle-{item_id}"
+            if effective_trigger_type:
+                effective_triggers.append(
+                    {
+                        "item_id": item_id,
+                        "trigger_type": effective_trigger_type,
+                        "trigger_entity": str(item.get("entity_key") or ""),
+                        "correlation_id": trigger_correlation_id,
+                    }
+                )
+            if (
+                item.get("trigger_class") == "REFRESH_ON_TRIGGER"
+                and not has_trigger
+            ):
+                self.lifecycle.transition(
+                    item_id,
+                    owner=owner,
+                    work_status="READY",
+                    refresh_reason="waiting_for_material_trigger",
+                    next_refresh_at=(
+                        now
+                        + timedelta(
+                            seconds=int(
+                                self.settings.lifecycle_due_scanner_interval_seconds
+                            )
+                        )
+                    ).isoformat(),
+                    now=now,
+                )
+                deferred.append(item_id)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "READY",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                continue
+            provider_result = (
+                resolver(item)
+                if resolver is not None
+                else {"status": "NOT_CONFIGURED"}
+            )
+            provider_calls += int(resolver is not None)
+            self.telemetry.emit(
+                "provider_call",
+                identifiers={"correlation_id": owner},
+                decision_summary="deterministic lifecycle resolver evaluated due item",
+                stop_reason=str(provider_result.get("status") or "NOT_CONFIGURED"),
+                payload={
+                    "status": str(
+                        provider_result.get("status") or "NOT_CONFIGURED"
+                    ),
+                    "reason": str(provider_result.get("reason") or ""),
+                },
+            )
+            if str(provider_result.get("status") or "").upper() in {
+                "RESOLVED",
+                "FRESH",
+                "NOT_REQUIRED",
+            }:
+                datum = provider_result.get("datum")
+                lifecycle = provider_result.get("lifecycle")
+                if isinstance(datum, dict):
+                    if lifecycle is None:
+                        lifecycle = compute_datum_lifecycle(
+                            str(item.get("entity_type") or "unknown"),
+                            str(item.get("entity_key") or ""),
+                            datum,
+                            settings=self.settings,
+                            now=now,
+                            triggering_event=effective_trigger_type,
+                            refresh_reason="provider_resolution_completed",
+                        )
+                    snapshot = self._rematerialize_provider_resolution(
+                        item=item,
+                        datum=datum,
+                        lifecycle=lifecycle.as_dict(),
+                        trigger_type=effective_trigger_type,
+                        owner=owner,
+                        now=now,
+                    )
+                    if snapshot is not None:
+                        rematerialized.append(str(snapshot["snapshot_id"]))
+                    else:
+                        self.lifecycle.upsert(
+                            lifecycle,
+                            payload=datum,
+                            work_status="COMPLETED",
+                        )
+                else:
+                    self.lifecycle.complete(
+                        item_id,
+                        owner=owner,
+                        next_refresh_at=provider_result.get("next_refresh_at"),
+                        now=now,
+                    )
+                resolved.append(item_id)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "RESOLVED",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                continue
+            provider_status = str(
+                provider_result.get("status") or "NOT_CONFIGURED"
+            ).upper()
+            unresolved = {
+                **item,
+                "provider_resolver_status": provider_status,
+                "effective_trigger_type": effective_trigger_type,
+                "trigger_correlation_id": trigger_correlation_id,
+            }
+            if provider_status == "DEFERRED":
+                deferred_lifecycle = provider_result.get("lifecycle")
+                deferred_datum = provider_result.get("datum")
+                if isinstance(deferred_lifecycle, dict):
+                    deferred_lifecycle = DatumLifecycle(**deferred_lifecycle)
+                if deferred_lifecycle is None:
+                    deferred_lifecycle = compute_datum_lifecycle(
+                        str(item.get("entity_type") or "unknown"),
+                        str(item.get("entity_key") or ""),
+                        {
+                            "refresh_reason": str(
+                                provider_result.get("reason")
+                                or "provider_temporary_failure"
+                            )
+                        },
+                        settings=self.settings,
+                        now=now,
+                        attempt_count=int(item.get("attempt_count") or 0) + 1,
+                        no_data=True,
+                        fields_attempted=list(
+                            item.get("fields_attempted") or []
+                        ),
+                        session_state=item.get("session_state"),
+                        triggering_event=effective_trigger_type,
+                        retry_class="PROVIDER_TEMPORARY",
+                        refresh_reason=str(
+                            provider_result.get("reason")
+                            or "provider_temporary_failure"
+                        ),
+                    )
+                if not isinstance(deferred_datum, dict):
+                    deferred_datum = {
+                        "reason": str(
+                            provider_result.get("reason")
+                            or "provider_temporary_failure"
+                        ),
+                        "fields_attempted": list(
+                            item.get("fields_attempted") or []
+                        ),
+                    }
+                self.lifecycle.upsert(
+                    deferred_lifecycle,
+                    payload=deferred_datum,
+                    work_status="BACKOFF",
+                )
+                deferred.append(item_id)
+                backoff.append(item_id)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "BACKOFF",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                self.telemetry.emit(
+                    "retry_backoff",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "temporary provider failure persisted as negative-cache backoff"
+                    ),
+                    stop_reason="BACKOFF",
+                    payload={
+                        "status": "BACKOFF",
+                        "reason": str(
+                            provider_result.get("reason")
+                            or "provider_temporary_failure"
+                        ),
+                    },
+                )
+                continue
+            residual.append(unresolved)
+            ai_decisions.append(
+                {
+                    "item_id": item_id,
+                    "agent_status": str(
+                        provider_result.get("agent_status")
+                        or (
+                            "ENABLED"
+                            if provider_result.get("ai_eligible") is True
+                            else "NOT_APPLICABLE"
+                        )
+                    ),
+                    "execution_status": str(
+                        provider_result.get("execution_status")
+                        or (
+                            "ELIGIBLE"
+                            if provider_result.get("ai_eligible") is True
+                            else "NOT_REQUESTED"
+                        )
+                    ),
+                }
+            )
+            if (
+                resolver is not None
+                and provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
+                and provider_result.get("ai_eligible", True) is True
+            ):
+                ai_eligible.append(unresolved)
+        ai_invocations = 0
+        enqueue_result: Any = None
+        if ai_eligible and ai_enqueue is not None:
+            enqueue_result = ai_enqueue(ai_eligible)
+            ai_invocations = 1
+            self.telemetry.emit(
+                "enqueue",
+                identifiers={"correlation_id": owner},
+                decision_summary="coalesced residual lifecycle gaps enqueued",
+                payload={
+                    "status": "QUEUED",
+                    "reason": f"residual_count:{len(ai_eligible)}",
+                },
+            )
+            for item in ai_eligible:
+                self.lifecycle.transition(
+                    str(item["item_id"]),
+                    owner=owner,
+                    work_status="QUEUED",
+                    refresh_reason="provider_exhausted_ai_queued",
+                    now=now,
+                )
+                item_outcomes.append(
+                    {
+                        "item_id": str(item["item_id"]),
+                        "status": "AI_QUEUED",
+                        "effective_trigger_type": item.get(
+                            "effective_trigger_type"
+                        ),
+                    }
+                )
+        else:
+            for item in residual:
+                if item in ai_eligible and ai_enqueue is not None:
+                    continue
+                agent_status = next(
+                    (
+                        decision["agent_status"]
+                        for decision in ai_decisions
+                        if decision["item_id"] == str(item["item_id"])
+                    ),
+                    "",
+                )
+                self.lifecycle.transition(
+                    str(item["item_id"]),
+                    owner=owner,
+                    work_status=(
+                        "DISABLED" if agent_status == "DISABLED" else "IDLE"
+                    ),
+                    refresh_reason=(
+                        "provider_deferred_ai_not_requested"
+                        if str(item.get("provider_resolver_status")) == "DEFERRED"
+                        else "agent_disabled_ai_not_requested"
+                        if agent_status == "DISABLED"
+                        else "provider_unresolved_ai_not_configured"
+                    ),
+                    next_refresh_at=(
+                        now
+                        + timedelta(
+                            seconds=int(
+                                self.settings.lifecycle_due_scanner_interval_seconds
+                            )
+                        )
+                    ).isoformat(),
+                    now=now,
+                )
+                self.telemetry.emit(
+                    "retry_backoff",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "unresolved lifecycle item deferred to bounded next check"
+                    ),
+                    stop_reason="DEFERRED",
+                    payload={
+                        "status": "IDLE",
+                        "reason": "provider_unresolved_ai_not_requested",
+                    },
+                )
+                item_outcomes.append(
+                    {
+                        "item_id": str(item["item_id"]),
+                        "status": (
+                            "DISABLED"
+                            if agent_status == "DISABLED"
+                            else "IDLE"
+                        ),
+                        "effective_trigger_type": item.get(
+                            "effective_trigger_type"
+                        ),
+                    }
+                )
+        return {
+            "status": "COMPLETED",
+            "claimed": len(claimed),
+            "provider_calls": provider_calls,
+            "resolved": resolved,
+            "rematerialized_snapshot_ids": rematerialized,
+            "deferred": deferred,
+            "backoff": backoff,
+            "residual_count": len(residual),
+            "ai_eligible_count": len(ai_eligible),
+            "ai_decisions": ai_decisions,
+            "item_outcomes": item_outcomes,
+            "effective_triggers": effective_triggers,
+            "ai_invocations": ai_invocations,
+            "enqueue_result": enqueue_result,
+            "coalesced": len(ai_eligible) > 1,
+        }
+
+    def _rematerialize_provider_resolution(
+        self,
+        *,
+        item: dict[str, Any],
+        datum: dict[str, Any],
+        lifecycle: dict[str, Any],
+        trigger_type: str | None,
+        owner: str,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        previous = self.snapshots.latest("MNQ")
+        if previous is None:
+            return None
+        components = self.snapshots.latest_components("MNQ")
+        if not components:
+            return None
+        debug = dict(components)
+        debug = _project_resolved_datum(
+            debug,
+            entity_type=str(item.get("entity_type") or ""),
+            entity_key=str(item.get("entity_key") or ""),
+            datum=datum,
+            lifecycle=lifecycle,
+        )
+        resolutions = dict(debug.get("lifecycle_resolutions") or {})
+        resolutions[str(item.get("entity_key") or item["item_id"])] = {
+            "entity_type": item.get("entity_type"),
+            "value": datum,
+            "lifecycle": lifecycle,
+        }
+        debug["lifecycle_resolutions"] = resolutions
+        debug["generated_at_utc"] = now.astimezone(UTC).replace(
+            microsecond=0
+        ).isoformat()
+        snapshot = self.snapshots.save_next(
+            symbol="MNQ",
+            refresh_mode="lifecycle_provider_resolution",
+            debug_payload=debug,
+            ai_enrichment={"status": "NOT_REQUIRED"},
+            trigger_type=trigger_type,
+            trigger_entity=str(item.get("entity_key") or ""),
+            correlation_id=owner,
+            resolved_lifecycle=DatumLifecycle(**lifecycle),
+            resolved_datum=datum,
+        )
+        self.telemetry.emit(
+            "materialization",
+            identifiers={
+                "correlation_id": owner,
+                "snapshot_id": snapshot.get("snapshot_id"),
+            },
+            decision_summary="provider resolution rematerialized from committed data",
+            payload={"status": "SUCCEEDED", "reason": str(trigger_type or "")},
+        )
+        return snapshot
+
+    def enqueue_due_residuals(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        trigger_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Use the normal persistent job service for resolver-exhausted gaps."""
+        jobs: list[dict[str, Any]] = []
+        for item in items:
+            topic = _topic_for_entity(str(item.get("entity_type") or ""))
+            profile_id = TOPIC_PROFILES.get(topic)
+            if not profile_id or not is_research_agent_enabled(
+                self.settings,
+                topic=topic,
+                profile_id=profile_id,
+            ):
+                continue
+            effective_trigger_type = _effective_trigger_type(
+                item,
+                explicit_trigger_type=trigger_type,
+            )
+            trigger_correlation_id = str(
+                item.get("trigger_correlation_id")
+                or f"lifecycle-{item.get('item_id')}"
+            )
+            job, created = self.service.enqueue_explicit(
+                job_type=profile_id,
+                symbol="MNQ",
+                correlation_id=f"lifecycle-due-{uuid.uuid4()}",
+                request_payload={
+                    "missing_fields": list(item.get("fields_attempted") or []),
+                    "lifecycle_item_id": item.get("item_id"),
+                    "database_context": item.get("payload") or {},
+                    "trigger_envelope": (
+                        {
+                            "trigger_type": effective_trigger_type,
+                            "trigger_entity": item.get("entity_key"),
+                            "correlation_id": trigger_correlation_id,
+                        }
+                        if effective_trigger_type
+                        else None
+                    ),
+                },
+                pending_fields=list(item.get("fields_attempted") or []),
+                specialized_topic=topic,
+            )
+            if created:
+                jobs.append(job)
+        return jobs
 
     def evaluate(self, trigger_name: str, *, force: bool = False) -> dict[str, Any]:
         snapshot = self.snapshots.latest("MNQ")
@@ -254,6 +746,197 @@ def _job_type(trigger: str) -> str:
     if trigger in {"speech_outcome"}:
         return "SPEECH_OUTCOME_REFRESH"
     return "MNQ_MARKET_RESEARCH"
+
+
+def _topic_for_entity(entity_type: str) -> str:
+    normalized = entity_type.lower()
+    if normalized in {"vix", "vvix", "vix_futures", "put_call", "skew"}:
+        return "vix_risk"
+    if normalized in {"cot", "cot_publication"}:
+        return "cot_positioning"
+    if normalized.startswith("earnings"):
+        return (
+            "earnings_intelligence"
+            if normalized == "earnings_intelligence"
+            else "earnings"
+        )
+    if normalized in TOPIC_PROFILES:
+        return normalized
+    if normalized in {"macro_actual", "macro_schedule", "macro_snapshot"}:
+        return "macro_events"
+    if normalized.startswith("fomc") or normalized == "fed_rates":
+        return "fed_rates"
+    if normalized in {"breaking_news", "news"}:
+        return "news"
+    return normalized
+
+
+def _effective_trigger_type(
+    item: dict[str, Any],
+    *,
+    explicit_trigger_type: str | None,
+) -> str | None:
+    if str(item.get("trigger_class") or "") == "NON_TRIGGERING":
+        return None
+    explicit = str(explicit_trigger_type or "").strip()
+    if explicit:
+        return explicit
+    preserved = str(item.get("effective_trigger_type") or "").strip()
+    if preserved:
+        return preserved
+    triggering_event = str(item.get("triggering_event") or "").strip()
+    if triggering_event:
+        return triggering_event
+    if str(item.get("trigger_class") or "") == "TRIGGER":
+        entity_type = str(item.get("entity_type") or "").strip()
+        return entity_type or None
+    return None
+
+
+def _project_resolved_datum(
+    debug: dict[str, Any],
+    *,
+    entity_type: str,
+    entity_key: str,
+    datum: dict[str, Any],
+    lifecycle: dict[str, Any],
+) -> dict[str, Any]:
+    """Project one provider resolution into its existing consumer-facing block."""
+    output = dict(debug)
+    normalized = entity_type.lower()
+    value = {**datum, "lifecycle": lifecycle}
+    if normalized in {"vix", "vvix", "skew"}:
+        risk = dict(output.get("risk_context") or {})
+        risk[normalized] = value
+        risk["status"] = "AVAILABLE"
+        output["risk_context"] = risk
+        return output
+    if normalized in {"vix_futures", "put_call"}:
+        risk = dict(output.get("risk_context") or {})
+        risk[
+            "vix_term_structure" if normalized == "vix_futures" else "put_call"
+        ] = value
+        risk["status"] = "AVAILABLE"
+        output["risk_context"] = risk
+        return output
+    if normalized in {"cot", "cot_positioning", "cot_publication"}:
+        positioning = dict(output.get("positioning") or {})
+        positioning.update(value)
+        positioning["status"] = str(value.get("status") or "AVAILABLE")
+        output["positioning"] = positioning
+        return output
+    if normalized.startswith("earnings") and normalized != "earnings_intelligence":
+        nasdaq = dict(output.get("nasdaq_context") or {})
+        earnings = dict(nasdaq.get("earnings") or {})
+        rows = list(
+            earnings.get("events")
+            or earnings.get("upcoming")
+            or earnings.get("released_earnings")
+            or []
+        )
+        matching = [
+            index
+            for index, row in enumerate(rows)
+            if isinstance(row, dict)
+            and _datum_entity_key(row) == entity_key.upper()
+        ]
+        if matching:
+            rows[matching[0]] = value
+        else:
+            rows.append(value)
+        earnings["events"] = rows
+        earnings["status"] = "AVAILABLE"
+        earnings["lifecycle"] = lifecycle
+        nasdaq["earnings"] = earnings
+        output["nasdaq_context"] = nasdaq
+        return output
+    if normalized in {"macro_actual", "macro_schedule"} or normalized.startswith(
+        "fomc"
+    ):
+        calendar = dict(output.get("event_calendar") or {})
+        bucket = (
+            "fed_communications"
+            if normalized.startswith("fomc")
+            else "critical_macro_events"
+        )
+        rows = list(calendar.get(bucket) or [])
+        matching = [
+            index
+            for index, row in enumerate(rows)
+            if isinstance(row, dict)
+            and str(
+                row.get("canonical_event_key")
+                or row.get("event_key")
+                or row.get("event_id")
+                or ""
+            )
+            == entity_key
+        ]
+        if matching:
+            rows[matching[0]] = value
+        else:
+            rows.append(value)
+        calendar[bucket] = rows
+        output["event_calendar"] = calendar
+        return output
+    if normalized == "macro_snapshot":
+        output["macro_snapshot"] = value
+        return output
+    if normalized == "fed_rates":
+        output["rates_expectations"] = value
+        return output
+    if normalized in {"nasdaq_100", "mega_cap_semiconductors"}:
+        nasdaq = dict(output.get("nasdaq_context") or {})
+        key = (
+            "qqq_holdings"
+            if normalized == "nasdaq_100"
+            else "mega_cap_snapshot"
+        )
+        nasdaq[key] = value
+        nasdaq["status"] = "AVAILABLE"
+        output["nasdaq_context"] = nasdaq
+        return output
+    if normalized in {"breaking_news", "news"}:
+        news = dict(output.get("news_context") or {})
+        rows = list(news.get("articles") or news.get("latest") or [])
+        rows = [
+            row
+            for row in rows
+            if not isinstance(row, dict)
+            or str(
+                row.get("news_key")
+                or row.get("canonical_url")
+                or row.get("url")
+                or ""
+            )
+            != entity_key
+        ]
+        rows.append(value)
+        news["articles"] = rows
+        news["status"] = "AVAILABLE"
+        output["news_context"] = news
+        return output
+    if normalized in TOPIC_PROFILES:
+        output[normalized] = value
+        return output
+    return output
+
+
+def _datum_entity_key(value: dict[str, Any]) -> str:
+    issuer = str(
+        value.get("ticker")
+        or value.get("symbol")
+        or value.get("issuer")
+        or value.get("company")
+        or ""
+    ).upper()
+    event_at = str(
+        value.get("event_at")
+        or value.get("earnings_date")
+        or value.get("date")
+        or ""
+    )[:10]
+    return f"{issuer}:{event_at}".strip(":")
 
 
 def _json(value: Any) -> str:

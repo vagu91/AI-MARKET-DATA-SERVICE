@@ -45,9 +45,15 @@ from app.services.market_context_snapshot_repository import MarketContextSnapsho
 from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.temporal_validation_service import TemporalValidationService
 from app.infrastructure.persistence.database_safety import assert_test_database_isolated
+from app.services.lifecycle_due_resolver import (
+    DeterministicLifecycleDueResolver,
+    existing_lifecycle_provider_adapters,
+)
+from app.services.research_agent_enablement import validate_research_agent_mapping
 
 
 def build_application_state(settings: Settings) -> dict[str, Any]:
+    validate_research_agent_mapping()
     assert_test_database_isolated(
         settings.database_path,
         environment=settings.environment,
@@ -111,6 +117,14 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         snapshots=market_context_snapshots,
     )
     research_scheduler = ResearchSchedulerService(settings)
+    lifecycle_due_resolver = DeterministicLifecycleDueResolver(
+        settings,
+        adapters=existing_lifecycle_provider_adapters(
+            macro_service=macro_service,
+            event_service=event_service,
+            nasdaq_data_service=nasdaq_data_service,
+        ),
+    )
 
     return {
         "settings": settings,
@@ -126,4 +140,5 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         "market_context_snapshots": market_context_snapshots,
         "ai_research_worker": ai_research_worker,
         "research_scheduler": research_scheduler,
+        "lifecycle_due_resolver": lifecycle_due_resolver,
     }

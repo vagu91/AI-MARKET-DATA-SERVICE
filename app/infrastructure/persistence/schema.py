@@ -1089,6 +1089,175 @@ CREATE TABLE IF NOT EXISTS research_reconciliation_audit (
 );
 """
 
+EVENT_DRIVEN_LIFECYCLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS datum_lifecycle_items (
+  item_id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,
+  entity_key TEXT NOT NULL,
+  trigger_class TEXT NOT NULL,
+  freshness_state TEXT NOT NULL,
+  observed_at TEXT NULL,
+  data_as_of TEXT NULL,
+  published_at TEXT NULL,
+  event_at TEXT NULL,
+  valid_from TEXT NULL,
+  valid_until TEXT NULL,
+  next_refresh_at TEXT NULL,
+  next_retry_at TEXT NULL,
+  superseded_by TEXT NULL,
+  refresh_reason TEXT NULL,
+  materiality_fingerprint TEXT NOT NULL,
+  source_lineage_json TEXT NOT NULL DEFAULT '[]',
+  acquisition_method TEXT NULL,
+  retry_class TEXT NULL,
+  retry_policy_json TEXT NOT NULL DEFAULT '{}',
+  negative_cache_key TEXT NULL,
+  negative_cache_expires_at TEXT NULL,
+  session_state TEXT NULL,
+  triggering_event TEXT NULL,
+  fields_attempted_json TEXT NOT NULL DEFAULT '[]',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  work_status TEXT NOT NULL DEFAULT 'READY',
+  lease_owner TEXT NULL,
+  lease_expires_at TEXT NULL,
+  heartbeat_at TEXT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(entity_type,entity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_datum_lifecycle_due
+  ON datum_lifecycle_items(work_status,next_retry_at,next_refresh_at,trigger_class);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_datum_negative_cache
+  ON datum_lifecycle_items(negative_cache_key)
+  WHERE negative_cache_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS market_context_outbox (
+  event_id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  trace_id TEXT NULL,
+  correlation_id TEXT NULL,
+  trigger_type TEXT NOT NULL,
+  trigger_entity TEXT NULL,
+  snapshot_id TEXT NOT NULL,
+  snapshot_revision INTEGER NOT NULL,
+  previous_snapshot_id TEXT NULL,
+  changed_sections_json TEXT NOT NULL DEFAULT '[]',
+  material_changes_json TEXT NOT NULL DEFAULT '[]',
+  data_as_of TEXT NULL,
+  created_at TEXT NOT NULL,
+  delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NULL,
+  acknowledged_at TEXT NULL,
+  acknowledged_by TEXT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload_hash TEXT NOT NULL,
+  FOREIGN KEY(snapshot_id) REFERENCES market_context_snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_context_outbox_delivery
+  ON market_context_outbox(delivery_status,next_attempt_at,created_at);
+
+CREATE TABLE IF NOT EXISTS service_telemetry_events (
+  telemetry_id TEXT PRIMARY KEY,
+  event_name TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  trace_id TEXT NULL,
+  span_id TEXT NULL,
+  parent_span_id TEXT NULL,
+  correlation_id TEXT NULL,
+  parent_run_id TEXT NULL,
+  child_job_id TEXT NULL,
+  child_run_id TEXT NULL,
+  invocation_id TEXT NULL,
+  tool_call_id TEXT NULL,
+  source_id TEXT NULL,
+  verification_id TEXT NULL,
+  claim_id TEXT NULL,
+  snapshot_id TEXT NULL,
+  outbox_event_id TEXT NULL,
+  decision_summary TEXT NULL,
+  confidence REAL NULL,
+  stop_reason TEXT NULL,
+  input_schema_version TEXT NULL,
+  output_schema_version TEXT NULL,
+  payload_hash TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  expires_at TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_telemetry_trace
+  ON service_telemetry_events(trace_id,occurred_at);
+CREATE INDEX IF NOT EXISTS idx_service_telemetry_run
+  ON service_telemetry_events(parent_run_id,child_run_id,occurred_at);
+
+CREATE TABLE IF NOT EXISTS anomaly_incidents (
+  incident_id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL UNIQUE,
+  severity TEXT NOT NULL,
+  category TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  occurrence_count INTEGER NOT NULL DEFAULT 1,
+  trace_ids_json TEXT NOT NULL DEFAULT '[]',
+  entity_ids_json TEXT NOT NULL DEFAULT '[]',
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  resolution_json TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_anomaly_incidents_status
+  ON anomaly_incidents(status,severity,last_seen_at);
+
+CREATE TABLE IF NOT EXISTS model_pricing_versions (
+  pricing_id TEXT PRIMARY KEY,
+  backend TEXT NOT NULL,
+  model TEXT NOT NULL,
+  effective_from TEXT NOT NULL,
+  input_per_million REAL NULL,
+  cached_input_per_million REAL NULL,
+  output_per_million REAL NULL,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  source_version TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  UNIQUE(backend,model,effective_from)
+);
+
+ALTER TABLE research_parent_runs
+  ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'PENDING';
+ALTER TABLE research_parent_runs
+  ADD COLUMN execution_complete INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_parent_runs
+  ADD COLUMN data_outcome TEXT NOT NULL DEFAULT 'NO_DATA';
+ALTER TABLE research_parent_runs
+  ADD COLUMN coverage_complete INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE research_parent_runs
+  ADD COLUMN coverage_score REAL NOT NULL DEFAULT 0;
+ALTER TABLE research_parent_runs
+  ADD COLUMN missing_topics_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE research_parent_runs
+  ADD COLUMN blocking_gaps_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE research_parent_runs
+  ADD COLUMN policy_no_data_topics_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE research_parent_runs
+  ADD COLUMN ready_for_trading_context INTEGER NOT NULL DEFAULT 0;
+
+UPDATE research_parent_runs
+SET execution_status=status,
+    execution_complete=CASE
+      WHEN status IN ('SUCCEEDED','PARTIAL','NO_DATA','FAILED') THEN 1
+      ELSE 0
+    END;
+
+ALTER TABLE research_gap_items ADD COLUMN next_retry_at TEXT NULL;
+ALTER TABLE research_gap_items ADD COLUMN negative_cache_key TEXT NULL;
+ALTER TABLE research_gap_items ADD COLUMN ai_eligible INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE research_gap_items
+  ADD COLUMN field_states_json TEXT NOT NULL DEFAULT '{}';
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -1110,4 +1279,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("017_temporal_quarantine_runtime_reconciliation", TEMPORAL_QUARANTINE_RUNTIME_SCHEMA),
     ("018_invalid_source_quarantine_and_reconciliation", SOURCE_QUARANTINE_SCHEMA),
     ("019_backend_invocation_lifecycle_and_reconciliation_audit", BACKEND_INVOCATION_LIFECYCLE_SCHEMA),
+    ("020_event_driven_lifecycle_outbox_telemetry_and_incidents", EVENT_DRIVEN_LIFECYCLE_SCHEMA),
 )

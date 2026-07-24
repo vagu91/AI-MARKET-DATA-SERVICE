@@ -10,6 +10,14 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.codex_runtime_contract import sanitize_diagnostic
+from app.services.research_agent_enablement import (
+    disabled_job_result,
+    is_research_agent_enabled,
+)
+from app.services.observability_contract_service import (
+    DeterministicAnomalyDetector,
+    TelemetryRepository,
+)
 
 
 ACTIVE_JOB_STATUSES = {"PENDING", "RUNNING", "RETRY_SCHEDULED"}
@@ -61,6 +69,41 @@ class AIResearchJobRepository:
         specialized_topic: str | None = None,
         child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if not is_research_agent_enabled(
+            self.settings,
+            topic=specialized_topic,
+            profile_id=profile_id,
+            job_type=job_type,
+        ):
+            rejected = disabled_job_result(
+                self.settings,
+                topic=specialized_topic,
+                profile_id=profile_id,
+                job_type=job_type,
+                correlation_id=correlation_id,
+            )
+            TelemetryRepository(self.settings, clock=self.clock).emit(
+                "agent_disabled",
+                identifiers={"correlation_id": correlation_id},
+                decision_summary="research job rejected by centralized enablement",
+                stop_reason="AGENT_DISABLED",
+                payload={
+                    "status": "REJECTED",
+                    "reason": "AGENT_DISABLED",
+                },
+            )
+            DeterministicAnomalyDetector(
+                self.settings,
+                clock=self.clock,
+            ).detect(
+                {
+                    "agent_invocation_attempted": True,
+                    "agent_enabled": False,
+                    "profile_id": profile_id,
+                    "job_type": job_type,
+                }
+            )
+            return rejected, False
         now = self._iso(self.clock())
         job_id = f"airj-{uuid.uuid4()}"
         with connect_sqlite(self.settings.database_path) as conn:
@@ -103,7 +146,18 @@ class AIResearchJobRepository:
                 ),
             )
             conn.commit()
-        return self.get(job_id), True
+        stored = self.get(job_id)
+        TelemetryRepository(self.settings, clock=self.clock).emit(
+            "enqueue",
+            identifiers={
+                "correlation_id": correlation_id,
+                "child_job_id": job_id,
+                "parent_run_id": parent_run_id,
+            },
+            decision_summary="persistent research job enqueued",
+            payload={"status": "PENDING", "reason": "enablement_allowed"},
+        )
+        return stored, True
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:
@@ -294,7 +348,8 @@ class AIResearchJobRepository:
             conn.execute("BEGIN IMMEDIATE")
             abandoned = conn.execute(
                 """
-                SELECT job_id,attempts,max_attempts,last_retry_reason
+                SELECT job_id,attempts,max_attempts,last_retry_reason,
+                       job_type,profile_id,specialized_topic
                 FROM ai_research_jobs
                 WHERE status='RUNNING' AND lease_expires_at IS NOT NULL
                   AND lease_expires_at<=?
@@ -302,6 +357,23 @@ class AIResearchJobRepository:
                 (now,),
             ).fetchall()
             for row in abandoned:
+                if not self._row_agent_enabled(row):
+                    conn.execute(
+                        """
+                        UPDATE ai_research_job_attempts
+                        SET status='REJECTED',completed_at=?,error='AGENT_DISABLED',
+                            error_category='AGENT_DISABLED',
+                            retry_classification='NON_RETRYABLE'
+                        WHERE job_id=? AND attempt_number=? AND status='RUNNING'
+                        """,
+                        (now, row["job_id"], row["attempts"]),
+                    )
+                    self._reject_job_in_transaction(
+                        conn,
+                        job_id=str(row["job_id"]),
+                        now=now,
+                    )
+                    continue
                 conn.execute(
                     """
                     UPDATE ai_research_job_attempts
@@ -368,6 +440,7 @@ class AIResearchJobRepository:
         lease = self._iso(now_dt + timedelta(seconds=self.settings.ai_job_lease_seconds))
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._reject_disabled_waiting_in_transaction(conn, now=now)
             type_clause = ""
             values: list[Any] = [now]
             if allowed_job_types is not None:
@@ -427,6 +500,70 @@ class AIResearchJobRepository:
             )
             conn.commit()
         return self.get(str(row["job_id"]))
+
+    def _row_agent_enabled(self, row: Any) -> bool:
+        return is_research_agent_enabled(
+            self.settings,
+            topic=row["specialized_topic"],
+            profile_id=row["profile_id"],
+            job_type=row["job_type"],
+        )
+
+    def _reject_disabled_waiting_in_transaction(
+        self,
+        conn: Any,
+        *,
+        now: str,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT job_id,job_type,profile_id,specialized_topic
+            FROM ai_research_jobs
+            WHERE status IN ('PENDING','RETRY_SCHEDULED')
+              AND source_audit_status='ACTIVE'
+            """
+        ).fetchall()
+        rejected = 0
+        for row in rows:
+            if self._row_agent_enabled(row):
+                continue
+            self._reject_job_in_transaction(
+                conn,
+                job_id=str(row["job_id"]),
+                now=now,
+            )
+            rejected += 1
+        return rejected
+
+    @staticmethod
+    def _reject_job_in_transaction(
+        conn: Any,
+        *,
+        job_id: str,
+        now: str,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE ai_research_jobs
+            SET status='REJECTED',worker_id=NULL,lease_expires_at=NULL,
+                heartbeat_at=NULL,next_retry_at=NULL,completed_at=?,
+                last_error='AGENT_DISABLED',retry_class='NON_RETRYABLE',
+                last_retry_reason='AGENT_DISABLED',updated_at=?
+            WHERE job_id=?
+              AND status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
+            """,
+            (now, now, job_id),
+        )
+        conn.execute(
+            """
+            UPDATE research_runs
+            SET status='REJECTED',completed_at=?,
+                blocking_gaps_json='["AGENT_DISABLED"]',updated_at=?
+            WHERE job_id=?
+              AND status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
+            """,
+            (now, now, job_id),
+        )
 
     def mark_pending_capability(self, status: str, *, excluded_job_types: list[str] | None = None) -> int:
         clauses = ["status IN ('PENDING','RETRY_SCHEDULED')"]

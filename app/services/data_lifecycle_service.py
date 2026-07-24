@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
+from app.services.event_driven_lifecycle_service import compute_datum_lifecycle
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -180,6 +181,7 @@ def attach_lifecycle_metadata(
     nasdaq = dict(output.get("nasdaq_context") or {})
     _attach(nasdaq, "qqq_holdings", catalog["nasdaq_weights"])
     _attach(nasdaq, "earnings", catalog["earnings"])
+    _attach_earnings_items(nasdaq, settings=settings, now=now)
     output["nasdaq_context"] = nasdaq
 
     sentiment = dict(output.get("sentiment_context") or {})
@@ -228,21 +230,58 @@ def _record(
 ) -> dict[str, Any]:
     policy = LIFECYCLE_POLICIES[category]
     context_anchor = _context_date_anchor(context_date)
-    born_at = _latest_timestamp(source, {"retrieved_at", "created_at", "generated_at", "generated_at_utc"})
+    lifecycle_input = dict(source) if isinstance(source, dict) else {"items": source}
+    born_at = _latest_timestamp(
+        source,
+        {"retrieved_at", "created_at", "generated_at", "generated_at_utc"},
+    )
     if category == "market_schedule":
         born_at = context_anchor
-    valid_until = explicit_valid_until or _earliest_timestamp(source, {"valid_until", "consensus_valid_until"})
+    valid_until = explicit_valid_until or _earliest_timestamp(
+        source,
+        {"valid_until", "consensus_valid_until"},
+    )
     data_present = _has_content(source)
-    if valid_until is None:
-        valid_until = (born_at or context_anchor) + _default_ttl(category, settings)
-    next_refresh = _earliest_timestamp(source, {"next_refresh", "next_refresh_at"}) or valid_until
+    if born_at is not None:
+        lifecycle_input.setdefault("observed_at", born_at.isoformat())
+    else:
+        lifecycle_input.setdefault("observed_at", context_anchor.isoformat())
+    if valid_until is not None:
+        lifecycle_input["valid_until"] = valid_until.isoformat()
+    next_refresh = _earliest_timestamp(source, {"next_refresh", "next_refresh_at"})
+    if next_refresh is not None:
+        lifecycle_input["next_refresh_at"] = next_refresh.isoformat()
+    lifecycle = compute_datum_lifecycle(
+        category,
+        category,
+        lifecycle_input,
+        settings=settings,
+        now=now,
+    )
+    valid_until = parse_datetime(lifecycle.valid_until)
+    next_refresh = parse_datetime(lifecycle.next_refresh_at)
     retention_days = _retention_days(category, settings)
     delete_after = valid_until + timedelta(days=retention_days) if valid_until and retention_days is not None else None
     return {
         "category": category,
-        "born_at": _iso(born_at),
-        "valid_until": _iso(valid_until),
-        "next_refresh": _iso(next_refresh),
+        "born_at": lifecycle.observed_at,
+        "trigger_class": lifecycle.trigger_class,
+        "freshness_state": lifecycle.freshness_state,
+        "observed_at": lifecycle.observed_at,
+        "data_as_of": lifecycle.data_as_of,
+        "published_at": lifecycle.published_at,
+        "event_at": lifecycle.event_at,
+        "valid_from": lifecycle.valid_from,
+        "valid_until": lifecycle.valid_until,
+        "next_refresh": lifecycle.next_refresh_at,
+        "next_refresh_at": lifecycle.next_refresh_at,
+        "next_retry_at": lifecycle.next_retry_at,
+        "superseded_by": lifecycle.superseded_by,
+        "refresh_reason": lifecycle.refresh_reason,
+        "materiality_fingerprint": lifecycle.materiality_fingerprint,
+        "source_lineage": list(lifecycle.source_lineage),
+        "acquisition_method": lifecycle.acquisition_method,
+        "retry_policy": lifecycle.retry_policy,
         "refresh_policy": policy.refresh_policy,
         "carry_forward_allowed": policy.carry_forward_allowed,
         "stale_policy": policy.stale_policy,
@@ -250,7 +289,9 @@ def _record(
         "delete_after": _iso(delete_after),
         "context_date": context_date,
         "data_present": data_present,
-        "currently_valid": bool(data_present and valid_until > now),
+        "currently_valid": bool(
+            data_present and lifecycle.freshness_state == "FRESH"
+        ),
     }
 
 
@@ -282,6 +323,67 @@ def _attach(parent: dict[str, Any], key: str, lifecycle: dict[str, Any]) -> None
     updated = dict(value)
     updated["lifecycle"] = lifecycle
     parent[key] = updated
+
+
+def _attach_earnings_items(
+    nasdaq: dict[str, Any],
+    *,
+    settings: Settings,
+    now: datetime,
+) -> None:
+    earnings = nasdaq.get("earnings")
+    if not isinstance(earnings, dict):
+        return
+    updated = dict(earnings)
+    for bucket in (
+        "upcoming",
+        "recent",
+        "items",
+        "events",
+        "upcoming_mega_cap_earnings_14d",
+        "released_earnings",
+    ):
+        rows = earnings.get(bucket)
+        if not isinstance(rows, list):
+            continue
+        enriched: list[Any] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                enriched.append(raw)
+                continue
+            item = dict(raw)
+            issuer = str(
+                item.get("issuer")
+                or item.get("company")
+                or item.get("company_name")
+                or item.get("ticker")
+                or item.get("symbol")
+                or "unknown"
+            ).strip().upper()
+            event_date = str(
+                item.get("earnings_date")
+                or item.get("date")
+                or item.get("event_date")
+                or (
+                    parse_datetime(item.get("event_at")).date().isoformat()
+                    if parse_datetime(item.get("event_at"))
+                    else None
+                )
+                or "unknown"
+            )
+            lifecycle = compute_datum_lifecycle(
+                "earnings",
+                f"{issuer}:{event_date}",
+                item,
+                settings=settings,
+                now=now,
+                attempt_count=int(item.get("attempt_count") or 0),
+                refresh_reason="issuer_event_lifecycle",
+            )
+            item["lifecycle"] = lifecycle.as_dict()
+            enriched.append(item)
+        updated[bucket] = enriched
+    nasdaq["earnings"] = updated
 
 
 def _has_event_value(event: dict[str, Any], field: str) -> bool:

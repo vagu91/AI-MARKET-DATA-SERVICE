@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from app.api.deps import (
     get_enrichment_orchestrator,
@@ -59,6 +59,10 @@ from app.services.ai_research_capability_service import AIResearchCapabilityServ
 from app.services.research_runtime_repository import ResearchRuntimeRepository
 from app.services.research_gap_manifest import ResearchGapManifestBuilder
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
+from app.services.market_context_outbox_service import (
+    MarketContextOutboxRepository,
+)
+from app.services.research_agent_enablement import safe_research_agent_capabilities
 
 router = APIRouter()
 
@@ -90,6 +94,9 @@ async def ai_research_status(
     return {
         **repository.status(),
         "enrichment": AIResearchJobService(enrichment_orchestrator.settings).enrichment_status("MNQ"),
+        "research_agents": safe_research_agent_capabilities(
+            enrichment_orchestrator.settings
+        ),
     }
 
 
@@ -97,7 +104,14 @@ async def ai_research_status(
 async def ai_research_capabilities(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
-    return AIResearchCapabilityService(enrichment_orchestrator.settings).probe(persist=True)
+    return {
+        **AIResearchCapabilityService(
+            enrichment_orchestrator.settings
+        ).probe(persist=True),
+        "research_agents": safe_research_agent_capabilities(
+            enrichment_orchestrator.settings
+        ),
+    }
 
 
 @router.get("/ai-research/jobs/{job_id}")
@@ -478,6 +492,53 @@ async def market_context_mnq_consumer(
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
     )
+
+
+@router.get("/market-context/outbox/events")
+async def market_context_outbox_events(
+    status: str | None = Query(
+        default="PENDING",
+        pattern="^(PENDING|ACKNOWLEDGED)$",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    events = MarketContextOutboxRepository(
+        enrichment_orchestrator.settings
+    ).list_events(status=status, limit=limit)
+    return {
+        "delivery_enabled": False,
+        "events": events,
+        "count": len(events),
+    }
+
+
+@router.post("/market-context/outbox/events/{event_id}/ack")
+async def acknowledge_market_context_outbox_event(
+    event_id: str,
+    payload: dict[str, object] = Body(...),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    try:
+        event = MarketContextOutboxRepository(
+            enrichment_orchestrator.settings
+        ).acknowledge(
+            event_id,
+            consumer_id=str(payload.get("consumer_id") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if detail == "outbox_event_not_found" else 409
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return {
+        "event": event,
+        "delivery_enabled": False,
+    }
 
 
 def _materialize_market_context(

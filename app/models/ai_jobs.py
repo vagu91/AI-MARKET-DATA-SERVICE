@@ -13,6 +13,8 @@ class AIResearchEnqueueRequest(BaseModel):
         "COT_POSITIONING_RESEARCH", "NASDAQ_100_RESEARCH",
         "MEGA_CAP_SEMICONDUCTORS_RESEARCH", "EARNINGS_RESEARCH",
         "NEWS_RESEARCH", "GEOPOLITICAL_REGULATORY_RISK_RESEARCH",
+        "OPTIONS_POSITIONING_RESEARCH", "MARKET_INTERNALS_RESEARCH",
+        "CROSS_ASSET_CONTEXT_RESEARCH", "EARNINGS_INTELLIGENCE_RESEARCH",
     ]
     symbol: str = Field(default="MNQ", min_length=1, max_length=16)
     correlation_id: str = Field(min_length=1, max_length=160)

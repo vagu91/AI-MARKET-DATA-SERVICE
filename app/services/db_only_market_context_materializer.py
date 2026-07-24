@@ -12,6 +12,7 @@ from app.services.temporal_validation_service import (
     TemporalValidationService,
     normalize_event_semantics,
 )
+from app.services.market_context_outbox_service import TriggerEnvelope
 
 
 class DBOnlyMarketContextMaterializer:
@@ -98,6 +99,7 @@ class DBOnlyMarketContextMaterializer:
         job_type = str(job.get("job_type") or "")
         if not research_run_id and job_type not in {"", "RELEASE_ACTUAL_REFRESH"}:
             raise ValueError("completed_research_job_missing_run_link")
+        trigger = _job_trigger(job)
         return self.snapshots.save_next(
             symbol=symbol,
             refresh_mode="worker_db_only_materialization",
@@ -106,6 +108,7 @@ class DBOnlyMarketContextMaterializer:
             source_job_id=str(job.get("job_id")),
             job_ids=[str(job.get("job_id"))],
             research_run_id=research_run_id,
+            **(trigger.snapshot_arguments() if trigger else {}),
         )
 
     def materialize_for_parent(
@@ -171,6 +174,7 @@ class DBOnlyMarketContextMaterializer:
         child_job_ids = [
             str(item["child_job_id"]) for item in parent.get("children") or []
         ]
+        trigger = TriggerEnvelope.from_mapping(parent.get("trigger_envelope"))
         return self.snapshots.save_next(
             symbol=symbol,
             refresh_mode="worker_db_only_parent_materialization",
@@ -179,6 +183,7 @@ class DBOnlyMarketContextMaterializer:
             source_job_id=None,
             job_ids=child_job_ids,
             parent_run_id=str(parent["parent_run_id"]),
+            **(trigger.snapshot_arguments() if trigger else {}),
         )
 
 
@@ -209,3 +214,10 @@ def _job_run_id(job: dict[str, Any]) -> str | None:
         result = {}
     value = result.get("run_id") or job.get("research_run_id")
     return str(value) if value else None
+
+
+def _job_trigger(job: dict[str, Any]) -> TriggerEnvelope | None:
+    request = job.get("request_payload")
+    if not isinstance(request, dict):
+        request = {}
+    return TriggerEnvelope.from_mapping(request.get("trigger_envelope"))

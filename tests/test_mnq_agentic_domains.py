@@ -65,6 +65,12 @@ def settings(tmp_path: Path, **overrides: Any) -> Settings:
         "enable_ai_researcher": True,
         "research_backend": "codex_cli",
         "research_parallelism": 2,
+        # This suite exercises the explicit enabled behavior of the four
+        # opt-in domains; production/default behavior is covered separately.
+        "research_agent_options_positioning_enabled": True,
+        "research_agent_market_internals_enabled": True,
+        "research_agent_cross_asset_context_enabled": True,
+        "research_agent_earnings_intelligence_enabled": True,
         "research_gateway_min_text_chars": 20,
         "research_gateway_respect_robots": False,
     }
@@ -688,14 +694,14 @@ def test_no_trading_order_or_execution_endpoints_were_added() -> None:
     ]
 
 
-def test_schema_19_remains_compatible_without_additional_migration(
+def test_schema_20_remains_compatible_without_additional_migration(
     tmp_path: Path,
 ) -> None:
     cfg = settings(tmp_path)
     first = migrate_database(cfg.database_path)
     second = migrate_database(cfg.database_path)
-    assert len(MIGRATIONS) == 19
-    assert first["schema_version"] == second["schema_version"] == 19
+    assert len(MIGRATIONS) == 20
+    assert first["schema_version"] == second["schema_version"] == 20
     assert second["applied"] == []
 
 

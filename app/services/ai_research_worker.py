@@ -6,6 +6,7 @@ import logging
 import threading
 import traceback
 import uuid
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -24,6 +25,11 @@ from app.services.codex_runtime_contract import classify_codex_failure, sanitize
 from app.services.research_backend import ResearchBackend, select_research_backend
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 from app.services.research_semantics import requires_event_value_projection
+from app.services.research_agent_enablement import is_research_agent_enabled
+from app.services.observability_contract_service import (
+    DeterministicAnomalyDetector,
+    TelemetryRepository,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +62,8 @@ class AIResearchWorker:
         self.agentic_runtime = agentic_runtime or AgenticResearchRuntime(settings)
         self.capabilities = capabilities or AIResearchCapabilityService(settings)
         self.parallel_coordinator = ParallelResearchCoordinator(settings)
+        self.telemetry = TelemetryRepository(settings)
+        self.anomalies = DeterministicAnomalyDetector(settings)
         self._capability_report: dict[str, Any] | None = None
         self._capability_lock = threading.Lock()
         self.worker_id = worker_id or f"ai-worker-{uuid.uuid4()}"
@@ -120,6 +128,73 @@ class AIResearchWorker:
             return False
         context = {"job_id": job["job_id"], "correlation_id": job["correlation_id"]}
         logger.info("ai_job_lease_acquired", extra=context)
+        identifiers = {
+            "correlation_id": job.get("correlation_id"),
+            "parent_run_id": job.get("parent_run_id"),
+            "child_job_id": job.get("job_id"),
+        }
+        self.telemetry.emit(
+            "dequeue",
+            identifiers=identifiers,
+            decision_summary="worker acquired next eligible persistent job",
+            payload={"status": "RUNNING"},
+        )
+        self.telemetry.emit(
+            "lease",
+            identifiers=identifiers,
+            decision_summary="worker lease acquired",
+            payload={"status": "RUNNING"},
+        )
+        if not is_research_agent_enabled(
+            self.settings,
+            topic=job.get("specialized_topic"),
+            profile_id=job.get("profile_id"),
+            job_type=job.get("job_type"),
+        ):
+            self.telemetry.emit(
+                "ai_invocation_aborted",
+                identifiers=identifiers,
+                decision_summary="backend invocation blocked immediately before execution",
+                stop_reason="AGENT_DISABLED",
+                payload={"status": "REJECTED", "reason": "AGENT_DISABLED"},
+            )
+            self.anomalies.detect(
+                {
+                    "agent_invocation_attempted": True,
+                    "agent_enabled": False,
+                    "job_id": job.get("job_id"),
+                    "parent_run_id": job.get("parent_run_id"),
+                    "profile_id": job.get("profile_id"),
+                    "job_type": job.get("job_type"),
+                    "trace_ids": [job.get("correlation_id")],
+                }
+            )
+            self.repository.complete(
+                str(job["job_id"]),
+                self.worker_id,
+                status="REJECTED",
+                result_payload={
+                    "status": "REJECTED",
+                    "error": "AGENT_DISABLED",
+                    "retryable": False,
+                },
+                accepted_fields=[],
+                rejected_fields=[],
+                error="AGENT_DISABLED",
+                diagnostic={
+                    "category": "AGENT_DISABLED",
+                    "retry_classification": "NON_RETRYABLE",
+                },
+            )
+            logger.info(
+                "ai_job_rejected_agent_disabled",
+                extra={
+                    **context,
+                    "profile_id": job.get("profile_id"),
+                    "specialized_topic": job.get("specialized_topic"),
+                },
+            )
+            return True
         workspace = Path(self.settings.ai_job_workspace_root) / str(job["job_id"])
         workspace.mkdir(parents=True, exist_ok=True)
         stop_heartbeat = threading.Event()
@@ -129,8 +204,18 @@ class AIResearchWorker:
             daemon=True,
         )
         heartbeat.start()
+        backend_started = time.monotonic()
         try:
             logger.info("ai_job_provider_started", extra=context)
+            self.telemetry.emit(
+                "ai_invocation_attempted",
+                identifiers=identifiers,
+                decision_summary="enabled backend invocation started",
+                payload={
+                    "status": "RUNNING",
+                    "reason": str(job.get("profile_id") or job.get("job_type")),
+                },
+            )
             if job["job_type"] == "RELEASE_ACTUAL_REFRESH":
                 result = self.actual_resolver(job, workspace, self.settings.ai_job_max_runtime_seconds)
             elif isinstance(self.executor, ResearchBackend) or hasattr(
@@ -335,6 +420,32 @@ class AIResearchWorker:
                         }, executable_version=self._capability_report.get("executable_version"))
                         self._capability_report = None
             logger.info("ai_job_completed", extra={**context, "status": terminal})
+            self.telemetry.emit(
+                "ai_invocation_completed",
+                identifiers={
+                    **identifiers,
+                    "child_run_id": result.get("run_id"),
+                    "snapshot_id": (
+                        materialized.get("snapshot_id") if materialized else None
+                    ),
+                },
+                decision_summary="backend, persistence and materialization completed",
+                stop_reason=terminal,
+                payload={
+                    "status": terminal,
+                    "duration_ms": int(
+                        (time.monotonic() - backend_started) * 1000
+                    ),
+                    "input_tokens": int(result.get("input_tokens") or 0),
+                    "output_tokens": int(result.get("output_tokens") or 0),
+                    "cached_tokens": int(result.get("cached_tokens") or 0),
+                    "cost_status": str(
+                        (result.get("cost") or {}).get("cost_status")
+                        or result.get("cost_status")
+                        or "unavailable"
+                    ),
+                },
+            )
             return True
         except Exception as exc:
             diagnostic = getattr(exc, "diagnostic", None)
@@ -397,6 +508,19 @@ class AIResearchWorker:
                         else "RETRYABLE"
                         if retryable
                         else "NON_RETRYABLE"
+                    ),
+                },
+            )
+            self.telemetry.emit(
+                "ai_invocation_aborted",
+                identifiers=identifiers,
+                decision_summary="backend or persistence path aborted",
+                stop_reason=error_code,
+                error=error_code,
+                payload={
+                    "status": "FAILED",
+                    "duration_ms": int(
+                        (time.monotonic() - backend_started) * 1000
                     ),
                 },
             )
