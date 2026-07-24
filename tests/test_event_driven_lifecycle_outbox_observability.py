@@ -132,7 +132,9 @@ def test_provider_resolution_results_in_zero_ai(tmp_path: Path) -> None:
         ai_enqueue=lambda _: calls.__setitem__("ai", calls["ai"] + 1),
         trigger_type="macro_actual",
     )
-    assert (result["provider_calls"], result["ai_invocations"], calls["ai"]) == (1, 0, 0)
+    assert result["resolver_evaluations"] == 1
+    assert result["actual_provider_requests"] == result["provider_calls"] == 0
+    assert (result["ai_invocations"], calls["ai"]) == (0, 0)
 
 
 def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:

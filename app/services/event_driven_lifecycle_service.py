@@ -70,12 +70,14 @@ VOLATILE_FINGERPRINT_KEYS = frozenset(
         "updated_at",
         "checked_at",
         "checked_at_utc",
+        "searched_at",
         "duration_ms",
         "trace_id",
         "span_id",
         "parent_span_id",
         "attempt_count",
         "heartbeat_at",
+        "lease_owner",
         "lease_expires_at",
     }
 )
@@ -398,6 +400,99 @@ def material_changes(
     return changed_sections, changes
 
 
+_LIFECYCLE_PERSISTED_FIELDS = (
+    "trigger_class",
+    "freshness_state",
+    "observed_at",
+    "data_as_of",
+    "published_at",
+    "event_at",
+    "valid_from",
+    "valid_until",
+    "next_refresh_at",
+    "next_retry_at",
+    "superseded_by",
+    "refresh_reason",
+    "materiality_fingerprint",
+    "source_lineage_json",
+    "acquisition_method",
+    "retry_class",
+    "retry_policy_json",
+    "negative_cache_key",
+    "negative_cache_expires_at",
+    "session_state",
+    "triggering_event",
+    "fields_attempted_json",
+    "attempt_count",
+    "work_status",
+)
+
+
+def _lifecycle_persistence_values(
+    lifecycle: DatumLifecycle,
+    *,
+    work_status: str,
+) -> dict[str, Any]:
+    return {
+        "trigger_class": lifecycle.trigger_class,
+        "freshness_state": lifecycle.freshness_state,
+        "observed_at": lifecycle.observed_at,
+        "data_as_of": lifecycle.data_as_of,
+        "published_at": lifecycle.published_at,
+        "event_at": lifecycle.event_at,
+        "valid_from": lifecycle.valid_from,
+        "valid_until": lifecycle.valid_until,
+        "next_refresh_at": lifecycle.next_refresh_at,
+        "next_retry_at": lifecycle.next_retry_at,
+        "superseded_by": lifecycle.superseded_by,
+        "refresh_reason": lifecycle.refresh_reason,
+        "materiality_fingerprint": lifecycle.materiality_fingerprint,
+        "source_lineage_json": _canonical(list(lifecycle.source_lineage)),
+        "acquisition_method": lifecycle.acquisition_method,
+        "retry_class": lifecycle.retry_class,
+        "retry_policy_json": _canonical(lifecycle.retry_policy),
+        "negative_cache_key": lifecycle.negative_cache_key,
+        "negative_cache_expires_at": lifecycle.negative_cache_expires_at,
+        "session_state": lifecycle.session_state,
+        "triggering_event": lifecycle.triggering_event,
+        "fields_attempted_json": _canonical(list(lifecycle.fields_attempted)),
+        "attempt_count": lifecycle.attempt_count,
+        "work_status": work_status,
+    }
+
+
+def _lifecycle_persistence_is_unchanged(
+    row: Any,
+    *,
+    lifecycle: DatumLifecycle,
+    payload: dict[str, Any],
+    work_status: str,
+) -> bool:
+    if row is None:
+        return False
+    expected = _lifecycle_persistence_values(
+        lifecycle,
+        work_status=work_status,
+    )
+    if any(row[field] != expected[field] for field in _LIFECYCLE_PERSISTED_FIELDS):
+        return False
+    try:
+        existing_payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if materiality_fingerprint(existing_payload) != materiality_fingerprint(
+        payload
+    ):
+        return False
+    return not (
+        work_status != "LEASED"
+        and any(
+            row[field] is not None
+            for field in ("lease_owner", "lease_expires_at", "heartbeat_at")
+        )
+    )
+
+
 class LifecycleRepository:
     def __init__(
         self,
@@ -426,7 +521,24 @@ class LifecycleRepository:
             in {"DUE", "AWAITING_ACTUAL", "STALE_LAST_KNOWN_GOOD"}
             else "COMPLETED"
         )
+        persisted_payload = dict(payload or {})
         with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT * FROM datum_lifecycle_items
+                WHERE entity_type=? AND entity_key=?
+                """,
+                (lifecycle.entity_type, lifecycle.entity_key),
+            ).fetchone()
+            if _lifecycle_persistence_is_unchanged(
+                existing,
+                lifecycle=lifecycle,
+                payload=persisted_payload,
+                work_status=status,
+            ):
+                conn.commit()
+                return _restore_item(existing)
             conn.execute(
                 """
                 INSERT INTO datum_lifecycle_items(
@@ -465,6 +577,9 @@ class LifecycleRepository:
                   attempt_count=excluded.attempt_count,
                   work_status=excluded.work_status,
                   payload_json=excluded.payload_json,
+                  lease_owner=NULL,
+                  lease_expires_at=NULL,
+                  heartbeat_at=NULL,
                   updated_at=excluded.updated_at
                 """,
                 (
@@ -495,7 +610,7 @@ class LifecycleRepository:
                     _canonical(list(lifecycle.fields_attempted)),
                     lifecycle.attempt_count,
                     status,
-                    _canonical(payload or {}),
+                    _canonical(persisted_payload),
                     now,
                     now,
                 ),
@@ -731,6 +846,43 @@ class LifecycleRepository:
             conn.commit()
         return int(cursor.rowcount or 0) == 1
 
+    def transition_finalized(
+        self,
+        item_id: str,
+        *,
+        expected_work_status: str,
+        work_status: str,
+        refresh_reason: str,
+        next_refresh_at: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Advance an already finalized item without reacquiring its lease."""
+        timestamp = _iso(now or self.clock())
+        with connect_sqlite(self.settings.database_path) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE datum_lifecycle_items
+                SET work_status=?,refresh_reason=?,
+                    next_refresh_at=COALESCE(?,next_refresh_at),
+                    lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
+                    updated_at=?
+                WHERE item_id=? AND work_status=?
+                  AND lease_owner IS NULL
+                  AND lease_expires_at IS NULL
+                  AND heartbeat_at IS NULL
+                """,
+                (
+                    work_status,
+                    refresh_reason,
+                    next_refresh_at,
+                    timestamp,
+                    item_id,
+                    expected_work_status,
+                ),
+            )
+            conn.commit()
+        return int(cursor.rowcount or 0) == 1
+
     def list_items(self, *, status: str | None = None) -> list[dict[str, Any]]:
         with connect_sqlite(self.settings.database_path) as conn:
             rows = conn.execute(
@@ -762,6 +914,20 @@ def persist_lifecycle_in_transaction(
             )
         )
     )
+    existing = conn.execute(
+        """
+        SELECT * FROM datum_lifecycle_items
+        WHERE entity_type=? AND entity_key=?
+        """,
+        (lifecycle.entity_type, lifecycle.entity_key),
+    ).fetchone()
+    if _lifecycle_persistence_is_unchanged(
+        existing,
+        lifecycle=lifecycle,
+        payload=payload,
+        work_status=work_status,
+    ):
+        return item_id
     conn.execute(
         """
         INSERT INTO datum_lifecycle_items(
@@ -800,6 +966,9 @@ def persist_lifecycle_in_transaction(
           attempt_count=excluded.attempt_count,
           work_status=excluded.work_status,
           payload_json=excluded.payload_json,
+          lease_owner=NULL,
+          lease_expires_at=NULL,
+          heartbeat_at=NULL,
           updated_at=excluded.updated_at
         """,
         (

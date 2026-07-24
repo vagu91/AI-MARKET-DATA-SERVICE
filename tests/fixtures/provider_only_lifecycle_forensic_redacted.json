@@ -1,0 +1,63 @@
+{
+  "schema_version": "provider_only_lifecycle_forensic_v1",
+  "batch_id": "manual-provider-only-20260724T170650Z",
+  "seeded_at": "2026-07-24T15:00:00+00:00",
+  "scan_at": "2026-07-24T17:06:50+00:00",
+  "targets": [
+    {
+      "entity_type": "nasdaq_100",
+      "entity_key": "MNQ:nasdaq_100",
+      "fields_attempted": ["as_of", "constituents", "holdings"],
+      "payload": {
+        "status": "NO_DATA",
+        "value": null,
+        "reason": "no_fresh_verified_source",
+        "valid_until": "2026-07-25T15:00:00+00:00",
+        "sources_attempted": [
+          {
+            "source_domain": "nasdaq.com",
+            "fetch_status": "FETCHED",
+            "verification_status": "VERIFIED"
+          }
+        ]
+      }
+    },
+    {
+      "entity_type": "geopolitical_regulatory_risk",
+      "entity_key": "MNQ:geopolitical_regulatory_risk",
+      "fields_attempted": [
+        "authority",
+        "current_data",
+        "mnq_relevance",
+        "published_at"
+      ],
+      "payload": {
+        "status": "NO_DATA",
+        "value": null,
+        "reason": "no_fresh_verified_source",
+        "valid_until": "2026-07-25T15:00:00+00:00",
+        "sources_attempted": [
+          {
+            "source_domain": "home.treasury.gov",
+            "fetch_status": "FETCHED",
+            "verification_status": "VERIFIED"
+          }
+        ]
+      }
+    }
+  ],
+  "unrelated_entity_keys": [
+    "AMD:2026-07-28",
+    "AAPL:2026-07-30",
+    "AMZN:2026-07-30",
+    "META:2026-07-29",
+    "MSFT:2026-07-29",
+    "TSLA:2026-07-22",
+    "ALPHABET INC.:2026-07-22"
+  ],
+  "artifact_payload": {
+    "schema_version": "2.1",
+    "symbol": "MNQ",
+    "forensic_marker": "unchanged-provider-only-artifact"
+  }
+}

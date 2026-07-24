@@ -59,6 +59,7 @@ class MarketContextSnapshotRepository:
         correlation_id: str | None = None,
         resolved_lifecycle: DatumLifecycle | None = None,
         resolved_datum: dict[str, Any] | None = None,
+        resolved_work_status: str = "COMPLETED",
     ) -> dict[str, Any]:
         """Allocate revision and persist both payloads in one SQLite write transaction."""
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -214,7 +215,7 @@ class MarketContextSnapshotRepository:
                     conn,
                     resolved_lifecycle,
                     payload=dict(resolved_datum or {}),
-                    work_status="COMPLETED",
+                    work_status=resolved_work_status,
                     timestamp=now,
                 )
             self._persist_projected_lifecycle(conn, debug, timestamp=now)
