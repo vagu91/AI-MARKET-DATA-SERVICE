@@ -364,13 +364,6 @@ class ResearchSchedulerService:
                     and provider_result.get("ai_eligible") is True
                 ):
                     ai_eligible.append(unresolved)
-                item_outcomes.append(
-                    {
-                        "item_id": item_id,
-                        "status": "PARTIAL",
-                        "effective_trigger_type": effective_trigger_type,
-                    }
-                )
                 continue
             if str(provider_result.get("status") or "").upper() in {
                 "RESOLVED",
@@ -532,6 +525,7 @@ class ResearchSchedulerService:
         ai_invocations = 0
         ai_jobs_created = 0
         enqueue_result: Any = None
+        queued_item_ids: set[str] = set()
         if ai_eligible and ai_enqueue is not None:
             enqueue_result = ai_enqueue(ai_eligible)
             ai_invocations = 1
@@ -557,51 +551,72 @@ class ResearchSchedulerService:
                     not transitioned
                     and item.get("lifecycle_finalized_as_partial") is True
                 ):
-                    self.lifecycle.transition_finalized(
+                    transitioned = self.lifecycle.transition_finalized(
                         str(item["item_id"]),
                         expected_work_status="PARTIAL",
                         work_status="QUEUED",
                         refresh_reason="provider_exhausted_ai_queued",
                         now=now,
                     )
-                item_outcomes.append(
-                    {
-                        "item_id": str(item["item_id"]),
-                        "status": "AI_QUEUED",
-                        "effective_trigger_type": item.get(
-                            "effective_trigger_type"
-                        ),
-                    }
-                )
-        else:
-            for item in residual:
-                if item in ai_eligible and ai_enqueue is not None:
-                    continue
-                agent_status = next(
-                    (
-                        decision["agent_status"]
-                        for decision in ai_decisions
-                        if decision["item_id"] == str(item["item_id"])
-                    ),
-                    "",
-                )
-                terminal_status = (
-                    "NO_DATA"
-                    if item.get("retry_deadline_exhausted")
-                    else "DISABLED"
-                    if agent_status == "DISABLED"
-                    else "IDLE"
-                )
-                terminal_reason = (
-                    "retry_deadline_exhausted_no_data"
-                    if item.get("retry_deadline_exhausted")
-                    else "agent_disabled_ai_not_requested"
-                    if agent_status == "DISABLED"
-                    else "provider_unresolved_ai_not_configured"
-                )
-                transitioned = self.lifecycle.transition(
-                    str(item["item_id"]),
-                    owner=owner,
+                if transitioned:
+                    queued_item_ids.add(str(item["item_id"]))
+                    item_outcomes.append(
+                        {
+                            "item_id": str(item["item_id"]),
+                            "status": "AI_QUEUED",
+                            "effective_trigger_type": item.get(
+                                "effective_trigger_type"
+                            ),
+                        }
+                    )
+        for item in residual:
+            item_id = str(item["item_id"])
+            if item_id in queued_item_ids:
+                continue
+            agent_status = next(
+                (
+                    decision["agent_status"]
+                    for decision in ai_decisions
+                    if decision["item_id"] == item_id
+                ),
+                "",
+            )
+            terminal_status = (
+                "NO_DATA"
+                if item.get("retry_deadline_exhausted")
+                else "DISABLED"
+                if agent_status == "DISABLED"
+                else "IDLE"
+            )
+            terminal_reason = (
+                "retry_deadline_exhausted_no_data"
+                if item.get("retry_deadline_exhausted")
+                else "agent_disabled_ai_not_requested"
+                if agent_status == "DISABLED"
+                else "provider_unresolved_ai_not_configured"
+            )
+            transitioned = self.lifecycle.transition(
+                item_id,
+                owner=owner,
+                work_status=terminal_status,
+                refresh_reason=terminal_reason,
+                next_refresh_at=(
+                    now
+                    + timedelta(
+                        seconds=int(
+                            self.settings.lifecycle_due_scanner_interval_seconds
+                        )
+                    )
+                ).isoformat(),
+                now=now,
+            )
+            if (
+                not transitioned
+                and item.get("lifecycle_finalized_as_partial") is True
+            ):
+                self.lifecycle.transition_finalized(
+                    item_id,
+                    expected_work_status="PARTIAL",
                     work_status=terminal_status,
                     refresh_reason=terminal_reason,
                     next_refresh_at=(
@@ -614,34 +629,15 @@ class ResearchSchedulerService:
                     ).isoformat(),
                     now=now,
                 )
-                if (
-                    not transitioned
-                    and item.get("lifecycle_finalized_as_partial") is True
-                ):
-                    self.lifecycle.transition_finalized(
-                        str(item["item_id"]),
-                        expected_work_status="PARTIAL",
-                        work_status=terminal_status,
-                        refresh_reason=terminal_reason,
-                        next_refresh_at=(
-                            now
-                            + timedelta(
-                                seconds=int(
-                                    self.settings.lifecycle_due_scanner_interval_seconds
-                                )
-                            )
-                        ).isoformat(),
-                        now=now,
-                    )
-                item_outcomes.append(
-                    {
-                        "item_id": str(item["item_id"]),
-                        "status": terminal_status,
-                        "effective_trigger_type": item.get(
-                            "effective_trigger_type"
-                        ),
-                    }
-                )
+            item_outcomes.append(
+                {
+                    "item_id": item_id,
+                    "status": terminal_status,
+                    "effective_trigger_type": item.get(
+                        "effective_trigger_type"
+                    ),
+                }
+            )
         return {
             "status": "COMPLETED",
             "claimed": len(claimed),

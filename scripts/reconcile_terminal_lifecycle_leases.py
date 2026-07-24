@@ -22,6 +22,17 @@ ORDER BY item_id
 """
 
 
+def _open_connection(database: Path, *, apply: bool) -> sqlite3.Connection:
+    if apply:
+        return sqlite3.connect(database)
+    connection = sqlite3.connect(
+        f"{database.as_uri()}?mode=ro",
+        uri=True,
+    )
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
 def reconcile_terminal_leases(
     database: Path,
     *,
@@ -30,7 +41,7 @@ def reconcile_terminal_leases(
     database = database.resolve()
     if not database.is_file():
         raise FileNotFoundError(database)
-    connection = sqlite3.connect(database)
+    connection = _open_connection(database, apply=apply)
     connection.row_factory = sqlite3.Row
     try:
         if apply:

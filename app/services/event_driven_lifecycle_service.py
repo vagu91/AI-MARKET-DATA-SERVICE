@@ -577,9 +577,21 @@ class LifecycleRepository:
                   attempt_count=excluded.attempt_count,
                   work_status=excluded.work_status,
                   payload_json=excluded.payload_json,
-                  lease_owner=NULL,
-                  lease_expires_at=NULL,
-                  heartbeat_at=NULL,
+                  lease_owner=CASE
+                    WHEN excluded.work_status='LEASED'
+                      THEN datum_lifecycle_items.lease_owner
+                    ELSE NULL
+                  END,
+                  lease_expires_at=CASE
+                    WHEN excluded.work_status='LEASED'
+                      THEN datum_lifecycle_items.lease_expires_at
+                    ELSE NULL
+                  END,
+                  heartbeat_at=CASE
+                    WHEN excluded.work_status='LEASED'
+                      THEN datum_lifecycle_items.heartbeat_at
+                    ELSE NULL
+                  END,
                   updated_at=excluded.updated_at
                 """,
                 (
@@ -966,9 +978,21 @@ def persist_lifecycle_in_transaction(
           attempt_count=excluded.attempt_count,
           work_status=excluded.work_status,
           payload_json=excluded.payload_json,
-          lease_owner=NULL,
-          lease_expires_at=NULL,
-          heartbeat_at=NULL,
+          lease_owner=CASE
+            WHEN excluded.work_status='LEASED'
+              THEN datum_lifecycle_items.lease_owner
+            ELSE NULL
+          END,
+          lease_expires_at=CASE
+            WHEN excluded.work_status='LEASED'
+              THEN datum_lifecycle_items.lease_expires_at
+            ELSE NULL
+          END,
+          heartbeat_at=CASE
+            WHEN excluded.work_status='LEASED'
+              THEN datum_lifecycle_items.heartbeat_at
+            ELSE NULL
+          END,
           updated_at=excluded.updated_at
         """,
         (

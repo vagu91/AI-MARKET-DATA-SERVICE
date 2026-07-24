@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,9 @@ from app.infrastructure.persistence.database import connect_sqlite
 from app.services.event_driven_lifecycle_service import (
     LifecycleRepository,
     compute_datum_lifecycle,
+    persist_lifecycle_in_transaction,
 )
+from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.lifecycle_due_resolver import (
     DeterministicLifecycleDueResolver,
     TemporaryLifecycleProviderError,
@@ -25,6 +28,7 @@ from app.services.market_context_snapshot_repository import (
 )
 from app.services.research_scheduler_service import ResearchSchedulerService
 from scripts.reconcile_terminal_lifecycle_leases import (
+    _open_connection,
     reconcile_terminal_leases,
 )
 from scripts.replay_provider_only_lifecycle_forensics import replay
@@ -449,6 +453,85 @@ def test_partial_result_exposes_only_missing_fields_without_enqueue(
     assert final["heartbeat_at"] is None
 
 
+def test_mixed_ai_eligible_and_disabled_residuals_finalize_every_lease(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(
+        tmp_path,
+        research_agent_macro_events_enabled=True,
+        research_agent_vix_risk_enabled=False,
+    )
+    eligible = seed_due(
+        settings,
+        entity_type="macro_actual",
+        entity_key="US:CPI:2026-07",
+        fields=["actual"],
+        payload={
+            "actual": None,
+            "valid_until": (NOW - timedelta(minutes=1)).isoformat(),
+        },
+    )
+    disabled = seed_due(
+        settings,
+        entity_type="vix",
+        entity_key="VIX",
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+    resolver = DeterministicLifecycleDueResolver(
+        settings,
+        clock=lambda: NOW,
+        adapters={},
+    )
+
+    first = scheduler.scan_due_items(
+        owner="mixed-ai-disabled-first",
+        resolver=resolver.resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+    jobs = AIResearchJobRepository(settings).latest(limit=10)
+    outcomes = {
+        item["item_id"]: item["status"]
+        for item in first["item_outcomes"]
+    }
+
+    assert first["claimed"] == 2
+    assert first["ai_invocations"] == 1
+    assert first["ai_jobs_created"] == 1
+    assert len(jobs) == 1
+    assert jobs[0]["request_payload"]["lifecycle_item_id"] == eligible["item_id"]
+    assert len(first["item_outcomes"]) == 2
+    assert len(outcomes) == 2
+    assert outcomes == {
+        eligible["item_id"]: "AI_QUEUED",
+        disabled["item_id"]: "DISABLED",
+    }
+
+    eligible_stored = stored_item(settings, eligible["item_id"])
+    disabled_stored = stored_item(settings, disabled["item_id"])
+    assert eligible_stored["work_status"] == "QUEUED"
+    assert disabled_stored["work_status"] == "DISABLED"
+    assert disabled_stored["lease_owner"] is None
+    assert disabled_stored["lease_expires_at"] is None
+    assert disabled_stored["heartbeat_at"] is None
+    with connect_sqlite(settings.database_path) as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM datum_lifecycle_items
+            WHERE work_status='LEASED'
+            """
+        ).fetchone()[0] == 0
+
+    second = scheduler.scan_due_items(
+        owner="mixed-ai-disabled-second",
+        resolver=resolver.resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+    assert second["claimed"] == 0
+    assert second["ai_invocations"] == 0
+    assert second["item_outcomes"] == []
+    assert len(AIResearchJobRepository(settings).latest(limit=10)) == 1
+
+
 @pytest.mark.parametrize(
     "work_status",
     [
@@ -497,6 +580,61 @@ def test_upsert_final_states_clear_owned_lease(
     assert final["lease_owner"] is final["lease_expires_at"] is None
     assert final["heartbeat_at"] is None
     assert item["item_id"] == leased["item_id"]
+
+
+@pytest.mark.parametrize("persistence_path", ["repository", "transaction"])
+def test_leased_upsert_preserves_existing_lease(
+    tmp_path: Path,
+    persistence_path: str,
+) -> None:
+    settings = cfg(tmp_path)
+    seed_due(settings)
+    repository = LifecycleRepository(settings, clock=lambda: NOW)
+    leased = repository.claim_due(owner="lease-owner", now=NOW)[0]
+    lifecycle = compute_datum_lifecycle(
+        "vix",
+        "VIX",
+        {
+            "value": 19.0,
+            "observed_at": NOW.isoformat(),
+            "valid_until": (NOW + timedelta(hours=1)).isoformat(),
+            **FRESH_SOURCE,
+        },
+        settings=settings,
+        now=NOW,
+        fields_attempted=["value"],
+        refresh_reason="leased_payload_refresh",
+    )
+    payload = {
+        "value": 19.0,
+        "observed_at": NOW.isoformat(),
+        "valid_until": (NOW + timedelta(hours=1)).isoformat(),
+        **FRESH_SOURCE,
+    }
+
+    if persistence_path == "repository":
+        repository.upsert(
+            lifecycle,
+            payload=payload,
+            work_status="LEASED",
+        )
+    else:
+        with connect_sqlite(settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            persist_lifecycle_in_transaction(
+                conn,
+                lifecycle,
+                payload=payload,
+                work_status="LEASED",
+                timestamp=NOW.isoformat(),
+            )
+            conn.commit()
+
+    final = stored_item(settings, leased["item_id"])
+    assert final["work_status"] == "LEASED"
+    assert final["lease_owner"] == leased["lease_owner"]
+    assert final["lease_expires_at"] == leased["lease_expires_at"]
+    assert final["heartbeat_at"] == leased["heartbeat_at"]
 
 
 def test_complete_and_transition_clear_owned_leases(
@@ -657,6 +795,29 @@ def test_reconciliation_is_scoped_idempotent_and_auditable(
     assert first["changed_count"] == 1
     assert first["remaining_candidate_count"] == 0
     assert second["candidate_count"] == second["changed_count"] == 0
+
+
+def test_reconciliation_dry_run_connection_is_sqlite_read_only(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    seed_due(settings)
+
+    connection = _open_connection(
+        settings.database_path.resolve(),
+        apply=False,
+    )
+    try:
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute(
+                """
+                UPDATE datum_lifecycle_items
+                SET refresh_reason='must-not-write'
+                """
+            )
+    finally:
+        connection.close()
 
 
 def test_repository_noop_upsert_preserves_created_and_updated_at(
