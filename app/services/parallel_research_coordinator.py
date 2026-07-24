@@ -527,6 +527,35 @@ def _aggregate_parent_telemetry(
                 "status": statuses[index],
                 "warning_count": len(metrics.get("threshold_warnings") or []),
                 "last_error": child.get("last_error"),
+                "duration_ms": sum(
+                    int(value or 0)
+                    for value in (
+                        metrics.get("phase_duration_ms") or {}
+                    ).values()
+                ),
+                "backend_invocations": int(
+                    (metrics.get("backend") or {}).get("completed") or 0
+                ),
+                "searches": int(metrics.get("searches") or 0),
+                "opened_sources": int(metrics.get("opened_sources") or 0),
+                "fetched_sources": int(sources.get("fetched") or 0),
+                "verified_sources": int(sources.get("verified") or 0),
+                "accepted_claims": int(
+                    metrics.get("claims_accepted") or 0
+                ),
+                "rejected_claims": int(
+                    metrics.get("claims_rejected") or 0
+                ),
+                "no_data_reason": metrics.get("no_data_reason"),
+                "input_tokens": int(metrics_usage.get("input_tokens") or 0),
+                "output_tokens": int(metrics_usage.get("output_tokens") or 0),
+                "cost": metrics.get("cost"),
+                "freshness_distribution": dict(
+                    metrics.get("freshness_distribution") or {}
+                ),
+                "acquisition_method_distribution": dict(
+                    metrics.get("acquisition_method_distribution") or {}
+                ),
             }
         )
     run_ids = [str(child.get("child_run_id")) for child in children if child.get("child_run_id")]

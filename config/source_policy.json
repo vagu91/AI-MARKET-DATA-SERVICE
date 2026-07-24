@@ -1,11 +1,14 @@
 {
-  "policy_version": "source-policy-v3",
+  "policy_version": "source-policy-v4",
   "default_unknown_tier": 5,
   "forbidden_domains": [],
-  "issuer_official_domains": ["apple.com", "microsoft.com", "nvidia.com", "amazon.com", "abc.xyz", "meta.com", "tesla.com"],
+  "issuer_official_domains": ["apple.com", "microsoft.com", "nvidia.com", "amazon.com", "abc.xyz", "meta.com", "broadcom.com", "tesla.com", "amd.com", "netflix.net", "qualcomm.com", "appliedmaterials.com", "micron.com"],
   "issuer_domain_allowlist": {
     "Apple": ["apple.com"], "Microsoft": ["microsoft.com"], "NVIDIA": ["nvidia.com"],
-    "Amazon": ["amazon.com"], "Alphabet": ["abc.xyz"], "Meta": ["meta.com"], "Tesla": ["tesla.com"]
+    "Amazon": ["amazon.com"], "Alphabet": ["abc.xyz"], "Meta": ["meta.com"],
+    "Broadcom": ["broadcom.com"], "Tesla": ["tesla.com"], "AMD": ["amd.com"],
+    "Netflix": ["netflix.net"], "Qualcomm": ["qualcomm.com"],
+    "Applied Materials": ["appliedmaterials.com"], "Micron": ["micron.com"]
   },
   "issuer_official_sources": {
     "Apple": {"domains": ["apple.com"], "newsroom_domains": ["apple.com"], "investor_relations_domains": ["investor.apple.com"]},
@@ -14,7 +17,13 @@
     "Amazon": {"domains": ["amazon.com"], "newsroom_domains": ["aboutamazon.com"], "investor_relations_domains": ["ir.aboutamazon.com"]},
     "Alphabet": {"domains": ["abc.xyz"], "newsroom_domains": ["blog.google"], "investor_relations_domains": ["abc.xyz"]},
     "Meta": {"domains": ["meta.com"], "newsroom_domains": ["about.fb.com"], "investor_relations_domains": ["investor.atmeta.com"]},
-    "Tesla": {"domains": ["tesla.com"], "newsroom_domains": ["tesla.com"], "investor_relations_domains": ["ir.tesla.com"]}
+    "Broadcom": {"domains": ["broadcom.com"], "newsroom_domains": ["broadcom.com"], "investor_relations_domains": ["investors.broadcom.com"]},
+    "Tesla": {"domains": ["tesla.com"], "newsroom_domains": ["tesla.com"], "investor_relations_domains": ["ir.tesla.com"]},
+    "AMD": {"domains": ["amd.com"], "newsroom_domains": ["amd.com"], "investor_relations_domains": ["ir.amd.com"]},
+    "Netflix": {"domains": ["netflix.net"], "newsroom_domains": ["about.netflix.com"], "investor_relations_domains": ["ir.netflix.net"]},
+    "Qualcomm": {"domains": ["qualcomm.com"], "newsroom_domains": ["qualcomm.com"], "investor_relations_domains": ["investor.qualcomm.com"]},
+    "Applied Materials": {"domains": ["appliedmaterials.com"], "newsroom_domains": ["appliedmaterials.com"], "investor_relations_domains": ["ir.appliedmaterials.com"]},
+    "Micron": {"domains": ["micron.com"], "newsroom_domains": ["micron.com"], "investor_relations_domains": ["investors.micron.com"]}
   },
   "semantic_policies": {
     "actual": {"allowed_tiers": [1], "required_confirmations": 1, "ttl_minutes": 10080, "max_reliability": 0.99},
@@ -25,6 +34,8 @@
     "earnings_schedule": {"allowed_tiers": [1, 2], "required_confirmations": 1, "lifecycle_minutes": 1440, "freshness_basis": "event_at", "published_at_required": false, "max_reliability": 0.99},
     "current_news": {"allowed_tiers": [1, 2, 3], "required_confirmations": 2, "ttl_minutes": 360, "freshness_basis": "published_at", "published_at_required": true, "max_reliability": 0.98},
     "current_market_context": {"allowed_tiers": [1, 2, 3], "required_confirmations": 1, "ttl_minutes": 60, "freshness_basis": "published_at", "published_at_required": true, "max_reliability": 0.90},
+    "verified_market_metric": {"allowed_tiers": [1, 2, 3], "required_confirmations": 1, "ttl_minutes": 1440, "freshness_basis": "published_at", "published_at_required": true, "max_reliability": 0.98},
+    "verified_corporate_metric": {"allowed_tiers": [1, 2], "required_confirmations": 1, "ttl_minutes": 43200, "freshness_basis": "published_at", "published_at_required": true, "max_reliability": 0.99},
     "forecast": {"allowed_tiers": [3, 4], "required_confirmations": 2, "ttl_minutes": 1440, "max_reliability": 0.92},
     "consensus": {"allowed_tiers": [3, 4], "required_confirmations": 2, "ttl_minutes": 1440, "max_reliability": 0.92},
     "previous": {"allowed_tiers": [1, 3, 4], "required_confirmations": 2, "ttl_minutes": 10080, "max_reliability": 0.92},

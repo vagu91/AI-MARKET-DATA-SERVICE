@@ -16,6 +16,8 @@ AI_RESEARCH_SEMANTICS = (
     "earnings_schedule",
     "current_news",
     "current_market_context",
+    "verified_market_metric",
+    "verified_corporate_metric",
     "exploratory_context",
     "forecast",
     "consensus",
@@ -26,9 +28,18 @@ AI_RESEARCH_SEMANTICS = (
 SERVICE_ONLY_SEMANTICS = ("official_actual",)
 EVENT_SEMANTICS = {"scheduled_event", "official_calendar_event"}
 ISSUER_EVENT_SEMANTICS = {"issuer_announcement", "earnings_schedule"}
-CURRENT_SEMANTICS = {"current_news", "current_market_context"}
+CURRENT_SEMANTICS = {
+    "current_news",
+    "current_market_context",
+    "verified_market_metric",
+    "verified_corporate_metric",
+}
 EVENT_IDENTITY_SEMANTICS = EVENT_SEMANTICS | ISSUER_EVENT_SEMANTICS
-OBSERVATION_SEMANTICS = {"current_market_context"}
+OBSERVATION_SEMANTICS = {
+    "current_market_context",
+    "verified_market_metric",
+    "verified_corporate_metric",
+}
 EVENT_VALUE_SEMANTICS = {
     "actual",
     "official_actual",
@@ -42,11 +53,17 @@ EVENT_VALUE_SEMANTICS = {
 _ISSUERS_BY_SYMBOL = {
     "AAPL": "Apple",
     "AMZN": "Amazon",
+    "AMD": "AMD",
+    "AMAT": "Applied Materials",
+    "AVGO": "Broadcom",
     "GOOG": "Alphabet",
     "GOOGL": "Alphabet",
     "META": "Meta",
+    "MU": "Micron",
     "MSFT": "Microsoft",
+    "NFLX": "Netflix",
     "NVDA": "NVIDIA",
+    "QCOM": "Qualcomm",
     "TSLA": "Tesla",
 }
 
@@ -180,6 +197,7 @@ def canonical_observation_key(claim: dict[str, Any]) -> str:
 
     observation_at = (
         claim.get("period")
+        or claim.get("data_as_of")
         or claim.get("valid_from")
         or claim.get("event_at")
         or claim.get("release_at")

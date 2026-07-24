@@ -255,7 +255,7 @@ def test_test_bootstrap_rejects_operational_database() -> None:
 
 
 def test_source_policy_v3_is_preserved() -> None:
-    assert SourcePolicyService().policy_version == "source-policy-v3"
+    assert SourcePolicyService().policy_version == "source-policy-v4"
     assert SourcePolicyService().validate_url(
         "https://fixture.test",
         allow_test_reserved=True,

@@ -37,6 +37,7 @@ from app.services.research_backend import (
     normalized_backend_input,
     select_research_backend,
 )
+from app.services.research_domain_contracts import AGENTIC_DOMAIN_FIELDS
 from app.services.research_gap_manifest import ResearchGapManifestBuilder
 from app.services.research_profiles import PROFILES
 from app.services.research_runtime_repository import (
@@ -124,6 +125,18 @@ def full_context(*, missing: str | None = None) -> dict[str, Any]:
         },
         "market_schedule": {"status": "AVAILABLE", "data_as_of": stamp},
     }
+    for topic, fields in AGENTIC_DOMAIN_FIELDS.items():
+        context[topic] = {
+            "status": "AVAILABLE",
+            "fields": {
+                field: {
+                    "value": "fixture",
+                    "data_as_of": stamp,
+                    "verification_status": "VERIFIED",
+                }
+                for field in fields
+            },
+        }
     mapping = {
         "macro_events": "event_calendar",
         "fed_rates": "rates_expectations",

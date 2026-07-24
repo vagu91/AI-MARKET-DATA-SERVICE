@@ -60,6 +60,18 @@ def _closed(properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _closed_with_optional(
+    properties: dict[str, Any],
+    *,
+    optional: set[str],
+) -> dict[str, Any]:
+    # Structured-output backends receive a fully closed schema. The service
+    # validator also accepts legacy payloads that predate additive metadata.
+    schema = _closed(properties)
+    schema["x-serviceOptional"] = sorted(optional)
+    return schema
+
+
 def _status(*values: str) -> dict[str, Any]:
     return {"type": "string", "enum": list(values)}
 
@@ -79,7 +91,20 @@ def _evidence_schema() -> dict[str, Any]:
 
 
 def _validated_claim_schema() -> dict[str, Any]:
-    return _closed(
+    optional = {
+        "data_as_of",
+        "observed_at",
+        "acquisition_method",
+        "quality",
+        "methodology",
+        "inputs",
+        "assumptions",
+        "chain_coverage",
+        "ticker",
+        "expected_basis",
+        "actual_basis",
+    }
+    return _closed_with_optional(
         {
             "topic": _string(max_length=100),
             "field_semantics": {
@@ -105,7 +130,27 @@ def _validated_claim_schema() -> dict[str, Any]:
             "topic_status": _status("SUPPORTED", "NOT_APPLICABLE"),
             "evidence": _array(_evidence_schema(), max_items=12),
             "warnings": _array(_string(max_length=300), max_items=20),
-        }
+            "data_as_of": _string(nullable=True, max_length=64),
+            "observed_at": _string(nullable=True, max_length=64),
+            "acquisition_method": {
+                "type": ["string", "null"],
+                "enum": [
+                    "agent_web",
+                    "public_endpoint",
+                    "api_provider",
+                    None,
+                ],
+            },
+            "quality": _string(nullable=True, max_length=40),
+            "methodology": _string(nullable=True, max_length=1000),
+            "inputs": _array(_string(max_length=240), max_items=40),
+            "assumptions": _array(_string(max_length=500), max_items=20),
+            "chain_coverage": _nullable("number", minimum=0, maximum=1),
+            "ticker": _string(nullable=True, max_length=16),
+            "expected_basis": _string(nullable=True, max_length=120),
+            "actual_basis": _string(nullable=True, max_length=120),
+        },
+        optional=optional,
     )
 
 
@@ -207,7 +252,7 @@ def step_output_schema(
             {
                 "status": _status("COMPLETED", "NO_DATA"),
                 "claims": _array(
-                    _closed(
+                    _closed_with_optional(
                         {
                             "claim_ref": _string(max_length=120),
                             "topic": _string(max_length=100),
@@ -222,7 +267,55 @@ def step_output_schema(
                             "unit": _string(nullable=True, max_length=80),
                             "evidence": _array(_evidence_schema(), max_items=12),
                             "warnings": _array(_string(max_length=300), max_items=20),
-                        }
+                            "data_as_of": _string(nullable=True, max_length=64),
+                            "observed_at": _string(nullable=True, max_length=64),
+                            "acquisition_method": {
+                                "type": ["string", "null"],
+                                "enum": [
+                                    "agent_web",
+                                    "public_endpoint",
+                                    "api_provider",
+                                    None,
+                                ],
+                            },
+                            "quality": _string(nullable=True, max_length=40),
+                            "methodology": _string(nullable=True, max_length=1000),
+                            "inputs": _array(
+                                _string(max_length=240),
+                                max_items=40,
+                            ),
+                            "assumptions": _array(
+                                _string(max_length=500),
+                                max_items=20,
+                            ),
+                            "chain_coverage": _nullable(
+                                "number",
+                                minimum=0,
+                                maximum=1,
+                            ),
+                            "ticker": _string(nullable=True, max_length=16),
+                            "expected_basis": _string(
+                                nullable=True,
+                                max_length=120,
+                            ),
+                            "actual_basis": _string(
+                                nullable=True,
+                                max_length=120,
+                            ),
+                        },
+                        optional={
+                            "data_as_of",
+                            "observed_at",
+                            "acquisition_method",
+                            "quality",
+                            "methodology",
+                            "inputs",
+                            "assumptions",
+                            "chain_coverage",
+                            "ticker",
+                            "expected_basis",
+                            "actual_basis",
+                        },
                     ),
                     max_items=40,
                 ),
@@ -491,7 +584,12 @@ def validate_payload(payload: Any, schema: dict[str, Any]) -> None:
             errors.append(f"{path}:enum")
         if isinstance(value, dict):
             properties = node.get("properties") or {}
-            missing = set(node.get("required") or []) - set(value)
+            service_optional = set(node.get("x-serviceOptional") or [])
+            missing = (
+                set(node.get("required") or [])
+                - service_optional
+                - set(value)
+            )
             unexpected = set(value) - set(properties)
             if missing:
                 errors.append(f"{path}:missing:{','.join(sorted(missing))}")

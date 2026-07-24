@@ -391,7 +391,7 @@ def test_parent_finalization_is_stable_and_aggregates_forensic_oracle(
         "symbol": "MNQ",
         "source_snapshot_id": None,
         "generated_at": replay["parent"]["created_at"],
-        "policy_version": "source-policy-v3",
+        "policy_version": "source-policy-v4",
         "agent_topics": replay["parent"]["required_topics"],
         "items": [
             {

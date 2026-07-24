@@ -24,6 +24,13 @@ from app.services.research_semantics import (
     normalize_research_claim,
     semantic_validation_warnings,
 )
+from app.services.research_domain_contracts import (
+    DOMAIN_PROFILE_TOPICS,
+    GAMMA_METRICS,
+    domain_claim_warnings,
+    enrich_domain_claim,
+    no_data_contract,
+)
 from app.services.source_policy_service import SourcePolicyService
 from app.services.research_tool_telemetry import (
     COUNTED_SOURCE_ACTIONS,
@@ -1188,7 +1195,13 @@ class ResearchRuntimeRepository:
         try:
             conn.execute("BEGIN IMMEDIATE")
             transaction_started = True
-            for raw_claim in claims:
+            persisted_input_refs: set[str] = set()
+            ordered_claims = sorted(
+                claims,
+                key=lambda item: str(item.get("metric_id") or "").lower()
+                in GAMMA_METRICS,
+            )
+            for raw_claim in ordered_claims:
                 current_claim = normalize_research_claim(
                     raw_claim,
                     policy=self.policy,
@@ -1200,6 +1213,7 @@ class ResearchRuntimeRepository:
                     current_claim,
                     observed_sources,
                     acquired_sources,
+                    persisted_input_refs,
                 )
                 evidence_by_claim[str(restored["claim_id"])] = evidence_rows
                 evidence_count += len(evidence_rows)
@@ -1228,6 +1242,8 @@ class ResearchRuntimeRepository:
                         )
                         restored["materialization_status"] = "MATERIALIZED"
                         read_back_count += 1
+                        if restored.get("claim_ref"):
+                            persisted_input_refs.add(str(restored["claim_ref"]))
                     else:
                         raise RuntimeError("research_fact_read_back_failed")
                 else:
@@ -1272,6 +1288,22 @@ class ResearchRuntimeRepository:
                 "blocking_gaps": blocking_gaps,
                 "coverage_score": coverage_score,
             }
+            if status == "NO_DATA" and str(run.get("profile_id") or "") in (
+                DOMAIN_PROFILE_TOPICS
+            ):
+                no_data = no_data_contract(
+                    searched_at=now,
+                    sources_attempted=acquired_sources,
+                )
+                result_payload.update(
+                    {
+                        "reason": no_data["reason"],
+                        "value": None,
+                        "searched_at": no_data["searched_at"],
+                        "sources_attempted": no_data["sources_attempted"],
+                        "no_data_reason": no_data["reason"],
+                    }
+                )
             results = [
                 self._claim_result_from_evidence(
                     item,
@@ -1292,6 +1324,8 @@ class ResearchRuntimeRepository:
                     "earnings_schedule",
                     "current_news",
                     "current_market_context",
+                    "verified_market_metric",
+                    "verified_corporate_metric",
                 }
             ]
             output = {"status": status, **result_payload, "results": results}
@@ -1607,6 +1641,7 @@ class ResearchRuntimeRepository:
         claim: dict[str, Any],
         observed_sources: list[dict[str, Any]],
         acquired_sources: list[dict[str, Any]],
+        persisted_input_refs: set[str],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         now = _now()
         claim = normalize_research_claim(
@@ -1640,13 +1675,36 @@ class ResearchRuntimeRepository:
                 "EARNINGS_RESEARCH",
                 "NEWS_RESEARCH",
                 "GEOPOLITICAL_REGULATORY_RISK_RESEARCH",
+                "OPTIONS_POSITIONING_RESEARCH",
+                "MARKET_INTERNALS_RESEARCH",
+                "CROSS_ASSET_CONTEXT_RESEARCH",
+                "EARNINGS_INTELLIGENCE_RESEARCH",
             }:
                 warnings.append("topic_is_applicable_not_applicable_forbidden")
+        claim = enrich_domain_claim(
+            claim,
+            evidence_rows,
+            now=self.now(),
+            acquisition_method="agent_web",
+        )
+        claim = normalize_research_claim(
+            claim,
+            policy=self.policy,
+            now=self.now(),
+        )
         warnings.extend(
             semantic_validation_warnings(
                 claim,
                 policy=self.policy,
                 now=self.now(),
+            )
+        )
+        warnings.extend(
+            domain_claim_warnings(
+                claim,
+                evidence_input,
+                now=self.now(),
+                persisted_input_refs=persisted_input_refs,
             )
         )
         warnings.extend(_official_numeric_warnings(claim, evidence_input))

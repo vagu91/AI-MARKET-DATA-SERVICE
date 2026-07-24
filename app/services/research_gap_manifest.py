@@ -13,6 +13,11 @@ from app.infrastructure.persistence.migrations import migrate_database
 from app.services.data_freshness_service import parse_datetime
 from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_validation_service import TemporalValidationService
+from app.services.research_domain_contracts import (
+    AGENTIC_DOMAIN_FIELDS,
+    DOMAIN_TOPICS,
+    field_states,
+)
 
 
 MNQ_TOPICS = (
@@ -25,6 +30,10 @@ MNQ_TOPICS = (
     "earnings",
     "news",
     "geopolitical_regulatory_risk",
+    "options_positioning",
+    "market_internals",
+    "cross_asset_context",
+    "earnings_intelligence",
     "market_schedule",
 )
 
@@ -38,6 +47,10 @@ TOPIC_PROFILES = {
     "earnings": "EARNINGS_RESEARCH",
     "news": "NEWS_RESEARCH",
     "geopolitical_regulatory_risk": "GEOPOLITICAL_REGULATORY_RISK_RESEARCH",
+    "options_positioning": "OPTIONS_POSITIONING_RESEARCH",
+    "market_internals": "MARKET_INTERNALS_RESEARCH",
+    "cross_asset_context": "CROSS_ASSET_CONTEXT_RESEARCH",
+    "earnings_intelligence": "EARNINGS_INTELLIGENCE_RESEARCH",
 }
 
 
@@ -54,6 +67,7 @@ class ResearchGapItem:
     source_lineage: tuple[dict[str, Any], ...]
     required_action: str
     reason: str
+    field_states: dict[str, str]
 
 
 class ResearchGapManifestBuilder:
@@ -97,6 +111,20 @@ class ResearchGapManifestBuilder:
             "generated_at": now.isoformat(),
             "policy_version": self.policy.policy_version,
             "items": [asdict(item) for item in items],
+            "provider_stage": {
+                "contract_version": "provider_gap_v1",
+                "precedence": [
+                    "api_provider",
+                    "public_endpoint",
+                    "agent_web_for_residual_gaps_only",
+                ],
+                "configured": bool(
+                    ((context.get("research_provider_stage") or {}).get("configured"))
+                ),
+                "completed": bool(
+                    ((context.get("research_provider_stage") or {}).get("completed"))
+                ),
+            },
         }
         checksum = hashlib.sha256(_json(body).encode("utf-8")).hexdigest()
         manifest = {
@@ -129,6 +157,7 @@ class ResearchGapManifestBuilder:
         data_as_of, valid_until = _timestamps(value)
         freshness = _freshness(data_as_of, valid_until, now)
         completeness, missing = _completeness(topic, value)
+        states = field_states(topic, value, now=now) if topic in DOMAIN_TOPICS else {}
         explicit_status = str(value.get("status") or "").upper() if isinstance(value, dict) else ""
         if topic == "market_schedule":
             return ResearchGapItem(
@@ -143,6 +172,54 @@ class ResearchGapManifestBuilder:
                 lineage,
                 "DETERMINISTIC_REFRESH",
                 "session_state_is_clock_dependent",
+                states,
+            )
+        if topic in DOMAIN_TOPICS:
+            residual = [
+                field
+                for field, state in states.items()
+                if state not in {"SATISFIED", "NOT_APPLICABLE"}
+            ]
+            satisfied = [
+                field for field, state in states.items() if state == "SATISFIED"
+            ]
+            if not residual:
+                return ResearchGapItem(
+                    topic,
+                    "APPLICABLE",
+                    "SATISFIED_FRESH_DB",
+                    "FRESH",
+                    data_as_of,
+                    valid_until,
+                    1.0,
+                    (),
+                    lineage,
+                    "NONE",
+                    "provider_or_database_fields_satisfied_before_agent_stage",
+                    states,
+                )
+            state_names = {states[field] for field in residual}
+            return ResearchGapItem(
+                topic,
+                "APPLICABLE",
+                (
+                    "NEEDS_AGENT_RESEARCH"
+                    if satisfied
+                    else "MISSING"
+                ),
+                (
+                    "STALE"
+                    if "STALE" in state_names
+                    else "UNKNOWN"
+                ),
+                data_as_of,
+                valid_until,
+                len(satisfied) / max(len(states), 1),
+                tuple(residual),
+                lineage,
+                "AGENT_RESEARCH",
+                "agent_receives_only_residual_provider_neutral_field_gaps",
+                states,
             )
         if explicit_status in {
             "NO_CURRENT_ITEM",
@@ -162,6 +239,7 @@ class ResearchGapManifestBuilder:
                 lineage,
                 "NONE",
                 "bounded_deterministic_query_proved_no_current_item",
+                states,
             )
         if explicit_status == "NOT_CONFIGURED":
             return ResearchGapItem(
@@ -176,6 +254,7 @@ class ResearchGapManifestBuilder:
                 lineage,
                 "AGENT_RESEARCH",
                 "deterministic_source_not_configured",
+                states,
             )
         if not _has_data(value):
             return ResearchGapItem(
@@ -190,6 +269,7 @@ class ResearchGapManifestBuilder:
                 lineage,
                 "AGENT_RESEARCH",
                 "no_committed_deterministic_data",
+                states,
             )
         if completeness < 1.0:
             return ResearchGapItem(
@@ -204,6 +284,7 @@ class ResearchGapManifestBuilder:
                 lineage,
                 "AGENT_RESEARCH",
                 "required_fields_incomplete",
+                states,
             )
         if freshness == "STALE":
             return ResearchGapItem(
@@ -218,6 +299,7 @@ class ResearchGapManifestBuilder:
                 lineage,
                 "DETERMINISTIC_REFRESH",
                 "committed_last_known_good_requires_provider_refresh",
+                states,
             )
         return ResearchGapItem(
             topic,
@@ -231,6 +313,7 @@ class ResearchGapManifestBuilder:
             lineage,
             "NONE",
             "committed_deterministic_data_is_complete_and_fresh",
+            states,
         )
 
     def _persist(self, manifest: dict[str, Any]) -> None:
@@ -301,12 +384,28 @@ def _topic_value(topic: str, context: dict[str, Any]) -> Any:
             context.get("geopolitical_regulatory_risk")
             or (context.get("risk_context") or {}).get("geopolitical_regulatory")
         ),
+        "options_positioning": context.get("options_positioning"),
+        "market_internals": context.get("market_internals"),
+        "cross_asset_context": context.get("cross_asset_context"),
+        "earnings_intelligence": context.get("earnings_intelligence"),
         "market_schedule": context.get("market_schedule"),
     }
     return mappings.get(topic)
 
 
 def _completeness(topic: str, value: Any) -> tuple[float, list[str]]:
+    if topic in DOMAIN_TOPICS:
+        if not isinstance(value, dict):
+            return 0.0, list(AGENTIC_DOMAIN_FIELDS[topic])
+        fields = value.get("fields") if isinstance(value.get("fields"), dict) else value
+        missing = [
+            field
+            for field in AGENTIC_DOMAIN_FIELDS[topic]
+            if not _has_data(fields.get(field))
+        ]
+        return (
+            len(AGENTIC_DOMAIN_FIELDS[topic]) - len(missing)
+        ) / len(AGENTIC_DOMAIN_FIELDS[topic]), missing
     if not _has_data(value):
         return 0.0, ["current_data"]
     if topic == "macro_events" and isinstance(value, dict):
