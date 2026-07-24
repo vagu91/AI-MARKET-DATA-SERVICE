@@ -67,6 +67,19 @@ _GENERAL_JOB_TOPICS = {
     "EARNINGS_CONTEXT": "earnings",
     "NEWS_DRIVER_RESEARCH": "news",
 }
+_EXPLICIT_GENERAL_JOB_FLAGS = {
+    # These two orchestrating profiles are intentionally governed by the
+    # documented research-agent master flag; they are not aliases for a
+    # specialized domain agent.
+    "MNQ_MARKET_RESEARCH": (
+        "research_agents_enabled",
+        "AI_MARKET_RESEARCH_AGENTS_ENABLED",
+    ),
+    "CONFLICT_RESOLUTION": (
+        "research_agents_enabled",
+        "AI_MARKET_RESEARCH_AGENTS_ENABLED",
+    ),
+}
 
 
 def registration_for(
@@ -101,24 +114,47 @@ def research_agent_enablement(
     profile_id: str | None = None,
     job_type: str | None = None,
 ) -> dict[str, Any]:
+    normalized_job_type = str(job_type or "").upper()
+    known_job_types = {
+        *_BY_JOB_TYPE,
+        *_GENERAL_JOB_TOPICS,
+        *_EXPLICIT_GENERAL_JOB_FLAGS,
+    }
+    unknown_job_type = bool(normalized_job_type) and (
+        normalized_job_type not in known_job_types
+    )
     registration = registration_for(
         topic=topic,
         profile_id=profile_id,
         job_type=job_type,
     )
+    if unknown_job_type:
+        registration = None
     master_enabled = bool(settings.research_agents_enabled)
-    configured_enabled = (
-        bool(getattr(settings, registration.settings_field))
-        if registration is not None
-        else True
+    explicit_general = (
+        None
+        if unknown_job_type
+        else _EXPLICIT_GENERAL_JOB_FLAGS.get(normalized_job_type)
     )
+    if registration is not None:
+        configured_enabled = bool(
+            getattr(settings, registration.settings_field)
+        )
+    elif explicit_general is not None:
+        configured_enabled = bool(getattr(settings, explicit_general[0]))
+    else:
+        configured_enabled = False
     enabled = master_enabled and configured_enabled
     if not master_enabled:
         reason = "research_agents_master_disabled"
+    elif unknown_job_type or (
+        registration is None and explicit_general is None
+    ):
+        reason = "unmapped_research_job_type"
     elif not configured_enabled:
         reason = "research_agent_disabled"
-    elif registration is None:
-        reason = "general_research_job_enabled"
+    elif explicit_general is not None:
+        reason = "explicit_general_research_job_enabled"
     else:
         reason = "research_agent_enabled"
     return {
@@ -129,8 +165,20 @@ def research_agent_enablement(
         "topic": registration.topic if registration else topic,
         "profile_id": registration.profile_id if registration else profile_id,
         "job_type": registration.job_type if registration else job_type,
-        "settings_field": registration.settings_field if registration else None,
-        "env_name": registration.env_name if registration else None,
+        "settings_field": (
+            registration.settings_field
+            if registration
+            else explicit_general[0]
+            if explicit_general
+            else None
+        ),
+        "env_name": (
+            registration.env_name
+            if registration
+            else explicit_general[1]
+            if explicit_general
+            else None
+        ),
     }
 
 
@@ -202,6 +250,7 @@ def safe_research_agent_capabilities(settings: Settings) -> dict[str, Any]:
 
 def validate_research_agent_mapping() -> None:
     from app.services.research_gap_manifest import TOPIC_PROFILES
+    from app.services.research_profiles import JOB_PROFILE
 
     expected = {(topic, profile) for topic, profile in TOPIC_PROFILES.items()}
     actual = {(item.topic, item.profile_id) for item in RESEARCH_AGENT_REGISTRY}
@@ -219,3 +268,11 @@ def validate_research_agent_mapping() -> None:
         RESEARCH_AGENT_REGISTRY
     ):
         raise RuntimeError("duplicate_research_agent_env_name")
+    mapped_job_types = {
+        *_BY_JOB_TYPE,
+        *_GENERAL_JOB_TOPICS,
+        *_EXPLICIT_GENERAL_JOB_FLAGS,
+    }
+    unknown = sorted(set(JOB_PROFILE) - mapped_job_types)
+    if unknown:
+        raise RuntimeError(f"unmapped_research_job_types:{unknown}")

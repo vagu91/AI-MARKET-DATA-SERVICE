@@ -85,10 +85,19 @@ The manifest, coordinator, job service, repository, and worker all enforce the
 same decision. A disabled topic has `required_action=NONE`,
 `ai_eligible=false`, `execution_status=NOT_REQUESTED`, and
 `data_outcome=DISABLED`. It creates no child/job/retry/recovery/backend/token or
-web work and is not a coverage denominator or blocking gap. A queued job that
-becomes disabled is terminally rejected immediately before backend execution
-with `AGENT_DISABLED` and a non-retryable classification. A running job is not
-interrupted. Disabling an agent never deletes its previously committed data.
+web work and is not a coverage denominator or blocking gap. Pending,
+retry-scheduled, and abandoned-running jobs that become disabled are rejected
+by the repository before acquisition/recovery with `AGENT_DISABLED`,
+`NON_RETRYABLE`, and no new attempt. Disabling an agent never deletes its
+previously committed data.
+
+Every executable job type is fail-closed. Specialized job types and legacy
+aliases resolve to one of the 13 topic flags. `MNQ_MARKET_RESEARCH` and
+`CONFLICT_RESOLUTION` are explicitly governed by
+`AI_MARKET_RESEARCH_AGENTS_ENABLED`. `RELEASE_ACTUAL_REFRESH` is mapped to the
+macro-events flag but runs only through the deterministic official-actual
+resolver. Unknown job types have no implicit general fallback and are rejected
+as `unmapped_research_job_type`.
 
 The general scheduler, research scheduler, due scanner, master agent switch,
 per-agent switches, and worker are separate controls. The scanner defaults to

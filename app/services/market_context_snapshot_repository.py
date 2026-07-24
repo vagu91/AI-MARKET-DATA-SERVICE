@@ -57,6 +57,8 @@ class MarketContextSnapshotRepository:
         trigger_entity: str | None = None,
         trace_id: str | None = None,
         correlation_id: str | None = None,
+        resolved_lifecycle: DatumLifecycle | None = None,
+        resolved_datum: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Allocate revision and persist both payloads in one SQLite write transaction."""
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -92,7 +94,7 @@ class MarketContextSnapshotRepository:
             conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute(
                 """
-                SELECT snapshot_id,debug_payload_json
+                SELECT snapshot_id,debug_payload_json,consumer_payload_json
                 FROM market_context_snapshots
                 WHERE symbol=? AND audit_status='ACTIVE'
                   AND source_audit_status='ACTIVE'
@@ -193,12 +195,12 @@ class MarketContextSnapshotRepository:
                     trigger_entity=trigger_entity,
                     snapshot_id=snapshot_id,
                     snapshot_revision=revision,
-                    current_payload=debug,
+                    current_payload=consumer,
                     previous_snapshot_id=(
                         str(previous["snapshot_id"]) if previous else None
                     ),
                     previous_payload=(
-                        json.loads(previous["debug_payload_json"] or "{}")
+                        json.loads(previous["consumer_payload_json"] or "{}")
                         if previous
                         else None
                     ),
@@ -206,6 +208,14 @@ class MarketContextSnapshotRepository:
                     correlation_id=correlation_id,
                     data_as_of=data_as_of,
                     created_at=now,
+                )
+            if resolved_lifecycle is not None:
+                persist_lifecycle_in_transaction(
+                    conn,
+                    resolved_lifecycle,
+                    payload=dict(resolved_datum or {}),
+                    work_status="COMPLETED",
+                    timestamp=now,
                 )
             self._persist_projected_lifecycle(conn, debug, timestamp=now)
             self._persist_components(

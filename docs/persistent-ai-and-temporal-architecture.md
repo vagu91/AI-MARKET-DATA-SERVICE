@@ -168,9 +168,11 @@ Optional pre-market, in-session, post-market, pre-event, post-release, speech, e
 The lifecycle due scanner is a third, independent opt-in and defaults to
 disabled. Its production APScheduler job is coroutine-safe and receives the
 application's deterministic resolver plus the persistent residual enqueue
-path. A missing deterministic provider returns a typed deferred result and an
-`IDLE` row with a bounded next check, never a tight `READY` lease loop and never
-an invented AI fallback.
+path. A missing deterministic provider returns `EXHAUSTED`/`NO_DATA` and
+reaches the residual persistent job path only when the mapped agent is enabled;
+disabled agents remain `NOT_REQUESTED`/`DISABLED`. Temporary provider errors
+create a negative-cache backoff and never invoke AI in the same scan. No path
+invents provider data.
 
 Central agent enablement is independent of all three scheduler/worker controls.
 The master `AI_MARKET_RESEARCH_AGENTS_ENABLED` switch dominates the 13

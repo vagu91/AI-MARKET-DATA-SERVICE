@@ -19,6 +19,7 @@ from app.services.data_freshness_service import parse_datetime
 from app.services.research_gap_manifest import ResearchGapManifestBuilder
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 from app.services.event_driven_lifecycle_service import (
+    DatumLifecycle,
     LifecycleRepository,
     TRIGGER_CLASS_BY_ENTITY,
     compute_datum_lifecycle,
@@ -80,6 +81,7 @@ class ResearchSchedulerService:
         rematerialized: list[str] = []
         residual: list[dict[str, Any]] = []
         ai_eligible: list[dict[str, Any]] = []
+        ai_decisions: list[dict[str, str]] = []
         deferred: list[str] = []
         for item in claimed:
             item_id = str(item["item_id"])
@@ -140,11 +142,6 @@ class ResearchSchedulerService:
                             triggering_event=trigger_type,
                             refresh_reason="provider_resolution_completed",
                         )
-                    self.lifecycle.upsert(
-                        lifecycle,
-                        payload=datum,
-                        work_status="COMPLETED",
-                    )
                     snapshot = self._rematerialize_provider_resolution(
                         item=item,
                         datum=datum,
@@ -163,6 +160,12 @@ class ResearchSchedulerService:
                     )
                     if snapshot is not None:
                         rematerialized.append(str(snapshot["snapshot_id"]))
+                    else:
+                        self.lifecycle.upsert(
+                            lifecycle,
+                            payload=datum,
+                            work_status="COMPLETED",
+                        )
                 else:
                     self.lifecycle.complete(
                         item_id,
@@ -180,6 +183,40 @@ class ResearchSchedulerService:
                 "provider_resolver_status": provider_status,
             }
             residual.append(unresolved)
+            ai_decisions.append(
+                {
+                    "item_id": item_id,
+                    "agent_status": str(
+                        provider_result.get("agent_status")
+                        or (
+                            "ENABLED"
+                            if provider_result.get("ai_eligible") is True
+                            else "NOT_APPLICABLE"
+                        )
+                    ),
+                    "execution_status": str(
+                        provider_result.get("execution_status")
+                        or (
+                            "ELIGIBLE"
+                            if provider_result.get("ai_eligible") is True
+                            else "NOT_REQUESTED"
+                        )
+                    ),
+                }
+            )
+            if provider_status == "DEFERRED":
+                deferred_lifecycle = provider_result.get("lifecycle")
+                deferred_datum = provider_result.get("datum")
+                if deferred_lifecycle is not None and isinstance(
+                    deferred_datum, dict
+                ):
+                    self.lifecycle.upsert(
+                        deferred_lifecycle,
+                        payload=deferred_datum,
+                        work_status="BACKOFF",
+                    )
+                    deferred.append(item_id)
+                    continue
             if (
                 resolver is not None
                 and provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
@@ -212,13 +249,25 @@ class ResearchSchedulerService:
             for item in residual:
                 if item in ai_eligible and ai_enqueue is not None:
                     continue
+                agent_status = next(
+                    (
+                        decision["agent_status"]
+                        for decision in ai_decisions
+                        if decision["item_id"] == str(item["item_id"])
+                    ),
+                    "",
+                )
                 self.lifecycle.transition(
                     str(item["item_id"]),
                     owner=owner,
-                    work_status="IDLE",
+                    work_status=(
+                        "DISABLED" if agent_status == "DISABLED" else "IDLE"
+                    ),
                     refresh_reason=(
                         "provider_deferred_ai_not_requested"
                         if str(item.get("provider_resolver_status")) == "DEFERRED"
+                        else "agent_disabled_ai_not_requested"
+                        if agent_status == "DISABLED"
                         else "provider_unresolved_ai_not_configured"
                     ),
                     next_refresh_at=(
@@ -252,6 +301,7 @@ class ResearchSchedulerService:
             "deferred": deferred,
             "residual_count": len(residual),
             "ai_eligible_count": len(ai_eligible),
+            "ai_decisions": ai_decisions,
             "ai_invocations": ai_invocations,
             "enqueue_result": enqueue_result,
             "coalesced": len(ai_eligible) > 1,
@@ -274,6 +324,13 @@ class ResearchSchedulerService:
         if not components:
             return None
         debug = dict(components)
+        debug = _project_resolved_datum(
+            debug,
+            entity_type=str(item.get("entity_type") or ""),
+            entity_key=str(item.get("entity_key") or ""),
+            datum=datum,
+            lifecycle=lifecycle,
+        )
         resolutions = dict(debug.get("lifecycle_resolutions") or {})
         resolutions[str(item.get("entity_key") or item["item_id"])] = {
             "entity_type": item.get("entity_type"),
@@ -292,6 +349,8 @@ class ResearchSchedulerService:
             trigger_type=trigger_type,
             trigger_entity=str(item.get("entity_key") or ""),
             correlation_id=owner,
+            resolved_lifecycle=DatumLifecycle(**lifecycle),
+            resolved_datum=datum,
         )
         self.telemetry.emit(
             "materialization",
@@ -595,6 +654,152 @@ def _topic_for_entity(entity_type: str) -> str:
     if normalized in {"breaking_news", "news"}:
         return "news"
     return normalized
+
+
+def _project_resolved_datum(
+    debug: dict[str, Any],
+    *,
+    entity_type: str,
+    entity_key: str,
+    datum: dict[str, Any],
+    lifecycle: dict[str, Any],
+) -> dict[str, Any]:
+    """Project one provider resolution into its existing consumer-facing block."""
+    output = dict(debug)
+    normalized = entity_type.lower()
+    value = {**datum, "lifecycle": lifecycle}
+    if normalized in {"vix", "vvix", "skew"}:
+        risk = dict(output.get("risk_context") or {})
+        risk[normalized] = value
+        risk["status"] = "AVAILABLE"
+        output["risk_context"] = risk
+        return output
+    if normalized in {"vix_futures", "put_call"}:
+        risk = dict(output.get("risk_context") or {})
+        risk[
+            "vix_term_structure" if normalized == "vix_futures" else "put_call"
+        ] = value
+        risk["status"] = "AVAILABLE"
+        output["risk_context"] = risk
+        return output
+    if normalized in {"cot", "cot_positioning", "cot_publication"}:
+        positioning = dict(output.get("positioning") or {})
+        positioning.update(value)
+        positioning["status"] = str(value.get("status") or "AVAILABLE")
+        output["positioning"] = positioning
+        return output
+    if normalized.startswith("earnings") and normalized != "earnings_intelligence":
+        nasdaq = dict(output.get("nasdaq_context") or {})
+        earnings = dict(nasdaq.get("earnings") or {})
+        rows = list(
+            earnings.get("events")
+            or earnings.get("upcoming")
+            or earnings.get("released_earnings")
+            or []
+        )
+        matching = [
+            index
+            for index, row in enumerate(rows)
+            if isinstance(row, dict)
+            and _datum_entity_key(row) == entity_key.upper()
+        ]
+        if matching:
+            rows[matching[0]] = value
+        else:
+            rows.append(value)
+        earnings["events"] = rows
+        earnings["status"] = "AVAILABLE"
+        earnings["lifecycle"] = lifecycle
+        nasdaq["earnings"] = earnings
+        output["nasdaq_context"] = nasdaq
+        return output
+    if normalized in {"macro_actual", "macro_schedule"} or normalized.startswith(
+        "fomc"
+    ):
+        calendar = dict(output.get("event_calendar") or {})
+        bucket = (
+            "fed_communications"
+            if normalized.startswith("fomc")
+            else "critical_macro_events"
+        )
+        rows = list(calendar.get(bucket) or [])
+        matching = [
+            index
+            for index, row in enumerate(rows)
+            if isinstance(row, dict)
+            and str(
+                row.get("canonical_event_key")
+                or row.get("event_key")
+                or row.get("event_id")
+                or ""
+            )
+            == entity_key
+        ]
+        if matching:
+            rows[matching[0]] = value
+        else:
+            rows.append(value)
+        calendar[bucket] = rows
+        output["event_calendar"] = calendar
+        return output
+    if normalized == "macro_snapshot":
+        output["macro_snapshot"] = value
+        return output
+    if normalized == "fed_rates":
+        output["rates_expectations"] = value
+        return output
+    if normalized in {"nasdaq_100", "mega_cap_semiconductors"}:
+        nasdaq = dict(output.get("nasdaq_context") or {})
+        key = (
+            "qqq_holdings"
+            if normalized == "nasdaq_100"
+            else "mega_cap_snapshot"
+        )
+        nasdaq[key] = value
+        nasdaq["status"] = "AVAILABLE"
+        output["nasdaq_context"] = nasdaq
+        return output
+    if normalized in {"breaking_news", "news"}:
+        news = dict(output.get("news_context") or {})
+        rows = list(news.get("articles") or news.get("latest") or [])
+        rows = [
+            row
+            for row in rows
+            if not isinstance(row, dict)
+            or str(
+                row.get("news_key")
+                or row.get("canonical_url")
+                or row.get("url")
+                or ""
+            )
+            != entity_key
+        ]
+        rows.append(value)
+        news["articles"] = rows
+        news["status"] = "AVAILABLE"
+        output["news_context"] = news
+        return output
+    if normalized in TOPIC_PROFILES:
+        output[normalized] = value
+        return output
+    return output
+
+
+def _datum_entity_key(value: dict[str, Any]) -> str:
+    issuer = str(
+        value.get("ticker")
+        or value.get("symbol")
+        or value.get("issuer")
+        or value.get("company")
+        or ""
+    ).upper()
+    event_at = str(
+        value.get("event_at")
+        or value.get("earnings_date")
+        or value.get("date")
+        or ""
+    )[:10]
+    return f"{issuer}:{event_at}".strip(":")
 
 
 def _json(value: Any) -> str:

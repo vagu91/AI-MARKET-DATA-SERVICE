@@ -175,30 +175,17 @@ def test_worker_rejects_preexisting_disabled_job_before_backend(tmp_path: Path) 
         executor=lambda *_: calls.append("backend") or {"status": "SUCCEEDED"},
         worker_id="disabled-worker",
     )
-    assert worker.process_once() is True
+    assert worker.process_once() is False
     assert calls == []
     stored = repository.get(job["job_id"])
     assert stored is not None
     assert stored["status"] == "REJECTED"
     assert stored["last_error"] == "AGENT_DISABLED"
-    with connect_sqlite(disabled.database_path) as conn:
-        telemetry = {
-            row[0]
-            for row in conn.execute(
-                "SELECT event_name FROM service_telemetry_events"
-            ).fetchall()
-        }
-        incidents = {
-            row[0]
-            for row in conn.execute(
-                "SELECT category FROM anomaly_incidents"
-            ).fetchall()
-        }
-    assert {"dequeue", "lease", "ai_invocation_aborted"} <= telemetry
-    assert "disabled_agent_invocation" in incidents
+    assert stored["attempts"] == 0
+    assert stored["retry_class"] == "NON_RETRYABLE"
 
 
-async def test_real_async_due_scan_wiring_defers_without_ai_or_ready_loop(
+async def test_real_async_due_scan_wiring_enqueues_residual_ai_once(
     tmp_path: Path,
 ) -> None:
     settings = cfg(tmp_path, lifecycle_due_scanner_enabled=True)
@@ -223,10 +210,10 @@ async def test_real_async_due_scan_wiring_defers_without_ai_or_ready_loop(
     }
     result = await run_lifecycle_due_scan(state)
     assert result["provider_calls"] == 1
-    assert result["ai_invocations"] == 0
+    assert result["ai_invocations"] == 1
     stored = LifecycleRepository(settings).list_items()[0]
-    assert stored["work_status"] == "IDLE"
-    assert stored["refresh_reason"] == "provider_deferred_ai_not_requested"
+    assert stored["work_status"] == "QUEUED"
+    assert stored["refresh_reason"] == "provider_exhausted_ai_queued"
 
 
 async def test_real_lifespan_registers_and_runs_ap_scheduler_due_job(
