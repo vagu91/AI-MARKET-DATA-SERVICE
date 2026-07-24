@@ -61,7 +61,13 @@ class ResearchSchedulerService:
             return {
                 "status": "DISABLED",
                 "provider_calls": 0,
+                "resolver_evaluations": 0,
+                "committed_payload_hits": 0,
+                "actual_provider_requests": 0,
+                "successful_provider_requests": 0,
+                "failed_provider_requests": 0,
                 "ai_invocations": 0,
+                "ai_jobs_created": 0,
                 "claimed": 0,
             }
         now = self.clock()
@@ -82,7 +88,11 @@ class ResearchSchedulerService:
         has_trigger = explicit_trigger_class == "TRIGGER" or any(
             item.get("trigger_class") == "TRIGGER" for item in claimed
         )
-        provider_calls = 0
+        resolver_evaluations = 0
+        committed_payload_hits = 0
+        actual_provider_requests = 0
+        successful_provider_requests = 0
+        failed_provider_requests = 0
         resolved: list[str] = []
         rematerialized: list[str] = []
         residual: list[dict[str, Any]] = []
@@ -141,19 +151,140 @@ class ResearchSchedulerService:
                 if resolver is not None
                 else {"status": "NOT_CONFIGURED"}
             )
-            provider_calls += int(resolver is not None)
-            self.telemetry.emit(
-                "provider_call",
-                identifiers={"correlation_id": owner},
-                decision_summary="deterministic lifecycle resolver evaluated due item",
-                stop_reason=str(provider_result.get("status") or "NOT_CONFIGURED"),
-                payload={
-                    "status": str(
+            if resolver is not None:
+                resolver_evaluations += 1
+                self.telemetry.emit(
+                    "resolver_evaluation",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "deterministic lifecycle resolver evaluated due item"
+                    ),
+                    stop_reason=str(
                         provider_result.get("status") or "NOT_CONFIGURED"
                     ),
-                    "reason": str(provider_result.get("reason") or ""),
-                },
-            )
+                    payload={
+                        "status": str(
+                            provider_result.get("status")
+                            or "NOT_CONFIGURED"
+                        ),
+                        "reason": str(
+                            provider_result.get("reason") or ""
+                        ),
+                    },
+                )
+            if provider_result.get("committed_payload_hit") is True:
+                committed_payload_hits += 1
+                self.telemetry.emit(
+                    "committed_payload_hit",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "persisted lifecycle payload was evaluated before provider I/O"
+                    ),
+                    stop_reason=str(
+                        provider_result.get("committed_payload_reason") or ""
+                    ),
+                    payload={
+                        "status": str(
+                            provider_result.get("status") or ""
+                        ),
+                        "reason": str(
+                            provider_result.get(
+                                "committed_payload_reason"
+                            )
+                            or ""
+                        ),
+                    },
+                )
+            if provider_result.get("provider_negative_cache_hit") is True:
+                self.telemetry.emit(
+                    "provider_negative_cache_hit",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "provider request suppressed by active negative cache"
+                    ),
+                    stop_reason="NEGATIVE_CACHE",
+                    payload={
+                        "status": "DEFERRED",
+                        "reason": str(
+                            provider_result.get("reason") or ""
+                        ),
+                    },
+                )
+            if provider_result.get("provider_cache_hit") is True:
+                self.telemetry.emit(
+                    "provider_cache_hit",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "provider adapter completed from its deterministic cache"
+                    ),
+                    stop_reason="CACHE_HIT",
+                    payload={
+                        "status": str(
+                            provider_result.get("status") or ""
+                        ),
+                        "reason": str(
+                            provider_result.get("reason") or ""
+                        ),
+                    },
+                )
+            if provider_result.get("provider_request_attempted") is True:
+                actual_provider_requests += 1
+                self.telemetry.emit(
+                    "provider_request_attempted",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "deterministic provider adapter attempted acquisition"
+                    ),
+                    payload={
+                        "status": "ATTEMPTED",
+                        "reason": str(
+                            provider_result.get("reason") or ""
+                        ),
+                    },
+                )
+                if provider_result.get("provider_request_failed") is True:
+                    failed_provider_requests += 1
+                    self.telemetry.emit(
+                        "provider_request_failed",
+                        identifiers={"correlation_id": owner},
+                        decision_summary=(
+                            "deterministic provider acquisition failed"
+                        ),
+                        stop_reason=str(
+                            provider_result.get("status") or "FAILED"
+                        ),
+                        payload={
+                            "status": str(
+                                provider_result.get("status") or "FAILED"
+                            ),
+                            "reason": str(
+                                provider_result.get("reason") or ""
+                            ),
+                        },
+                    )
+                elif provider_result.get(
+                    "provider_request_completed"
+                ) is True:
+                    successful_provider_requests += 1
+                    self.telemetry.emit(
+                        "provider_request_completed",
+                        identifiers={"correlation_id": owner},
+                        decision_summary=(
+                            "deterministic provider acquisition completed"
+                        ),
+                        stop_reason=str(
+                            provider_result.get("status") or "COMPLETED"
+                        ),
+                        payload={
+                            "status": str(
+                                provider_result.get("status")
+                                or "COMPLETED"
+                            ),
+                            "reason": str(
+                                provider_result.get("reason") or ""
+                            ),
+                        },
+                    )
             provider_status = str(
                 provider_result.get("status") or "NOT_CONFIGURED"
             ).upper()
@@ -191,9 +322,16 @@ class ResearchSchedulerService:
                     )
                     if snapshot is not None:
                         rematerialized.append(str(snapshot["snapshot_id"]))
+                    else:
+                        self.lifecycle.upsert(
+                            DatumLifecycle(**lifecycle_value),
+                            payload=datum,
+                            work_status="PARTIAL",
+                        )
                 unresolved = {
                     **item,
                     "provider_resolver_status": "PARTIAL",
+                    "lifecycle_finalized_as_partial": True,
                     "effective_trigger_type": effective_trigger_type,
                     "trigger_correlation_id": trigger_correlation_id,
                     "fields_attempted": missing_fields,
@@ -226,13 +364,6 @@ class ResearchSchedulerService:
                     and provider_result.get("ai_eligible") is True
                 ):
                     ai_eligible.append(unresolved)
-                item_outcomes.append(
-                    {
-                        "item_id": item_id,
-                        "status": "PARTIAL",
-                        "effective_trigger_type": effective_trigger_type,
-                    }
-                )
                 continue
             if str(provider_result.get("status") or "").upper() in {
                 "RESOLVED",
@@ -392,10 +523,13 @@ class ResearchSchedulerService:
             ):
                 ai_eligible.append(unresolved)
         ai_invocations = 0
+        ai_jobs_created = 0
         enqueue_result: Any = None
+        queued_item_ids: set[str] = set()
         if ai_eligible and ai_enqueue is not None:
             enqueue_result = ai_enqueue(ai_eligible)
             ai_invocations = 1
+            ai_jobs_created = _created_job_count(enqueue_result)
             self.telemetry.emit(
                 "enqueue",
                 identifiers={"correlation_id": owner},
@@ -406,51 +540,83 @@ class ResearchSchedulerService:
                 },
             )
             for item in ai_eligible:
-                self.lifecycle.transition(
+                transitioned = self.lifecycle.transition(
                     str(item["item_id"]),
                     owner=owner,
                     work_status="QUEUED",
                     refresh_reason="provider_exhausted_ai_queued",
                     now=now,
                 )
-                item_outcomes.append(
-                    {
-                        "item_id": str(item["item_id"]),
-                        "status": "AI_QUEUED",
-                        "effective_trigger_type": item.get(
-                            "effective_trigger_type"
-                        ),
-                    }
-                )
-        else:
-            for item in residual:
-                if item in ai_eligible and ai_enqueue is not None:
-                    continue
-                agent_status = next(
-                    (
-                        decision["agent_status"]
-                        for decision in ai_decisions
-                        if decision["item_id"] == str(item["item_id"])
-                    ),
-                    "",
-                )
-                terminal_status = (
-                    "NO_DATA"
-                    if item.get("retry_deadline_exhausted")
-                    else "DISABLED"
-                    if agent_status == "DISABLED"
-                    else "IDLE"
-                )
-                terminal_reason = (
-                    "retry_deadline_exhausted_no_data"
-                    if item.get("retry_deadline_exhausted")
-                    else "agent_disabled_ai_not_requested"
-                    if agent_status == "DISABLED"
-                    else "provider_unresolved_ai_not_configured"
-                )
-                self.lifecycle.transition(
-                    str(item["item_id"]),
-                    owner=owner,
+                if (
+                    not transitioned
+                    and item.get("lifecycle_finalized_as_partial") is True
+                ):
+                    transitioned = self.lifecycle.transition_finalized(
+                        str(item["item_id"]),
+                        expected_work_status="PARTIAL",
+                        work_status="QUEUED",
+                        refresh_reason="provider_exhausted_ai_queued",
+                        now=now,
+                    )
+                if transitioned:
+                    queued_item_ids.add(str(item["item_id"]))
+                    item_outcomes.append(
+                        {
+                            "item_id": str(item["item_id"]),
+                            "status": "AI_QUEUED",
+                            "effective_trigger_type": item.get(
+                                "effective_trigger_type"
+                            ),
+                        }
+                    )
+        for item in residual:
+            item_id = str(item["item_id"])
+            if item_id in queued_item_ids:
+                continue
+            agent_status = next(
+                (
+                    decision["agent_status"]
+                    for decision in ai_decisions
+                    if decision["item_id"] == item_id
+                ),
+                "",
+            )
+            terminal_status = (
+                "NO_DATA"
+                if item.get("retry_deadline_exhausted")
+                else "DISABLED"
+                if agent_status == "DISABLED"
+                else "IDLE"
+            )
+            terminal_reason = (
+                "retry_deadline_exhausted_no_data"
+                if item.get("retry_deadline_exhausted")
+                else "agent_disabled_ai_not_requested"
+                if agent_status == "DISABLED"
+                else "provider_unresolved_ai_not_configured"
+            )
+            transitioned = self.lifecycle.transition(
+                item_id,
+                owner=owner,
+                work_status=terminal_status,
+                refresh_reason=terminal_reason,
+                next_refresh_at=(
+                    now
+                    + timedelta(
+                        seconds=int(
+                            self.settings.lifecycle_due_scanner_interval_seconds
+                        )
+                    )
+                ).isoformat(),
+                now=now,
+            )
+            if (
+                not transitioned
+                and item.get("lifecycle_finalized_as_partial") is True
+            ):
+                self.lifecycle.transition_finalized(
+                    item_id,
+                    expected_work_status="PARTIAL",
                     work_status=terminal_status,
                     refresh_reason=terminal_reason,
                     next_refresh_at=(
@@ -463,37 +629,24 @@ class ResearchSchedulerService:
                     ).isoformat(),
                     now=now,
                 )
-                self.telemetry.emit(
-                    (
-                        "provider_call"
-                        if terminal_status == "NO_DATA"
-                        else "retry_backoff"
+            item_outcomes.append(
+                {
+                    "item_id": item_id,
+                    "status": terminal_status,
+                    "effective_trigger_type": item.get(
+                        "effective_trigger_type"
                     ),
-                    identifiers={"correlation_id": owner},
-                    decision_summary=(
-                        "resolver chain reached a terminal no-data outcome"
-                        if terminal_status == "NO_DATA"
-                        else "unresolved lifecycle item deferred to bounded next check"
-                    ),
-                    stop_reason=terminal_status,
-                    payload={
-                        "status": terminal_status,
-                        "reason": terminal_reason,
-                    },
-                )
-                item_outcomes.append(
-                    {
-                        "item_id": str(item["item_id"]),
-                        "status": terminal_status,
-                        "effective_trigger_type": item.get(
-                            "effective_trigger_type"
-                        ),
-                    }
-                )
+                }
+            )
         return {
             "status": "COMPLETED",
             "claimed": len(claimed),
-            "provider_calls": provider_calls,
+            "provider_calls": actual_provider_requests,
+            "resolver_evaluations": resolver_evaluations,
+            "committed_payload_hits": committed_payload_hits,
+            "actual_provider_requests": actual_provider_requests,
+            "successful_provider_requests": successful_provider_requests,
+            "failed_provider_requests": failed_provider_requests,
             "resolved": resolved,
             "rematerialized_snapshot_ids": rematerialized,
             "deferred": deferred,
@@ -504,6 +657,7 @@ class ResearchSchedulerService:
             "item_outcomes": item_outcomes,
             "effective_triggers": effective_triggers,
             "ai_invocations": ai_invocations,
+            "ai_jobs_created": ai_jobs_created,
             "enqueue_result": enqueue_result,
             "coalesced": len(ai_eligible) > 1,
         }
@@ -524,7 +678,13 @@ class ResearchSchedulerService:
                 "reason": "scheduler_or_due_scanner_disabled",
                 "claimed": 0,
                 "provider_calls": 0,
+                "resolver_evaluations": 0,
+                "committed_payload_hits": 0,
+                "actual_provider_requests": 0,
+                "successful_provider_requests": 0,
+                "failed_provider_requests": 0,
                 "ai_invocations": 0,
+                "ai_jobs_created": 0,
                 "writes": 0,
             }
         now = self.clock()
@@ -631,9 +791,12 @@ class ResearchSchedulerService:
             trigger_entity=str(item.get("entity_key") or ""),
             correlation_id=owner,
             resolved_lifecycle=(
-                DatumLifecycle(**lifecycle) if final_resolution else None
+                DatumLifecycle(**lifecycle)
             ),
-            resolved_datum=datum if final_resolution else None,
+            resolved_datum=datum,
+            resolved_work_status=(
+                "COMPLETED" if final_resolution else "PARTIAL"
+            ),
         )
         self.telemetry.emit(
             "materialization",
@@ -1113,6 +1276,19 @@ def _datum_entity_key(value: dict[str, Any]) -> str:
         or ""
     )[:10]
     return f"{issuer}:{event_at}".strip(":")
+
+
+def _created_job_count(value: Any) -> int:
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    if isinstance(value, dict):
+        for key in ("jobs", "created_jobs", "items"):
+            jobs = value.get(key)
+            if isinstance(jobs, (list, tuple, set)):
+                return len(jobs)
+        if value.get("created") is True or value.get("job_id"):
+            return 1
+    return 0
 
 
 def _json(value: Any) -> str:

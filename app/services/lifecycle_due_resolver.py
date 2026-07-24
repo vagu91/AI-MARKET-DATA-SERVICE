@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
 from app.services.event_driven_lifecycle_service import compute_datum_lifecycle
 from app.services.research_agent_enablement import research_agent_enablement
+from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key
 
 
@@ -28,6 +29,7 @@ class StaticLifecycleProviderAdapter:
     status: str
     datum: dict[str, Any] | None = None
     reason: str | None = None
+    performs_io: bool = False
 
     def resolve(self, item: dict[str, Any]) -> dict[str, Any]:
         del item
@@ -35,6 +37,9 @@ class StaticLifecycleProviderAdapter:
             "status": self.status,
             "datum": dict(self.datum or {}),
             "reason": self.reason or "static_provider_result",
+            "provider_request_attempted": False,
+            "provider_request_completed": False,
+            "provider_request_failed": False,
         }
 
 
@@ -51,12 +56,14 @@ class CallableLifecycleProviderAdapter:
         self.acquire = acquire
         self.select = select
         self.name = name
+        self.performs_io = True
 
     def resolve(self, item: dict[str, Any]) -> dict[str, Any]:
         output = self.acquire(item)
         if inspect.isawaitable(output):
             output = asyncio.run(output)
         datum = self.select(output, item)
+        request_telemetry = _provider_request_telemetry(output)
         if not datum:
             if _has_temporary_provider_failure(output):
                 raise TemporaryLifecycleProviderError(
@@ -65,6 +72,7 @@ class CallableLifecycleProviderAdapter:
             return {
                 "status": "NO_DATA",
                 "reason": f"{self.name}_exhausted",
+                **request_telemetry,
             }
         missing_fields = _missing_requested_fields(
             datum,
@@ -75,6 +83,7 @@ class CallableLifecycleProviderAdapter:
             "reason": f"{self.name}_resolved",
             "datum": datum,
             "missing_fields": missing_fields,
+            **request_telemetry,
         }
 
 
@@ -274,13 +283,24 @@ class DeterministicLifecycleDueResolver:
             str(entity_type).lower(): adapter
             for entity_type, adapter in dict(adapters or {}).items()
         }
+        self.source_policy = SourcePolicyService(settings.source_policy_path)
 
     def resolve(self, item: dict[str, Any]) -> dict[str, Any]:
         now = self.clock()
         entity_type = str(item.get("entity_type") or "unknown").lower()
         entity_key = str(item.get("entity_key") or "")
         datum = item.get("payload")
+        telemetry: dict[str, Any] = {
+            "committed_payload_hit": False,
+            "committed_payload_reason": None,
+            "provider_request_attempted": False,
+            "provider_request_completed": False,
+            "provider_request_failed": False,
+            "provider_cache_hit": False,
+            "provider_negative_cache_hit": False,
+        }
         if isinstance(datum, dict) and datum:
+            telemetry["committed_payload_hit"] = True
             committed = compute_datum_lifecycle(
                 entity_type,
                 entity_key,
@@ -292,14 +312,23 @@ class DeterministicLifecycleDueResolver:
                 triggering_event=item.get("triggering_event"),
                 refresh_reason="deterministic_committed_payload_revalidated",
             )
-            if committed.freshness_state == "FRESH":
+            committed_reason = _committed_payload_reason(
+                item,
+                datum,
+                lifecycle=committed,
+                source_policy=self.source_policy,
+                allow_test_reserved=self.settings.environment.lower() == "test",
+            )
+            telemetry["committed_payload_reason"] = committed_reason
+            if committed_reason == "committed_payload_operationally_fresh":
                 return {
                     "status": "RESOLVED",
-                    "reason": "committed_provider_payload_is_fresh",
+                    "reason": committed_reason,
                     "datum": datum,
                     "lifecycle": committed,
                     "next_refresh_at": committed.next_refresh_at,
                     "ai_eligible": False,
+                    **telemetry,
                 }
 
         cached_until = parse_datetime(
@@ -315,6 +344,10 @@ class DeterministicLifecycleDueResolver:
                 "reason": "provider_negative_cache_active",
                 "ai_eligible": False,
                 "next_retry_at": cached_until.isoformat(),
+                **{
+                    **telemetry,
+                    "provider_negative_cache_hit": True,
+                },
             }
 
         adapter = self.adapters.get(entity_type)
@@ -323,7 +356,12 @@ class DeterministicLifecycleDueResolver:
                 item,
                 status="EXHAUSTED",
                 reason="deterministic_provider_not_configured",
+                telemetry=telemetry,
             )
+        provider_request_attempted = bool(
+            getattr(adapter, "performs_io", True)
+        )
+        telemetry["provider_request_attempted"] = provider_request_attempted
         try:
             result = (
                 adapter.resolve(item)
@@ -333,18 +371,56 @@ class DeterministicLifecycleDueResolver:
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
         except TemporaryLifecycleProviderError as exc:
-            return self._temporary_failure(item, reason=str(exc) or "provider_temporary_error")
+            return self._temporary_failure(
+                item,
+                reason=str(exc) or "provider_temporary_error",
+                telemetry={
+                    **telemetry,
+                    "provider_request_failed": provider_request_attempted,
+                },
+            )
         except (TimeoutError, ConnectionError) as exc:
             return self._temporary_failure(
                 item,
                 reason=f"provider_temporary_error:{type(exc).__name__}",
+                telemetry={
+                    **telemetry,
+                    "provider_request_failed": provider_request_attempted,
+                },
             )
 
         if not isinstance(result, dict):
             return self._temporary_failure(
                 item,
                 reason="provider_contract_invalid",
+                telemetry={
+                    **telemetry,
+                    "provider_request_failed": provider_request_attempted,
+                },
             )
+        provider_request_attempted = bool(
+            result.get(
+                "provider_request_attempted",
+                provider_request_attempted,
+            )
+        )
+        telemetry.update(
+            {
+                "provider_request_attempted": provider_request_attempted,
+                "provider_request_completed": bool(
+                    result.get(
+                        "provider_request_completed",
+                        provider_request_attempted,
+                    )
+                ),
+                "provider_request_failed": bool(
+                    result.get("provider_request_failed")
+                ),
+                "provider_cache_hit": bool(
+                    result.get("provider_cache_hit")
+                ),
+            }
+        )
         status = str(result.get("status") or "NO_DATA").upper()
         if status in {
             "DEFERRED",
@@ -356,17 +432,28 @@ class DeterministicLifecycleDueResolver:
             return self._temporary_failure(
                 item,
                 reason=str(result.get("reason") or status.lower()),
+                telemetry={
+                    **telemetry,
+                    "provider_request_completed": False,
+                    "provider_request_failed": provider_request_attempted,
+                },
             )
         if status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA", "NOT_CONFIGURED"}:
             return self._exhausted(
                 item,
                 status="NO_DATA" if status == "NO_DATA" else "EXHAUSTED",
                 reason=str(result.get("reason") or "deterministic_provider_exhausted"),
+                telemetry=telemetry,
             )
         if status not in {"RESOLVED", "FRESH", "SUCCEEDED", "PARTIAL"}:
             return self._temporary_failure(
                 item,
                 reason=f"provider_status_invalid:{status}",
+                telemetry={
+                    **telemetry,
+                    "provider_request_completed": False,
+                    "provider_request_failed": provider_request_attempted,
+                },
             )
         provider_datum = result.get("datum")
         if not isinstance(provider_datum, dict) or not provider_datum:
@@ -374,6 +461,7 @@ class DeterministicLifecycleDueResolver:
                 item,
                 status="NO_DATA",
                 reason="deterministic_provider_returned_no_data",
+                telemetry=telemetry,
             )
         lifecycle = compute_datum_lifecycle(
             entity_type,
@@ -391,6 +479,7 @@ class DeterministicLifecycleDueResolver:
                 item,
                 status="NO_DATA",
                 reason="deterministic_provider_result_not_fresh",
+                telemetry=telemetry,
             )
         if status == "PARTIAL":
             decision = research_agent_enablement(
@@ -418,6 +507,7 @@ class DeterministicLifecycleDueResolver:
                     if decision["agent_enabled"]
                     else "NOT_REQUESTED"
                 ),
+                **telemetry,
             }
         return {
             **result,
@@ -426,6 +516,7 @@ class DeterministicLifecycleDueResolver:
             "lifecycle": lifecycle,
             "next_refresh_at": lifecycle.next_refresh_at,
             "ai_eligible": False,
+            **telemetry,
         }
 
     def _exhausted(
@@ -434,6 +525,7 @@ class DeterministicLifecycleDueResolver:
         *,
         status: str,
         reason: str,
+        telemetry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         decision = research_agent_enablement(
             self.settings,
@@ -467,6 +559,7 @@ class DeterministicLifecycleDueResolver:
             ),
             "retry_deadline_exhausted": retry_deadline_exhausted,
             "enablement": decision,
+            **dict(telemetry or {}),
         }
 
     def _temporary_failure(
@@ -474,6 +567,7 @@ class DeterministicLifecycleDueResolver:
         item: dict[str, Any],
         *,
         reason: str,
+        telemetry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         lifecycle = compute_datum_lifecycle(
             str(item.get("entity_type") or "unknown"),
@@ -499,6 +593,7 @@ class DeterministicLifecycleDueResolver:
             "lifecycle": lifecycle,
             "next_retry_at": lifecycle.next_retry_at,
             "ai_eligible": False,
+            **dict(telemetry or {}),
         }
 
 
@@ -933,6 +1028,190 @@ def _missing_requested_fields(
             and datum.get(str(field)) in (None, "", [], {})
         }
     )
+
+
+_NO_DATA_ENVELOPE_STATUSES = frozenset(
+    {
+        "DISABLED",
+        "NOT_CONFIGURED",
+        "NOT_FOUND",
+        "NO_DATA",
+        "NO_DATA_AVAILABLE",
+        "PROVIDER_FAILED",
+        "QUARANTINED",
+        "REJECTED",
+    }
+)
+_NON_OPERATIONAL_PAYLOAD_KEYS = frozenset(
+    {
+        "fields_attempted",
+        "negative_cache_expires_at",
+        "negative_cache_key",
+        "next_refresh_at",
+        "next_retry_at",
+        "reason",
+        "refresh_reason",
+        "retry_class",
+        "searched_at",
+        "session_state",
+        "sources_attempted",
+        "status",
+        "triggering_event",
+        "valid_from",
+        "valid_until",
+    }
+)
+
+
+def _committed_payload_reason(
+    item: dict[str, Any],
+    datum: dict[str, Any],
+    *,
+    lifecycle: Any,
+    source_policy: SourcePolicyService,
+    allow_test_reserved: bool,
+) -> str:
+    status = str(datum.get("status") or "").upper()
+    if status in _NO_DATA_ENVELOPE_STATUSES or (
+        datum.get("value") is None
+        and str(datum.get("reason") or "").lower()
+        in {
+            "no_fresh_verified_source",
+            "no_data",
+            "not_found",
+            "provider_failed",
+        }
+    ):
+        return "committed_payload_no_data_envelope"
+    if not _committed_payload_has_operational_value(item, datum):
+        return "committed_payload_temporally_valid_but_not_operational"
+    if not _committed_payload_source_verified(
+        datum,
+        source_policy=source_policy,
+        allow_test_reserved=allow_test_reserved,
+    ):
+        return "committed_payload_source_unverified"
+    if str(lifecycle.freshness_state) == "FRESH":
+        return "committed_payload_operationally_fresh"
+    return "committed_payload_temporally_stale"
+
+
+def _committed_payload_has_operational_value(
+    item: dict[str, Any],
+    datum: dict[str, Any],
+) -> bool:
+    requested = [
+        str(field)
+        for field in item.get("fields_attempted") or []
+        if str(field)
+    ]
+    if requested:
+        return any(
+            datum.get(field) not in (None, "", [], {})
+            for field in requested
+        )
+    return any(
+        key not in _NON_OPERATIONAL_PAYLOAD_KEYS
+        and value not in (None, "", [], {}, False)
+        for key, value in datum.items()
+    )
+
+
+def _committed_payload_source_verified(
+    datum: dict[str, Any],
+    *,
+    source_policy: SourcePolicyService,
+    allow_test_reserved: bool,
+) -> bool:
+    validation = (
+        datum.get("validation")
+        if isinstance(datum.get("validation"), dict)
+        else {}
+    )
+    if (
+        str(datum.get("source_classification") or "").lower()
+        == "invalid_source"
+        or str(datum.get("source_audit_status") or "").upper()
+        in {"QUARANTINED", "REJECTED"}
+        or str(datum.get("verification_status") or "").upper()
+        in {"QUARANTINED", "REJECTED", "UNVERIFIED"}
+        or str(validation.get("status") or "").lower() == "rejected"
+    ):
+        return False
+    raw_lineage = datum.get("source_lineage") or datum.get("lineage") or []
+    if isinstance(raw_lineage, dict):
+        raw_lineage = [raw_lineage]
+    lineage = [
+        dict(entry)
+        for entry in raw_lineage
+        if isinstance(entry, dict)
+    ]
+    if datum.get("source") or datum.get("provider"):
+        lineage.append(datum)
+    for entry in lineage:
+        classification = str(
+            entry.get("source_classification") or ""
+        ).lower()
+        verification = str(
+            entry.get("verification_status")
+            or entry.get("validation_status")
+            or ""
+        ).upper()
+        if classification == "invalid_source" or verification in {
+            "QUARANTINED",
+            "REJECTED",
+            "UNVERIFIED",
+        }:
+            continue
+        source_url = entry.get("source_url") or entry.get("canonical_url")
+        if source_url and source_policy.validate_url(
+            str(source_url),
+            allow_test_reserved=allow_test_reserved,
+        ).accepted:
+            return True
+        if (
+            entry.get("source")
+            or entry.get("provider")
+            or entry.get("publisher")
+        ) and (
+            verification in {"ACCEPTED", "VERIFIED", "SUCCEEDED", "VALID"}
+            or classification
+            in {"official_source", "primary_source", "verified_source"}
+            or entry.get("provider_type")
+        ):
+            return True
+    return False
+
+
+def _provider_request_telemetry(output: Any) -> dict[str, bool]:
+    value = _model_dump(output)
+    candidates = [
+        value,
+        value.get("metadata") if isinstance(value, dict) else None,
+        value.get("data_quality") if isinstance(value, dict) else None,
+        value.get("diagnostics") if isinstance(value, dict) else None,
+    ]
+    counts: list[int] = []
+    cache_used = False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        cache_used = cache_used or bool(candidate.get("cache_used"))
+        for field in ("actual_network_calls", "provider_calls"):
+            if candidate.get(field) is None:
+                continue
+            try:
+                counts.append(max(int(candidate[field]), 0))
+            except (TypeError, ValueError):
+                continue
+    attempted = any(count > 0 for count in counts) if counts else True
+    cache_hit = bool(cache_used and not attempted)
+    return {
+        "provider_request_attempted": attempted,
+        "provider_request_completed": attempted,
+        "provider_request_failed": False,
+        "provider_cache_hit": cache_hit,
+    }
 
 
 def _topic_for_entity(entity_type: str) -> str:

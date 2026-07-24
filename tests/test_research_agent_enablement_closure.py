@@ -209,7 +209,8 @@ async def test_real_async_due_scan_wiring_enqueues_residual_ai_once(
         ),
     }
     result = await run_lifecycle_due_scan(state)
-    assert result["provider_calls"] == 1
+    assert result["resolver_evaluations"] == 1
+    assert result["actual_provider_requests"] == result["provider_calls"] == 0
     assert result["ai_invocations"] == 1
     stored = LifecycleRepository(settings).list_items()[0]
     assert stored["work_status"] == "QUEUED"
