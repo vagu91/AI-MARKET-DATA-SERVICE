@@ -24,7 +24,7 @@ from app.services.research_tool_telemetry import (
     ResearchLoopDetected,
 )
 from app.services.research_metrics_service import ResearchMetricsService
-from app.services.research_backend import ResearchBackend
+from app.services.research_backend import ResearchBackend, normalize_backend_payload
 from app.services.research_source_gateway import ResearchSourceGateway
 from app.services.temporal_validation_service import TemporalValidationService
 from app.services.research_semantics import document_not_applicable_claims
@@ -595,9 +595,7 @@ class AgenticResearchRuntime:
                     )
                 self.metrics.snapshot(run_id, persist=True)
                 raise
-            payload = dict(result.payload)
-            if not isinstance(payload, dict):
-                raise ValueError("agentic_backend_output_not_object")
+            payload = normalize_backend_payload(result.payload)
             for event in result.tool_events:
                 observe_tool_event(dict(event))
             self.repository.record_backend_invocation(run_id, result)

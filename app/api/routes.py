@@ -178,8 +178,9 @@ async def mnq_market_research_run(
     if run_id.startswith("prun-"):
         try:
             return ParallelResearchCoordinator(
-                enrichment_orchestrator.settings
-            ).reconcile_parent(run_id)
+                enrichment_orchestrator.settings,
+                read_only=True,
+            ).get_parent(run_id)
         except ValueError:
             raise HTTPException(
                 status_code=404,

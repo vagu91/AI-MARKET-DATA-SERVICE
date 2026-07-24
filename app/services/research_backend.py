@@ -25,6 +25,11 @@ class ResearchBackendResult:
     model: str | None = None
 
 
+class ResearchBackendContractError(ValueError):
+    category = "OUTPUT_CONTRACT"
+    retryable = False
+
+
 @runtime_checkable
 class ResearchBackend(Protocol):
     """Portable model backend. Source acquisition and verification stay service-owned."""
@@ -197,6 +202,45 @@ def select_research_backend(
             request_sender=openai_request_sender,
         )
     raise ValueError(f"unsupported_research_backend:{backend}")
+
+
+def normalize_backend_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ResearchBackendContractError("backend_output_not_object")
+    normalized = dict(payload)
+    status = str(normalized.get("status") or "NO_DATA").upper()
+    if status not in {"COMPLETED", "SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED"}:
+        raise ResearchBackendContractError(f"unsupported_backend_status:{status}")
+    normalized["status"] = status
+    for key in ("searches", "acquisition_requests", "claims", "warnings"):
+        value = normalized.get(key)
+        if value is None:
+            normalized[key] = []
+        elif not isinstance(value, list):
+            raise ResearchBackendContractError(f"backend_{key}_not_array")
+    for key in ("plan", "topic_statuses"):
+        value = normalized.get(key)
+        if value is None:
+            normalized[key] = {}
+        elif not isinstance(value, dict):
+            raise ResearchBackendContractError(f"backend_{key}_not_object")
+    normalized["contract"] = {
+        "version": "research_backend_v1",
+        "logical_phases": [
+            "PLAN",
+            "SEARCH",
+            "OPEN_SOURCE",
+            "EXTRACT",
+            "CROSS_CHECK",
+            "VALIDATE",
+            "PERSIST",
+            "READ_BACK",
+        ],
+        "source_verification": "server_owned",
+        "lineage": "server_owned",
+        "error_taxonomy": "shared",
+    }
+    return normalized
 
 
 def _responses_payload(response: dict[str, Any]) -> dict[str, Any]:

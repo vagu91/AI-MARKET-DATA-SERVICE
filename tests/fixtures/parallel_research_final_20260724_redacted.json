@@ -1,0 +1,122 @@
+{
+  "fixture_version": "parallel-research-final-v1",
+  "source": "redacted bounded replay derived from local parallel-full-forensics.json",
+  "live_calls_permitted": false,
+  "queued": {
+    "created": true,
+    "run_id": "prun-redacted",
+    "parent_run_id": "prun-redacted",
+    "job_id": null,
+    "child_job_ids": [
+      "airj-cot",
+      "airj-geopolitical",
+      "airj-macro",
+      "airj-mega-cap",
+      "airj-nasdaq",
+      "airj-vix"
+    ],
+    "manifest_id": "rgm-redacted",
+    "status": "PENDING",
+    "poll_url": "/market-research/mnq/runs/prun-redacted"
+  },
+  "parent": {
+    "created_at": "2026-07-23T20:41:25+00:00",
+    "first_completed_at": "2026-07-23T20:44:52+00:00",
+    "mutated_completed_at": "2026-07-23T20:46:32+00:00",
+    "expected_child_count": 6,
+    "terminal_child_count": 6,
+    "required_topics": [
+      "cot_positioning",
+      "geopolitical_regulatory_risk",
+      "macro_events",
+      "mega_cap_semiconductors",
+      "nasdaq_100",
+      "vix_risk"
+    ],
+    "child_statuses": {
+      "cot_positioning": "NO_DATA",
+      "geopolitical_regulatory_risk": "NO_DATA",
+      "macro_events": "FAILED",
+      "mega_cap_semiconductors": "NO_DATA",
+      "nasdaq_100": "NO_DATA",
+      "vix_risk": "NO_DATA"
+    }
+  },
+  "telemetry_oracle": {
+    "backend_invocations": 6,
+    "searches": 16,
+    "opened_sources": 47,
+    "fetched_sources": 46,
+    "verified_sources": 8,
+    "candidate_claims": 20,
+    "accepted_claims": 5,
+    "rejected_claims": 15,
+    "usage": {
+      "input_tokens": 688404,
+      "output_tokens": 18853,
+      "cached_tokens": 441088,
+      "reasoning_tokens": 0,
+      "total_tokens": 707257
+    }
+  },
+  "children": [
+    {
+      "topic": "cot_positioning",
+      "status": "NO_DATA",
+      "metrics": {"searches": 2, "opened_sources": 2, "claims_extracted": 3, "claims_accepted": 0, "claims_rejected": 3, "sources": {"fetched": 2, "verified": 0}, "backend": {"invocations": 1}, "usage": {"input_tokens": 76880, "output_tokens": 2008, "cached_tokens": 42496, "reasoning_tokens": 0, "total_tokens": 78888}}
+    },
+    {
+      "topic": "geopolitical_regulatory_risk",
+      "status": "NO_DATA",
+      "metrics": {"searches": 3, "opened_sources": 5, "claims_extracted": 4, "claims_accepted": 0, "claims_rejected": 4, "sources": {"fetched": 5, "verified": 3}, "backend": {"invocations": 1}, "usage": {"input_tokens": 120373, "output_tokens": 3548, "cached_tokens": 79872, "reasoning_tokens": 0, "total_tokens": 123921}}
+    },
+    {
+      "topic": "macro_events",
+      "status": "FAILED",
+      "error": "accepted event research result requires event_key",
+      "metrics": {"searches": 2, "opened_sources": 10, "claims_extracted": 7, "claims_accepted": 5, "claims_rejected": 2, "sources": {"fetched": 10, "verified": 4}, "backend": {"invocations": 1}, "usage": {"input_tokens": 76310, "output_tokens": 3935, "cached_tokens": 42496, "reasoning_tokens": 0, "total_tokens": 80245}}
+    },
+    {
+      "topic": "mega_cap_semiconductors",
+      "status": "NO_DATA",
+      "metrics": {"searches": 2, "opened_sources": 15, "claims_extracted": 1, "claims_accepted": 0, "claims_rejected": 1, "sources": {"fetched": 15, "verified": 1}, "backend": {"invocations": 1}, "usage": {"input_tokens": 76734, "output_tokens": 2620, "cached_tokens": 42496, "reasoning_tokens": 0, "total_tokens": 79354}}
+    },
+    {
+      "topic": "nasdaq_100",
+      "status": "NO_DATA",
+      "metrics": {"searches": 4, "opened_sources": 6, "claims_extracted": 3, "claims_accepted": 0, "claims_rejected": 3, "sources": {"fetched": 5, "verified": 0}, "backend": {"invocations": 1}, "usage": {"input_tokens": 222354, "output_tokens": 3598, "cached_tokens": 153728, "reasoning_tokens": 0, "total_tokens": 225952}}
+    },
+    {
+      "topic": "vix_risk",
+      "status": "NO_DATA",
+      "metrics": {"searches": 3, "opened_sources": 9, "claims_extracted": 2, "claims_accepted": 0, "claims_rejected": 2, "sources": {"fetched": 9, "verified": 0}, "backend": {"invocations": 1}, "usage": {"input_tokens": 115753, "output_tokens": 3144, "cached_tokens": 80000, "reasoning_tokens": 0, "total_tokens": 118897}}
+    }
+  ],
+  "macro_projection": {
+    "candidate_count": 7,
+    "accepted_count": 5,
+    "persisted_count": 5,
+    "read_back_count": 5,
+    "claims": [
+      {"claim_ref": "candidate-1", "metric_id": "census_advance_economic_indicators", "event_key": "CENSUS_ADVANCE_ECONOMIC_INDICATORS_2026-06", "event_at": "2026-07-28T12:30:00+00:00", "source_url": "https://www.census.gov/economic-indicators/calendar-listview.html"},
+      {"claim_ref": "candidate-2", "metric_id": "fomc_policy_decision", "event_key": "FED_FOMC_2026-07", "event_at": "2026-07-29T18:00:00+00:00", "source_url": "https://www.federalreserve.gov/newsevents/2026-july.htm"},
+      {"claim_ref": "candidate-3", "metric_id": "bea_gdp_advance", "event_key": "BEA_GDP_ADVANCE_2026-Q2", "event_at": "2026-07-30T12:30:00+00:00", "source_url": "https://www.bea.gov/news/schedule"},
+      {"claim_ref": "candidate-4", "metric_id": "bea_personal_income_outlays", "event_key": "BEA_PERSONAL_INCOME_OUTLAYS_2026-06", "event_at": "2026-07-30T12:30:00+00:00", "source_url": "https://www.bea.gov/news/schedule"},
+      {"claim_ref": "candidate-5", "metric_id": "eia_weekly_petroleum_status_report", "event_key": "EIA_WEEKLY_PETROLEUM_2026-07-29", "event_at": "2026-07-29T14:30:00+00:00", "source_url": "https://www.eia.gov/petroleum/supply/weekly/schedule.php"}
+    ]
+  },
+  "official_evidence": {
+    "cftc": {
+      "domain": "cftc.gov",
+      "metadata_anchor": "MICRO E-MINI NASDAQ-100 INDEX - CHICAGO MERCANTILE EXCHANGE Code-209747 FUTURES ONLY POSITIONS AS OF 07/14/26",
+      "numeric_anchor": "COMMITMENTS 56,580 186,918 2,735 68,389 7,570",
+      "document": "MICRO E-MINI NASDAQ-100 INDEX CHICAGO MERCANTILE EXCHANGE Code 209747 FUTURES ONLY POSITIONS AS OF 07/14/26 LONG SHORT SPREADS COMMITMENTS 56580 186918 2735 68389 7570",
+      "derived_net": "-130338"
+    },
+    "cboe": {
+      "domain": "cboe.com",
+      "anchor": "VX/Q6 08/19/2026 19.75 1.25 20 18.35 18.5033 77730",
+      "document": "Contract Expiration Last Change High Low Settlement Volume VX/Q6 08/19/2026 19.75 1.25 20 18.35 18.5033 77730"
+    }
+  }
+}

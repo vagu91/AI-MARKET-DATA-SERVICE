@@ -20,6 +20,10 @@ $decision = $null
 $context = $null
 $runId = $null
 $jobId = $null
+$parentRunId = $null
+$queueContract = $null
+$children = @()
+$failedChildren = @()
 $failureMessage = $null
 $startedAt = [DateTimeOffset]::UtcNow
 
@@ -42,26 +46,34 @@ try {
         -Body $request
     $queued | ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath "$outputPath\queued.json" -Encoding utf8
-    $runId = [string]$queued.run_id
-    $jobId = [string]$queued.job_id
-    if ([string]::IsNullOrWhiteSpace($runId)) { throw "The service did not return run_id" }
-    if ([string]::IsNullOrWhiteSpace($jobId)) { throw "The service did not return job_id" }
+    $queueContract = Resolve-SmokeQueueContract -Queued $queued -BaseUrl $BaseUrl
+    $runId = [string]$queueContract.run_id
+    $parentRunId = [string]$queueContract.parent_run_id
+    $jobId = [string]$queueContract.job_id
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $run = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/runs/$runId"
-        $job = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/jobs/$jobId"
+        $run = Invoke-RestMethod -Method Get -Uri $queueContract.poll_url
         $queue = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/status"
-        $latestAttempt = @($job.attempt_history) | Select-Object -Last 1
-        $currentStep = @($run.steps) |
-            Where-Object { $_.status -in @("RUNNING", "FAILED") } |
-            Select-Object -Last 1
-        $decision = Get-SmokePollingDecision `
-            -RunStatus ([string]$run.status) `
-            -JobStatus ([string]$job.status) `
-            -QueueDepth ([int]$queue.metrics.queue_depth) `
-            -RunningJobs ([int]$queue.metrics.running_jobs) `
-            -AttemptStatus ([string]$latestAttempt.status)
+        if ($queueContract.is_parent) {
+            $decision = Get-SmokeParentPollingDecision `
+                -ParentStatus ([string]$run.status) `
+                -ExpectedChildCount ([int]$run.expected_child_count) `
+                -TerminalChildCount ([int]$run.terminal_child_count)
+        }
+        else {
+            $job = Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/jobs/$jobId"
+            $latestAttempt = @($job.attempt_history) | Select-Object -Last 1
+            $currentStep = @($run.steps) |
+                Where-Object { $_.status -in @("RUNNING", "FAILED") } |
+                Select-Object -Last 1
+            $decision = Get-SmokePollingDecision `
+                -RunStatus ([string]$run.status) `
+                -JobStatus ([string]$job.status) `
+                -QueueDepth ([int]$queue.metrics.queue_depth) `
+                -RunningJobs ([int]$queue.metrics.running_jobs) `
+                -AttemptStatus ([string]$latestAttempt.status)
+        }
         if ($decision.done) { break }
         Start-Sleep -Seconds 5
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
@@ -71,6 +83,34 @@ try {
     }
     if ($decision.failed) {
         throw "Authorized smoke failed fast: $($decision.reason)"
+    }
+    if ($queueContract.is_parent) {
+        $children = @($run.children)
+        if ($children.Count -ne [int]$run.expected_child_count) {
+            throw "Parent returned $($children.Count) children; expected $($run.expected_child_count)"
+        }
+        $failedChildren = @(
+            $children | Where-Object {
+                $_.status -in @(
+                    "FAILED", "LOOP_DETECTED", "TIMED_OUT", "CANCELLED", "REJECTED"
+                )
+            }
+        )
+        foreach ($child in $children) {
+            $childJobId = [string]$child.child_job_id
+            $childRunId = [string]$child.child_run_id
+            if (-not [string]::IsNullOrWhiteSpace($childJobId)) {
+                Invoke-RestMethod -Method Get -Uri "$BaseUrl/ai-research/jobs/$childJobId" |
+                    ConvertTo-Json -Depth 20 |
+                    Set-Content -LiteralPath "$outputPath\child-job-$childJobId.json" -Encoding utf8
+            }
+            if (-not [string]::IsNullOrWhiteSpace($childRunId)) {
+                Invoke-RestMethod -Method Get `
+                    -Uri "$BaseUrl/market-research/mnq/runs/$childRunId" |
+                    ConvertTo-Json -Depth 20 |
+                    Set-Content -LiteralPath "$outputPath\child-run-$childRunId.json" -Encoding utf8
+            }
+        }
     }
 
     $latest = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/latest"
@@ -88,17 +128,55 @@ try {
     }
     $summary = [ordered]@{
         run_id = $runId
-        job_id = $jobId
+        parent_run_id = if ($queueContract.is_parent) { $parentRunId } else { $null }
+        job_id = if ($queueContract.is_parent) { $null } else { $jobId }
+        manifest_id = $queueContract.manifest_id
         terminal_status = $run.status
+        expected_child_count = if ($queueContract.is_parent) {
+            [int]$run.expected_child_count
+        } else { 1 }
+        terminal_child_count = if ($queueContract.is_parent) {
+            [int]$run.terminal_child_count
+        } else { 1 }
+        child_statuses = if ($queueContract.is_parent) {
+            @($children | ForEach-Object {
+                [ordered]@{
+                    topic = $_.topic
+                    job_id = $_.child_job_id
+                    run_id = $_.child_run_id
+                    status = $_.status
+                }
+            })
+        } else { @() }
+        failed_children = @($failedChildren)
         snapshot_id = $context.snapshot_id
         snapshot_revision = $context.snapshot_revision
         artifacts = $checksums
         trading_or_order_endpoints_called = $false
         ai_trader_modified = $false
-        requested_job_count = 1
-        research_metrics = Get-SmokeCompactResearchMetrics $run.metrics
-        budget_mode = $run.metrics.budget_mode
-        threshold_exceeded = @($run.metrics.threshold_warnings)
+        requested_job_count = if ($queueContract.is_parent) {
+            [int]$run.expected_child_count
+        } else { 1 }
+        research_metrics = if ($queueContract.is_parent) {
+            $run.telemetry
+        } else {
+            Get-SmokeCompactResearchMetrics $run.metrics
+        }
+        budget_mode = if ($queueContract.is_parent) {
+            $run.telemetry.budget_mode
+        } else {
+            $run.metrics.budget_mode
+        }
+        threshold_exceeded = @(
+            ConvertTo-SmokeNonNullArray $(
+                if ($queueContract.is_parent) {
+                    $run.telemetry.warnings
+                }
+                else {
+                    $run.metrics.threshold_warnings
+                }
+            )
+        )
         checkpoint = $run.checkpoint
         continuation_count = $run.continuation_count
     }
@@ -116,7 +194,13 @@ catch {
         if (-not $failureStep) { $failureStep = $currentStep.step_name }
         $failure = [ordered]@{
             run_id = $runId
-            job_id = $jobId
+            parent_run_id = if ($queueContract -and $queueContract.is_parent) {
+                $parentRunId
+            } else { $null }
+            job_id = if ($queueContract -and $queueContract.is_parent) {
+                $null
+            } else { $jobId }
+            manifest_id = if ($queueContract) { $queueContract.manifest_id } else { $null }
             run_status = $run.status
             job_status = $job.status
             attempts = $job.attempts
@@ -137,8 +221,27 @@ catch {
             effective_usage = $diagnostic.effective_usage
             effective_budget = Get-SmokeCompactBudget $diagnostic.effective_budget
             budget_mode = $run.metrics.budget_mode
-            threshold_exceeded = @($run.metrics.threshold_warnings)
+            threshold_exceeded = @(
+                ConvertTo-SmokeNonNullArray $(
+                    if ($queueContract -and $queueContract.is_parent) {
+                        $run.telemetry.warnings
+                    }
+                    else {
+                        $run.metrics.threshold_warnings
+                    }
+                )
+            )
             research_metrics = Get-SmokeCompactResearchMetrics $run.metrics
+            parent = if ($queueContract -and $queueContract.is_parent) {
+                [ordered]@{
+                    status = $run.status
+                    expected_child_count = $run.expected_child_count
+                    terminal_child_count = $run.terminal_child_count
+                    checkpoint = $run.checkpoint
+                    telemetry = $run.telemetry
+                }
+            } else { $null }
+            failed_children = @($failedChildren)
             progress = $diagnostic.progress
             loop_guard = [ordered]@{
                 category = $diagnostic.category

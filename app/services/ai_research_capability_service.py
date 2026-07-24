@@ -26,6 +26,7 @@ from app.services.source_policy_service import SourcePolicyService
 from app.services.research_budget import build_effective_budget
 from app.services.research_profiles import PROFILES
 from app.services.research_runtime_repository import ResearchRuntimeRepository
+from app.services.research_source_gateway import pdf_parser_available
 
 
 CAPABILITY_STATES = {
@@ -168,6 +169,7 @@ class AIResearchCapabilityService:
             policy_version = None
         live_verification = self.latest_live_verification()
         live_verified = live_verification is not None
+        pdf_parser_ready = pdf_parser_available()
         web_configured = bool(self.settings.ai_research_web_access_enabled and web_flag_supported)
         worker_active = bool(self.settings.ai_worker_enabled)
         if not configured:
@@ -179,6 +181,8 @@ class AIResearchCapabilityService:
         elif not schemas_valid:
             status = "SCHEMA_INVALID"
         elif not budget_contract_valid:
+            status = "DEGRADED"
+        elif not pdf_parser_ready:
             status = "DEGRADED"
         elif not web_flag_supported or not self.settings.ai_research_web_access_enabled:
             status = "WEB_UNAVAILABLE"
@@ -228,6 +232,8 @@ class AIResearchCapabilityService:
             "process_group_watchdog_available": True,
             "source_policy_loaded": policy_loaded,
             "source_policy_version": policy_version,
+            "pdf_parser_available": pdf_parser_ready,
+            "source_gateway_fully_ready": bool(policy_loaded and pdf_parser_ready),
             "worker_active": worker_active,
             "secrets_exposed": False,
             "live_verification_note": (

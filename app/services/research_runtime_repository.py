@@ -7,6 +7,7 @@ import sqlite3
 import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -1201,7 +1202,7 @@ class ResearchRuntimeRepository:
                 """,
                 (
                     status,
-                    _json(result_payload),
+                    _json(output),
                     coverage_score,
                     _json(sorted(source_domains)),
                     _json(sorted(completed_topics)),
@@ -1546,6 +1547,7 @@ class ResearchRuntimeRepository:
                 now=self.now(),
             )
         )
+        warnings.extend(_official_numeric_warnings(claim, evidence_input))
         semantic_policy = self.policy.semantic_policy(semantics)
         groups = {row["independent_source_group"] for row in evidence_rows}
         required = self.policy.required_confirmations(semantics)
@@ -1773,7 +1775,17 @@ class ResearchRuntimeRepository:
                 continue
             seen.add(key)
             published = parse_datetime(item.get("published_at"))
-            if published_at_required and published is None:
+            official_observation = (
+                semantics == "current_market_context"
+                and tier == 1
+                and domain in {"cftc.gov", "cboe.com"}
+                and service_verification.get("accepted") is True
+                and service_verification.get("match_method")
+                in {"exact_normalized", "official_table_numeric"}
+                and parse_datetime(item.get("retrieved_at") or (acquired or {}).get("retrieved_at"))
+                is not None
+            )
+            if published_at_required and published is None and not official_observation:
                 warnings.append(
                     "current_news_published_at_required"
                     if semantics in {"news", "current_news"}
@@ -1903,13 +1915,17 @@ class ResearchRuntimeRepository:
             }
         )
         return {
+            "claim_id": claim["claim_id"],
+            "claim_ref": claim.get("claim_ref"),
             "field": claim["field_semantics"],
             "field_semantics": claim["field_semantics"],
             "value": claim["value"],
             "metric_id": claim.get("metric_id"),
+            "topic": claim.get("topic"),
             "period": claim.get("period"),
             "frequency": claim.get("frequency"),
             "unit": claim.get("unit"),
+            "event_key": claim.get("event_key"),
             "event_at": claim.get("event_at"),
             "release_at": claim.get("release_at"),
             "issuer": claim.get("issuer"),
@@ -1922,11 +1938,31 @@ class ResearchRuntimeRepository:
             "source_url": primary["canonical_url"],
             "canonical_url": primary["canonical_url"],
             "evidence_text": primary["evidence_text"],
+            "source_id": primary.get("source_id"),
+            "verification_id": primary.get("verification_id"),
+            "source_references": [
+                {
+                    "source_id": item.get("source_id"),
+                    "verification_id": item.get("verification_id"),
+                    "canonical_url": item.get("canonical_url"),
+                    "publisher": item.get("publisher"),
+                    "source_tier": item.get("source_tier"),
+                    "content_checksum": item.get("content_checksum"),
+                }
+                for item in evidence
+            ],
             "published_at": primary.get("published_at"),
             "retrieved_at": primary["retrieved_at"],
             "confidence": claim.get("confidence") or 0,
             "reliability": 0.0,
             "verified_independent_domains": independent_domains,
+            "lineage": {
+                "research_run_id": claim.get("research_run_id"),
+                "claim_id": claim["claim_id"],
+                "policy_version": claim.get("policy_version"),
+                "prompt_version": claim.get("prompt_version"),
+                "materialization_status": claim.get("materialization_status"),
+            },
         }
 
     @staticmethod
@@ -2156,6 +2192,37 @@ def _cost_value(cost: dict[str, Any]) -> float:
         if cost.get(key) is not None:
             return max(float(cost[key]), 0.0)
     return 0.0
+
+
+def _official_numeric_warnings(
+    claim: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> list[str]:
+    metric = str(claim.get("metric_id") or "").lower()
+    requires_deterministic_value = (
+        metric == "vix"
+        or (metric.startswith("cot_") and "net_position" in metric)
+    )
+    if not requires_deterministic_value:
+        return []
+    deterministic_values = [
+        item.get("_service_verification", {}).get("deterministic_value")
+        for item in evidence
+        if isinstance(item.get("_service_verification"), dict)
+        and item.get("_service_verification", {}).get("accepted") is True
+        and item.get("_service_verification", {}).get("deterministic_value") is not None
+    ]
+    if not deterministic_values:
+        return ["official_numeric_value_not_deterministically_verified"]
+    try:
+        claimed = Decimal(str(claim.get("value")).replace(",", ""))
+        verified = {
+            Decimal(str(value).replace(",", ""))
+            for value in deterministic_values
+        }
+    except (InvalidOperation, TypeError, ValueError):
+        return ["official_numeric_value_not_deterministically_verified"]
+    return [] if claimed in verified else ["official_numeric_value_mismatch"]
 
 
 def _json(value: Any) -> str:
