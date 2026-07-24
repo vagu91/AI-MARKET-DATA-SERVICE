@@ -1,0 +1,107 @@
+{
+  "reference_now": "2026-07-24T15:00:00+00:00",
+  "options_fresh": {
+    "topic": "options_positioning",
+    "field_semantics": "verified_market_metric",
+    "metric_id": "total_put_call_ratio",
+    "value": "0.82",
+    "unit": "ratio",
+    "frequency": "daily",
+    "data_as_of": "2026-07-24T14:30:00+00:00",
+    "evidence": {
+      "source_url": "https://www.cboe.com/us/options/market_statistics/",
+      "publisher": "Cboe",
+      "published_at": "2026-07-24T14:30:00+00:00",
+      "evidence_text": "Cboe total put call ratio 0.82 for July 24 2026"
+    }
+  },
+  "options_stale": {
+    "topic": "options_positioning",
+    "field_semantics": "verified_market_metric",
+    "metric_id": "qqq_put_call_ratio",
+    "value": "0.91",
+    "unit": "ratio",
+    "frequency": "daily",
+    "data_as_of": "2026-07-20T20:00:00+00:00"
+  },
+  "gamma_incomplete": {
+    "topic": "options_positioning",
+    "field_semantics": "verified_market_metric",
+    "metric_id": "estimated_gamma_exposure",
+    "value": "-120000000",
+    "unit": "USD",
+    "data_as_of": "2026-07-24T14:30:00+00:00",
+    "quality": "ESTIMATED",
+    "methodology": "open-interest weighted option gamma",
+    "inputs": [],
+    "assumptions": [],
+    "chain_coverage": null
+  },
+  "market_internals": {
+    "topic": "market_internals",
+    "field_semantics": "verified_market_metric",
+    "metric_id": "advancers",
+    "value": "58",
+    "unit": "components",
+    "frequency": "intraday",
+    "data_as_of": "2026-07-24T14:45:00+00:00",
+    "evidence_text": "Nasdaq-100 advancing components 58 at 14:45 UTC"
+  },
+  "cross_asset": [
+    {
+      "topic": "cross_asset_context",
+      "field_semantics": "verified_market_metric",
+      "metric_id": "value",
+      "symbol": "DGS10",
+      "value": "4.38",
+      "unit": "percent",
+      "frequency": "intraday",
+      "data_as_of": "2026-07-24T14:00:00+00:00"
+    },
+    {
+      "topic": "cross_asset_context",
+      "field_semantics": "verified_market_metric",
+      "metric_id": "change_percent",
+      "symbol": "BTCUSD",
+      "value": "1.7",
+      "unit": "percent",
+      "frequency": "daily",
+      "data_as_of": "2026-07-23T00:00:00+00:00"
+    }
+  ],
+  "earnings_verified": {
+    "topic": "earnings_intelligence",
+    "field_semantics": "verified_corporate_metric",
+    "metric_id": "actual_eps",
+    "issuer": "Microsoft",
+    "ticker": "MSFT",
+    "symbol": "MSFT",
+    "value": "3.65",
+    "unit": "USD/share",
+    "frequency": "quarterly",
+    "data_as_of": "2026-07-24T12:00:00+00:00",
+    "actual_basis": "GAAP diluted",
+    "evidence_text": "Microsoft reported GAAP diluted earnings per share of 3.65"
+  },
+  "earnings_incompatible": {
+    "topic": "earnings_intelligence",
+    "field_semantics": "verified_corporate_metric",
+    "metric_id": "eps_surprise",
+    "issuer": "Microsoft",
+    "ticker": "MSFT",
+    "symbol": "MSFT",
+    "value": "0.25",
+    "unit": "USD/share",
+    "data_as_of": "2026-07-24T12:00:00+00:00",
+    "expected_basis": "non-GAAP adjusted",
+    "actual_basis": "GAAP diluted"
+  },
+  "source_without_timestamp": {
+    "topic": "market_internals",
+    "field_semantics": "verified_market_metric",
+    "metric_id": "decliners",
+    "value": "41",
+    "unit": "components",
+    "data_as_of": null
+  }
+}

@@ -23,7 +23,7 @@ class ResearchMetricsService:
         with connect_sqlite(self.settings.database_path) as conn:
             run = conn.execute(
                 """
-                SELECT request_json,usage_json,cost_json,threshold_warnings_json,
+                SELECT request_json,result_json,usage_json,cost_json,threshold_warnings_json,
                        checkpoint_json,continuation_count,loop_detection_count
                 FROM research_runs WHERE run_id=?
                 """,
@@ -162,9 +162,19 @@ class ResearchMetricsService:
                 """,
                 (run_id,),
             ).fetchall()
+            claim_metadata_rows = conn.execute(
+                """
+                SELECT payload_json FROM research_claims
+                WHERE research_run_id=? AND validation_status='accepted'
+                  AND materialization_status='MATERIALIZED'
+                  AND source_audit_status='ACTIVE'
+                """,
+                (run_id,),
+            ).fetchall()
         usage = json.loads(run["usage_json"] or "{}")
         cost = json.loads(run["cost_json"] or "{}")
         request = json.loads(run["request_json"] or "{}")
+        result = json.loads(run["result_json"] or "{}")
         accepted = int(claims["accepted"] or 0)
         extracted = max(
             int(claims["extracted"] or 0),
@@ -204,6 +214,21 @@ class ResearchMetricsService:
         accepted_domains = sorted(
             {str(row["source_domain"]) for row in accepted_domain_rows if row["source_domain"]}
         )
+        freshness_distribution: dict[str, int] = {}
+        acquisition_distribution: dict[str, int] = {}
+        for row in claim_metadata_rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            freshness = str(payload.get("freshness_status") or "UNAVAILABLE")
+            acquisition = str(payload.get("acquisition_method") or "unavailable")
+            freshness_distribution[freshness] = (
+                freshness_distribution.get(freshness, 0) + 1
+            )
+            acquisition_distribution[acquisition] = (
+                acquisition_distribution.get(acquisition, 0) + 1
+            )
         metrics = {
             "budget_mode": (
                 (request.get("effective_budget") or {}).get("budget_mode")
@@ -227,6 +252,7 @@ class ResearchMetricsService:
             },
             "cost": cost or None,
             "cost_status": "available" if cost else "cost_unavailable",
+            "no_data_reason": result.get("no_data_reason"),
             "phase_duration_ms": {
                 str(step["step_name"]): int(step["duration_ms"] or 0) for step in steps
             },
@@ -260,6 +286,24 @@ class ResearchMetricsService:
                     invocation_stats["usage_unavailable_count"] or 0
                 ),
             },
+            "backend_invocations": int(
+                invocation_stats["completed_count"] or 0
+            ),
+            "fetched_sources": gateway_fetched,
+            "verified_sources": max(
+                int(verified_sources or 0),
+                gateway_verified,
+            ),
+            "accepted_claims": accepted,
+            "rejected_claims": int(claims["rejected"] or 0),
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "freshness_distribution": dict(
+                sorted(freshness_distribution.items())
+            ),
+            "acquisition_method_distribution": dict(
+                sorted(acquisition_distribution.items())
+            ),
             "tokens_per_accepted_claim": (token_total / accepted if accepted else None),
             "cost_per_accepted_claim": (
                 _cost_value(cost) / accepted if cost and accepted else None

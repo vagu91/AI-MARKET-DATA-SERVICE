@@ -173,6 +173,17 @@ def normalized_backend_input(
         "planned_queries": list(profile_value.get("planned_queries") or []),
         "priority_domains": list(profile_value.get("priority_domains") or []),
         "required_fields": list(profile_value.get("required_fields") or []),
+        "acquisition_methods": list(
+            profile_value.get("acquisition_methods") or []
+        ),
+        "provider_precedence": list(
+            profile_value.get("provider_precedence") or []
+        ),
+        "no_data_criteria": profile_value.get("no_data_criteria"),
+        "prohibitions": list(profile_value.get("prohibitions") or []),
+        "domain_validation_contract": dict(
+            profile_value.get("domain_validation_contract") or {}
+        ),
         "effective_budget": dict(effective_budget),
         "output_schema": {
             "status": "SUCCEEDED|PARTIAL|NO_DATA|FAILED",

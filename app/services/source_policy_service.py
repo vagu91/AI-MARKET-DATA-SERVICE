@@ -483,6 +483,10 @@ class SourcePolicyService:
             return {"news"}
         if semantics == "current_market_context":
             return {"market", "positioning"}
+        if semantics == "verified_market_metric":
+            return {"actual", "market", "positioning"}
+        if semantics == "verified_corporate_metric":
+            return {"actual", "earnings", "guidance"}
         if semantics in {"outcome", "exploratory_context"}:
             return {
                 "actual",

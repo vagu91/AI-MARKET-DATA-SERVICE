@@ -12,6 +12,10 @@ from app.infrastructure.persistence.migrations import migrate_database
 from app.services.temporal_validation_service import TemporalValidationService
 from app.services.source_policy_service import SourcePolicyService
 from app.infrastructure.persistence.database_safety import assert_test_database_isolated
+from app.services.research_domain_contracts import (
+    DOMAIN_TOPICS,
+    build_domain_projection,
+)
 
 
 class MarketContextSnapshotRepository:
@@ -82,6 +86,11 @@ class MarketContextSnapshotRepository:
             if research is not None:
                 research["snapshot_id"] = snapshot_id
                 debug["research"] = research
+                for topic, projection in (
+                    research.get("domains") or {}
+                ).items():
+                    if topic in DOMAIN_TOPICS:
+                        debug[topic] = projection
             elif research_run_id or parent_run_id:
                 raise ValueError("snapshot_research_link_invalid")
             debug.update({
@@ -311,7 +320,7 @@ class MarketContextSnapshotRepository:
                 """
                 SELECT COUNT(*) FROM research_claims
                 WHERE research_run_id=? AND validation_status='accepted'
-                  AND materialization_status='ELIGIBLE'
+                  AND materialization_status='MATERIALIZED'
                   AND source_audit_status='ACTIVE'
                 """,
                 (run_id,),
@@ -323,7 +332,7 @@ class MarketContextSnapshotRepository:
                 SELECT COUNT(*) FROM research_evidence e
                 JOIN research_claims c ON c.claim_id=e.claim_id
                 WHERE c.research_run_id=? AND c.validation_status='accepted'
-                  AND c.materialization_status='ELIGIBLE' AND e.audit_status='ACTIVE'
+                  AND c.materialization_status='MATERIALIZED' AND e.audit_status='ACTIVE'
                   AND e.source_audit_status='ACTIVE'
                 """,
                 (run_id,),
@@ -336,7 +345,7 @@ class MarketContextSnapshotRepository:
                 SELECT DISTINCT e.source_domain FROM research_evidence e
                 JOIN research_claims c ON c.claim_id=e.claim_id
                 WHERE c.research_run_id=? AND c.validation_status='accepted'
-                  AND c.materialization_status='ELIGIBLE' AND e.audit_status='ACTIVE'
+                  AND c.materialization_status='MATERIALIZED' AND e.audit_status='ACTIVE'
                   AND e.source_audit_status='ACTIVE'
                 ORDER BY e.source_domain
                 """,
@@ -344,6 +353,38 @@ class MarketContextSnapshotRepository:
             ).fetchall()
         ]
         result = json.loads(run.get("result_json") or "{}")
+        claim_rows = conn.execute(
+            """
+            SELECT topic,metric_id,value_json,unit,symbol,issuer,payload_json
+            FROM research_claims
+            WHERE research_run_id=? AND validation_status='accepted'
+              AND materialization_status='MATERIALIZED'
+              AND source_audit_status='ACTIVE'
+            ORDER BY rowid
+            """,
+            (run_id,),
+        ).fetchall()
+        claims = []
+        for row in claim_rows:
+            payload = json.loads(row["payload_json"] or "{}")
+            claims.append(
+                {
+                    **dict(row),
+                    "value": json.loads(row["value_json"] or "null"),
+                    "payload": payload,
+                }
+            )
+        required_topics = json.loads(run.get("required_topics_json") or "[]")
+        domains = {
+            topic: build_domain_projection(
+                topic,
+                [claim for claim in claims if claim.get("topic") == topic],
+                status=str(run["status"]),
+                no_data_reason=result.get("no_data_reason"),
+            )
+            for topic in required_topics
+            if topic in DOMAIN_TOPICS
+        }
         return {
             "status": str(run["status"]),
             "run_id": run_id,
@@ -354,7 +395,7 @@ class MarketContextSnapshotRepository:
             "data_as_of": run.get("data_as_of"),
             "fresh_until": run.get("fresh_until"),
             "coverage_score": float(run.get("coverage_score") or 0),
-            "required_topics": json.loads(run.get("required_topics_json") or "[]"),
+            "required_topics": required_topics,
             "completed_topics": json.loads(run.get("completed_topics_json") or "[]"),
             "missing_topics": json.loads(run.get("missing_topics_json") or "[]"),
             "blocking_gaps": json.loads(run.get("blocking_gaps_json") or "[]"),
@@ -367,6 +408,7 @@ class MarketContextSnapshotRepository:
             ),
             "source_domains": source_domains,
             "warnings": json.loads(run.get("warnings_json") or "[]"),
+            "domains": domains,
         }
 
     @staticmethod
@@ -457,6 +499,11 @@ class MarketContextSnapshotRepository:
             "warnings": sorted(
                 {warning for item in projections for warning in item["warnings"]}
             ),
+            "domains": {
+                topic: projection
+                for item in projections
+                for topic, projection in (item.get("domains") or {}).items()
+            },
         }
 
     @staticmethod

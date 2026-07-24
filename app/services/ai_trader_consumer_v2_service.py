@@ -10,6 +10,10 @@ from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_hardening_service import harden_market_context
 from app.services.market_session_service import NEW_YORK
 from app.services.temporal_domain_service import temporal_event_state
+from app.services.research_domain_contracts import (
+    DOMAIN_TOPICS,
+    compact_domain_projection,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,7 @@ INCLUDED_SECTIONS = [
     "news",
     "sentiment",
     "market_schedule",
+    "agentic_domains",
     "quality",
 ]
 EXCLUDED_DEBUG_SECTIONS = [
@@ -121,6 +126,10 @@ def build_ai_trader_consumer_v2(
         ),
         "sentiment": _sentiment(hardened.get("sentiment_context") or {}),
         "market_schedule": _schedule(hardened.get("market_schedule") or {}),
+        "agentic_domains": {
+            topic: compact_domain_projection(hardened.get(topic) or {})
+            for topic in sorted(DOMAIN_TOPICS)
+        },
         "quality": hardened.get("quality") or {},
         "lifecycle": ((hardened.get("metadata") or {}).get("data_lifecycle") or hardened.get("lifecycle") or {}),
         "ai_enrichment": ai_enrichment,
