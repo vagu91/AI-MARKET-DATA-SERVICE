@@ -20,8 +20,12 @@ from app.services.research_runtime_repository import ResearchRuntimeRepository
 class ParallelResearchCoordinator:
     """Persistent parent/child coordinator; children exchange only DB artifacts."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, read_only: bool = False) -> None:
         self.settings = settings
+        if read_only:
+            self.jobs = None
+            self.runs = None
+            return
         self.jobs = AIResearchJobService(settings)
         self.runs = ResearchRuntimeRepository(settings)
         migrate_database(settings.database_path)
@@ -35,6 +39,8 @@ class ParallelResearchCoordinator:
         authorized_live_smoke: bool = False,
     ) -> dict[str, Any]:
         backend = str(self.settings.research_backend).lower()
+        if self.jobs is None or self.runs is None:
+            raise RuntimeError("read_only_parallel_coordinator_cannot_create_parent")
         if backend not in {"codex_cli", "openai_api"}:
             raise ValueError(f"unsupported_research_backend:{backend}")
         if not force:
@@ -167,6 +173,8 @@ class ParallelResearchCoordinator:
         return self.get_parent(str(row["parent_run_id"])) if row else None
 
     def reconcile_parent(self, parent_run_id: str) -> dict[str, Any]:
+        if self.jobs is None or self.runs is None:
+            raise RuntimeError("read_only_parallel_coordinator_cannot_reconcile")
         now = _now()
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -179,7 +187,10 @@ class ParallelResearchCoordinator:
                 raise ValueError("research_parent_run_not_found")
             children = conn.execute(
                 """
-                SELECT c.*,j.status AS job_status,r.status AS run_status,r.result_json
+                SELECT c.*,j.status AS job_status,j.last_error,
+                       r.status AS run_status,r.result_json,r.metrics_json,
+                       r.usage_json,r.cost_json,r.warnings_json,
+                       r.started_at AS run_started_at,r.completed_at AS run_completed_at
                 FROM research_parent_children c
                 JOIN ai_research_jobs j ON j.job_id=c.child_job_id
                 LEFT JOIN research_runs r ON r.run_id=c.child_run_id
@@ -187,6 +198,7 @@ class ParallelResearchCoordinator:
                 """,
                 (parent_run_id,),
             ).fetchall()
+            child_rows = [dict(child) for child in children]
             statuses: list[str] = []
             for child in children:
                 status = _verified_child_status(dict(child))
@@ -199,30 +211,71 @@ class ParallelResearchCoordinator:
                     UPDATE research_parent_children
                     SET status=?,result_checksum=?,updated_at=?
                     WHERE parent_run_id=? AND child_job_id=?
+                      AND (status!=? OR COALESCE(result_checksum,'')!=COALESCE(?,''))
                     """,
-                    (status, checksum, now, parent_run_id, child["child_job_id"]),
+                    (
+                        status,
+                        checksum,
+                        now,
+                        parent_run_id,
+                        child["child_job_id"],
+                        status,
+                        checksum,
+                    ),
                 )
             parent_status = _parent_status(statuses)
             terminal_count = sum(status in TERMINAL_JOB_STATUSES for status in statuses)
+            completed_at = (
+                str(parent["completed_at"] or now)
+                if parent_status in {"SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED"}
+                else None
+            )
+            checkpoint = {
+                "child_statuses": statuses,
+                "terminal_count": terminal_count,
+            }
+            telemetry = _aggregate_parent_telemetry(
+                conn,
+                dict(parent),
+                child_rows,
+                statuses,
+                completed_at=completed_at,
+            )
+            checkpoint_json = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
+            telemetry_json = json.dumps(telemetry, sort_keys=True, separators=(",", ":"))
             conn.execute(
                 """
                 UPDATE research_parent_runs
                 SET status=?,terminal_child_count=?,started_at=COALESCE(started_at,?),
-                    completed_at=?,checkpoint_json=?,updated_at=?
+                    completed_at=CASE
+                      WHEN ? IS NULL THEN completed_at
+                      ELSE COALESCE(completed_at,?)
+                    END,
+                    checkpoint_json=?,telemetry_json=?,updated_at=?
                 WHERE parent_run_id=?
+                  AND (
+                    status!=?
+                    OR terminal_child_count!=?
+                    OR checkpoint_json!=?
+                    OR telemetry_json!=?
+                    OR (? IS NOT NULL AND completed_at IS NULL)
+                  )
                 """,
                 (
                     parent_status,
                     terminal_count,
                     now,
-                    now if parent_status in {"SUCCEEDED", "PARTIAL", "NO_DATA", "FAILED"} else None,
-                    json.dumps(
-                        {"child_statuses": statuses, "terminal_count": terminal_count},
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
+                    completed_at,
+                    completed_at,
+                    checkpoint_json,
+                    telemetry_json,
                     now,
                     parent_run_id,
+                    parent_status,
+                    terminal_count,
+                    checkpoint_json,
+                    telemetry_json,
+                    completed_at,
                 ),
             )
             conn.commit()
@@ -241,12 +294,48 @@ class ParallelResearchCoordinator:
                 """,
                 (parent_run_id,),
             ).fetchall()
+            manifest = (
+                conn.execute(
+                    "SELECT manifest_json FROM research_gap_manifests WHERE manifest_id=?",
+                    (parent["manifest_id"],),
+                ).fetchone()
+                if parent is not None
+                else None
+            )
+            counts = (
+                _materialized_parent_counts(conn, [str(row["child_run_id"]) for row in children])
+                if parent is not None
+                else {"claim_count": 0, "evidence_count": 0}
+            )
         if parent is None:
             raise ValueError("research_parent_run_not_found")
         output = dict(parent)
         output["checkpoint"] = json.loads(output.pop("checkpoint_json") or "{}")
         output["telemetry"] = json.loads(output.pop("telemetry_json") or "{}")
         output["children"] = [dict(row) for row in children]
+        manifest_payload = json.loads(manifest["manifest_json"] or "{}") if manifest else {}
+        required_topics = _manifest_required_topics(manifest_payload)
+        failed_topics = sorted(
+            str(row["topic"])
+            for row in children
+            if str(row["status"]) in {"FAILED", "LOOP_DETECTED", "TIMED_OUT", "CANCELLED", "REJECTED"}
+        )
+        output.update(
+            {
+                "research_status": output["status"],
+                "snapshot_status": (
+                    "MATERIALIZING"
+                    if output.get("snapshot_id") == "MATERIALIZING"
+                    else "MATERIALIZED"
+                    if output.get("snapshot_id")
+                    else "NOT_MATERIALIZED"
+                ),
+                "required_topics": required_topics,
+                "failed_topics": failed_topics,
+                "blocking_gaps": [f"failed_topic:{topic}" for topic in failed_topics],
+                **counts,
+            }
+        )
         return output
 
     def claim_materialization(self, parent_run_id: str) -> bool:
@@ -327,6 +416,189 @@ def _parent_status(statuses: list[str]) -> str:
     if partial or successful + no_data < len(statuses):
         return "PARTIAL"
     return "SUCCEEDED"
+
+
+def _manifest_required_topics(manifest: dict[str, Any]) -> list[str]:
+    topics = {
+        str(item.get("topic"))
+        for item in manifest.get("items") or []
+        if isinstance(item, dict)
+        and item.get("required_action") == "AGENT_RESEARCH"
+        and item.get("topic")
+    }
+    topics.update(str(item) for item in manifest.get("agent_topics") or [] if item)
+    return sorted(topics)
+
+
+def _materialized_parent_counts(
+    conn: Any,
+    run_ids: list[str],
+) -> dict[str, int]:
+    active_run_ids = [item for item in run_ids if item]
+    if not active_run_ids:
+        return {"claim_count": 0, "evidence_count": 0}
+    placeholders = ",".join("?" for _ in active_run_ids)
+    claim_count = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*) FROM research_claims
+            WHERE research_run_id IN ({placeholders})
+              AND validation_status='accepted'
+              AND materialization_status='MATERIALIZED'
+              AND source_audit_status='ACTIVE'
+            """,
+            active_run_ids,
+        ).fetchone()[0]
+    )
+    evidence_count = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*) FROM research_evidence e
+            JOIN research_claims c ON c.claim_id=e.claim_id
+            WHERE c.research_run_id IN ({placeholders})
+              AND c.validation_status='accepted'
+              AND c.materialization_status='MATERIALIZED'
+              AND c.source_audit_status='ACTIVE'
+              AND e.audit_status='ACTIVE'
+              AND e.source_audit_status='ACTIVE'
+            """,
+            active_run_ids,
+        ).fetchone()[0]
+    )
+    return {"claim_count": claim_count, "evidence_count": evidence_count}
+
+
+def _aggregate_parent_telemetry(
+    conn: Any,
+    parent: dict[str, Any],
+    children: list[dict[str, Any]],
+    statuses: list[str],
+    *,
+    completed_at: str | None,
+) -> dict[str, Any]:
+    totals = {
+        "searches": 0,
+        "opened_sources": 0,
+        "fetched_sources": 0,
+        "verified_sources": 0,
+        "candidate_claims": 0,
+        "accepted_claims": 0,
+        "rejected_claims": 0,
+    }
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+    }
+    warnings: set[str] = set()
+    rejection_reasons: dict[tuple[str, str], int] = {}
+    child_statuses: list[dict[str, Any]] = []
+    costs: list[float] = []
+    for index, child in enumerate(children):
+        metrics = _load_json_object(child.get("metrics_json"))
+        metrics_usage = metrics.get("usage") if isinstance(metrics.get("usage"), dict) else {}
+        sources = metrics.get("sources") if isinstance(metrics.get("sources"), dict) else {}
+        totals["searches"] += int(metrics.get("searches") or 0)
+        totals["opened_sources"] += int(metrics.get("opened_sources") or 0)
+        totals["fetched_sources"] += int(sources.get("fetched") or 0)
+        totals["verified_sources"] += int(sources.get("verified") or 0)
+        totals["candidate_claims"] += int(metrics.get("claims_extracted") or 0)
+        totals["accepted_claims"] += int(metrics.get("claims_accepted") or 0)
+        totals["rejected_claims"] += int(metrics.get("claims_rejected") or 0)
+        for key in usage:
+            usage[key] += int(metrics_usage.get(key) or 0)
+        warnings.update(str(item) for item in metrics.get("threshold_warnings") or [] if item)
+        warnings.update(str(item) for item in _load_json_list(child.get("warnings_json")) if item)
+        for item in sources.get("rejection_reasons") or []:
+            if not isinstance(item, dict):
+                continue
+            key = (str(item.get("status") or "REJECTED"), str(item.get("reason") or "unknown"))
+            rejection_reasons[key] = rejection_reasons.get(key, 0) + int(item.get("count") or 0)
+        cost = _load_json_object(child.get("cost_json"))
+        if cost.get("total_cost_usd") is not None:
+            costs.append(float(cost["total_cost_usd"]))
+        child_statuses.append(
+            {
+                "topic": child.get("topic"),
+                "job_id": child.get("child_job_id"),
+                "run_id": child.get("child_run_id"),
+                "status": statuses[index],
+                "warning_count": len(metrics.get("threshold_warnings") or []),
+                "last_error": child.get("last_error"),
+            }
+        )
+    run_ids = [str(child.get("child_run_id")) for child in children if child.get("child_run_id")]
+    invocation_count = 0
+    if run_ids:
+        placeholders = ",".join("?" for _ in run_ids)
+        invocation_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT invocation_id)
+                FROM research_backend_invocations
+                WHERE run_id IN ({placeholders})
+                """,
+                run_ids,
+            ).fetchone()[0]
+        )
+    if invocation_count == 0:
+        invocation_count = sum(
+            int(
+                (
+                    _load_json_object(child.get("metrics_json")).get("backend")
+                    or {}
+                ).get("invocations")
+                or 0
+            )
+            for child in children
+        )
+    wall_clock_seconds = None
+    if parent.get("started_at") and completed_at:
+        started = datetime.fromisoformat(str(parent["started_at"]).replace("Z", "+00:00"))
+        completed = datetime.fromisoformat(str(completed_at).replace("Z", "+00:00"))
+        wall_clock_seconds = max(round((completed - started).total_seconds(), 3), 0)
+    return {
+        "aggregation_version": "parent-replay-v1",
+        "deduplication": {
+            "invocations": "invocation_id",
+            "sources": "child_run_id/source_id",
+            "tools": "child_run_id/tool_action_fingerprint",
+        },
+        "child_statuses": child_statuses,
+        "backend_invocations": invocation_count,
+        **totals,
+        "usage": usage,
+        "wall_clock_seconds": wall_clock_seconds,
+        "cost": {"total_cost_usd": round(sum(costs), 10)} if costs else None,
+        "cost_status": "available" if costs else "cost_unavailable",
+        "warnings": sorted(warnings),
+        "rejection_reasons": [
+            {"status": key[0], "reason": key[1], "count": count}
+            for key, count in sorted(rejection_reasons.items())
+        ],
+    }
+
+
+def _load_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        restored = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return restored if isinstance(restored, dict) else {}
+
+
+def _load_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        restored = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return restored if isinstance(restored, list) else []
 
 
 def _now() -> str:

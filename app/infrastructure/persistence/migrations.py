@@ -640,6 +640,9 @@ def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
                     step["attempt"],
                 ),
             )
+        if failed and _repair_event_projection_failure(conn, row, now=now):
+            repaired += 1
+            continue
         try:
             result = json.loads(row["result_json"] or "{}")
         except json.JSONDecodeError:
@@ -738,6 +741,249 @@ def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
         )
         repaired += 1
     return repaired
+
+
+def _repair_event_projection_failure(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    now: str,
+) -> bool:
+    error_text = str(row["last_error"] or "")
+    try:
+        diagnostic = json.loads(row["last_diagnostic_json"] or "{}")
+    except (TypeError, ValueError):
+        diagnostic = {}
+    message = str(diagnostic.get("message") or "")
+    expected_error = "accepted event research result requires event_key"
+    if expected_error not in f"{error_text} {message}".lower():
+        return False
+    step_rows = {
+        str(step["step_name"]): step
+        for step in conn.execute(
+            """
+            SELECT step_id,step_name,status,output_json
+            FROM research_run_steps
+            WHERE run_id=? AND step_name IN ('PERSIST','READ_BACK')
+            """,
+            (row["run_id"],),
+        ).fetchall()
+    }
+    persist_step = step_rows.get("PERSIST")
+    read_step = step_rows.get("READ_BACK")
+    if (
+        persist_step is None
+        or read_step is None
+        or persist_step["status"] != "COMPLETED"
+        or read_step["status"] != "COMPLETED"
+    ):
+        return False
+    try:
+        persisted = json.loads(persist_step["output_json"] or "{}")
+        read_back = json.loads(read_step["output_json"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    counts = (
+        int(persisted.get("accepted_count") or 0),
+        int(persisted.get("persisted_count") or 0),
+        int(read_back.get("read_back_count") or persisted.get("read_back_count") or 0),
+    )
+    if not (counts[0] == counts[1] == counts[2] and counts[0] > 0):
+        return False
+    claims = conn.execute(
+        """
+        SELECT * FROM research_claims
+        WHERE research_run_id=? AND validation_status='accepted'
+        ORDER BY rowid
+        """,
+        (row["run_id"],),
+    ).fetchall()
+    if len(claims) != counts[0]:
+        return False
+    allowed_semantics = {"official_calendar_event", "scheduled_event"}
+    if any(
+        str(claim["field_semantics"]) not in allowed_semantics
+        or not str(claim["event_key"] or "").strip()
+        or claim["materialization_status"] != "MATERIALIZED"
+        or claim["source_audit_status"] != "ACTIVE"
+        for claim in claims
+    ):
+        return False
+    claim_ids = [str(claim["claim_id"]) for claim in claims]
+    placeholders = ",".join("?" for _ in claim_ids)
+    active_facts = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*) FROM market_facts
+            WHERE fact_key IN ({",".join("'research:' || ?" for _ in claim_ids)})
+              AND status='active' AND source_audit_status='ACTIVE'
+            """,
+            claim_ids,
+        ).fetchone()[0]
+    )
+    evidenced_claims = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT claim_id) FROM research_evidence
+            WHERE claim_id IN ({placeholders})
+              AND audit_status='ACTIVE' AND source_audit_status='ACTIVE'
+            """,
+            claim_ids,
+        ).fetchone()[0]
+    )
+    if active_facts != counts[0] or evidenced_claims != counts[0]:
+        return False
+    projection = [
+        _event_projection_result(conn, claim)
+        for claim in claims
+    ]
+    if any(item is None for item in projection):
+        return False
+    results = [item for item in projection if item is not None]
+    repaired_status = str(persisted.get("status") or "SUCCEEDED")
+    if repaired_status not in {"SUCCEEDED", "PARTIAL"}:
+        return False
+    reconciliation = {
+        "action": "REBUILT_EVENT_PROJECTION",
+        "reason": expected_error,
+        "reconciled_at": now,
+        "invariant": {
+            "accepted_count": counts[0],
+            "persisted_count": counts[1],
+            "read_back_count": counts[2],
+            "official_event_keys_valid": True,
+        },
+        "original_job_status": str(row["job_status"]),
+        "original_run_status": str(row["run_status"]),
+        "original_error": error_text or message,
+    }
+    repaired_result = {
+        **persisted,
+        "status": repaired_status,
+        "results": results,
+        "event_projection": {
+            "persisted_count": counts[1],
+            "read_back_count": counts[2],
+            "reconciled": True,
+        },
+        "reconciliation": reconciliation,
+    }
+    persist_output = {**persisted, "results": results, "reconciliation": reconciliation}
+    conn.execute(
+        """
+        UPDATE research_run_steps SET output_json=?,output_checksum=?
+        WHERE step_id=?
+        """,
+        (
+            json.dumps(persist_output, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            hashlib.sha256(
+                json.dumps(
+                    persist_output,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            persist_step["step_id"],
+        ),
+    )
+    encoded = json.dumps(
+        repaired_result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        UPDATE research_runs
+        SET status=?,result_json=?,completed_at=COALESCE(completed_at,?),
+            missing_topics_json='[]',blocking_gaps_json='[]',updated_at=?
+        WHERE run_id=?
+        """,
+        (repaired_status, encoded, row["completed_at"] or now, now, row["run_id"]),
+    )
+    conn.execute(
+        """
+        UPDATE ai_research_jobs
+        SET status=?,result_payload_json=?,accepted_fields_json=?,
+            rejected_fields_json='[]',last_error=NULL,last_diagnostic_json=NULL,
+            completed_at=COALESCE(completed_at,?),updated_at=?
+        WHERE job_id=?
+        """,
+        (
+            repaired_status,
+            encoded,
+            json.dumps(
+                sorted({str(item["field_semantics"]) for item in results}),
+                separators=(",", ":"),
+            ),
+            row["completed_at"] or now,
+            now,
+            row["job_id"],
+        ),
+    )
+    return True
+
+
+def _event_projection_result(
+    conn: sqlite3.Connection,
+    claim: sqlite3.Row,
+) -> dict[str, object] | None:
+    evidence = conn.execute(
+        """
+        SELECT * FROM research_evidence
+        WHERE claim_id=? AND audit_status='ACTIVE' AND source_audit_status='ACTIVE'
+        ORDER BY source_tier,source_domain,evidence_id
+        """,
+        (claim["claim_id"],),
+    ).fetchall()
+    if not evidence:
+        return None
+    try:
+        payload = json.loads(claim["payload_json"] or "{}")
+        value = json.loads(claim["value_json"] or "null")
+    except (TypeError, ValueError):
+        return None
+    primary = evidence[0]
+    source_references = [
+        {
+            "source_id": item["source_id"],
+            "verification_id": item["verification_id"],
+            "canonical_url": item["canonical_url"],
+            "publisher": item["publisher"],
+            "source_tier": item["source_tier"],
+            "content_checksum": item["content_checksum"],
+        }
+        for item in evidence
+    ]
+    return {
+        "claim_id": claim["claim_id"],
+        "claim_ref": payload.get("claim_ref"),
+        "field": claim["field_semantics"],
+        "field_semantics": claim["field_semantics"],
+        "topic": claim["topic"],
+        "value": value,
+        "metric_id": claim["metric_id"],
+        "event_key": claim["event_key"],
+        "event_at": claim["event_at"],
+        "release_at": claim["release_at"],
+        "period": claim["period"],
+        "frequency": claim["frequency"],
+        "unit": claim["unit"],
+        "source": primary["publisher"],
+        "publisher": primary["publisher"],
+        "source_url": primary["canonical_url"],
+        "canonical_url": primary["canonical_url"],
+        "retrieved_at": primary["retrieved_at"],
+        "source_references": source_references,
+        "lineage": {
+            "research_run_id": claim["research_run_id"],
+            "claim_id": claim["claim_id"],
+            "policy_version": claim["policy_version"],
+            "prompt_version": claim["prompt_version"],
+            "materialization_status": claim["materialization_status"],
+        },
+    }
 
 
 def _reconciliation_diagnostic(

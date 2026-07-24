@@ -29,6 +29,98 @@ function ConvertTo-SmokeSafeText {
     return $text
 }
 
+function ConvertTo-SmokeNonNullArray {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    return @($Value) | Where-Object { $null -ne $_ }
+}
+
+function Resolve-SmokeQueueContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Queued,
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl
+    )
+
+    $parentRunId = [string]$Queued.parent_run_id
+    $runId = if (-not [string]::IsNullOrWhiteSpace($parentRunId)) {
+        $parentRunId
+    }
+    else {
+        [string]$Queued.run_id
+    }
+    if ([string]::IsNullOrWhiteSpace($runId)) {
+        throw "The service did not return run_id or parent_run_id"
+    }
+
+    $jobId = [string]$Queued.job_id
+    $isParent = -not [string]::IsNullOrWhiteSpace($parentRunId)
+    if (-not $isParent -and [string]::IsNullOrWhiteSpace($jobId)) {
+        throw "The legacy service contract did not return job_id"
+    }
+    $pollUrl = [string]$Queued.poll_url
+    if ([string]::IsNullOrWhiteSpace($pollUrl)) {
+        $pollUrl = "/market-research/mnq/runs/$runId"
+    }
+    if ($pollUrl -notmatch '^https?://') {
+        $pollUrl = "$($BaseUrl.TrimEnd('/'))/$($pollUrl.TrimStart('/'))"
+    }
+    return [pscustomobject]@{
+        is_parent = $isParent
+        run_id = $runId
+        parent_run_id = if ($isParent) { $parentRunId } else { $null }
+        job_id = if ([string]::IsNullOrWhiteSpace($jobId)) { $null } else { $jobId }
+        child_job_ids = @(
+            ConvertTo-SmokeNonNullArray $Queued.child_job_ids |
+                ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        manifest_id = $Queued.manifest_id
+        poll_url = $pollUrl
+    }
+}
+
+function Get-SmokeParentPollingDecision {
+    param(
+        [string]$ParentStatus,
+        [int]$ExpectedChildCount = 0,
+        [int]$TerminalChildCount = 0
+    )
+
+    $successful = @("SUCCEEDED", "PARTIAL", "NO_DATA")
+    $failed = @("FAILED", "LOOP_DETECTED", "TIMED_OUT", "CANCELLED", "REJECTED")
+    if ($ParentStatus -in $failed) {
+        return [pscustomobject]@{
+            done = $true
+            failed = $true
+            reason = "parent_terminal_failure:$ParentStatus"
+        }
+    }
+    if ($ParentStatus -in $successful) {
+        if ($TerminalChildCount -ne $ExpectedChildCount) {
+            return [pscustomobject]@{
+                done = $true
+                failed = $true
+                reason = "parent_terminal_child_count_mismatch:$TerminalChildCount/$ExpectedChildCount"
+            }
+        }
+        return [pscustomobject]@{
+            done = $true
+            failed = $false
+            reason = "parent_terminal_success:$ParentStatus"
+        }
+    }
+    return [pscustomobject]@{
+        done = $false
+        failed = $false
+        reason = "polling_parent"
+    }
+}
+
 function Write-SmokeFailureReport {
     param(
         [Parameter(Mandatory = $true)]
@@ -117,7 +209,10 @@ function Get-SmokeCompactResearchMetrics {
         progress = $Metrics.progress
         usage = $Metrics.usage
         cost_status = $Metrics.cost_status
-        threshold_warnings = @($Metrics.threshold_warnings) | Select-Object -Last 20
+        threshold_warnings = @(
+            ConvertTo-SmokeNonNullArray $Metrics.threshold_warnings |
+                Select-Object -Last 20
+        )
         loop_detections = $Metrics.loop_detections
         continuation_count = $Metrics.continuation_count
         checkpoint = $Metrics.checkpoint

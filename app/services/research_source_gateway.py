@@ -4,6 +4,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import re
 import socket
 import unicodedata
 import urllib.robotparser
@@ -28,9 +29,10 @@ from app.core.text_normalization import (
 from app.services.source_policy_service import SourcePolicyService
 
 try:  # Installed as an application dependency; kept lazy for migration-only tooling.
-    from pypdf import PdfReader
+    from pypdf import PdfReader, PdfWriter
 except ImportError:  # pragma: no cover - exercised only in incomplete runtime installs.
     PdfReader = None  # type: ignore[assignment]
+    PdfWriter = None  # type: ignore[assignment]
 
 
 SUPPORTED_CONTENT_TYPES = {
@@ -365,12 +367,28 @@ class ResearchSourceGateway:
                         0,
                     )
                 else:
-                    match = match_evidence(
+                    match = match_official_structured_evidence(
                         str(evidence.get("evidence_text") or ""),
                         str(source.get("content_text") or ""),
-                        threshold=self.settings.research_evidence_match_threshold,
-                        minimum_tokens=self.settings.research_evidence_min_tokens,
+                        source_domain=str(source.get("source_domain") or ""),
+                        claim=claim,
                     )
+                    if not match.accepted:
+                        match = match_evidence(
+                            str(evidence.get("evidence_text") or ""),
+                            str(source.get("content_text") or ""),
+                            threshold=self.settings.research_evidence_match_threshold,
+                            minimum_tokens=self.settings.research_evidence_min_tokens,
+                        )
+                deterministic_value = (
+                    deterministic_official_numeric_value(
+                        claim,
+                        str(evidence.get("evidence_text") or ""),
+                        source_domain=str((source or {}).get("source_domain") or ""),
+                    )
+                    if match.accepted
+                    else None
+                )
                 verification_id = (
                     "rverify-"
                     f"{hashlib.sha256(f'{run_id}|{claim_ref}|{evidence_index}|{url}'.encode()).hexdigest()[:24]}"
@@ -387,6 +405,7 @@ class ResearchSourceGateway:
                     "evidence_anchor": match.anchor,
                     "evidence_token_count": match.evidence_token_count,
                     "matched_token_count": match.matched_token_count,
+                    "deterministic_value": deterministic_value,
                     "verification_duration_ms": int((perf_counter() - started) * 1000),
                 }
                 persisted = self.repository.record_evidence_verification(run_id, verification)
@@ -400,6 +419,7 @@ class ResearchSourceGateway:
                     "content_sha256": (source.get("content_sha256") if source else None),
                     "canonical_url": (source.get("canonical_url") if source else None),
                     "retrieved_at": source.get("retrieved_at") if source else None,
+                    "deterministic_value": deterministic_value,
                 }
                 if source is not None:
                     evidence["canonical_url"] = source.get("canonical_url")
@@ -477,6 +497,20 @@ class ResearchSourceGateway:
 
 class SourceGatewayLimitError(RuntimeError):
     pass
+
+
+def pdf_parser_available() -> bool:
+    if PdfReader is None or PdfWriter is None:
+        return False
+    try:
+        buffer = BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=72, height=72)
+        writer.write(buffer)
+        buffer.seek(0)
+        return len(PdfReader(buffer).pages) == 1
+    except Exception:
+        return False
 
 
 def _failure_stage(reason: str, *, http_fetched: bool) -> str:
@@ -566,6 +600,117 @@ def match_evidence(
         len(evidence_tokens),
         matched,
     )
+
+
+def match_official_structured_evidence(
+    evidence_text: str,
+    document_text: str,
+    *,
+    source_domain: str,
+    claim: dict[str, Any] | None = None,
+) -> EvidenceMatch:
+    anchor = _bounded_anchor(evidence_text)
+    domain = str(source_domain or "").lower().removeprefix("www.")
+    if domain not in {"cboe.com", "cftc.gov"}:
+        return EvidenceMatch(
+            False,
+            "official_structured_adapter_not_applicable",
+            None,
+            0.0,
+            anchor,
+            len(_structured_tokens(anchor)),
+            0,
+        )
+    evidence_tokens = _structured_tokens(anchor)
+    document_tokens = _structured_tokens(document_text)
+    numeric_count = sum(_is_number_token(item) for item in evidence_tokens)
+    identity_present = bool(
+        re.search(r"\bVX/[A-Z]\d\b", anchor, flags=re.IGNORECASE)
+        or re.search(r"\bCODE[- ]?\d{5,6}\b", anchor, flags=re.IGNORECASE)
+        or re.search(r"\bVIX\b", anchor, flags=re.IGNORECASE)
+        or re.search(r"\bPOSITIONS AS OF\b", anchor, flags=re.IGNORECASE)
+    )
+    if domain == "cftc.gov" and re.search(r"\bCOMMITMENTS\b", anchor, flags=re.IGNORECASE):
+        code = re.search(r"\b(\d{5,6})\b", str((claim or {}).get("event_key") or ""))
+        identity_present = bool(
+            code
+            and re.search(
+                rf"\bCODE[- ]?{re.escape(code.group(1))}\b",
+                document_text,
+                flags=re.IGNORECASE,
+            )
+        )
+    if len(evidence_tokens) < 3 or numeric_count == 0 or not identity_present:
+        return EvidenceMatch(
+            False,
+            "official_structured_anchor_incomplete",
+            None,
+            0.0,
+            anchor,
+            len(evidence_tokens),
+            0,
+        )
+    matched = _ordered_subsequence_count(evidence_tokens, document_tokens)
+    accepted = matched == len(evidence_tokens)
+    return EvidenceMatch(
+        accepted,
+        "verified_official_table_numeric"
+        if accepted
+        else "official_structured_evidence_mismatch",
+        "official_table_numeric" if accepted else None,
+        round(matched / max(len(evidence_tokens), 1), 6),
+        anchor,
+        len(evidence_tokens),
+        matched,
+    )
+
+
+def deterministic_official_numeric_value(
+    claim: dict[str, Any],
+    evidence_text: str,
+    *,
+    source_domain: str,
+) -> str | None:
+    domain = str(source_domain or "").lower().removeprefix("www.")
+    metric = str(claim.get("metric_id") or "").lower()
+    normalized = unicodedata.normalize("NFKC", evidence_text)
+    if domain == "cftc.gov" and metric.startswith("cot_") and "net_position" in metric:
+        commitments = re.search(
+            r"COMMITMENTS\s+(-?[\d,]+)\s+(-?[\d,]+)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if commitments:
+            long_value = int(commitments.group(1).replace(",", ""))
+            short_value = int(commitments.group(2).replace(",", ""))
+            return str(long_value - short_value)
+    if domain == "cboe.com" and metric == "vix":
+        value = re.search(r"\bVIX\s*[-:|]?\s*(\d+(?:\.\d+)?)", normalized, flags=re.IGNORECASE)
+        if value:
+            return value.group(1)
+    return None
+
+
+def _structured_tokens(value: Any) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", normalize_text(value)).casefold()
+    normalized = normalized.replace(",", "")
+    normalized = re.sub(r"(?<=[a-z])-(?=\d)", " ", normalized)
+    return re.findall(
+        r"[a-z]+/[a-z]\d|[a-z]+|\d{1,4}/\d{1,2}/\d{1,4}|-?\d+(?:\.\d+)?",
+        normalized,
+    )
+
+
+def _is_number_token(value: str) -> bool:
+    return bool(re.fullmatch(r"-?\d+(?:\.\d+)?|\d{1,4}/\d{1,2}/\d{1,4}", value))
+
+
+def _ordered_subsequence_count(needles: list[str], haystack: list[str]) -> int:
+    matched = 0
+    for token in haystack:
+        if matched < len(needles) and token == needles[matched]:
+            matched += 1
+    return matched
 
 
 def normalize_match_text(value: Any) -> str:
