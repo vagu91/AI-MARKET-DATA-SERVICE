@@ -42,6 +42,7 @@ TELEMETRY_EVENTS = frozenset(
         "retry_backoff",
         "loop_emergency_ceiling",
         "agent_disabled",
+        "startup_catch_up",
     }
 )
 IDENTIFIER_FIELDS = (
@@ -365,6 +366,126 @@ class DeterministicAnomalyDetector:
                         "profile_id": signals.get("profile_id"),
                         "job_type": signals.get("job_type"),
                     },
+                )
+            )
+        for event in signals.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            release = parse_datetime(
+                event.get("release_at") or event.get("time_utc")
+            )
+            if (
+                str(
+                    event.get("temporal_status")
+                    or event.get("status")
+                    or ""
+                ).upper()
+                == "PRE_RELEASE"
+                and release is not None
+                and release <= now
+            ):
+                findings.append(
+                    (
+                        "HIGH",
+                        "past_event_pre_release",
+                        {
+                            "event_key": event.get("canonical_event_key")
+                            or event.get("event_id"),
+                            "release_at": release,
+                        },
+                    )
+                )
+        next_event = signals.get("next_critical_event")
+        if isinstance(next_event, dict):
+            next_release = parse_datetime(
+                next_event.get("release_at") or next_event.get("time_utc")
+            )
+            if next_release is not None and next_release <= now:
+                findings.append(
+                    (
+                        "HIGH",
+                        "next_critical_event_in_past",
+                        {"release_at": next_release},
+                    )
+                )
+        if int(signals.get("duplicate_occurrence_count") or 0) > 0:
+            findings.append(
+                (
+                    "HIGH",
+                    "duplicate_event_occurrence",
+                    {
+                        "count": int(
+                            signals.get("duplicate_occurrence_count") or 0
+                        )
+                    },
+                )
+            )
+        for item in signals.get("lifecycle_items") or []:
+            if not isinstance(item, dict):
+                continue
+            valid_from = parse_datetime(item.get("valid_from"))
+            valid_until = parse_datetime(item.get("valid_until"))
+            if (
+                valid_from is not None
+                and valid_until is not None
+                and valid_until <= valid_from
+            ):
+                findings.append(
+                    (
+                        "HIGH",
+                        "invalid_validity_interval",
+                        {"entity_key": item.get("entity_key")},
+                    )
+                )
+            if item.get("data_present") is True and item.get(
+                "operational_value_present"
+            ) is False:
+                findings.append(
+                    (
+                        "HIGH",
+                        "data_present_without_operational_value",
+                        {"entity_key": item.get("entity_key")},
+                    )
+                )
+            if (
+                str(item.get("status") or "").upper() == "AVAILABLE"
+                and (
+                    str(item.get("source_classification") or "").lower()
+                    == "invalid_source"
+                    or str(item.get("validation_status") or "").lower()
+                    == "rejected"
+                )
+            ):
+                findings.append(
+                    (
+                        "HIGH",
+                        "available_from_invalid_source",
+                        {"entity_key": item.get("entity_key")},
+                    )
+                )
+        consumer_payload = signals.get("consumer_payload")
+        if isinstance(consumer_payload, dict):
+            consumer_size = len(
+                _json(consumer_payload).encode("utf-8")
+            )
+            if consumer_size > 90 * 1024:
+                findings.append(
+                    (
+                        "HIGH",
+                        "consumer_payload_over_90kib",
+                        {"payload_size_bytes": consumer_size},
+                    )
+                )
+        if (
+            signals.get("deterministic_provider_available")
+            and signals.get("agent_invocation_attempted")
+            and not signals.get("ai_invocation_reason")
+        ):
+            findings.append(
+                (
+                    "HIGH",
+                    "provider_available_ai_invoked_without_reason",
+                    {"provider": signals.get("provider_name")},
                 )
             )
         return [

@@ -246,6 +246,8 @@ def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row
 
 
 def _event_record_payload(row: Any) -> dict[str, Any]:
+    from app.services.temporal_domain_service import temporal_event_state
+
     payload = decode(row["raw_payload_json"], {})
     payload.update({
         "event_id": row["event_id"], "event_key": row["event_key"],
@@ -276,6 +278,21 @@ def _event_record_payload(row: Any) -> dict[str, Any]:
     payload["enrichment"] = enrichment
     if row["outcome_json"]:
         payload["outcome"] = decode(row["outcome_json"], {})
+    persisted_status = str(
+        payload.get("temporal_audit_status")
+        or payload.get("temporal_status")
+        or ""
+    ).upper()
+    if persisted_status == QUARANTINED_STATUS:
+        payload["status"] = QUARANTINED_STATUS
+        payload["temporal_status"] = QUARANTINED_STATUS
+    else:
+        recalculated = temporal_event_state(payload)
+        payload["status"] = recalculated["temporal_status"]
+        payload["temporal_status"] = recalculated["temporal_status"]
+        payload["actual"] = recalculated["actual"]
+        payload["event_kind"] = recalculated["event_kind"]
+        payload["canonical_event_key"] = recalculated["canonical_event_key"]
     return payload
 
 
@@ -1014,7 +1031,7 @@ class MarketFactRepository:
         with connect_market_db(self.settings) as conn:
             rows = conn.execute(
                 """
-                SELECT raw_payload_json
+                SELECT *
                 FROM economic_events_history
                 WHERE country = ? AND date >= ? AND date <= ?
                   AND temporal_audit_status!='QUARANTINED'
@@ -1024,7 +1041,7 @@ class MarketFactRepository:
                 """,
                 (country.upper(), start_date, end_date),
             ).fetchall()
-        return [payload for row in rows if isinstance((payload := decode(row["raw_payload_json"], None)), dict)]
+        return [_event_record_payload(row) for row in rows]
 
     def economic_event_records(self, *, country: str = "US") -> list[dict[str, Any]]:
         with connect_market_db(self.settings) as conn:

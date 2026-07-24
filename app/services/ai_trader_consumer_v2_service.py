@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.config import Settings
@@ -14,6 +14,7 @@ from app.services.research_domain_contracts import (
     DOMAIN_TOPICS,
     compact_domain_projection,
 )
+from app.services.research_agent_enablement import research_agent_enablement
 
 
 logger = logging.getLogger(__name__)
@@ -55,11 +56,26 @@ def build_ai_trader_consumer_v2(
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
+    settings = settings or Settings(_env_file=None)
     generated_at = parse_datetime(full.get("generated_at_utc") or full.get("generated_at"))
     hardened = harden_market_context(full, settings=settings, now=generated_at)
     readiness = dict(hardened.get("readiness") or {})
     ai_enrichment = _ai_enrichment(hardened.get("ai_enrichment") or {})
     research = _research(hardened.get("research") or {})
+    disabled_topics = sorted(
+        topic
+        for topic in DOMAIN_TOPICS
+        if not research_agent_enablement(
+            settings,
+            topic=topic,
+        )["agent_enabled"]
+    )
+    research["disabled_optional_topics"] = sorted(
+        {
+            *research["disabled_optional_topics"],
+            *disabled_topics,
+        }
+    )
     temporal_pending = _has_temporal_status(
         hardened,
         {"AWAITING_ACTUAL", "AWAITING_OUTCOME", "ACTUAL_UNAVAILABLE"},
@@ -127,7 +143,15 @@ def build_ai_trader_consumer_v2(
         "sentiment": _sentiment(hardened.get("sentiment_context") or {}),
         "market_schedule": _schedule(hardened.get("market_schedule") or {}),
         "agentic_domains": {
-            topic: compact_domain_projection(hardened.get(topic) or {})
+            topic: (
+                {
+                    "status": "DISABLED",
+                    "enabled": False,
+                    "reason": "agent_disabled_by_configuration",
+                }
+                if topic in disabled_topics
+                else compact_domain_projection(hardened.get(topic) or {})
+            )
             for topic in sorted(DOMAIN_TOPICS)
         },
         "quality": hardened.get("quality") or {},
@@ -150,6 +174,7 @@ def build_ai_trader_consumer_v2(
 def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> None:
     if _payload_size(consumer) < limit:
         return
+    consumer.pop("lifecycle", None)
     news = consumer.get("news") or {}
     event_risk = consumer.get("event_risk") or {}
     earnings = consumer.get("earnings") or {}
@@ -175,6 +200,40 @@ def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> Non
             key: value for key, value in quality.items()
             if key in {"section_quality", "overall_data_quality", "pipeline_integrity", "consumer_quality"}
         }
+    if _payload_size(consumer) >= limit:
+        compact = _drop_nulls(consumer)
+        consumer.clear()
+        consumer.update(compact)
+        for domain in (consumer.get("agentic_domains") or {}).values():
+            if not isinstance(domain, dict):
+                continue
+            if isinstance(domain.get("items"), list):
+                domain["items"] = domain["items"][:8]
+            if isinstance(domain.get("fields"), dict):
+                domain["fields"] = {
+                    key: value
+                    for key, value in domain["fields"].items()
+                    if value not in (None, {}, [])
+                }
+    if _payload_size(consumer) >= limit:
+        for container, key, keep in (
+            (consumer.get("news") or {}, "articles", 2),
+            (consumer.get("news") or {}, "current_drivers", 2),
+            (consumer.get("news") or {}, "previous_session_drivers", 2),
+            (consumer.get("event_risk") or {}, "critical_events", 2),
+            (consumer.get("event_risk") or {}, "historical_events", 2),
+            (consumer.get("earnings") or {}, "upcoming_mega_cap_earnings_14d", 4),
+            (consumer.get("earnings") or {}, "released_earnings", 4),
+        ):
+            if isinstance(container.get(key), list):
+                container[key] = container[key][:keep]
+        consumer["quality"] = {}
+    if _payload_size(consumer) >= limit:
+        bounded = _bound_strings(consumer, limit=512)
+        consumer.clear()
+        consumer.update(bounded)
+    if _payload_size(consumer) >= limit:
+        raise ValueError("consumer_payload_exceeds_90kb")
 
 
 def _ai_enrichment(value: dict[str, Any]) -> dict[str, Any]:
@@ -357,10 +416,68 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
     windows = full.get("event_windows") or {}
     critical = list(calendar.get("critical_macro_events") or [])
     fed = list(calendar.get("fed_communications") or [])
+    other = list(calendar.get("other_economic_events") or [])
+    now = parse_datetime(
+        full.get("generated_at_utc") or full.get("generated_at")
+    ) or datetime.now(UTC)
+    projected_by_key: dict[str, dict[str, Any]] = {}
+    for raw in [*critical, *fed, *other]:
+        if not isinstance(raw, dict):
+            continue
+        state = temporal_event_state(raw, now=now)
+        item = {
+            **raw,
+            "canonical_event_key": state["canonical_event_key"],
+            "temporal_status": state["temporal_status"],
+            "status": state["temporal_status"],
+            "release_at": state["release_at"],
+            "actual": state["actual"],
+        }
+        projected_by_key.setdefault(state["canonical_event_key"], item)
+    projected = list(projected_by_key.values())
+    upcoming_events = sorted(
+        (
+            item
+            for item in projected
+            if item.get("temporal_status") == "PRE_RELEASE"
+            and (parse_datetime(item.get("release_at")) or now) > now
+        ),
+        key=lambda item: str(item.get("release_at") or ""),
+    )
+    awaiting_actual_events = [
+        item
+        for item in projected
+        if item.get("temporal_status")
+        in {"AWAITING_ACTUAL", "AWAITING_OUTCOME"}
+    ]
+    recently_released_events = [
+        item
+        for item in projected
+        if item.get("temporal_status") in {"RELEASED", "COMPLETED"}
+        and (release := parse_datetime(item.get("release_at"))) is not None
+        and timedelta(0) <= now - release <= timedelta(hours=24)
+    ]
+    historical_events = [
+        item
+        for item in projected
+        if (release := parse_datetime(item.get("release_at"))) is not None
+        and release < now
+        and item not in awaiting_actual_events
+        and item not in recently_released_events
+    ]
     active = list(windows.get("active") or windows.get("active_event_windows") or [])
     upcoming = [item for item in (windows.get("upcoming") or windows.get("upcoming_event_windows") or []) if str(item.get("impact") or "").upper() == "HIGH" and _event_release_at(item)]
     unscheduled = [item for item in (windows.get("upcoming_unscheduled") or []) if str(item.get("impact") or "").upper() == "HIGH"]
-    scheduled_critical = [item for item in critical if _event_release_at(item)]
+    critical_keys = {
+        temporal_event_state(item, now=now)["canonical_event_key"]
+        for item in critical
+        if isinstance(item, dict)
+    }
+    scheduled_critical = [
+        item
+        for item in upcoming_events
+        if item.get("canonical_event_key") in critical_keys
+    ]
     xtb = ((full.get("economic_calendar_enrichment") or {}).get("xtb") or {})
     return {
         "consensus_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_consensus") or {},
@@ -371,8 +488,22 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
         "upcoming_high_impact_windows": [_event(item) for item in upcoming[:6]],
         "upcoming_high_impact_events_unscheduled": [_unscheduled_event(item) for item in unscheduled[:6]],
         "next_critical_event": _event(scheduled_critical[0]) if scheduled_critical else None,
-        "next_fomc": _event(next((item for item in [*critical, *fed] if "FOMC" in _event_text(item)), {})) or None,
-        "critical_events": [_event(item) for item in critical[:6]],
+        "next_fomc": _event(
+            next((item for item in upcoming_events if "FOMC" in _event_text(item)), {})
+        ) or None,
+        "upcoming_events": [_event(item) for item in upcoming_events[:20]],
+        "awaiting_actual_events": [
+            _event(item) for item in awaiting_actual_events[:20]
+        ],
+        "recently_released_events": [
+            _event(item) for item in recently_released_events[:20]
+        ],
+        "historical_events": [_event(item) for item in historical_events[:20]],
+        "critical_events": [
+            _event(item)
+            for item in projected
+            if item.get("canonical_event_key") in critical_keys
+        ][:6],
         "xtb_us_macro_calendar": {
             "status": xtb.get("status"),
             "provider_status": xtb.get("status"),
@@ -467,11 +598,47 @@ def _positioning(positioning: dict[str, Any]) -> dict[str, Any]:
 
 def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
     qqq = nasdaq.get("qqq_holdings") or {}
+    if not _consumer_holdings_usable(qqq):
+        return {
+            "lifecycle": qqq.get("lifecycle") or {},
+            "status": (
+                "LAST_KNOWN_GOOD"
+                if str(qqq.get("status") or "").upper()
+                == "LAST_KNOWN_GOOD"
+                else "NOT_AVAILABLE"
+            ),
+            "top_20_holdings": (
+                [_holding(item) for item in (qqq.get("holdings") or [])[:20]]
+                if str(qqq.get("status") or "").upper()
+                == "LAST_KNOWN_GOOD"
+                else []
+            ),
+            "holdings_count": (
+                int(qqq.get("holdings_count") or 0)
+                if str(qqq.get("status") or "").upper()
+                == "LAST_KNOWN_GOOD"
+                else 0
+            ),
+            "concentration": {},
+            "sector_exposure": {},
+            "mega_cap_contributors": {},
+            "semiconductor_context": {},
+            "alphabet_aggregate": None,
+            "proxy_status": {
+                "is_proxy": qqq.get("is_proxy"),
+                "proxy_for": qqq.get("proxy_for"),
+            },
+            "weight_method": {},
+            "quality": {
+                "reason": qqq.get("reason")
+                or "qqq_holdings_source_not_operational"
+            },
+        }
     holdings = qqq.get("holdings") or qqq.get("top_holdings") or []
     breadth = nasdaq.get("mega_cap_breadth") or {}
     return {
         "lifecycle": qqq.get("lifecycle") or {},
-        "status": nasdaq.get("status"),
+        "status": nasdaq.get("status") or qqq.get("status"),
         "top_20_holdings": [_holding(item) for item in holdings[:20]],
         "holdings_count": qqq.get("holdings_count"),
         "concentration": nasdaq.get("concentration") or {},
@@ -492,6 +659,50 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
         },
         "quality": nasdaq.get("weight_quality") or qqq.get("data_quality") or {},
     }
+
+
+def _consumer_holdings_usable(value: dict[str, Any]) -> bool:
+    status = str(value.get("status") or "").upper()
+    if status == "LAST_KNOWN_GOOD":
+        lifecycle = (
+            value.get("lifecycle")
+            if isinstance(value.get("lifecycle"), dict)
+            else {}
+        )
+        age = (
+            value.get("age_minutes")
+            if value.get("age_minutes") is not None
+            else value.get("age_hours")
+        )
+        reliability = value.get("reliability")
+        return bool(
+            (value.get("holdings") or value.get("top_holdings"))
+            and (value.get("data_as_of") or lifecycle.get("data_as_of"))
+            and (value.get("valid_until") or lifecycle.get("valid_until"))
+            and age is not None
+            and (
+                value.get("quality_penalty")
+                or value.get("confidence_penalty")
+                or (
+                    reliability is not None
+                    and float(reliability) < 1.0
+                )
+            )
+        )
+    validation = value.get("validation") if isinstance(value.get("validation"), dict) else {}
+    lifecycle = value.get("lifecycle") if isinstance(value.get("lifecycle"), dict) else {}
+    return bool(
+        (value.get("holdings") or value.get("top_holdings"))
+        and str(value.get("source_classification") or "").lower()
+        != "invalid_source"
+        and str(value.get("source_audit_status") or "").upper()
+        not in {"QUARANTINED", "REJECTED"}
+        and str(validation.get("status") or "").lower() != "rejected"
+        and value.get("reliability") != 0
+        and lifecycle.get("currently_valid") is not False
+        and str(lifecycle.get("freshness_state") or "").upper()
+        not in {"DUE", "EXPIRED", "QUARANTINED"}
+    )
 
 
 def _earnings(full: dict[str, Any]) -> dict[str, Any]:
@@ -676,9 +887,21 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
     projected = {
         **_select(item, "event_id", "canonical_event_key", "name", "event_name", "category", "impact", "date", "time_utc", "event_type", "event_kind", "temporal_status", "release_status", "release_period", "period_date_consistent", "event_risk_window_status"),
         "release_at": _event_release_at(item),
-        "consensus": enrichment.get("consensus"),
-        "previous": enrichment.get("previous"),
-        "actual": enrichment.get("actual"),
+        "consensus": (
+            enrichment.get("consensus")
+            if enrichment.get("consensus") not in (None, "")
+            else item.get("consensus")
+        ),
+        "previous": (
+            enrichment.get("previous")
+            if enrichment.get("previous") not in (None, "")
+            else item.get("previous")
+        ),
+        "actual": (
+            enrichment.get("actual")
+            if enrichment.get("actual") not in (None, "")
+            else item.get("actual")
+        ),
         "metrics": [
             _event_metric(metric)
             for metric in (enrichment.get("metrics") or [])[:6]
@@ -1076,3 +1299,32 @@ def _event_text(item: dict[str, Any]) -> str:
 
 def _payload_size(value: dict[str, Any]) -> int:
     return len(json.dumps(value, default=str, separators=(",", ":")).encode("utf-8"))
+
+
+def _drop_nulls(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, item in value.items()
+            if (cleaned := _drop_nulls(item)) not in (None, {}, [])
+        }
+    if isinstance(value, list):
+        return [
+            cleaned
+            for item in value
+            if (cleaned := _drop_nulls(item)) not in (None, {}, [])
+        ]
+    return value
+
+
+def _bound_strings(value: Any, *, limit: int) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _bound_strings(item, limit=limit)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_bound_strings(item, limit=limit) for item in value]
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit]
+    return value

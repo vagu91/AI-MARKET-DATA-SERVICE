@@ -30,6 +30,10 @@ from app.providers.fred import FredProvider
 from app.providers.mega_cap_snapshot_provider import MegaCapSnapshotProvider
 from app.providers.news_provider import NewsProvider
 from app.providers.qqq_holdings_provider import QQQHoldingsProvider
+from app.providers.cftc_cot_provider import CftcCotProvider
+from app.providers.cboe_put_call_provider import CboePutCallProvider
+from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
+from app.providers.cboe_vix_futures_provider import CboeVixFuturesProvider
 from app.providers.scraper_calendar import EconomicCalendarScraperProvider
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.event_enrichment_service import EventEnrichmentService
@@ -49,6 +53,9 @@ from app.services.lifecycle_due_resolver import (
     DeterministicLifecycleDueResolver,
     existing_lifecycle_provider_adapters,
 )
+from app.services.deterministic_actual_resolver import (
+    DeterministicActualResolver,
+)
 from app.services.research_agent_enablement import validate_research_agent_mapping
 
 
@@ -61,13 +68,12 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
     cache = ProviderCacheRepository(settings.database_path)
     init_market_db(settings)
 
-    macro_service = MacroService(
-        providers=[
-            FredProvider(cache, settings),
-            BlsProvider(cache, settings),
-            BeaProvider(cache, settings),
-        ]
-    )
+    macro_providers = [
+        FredProvider(cache, settings),
+        BlsProvider(cache, settings),
+        BeaProvider(cache, settings),
+    ]
+    macro_service = MacroService(providers=macro_providers)
     event_enrichment_service = EventEnrichmentService(
         cache=cache,
         providers=[
@@ -117,12 +123,26 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         snapshots=market_context_snapshots,
     )
     research_scheduler = ResearchSchedulerService(settings)
+    official_actual_resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            provider.source: provider
+            for provider in macro_providers
+            if provider.source in {"BLS", "BEA"}
+        },
+    )
     lifecycle_due_resolver = DeterministicLifecycleDueResolver(
         settings,
         adapters=existing_lifecycle_provider_adapters(
             macro_service=macro_service,
             event_service=event_service,
             nasdaq_data_service=nasdaq_data_service,
+            settings=settings,
+            official_actual_resolver=official_actual_resolver,
+            cftc_provider=CftcCotProvider(settings),
+            cboe_risk_indices_provider=CboeRiskIndicesProvider(settings),
+            cboe_vix_futures_provider=CboeVixFuturesProvider(settings),
+            cboe_put_call_provider=CboePutCallProvider(settings),
         ),
     )
 

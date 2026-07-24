@@ -36,7 +36,16 @@ class CboeRiskIndicesProvider:
                         timeout=min(float(self.settings.http_timeout_seconds), 10.0),
                     )
                     response.raise_for_status()
-                    results[key] = _normalize(key, response.json(), url)
+                    normalized = _normalize(
+                        key,
+                        response.json(),
+                        url,
+                        now=datetime.now(UTC),
+                    )
+                    if normalized.get("status") == "quarantined":
+                        errors.append(f"{key}_future_timestamp_quarantined")
+                    else:
+                        results[key] = normalized
                 except TimeoutError:
                     errors.append(f"{key}_timeout")
                 except Exception as exc:
@@ -79,10 +88,34 @@ class CboeRiskIndicesProvider:
         }
 
 
-def _normalize(key: str, payload: dict[str, Any], url: str) -> dict[str, Any]:
+def _normalize(
+    key: str,
+    payload: dict[str, Any],
+    url: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
     data = payload.get("data") or {}
     timestamp = _timestamp(payload.get("timestamp"))
-    stale = bool(timestamp and datetime.now(UTC) - timestamp > timedelta(hours=2))
+    if timestamp and timestamp > now + timedelta(minutes=5):
+        return {
+            "status": "quarantined",
+            "canonical_series_id": key.upper(),
+            "current_price": None,
+            "provider_timestamp": payload.get("timestamp"),
+            "retrieved_at": _iso(now),
+            "source": "CBOE",
+            "source_url": url,
+            "reliability": 0.0,
+            "is_official_source": True,
+            "validation": {
+                "status": "rejected",
+                "reason": "provider_timestamp_in_future",
+            },
+            "warnings": ["provider_timestamp_in_future"],
+        }
+    stale = bool(timestamp and now - timestamp > timedelta(hours=2))
     unreliable_ohl = key == "skew" and any(float(data.get(field) or 0) == 0.0 for field in ("open", "high", "low"))
     return {
         "canonical_series_id": key.upper(),
@@ -98,7 +131,9 @@ def _normalize(key: str, payload: dict[str, Any], url: str) -> dict[str, Any]:
         "percentage_change": _float(data.get("price_change_percent")),
         "last_trade_time": data.get("last_trade_time"),
         "provider_timestamp": payload.get("timestamp"),
-        "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "retrieved_at": _iso(now),
+        "valid_from": _iso(timestamp or now),
+        "valid_until": _iso(now + timedelta(minutes=15)),
         "source": "CBOE",
         "source_url": url,
         "delayed": True,
@@ -163,3 +198,10 @@ def _timestamp(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace(" ", "T")).replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(UTC).replace(microsecond=0).isoformat().replace(
+        "+00:00",
+        "Z",
+    )

@@ -22,6 +22,15 @@ async def run_lifecycle_due_scan(state):
     )
 
 
+async def run_startup_lifecycle_catchup(state):
+    scheduler = state["research_scheduler"]
+    return await asyncio.to_thread(
+        scheduler.startup_catch_up,
+        resolver=state["lifecycle_due_resolver"].resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -31,6 +40,9 @@ async def lifespan(app: FastAPI):
         setattr(app.state, name, value)
     app.state.startup_storage_cleanup = maybe_run_startup_cleanup(settings)
     app.state.startup_database_maintenance = run_database_maintenance(settings, dry_run=False)
+    app.state.startup_lifecycle_catchup = (
+        await run_startup_lifecycle_catchup(state)
+    )
 
     scheduler = None
     ai_worker_task = None

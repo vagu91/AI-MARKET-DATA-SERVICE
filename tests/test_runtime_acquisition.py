@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from app.providers.aaii_sentiment_provider import parse_aaii_sentiment
-from app.providers.cftc_cot_provider import find_nasdaq_row, parse_cftc_financial_row
+from app.providers.cftc_cot_provider import find_mnq_row, parse_cftc_financial_row
 from app.services.credential_audit_service import credential_audit
 from app.core.config import Settings
 from app.api.routes import router
@@ -18,17 +18,19 @@ def test_cftc_nasdaq_row_parses_net_values():
     text = '\n'.join(
         [
             '"OTHER",260630,2026-06-30,000000,CME ,00,000 ,  1,  1,  1',
-            '"NASDAQ MINI - CHICAGO MERCANTILE EXCHANGE",260630,2026-06-30,209742,CME ,00,209 ,  278558,   77804,   80900,    2486,  102755,   35445,    3554,   36796,  105413,   10251,    6991,    7940,       0,  240637,  245989,   37921,   32569,   13475,    8614,   -7097,    -801,    3986,    -416,     486,   -5256,  100.0,"(NASDAQ 100 STOCK INDEX X $20)","209742","CME ","209 ","F20","FutOnly"',
+            '"MICRO E-MINI NASDAQ-100 INDEX - CHICAGO MERCANTILE EXCHANGE",260630,2026-06-30,209747,CME ,00,209 ,  278558,   77804,   80900,    2486,  102755,   35445,    3554,   36796,  105413,   10251,    6991,    7940,       0,  240637,  245989,   37921,   32569,   13475,    8614,   -7097,    -801,    3986,    -416,     486,   -5256,  100.0,"(MICRO E-MINI NASDAQ-100 INDEX)","209747","CME ","209 ","F20","FutOnly"',
         ]
     )
 
-    row = find_nasdaq_row(text)
+    row = find_mnq_row(text)
     parsed = parse_cftc_financial_row(row)
 
-    assert parsed["market_name"].startswith("NASDAQ MINI")
-    assert parsed["cftc_contract_market_code"] == "209742"
-    assert parsed["asset_managers"]["net"] == 77804 - 80900
-    assert parsed["leveraged_funds"]["net"] == 102755 - 35445
+    assert parsed["market_name"].startswith("MICRO E-MINI NASDAQ-100")
+    assert parsed["cftc_contract_market_code"] == "209747"
+    assert parsed["dealers"]["net"] == 77804 - 80900
+    assert parsed["asset_managers"]["net"] == 102755 - 35445
+    assert parsed["leveraged_funds"]["net"] == 36796 - 105413
+    assert parsed["validation"]["valid"] is True
 
 
 def test_aaii_parser_requires_three_percentages():

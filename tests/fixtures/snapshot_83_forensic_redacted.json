@@ -1,0 +1,144 @@
+{
+  "fixture_version": "snapshot83-redacted-v1",
+  "source": {
+    "parent_run_id": "prun-b67a84fc-29bb-4db0-90c0-42648e087ea1",
+    "snapshot_id": "mcs-7064e0af-faf1-479d-8855-cdb80ef110fb",
+    "revision": 83,
+    "generated_at": "2026-07-24T15:01:42+00:00",
+    "child_terminal_count": 6,
+    "child_status_counts": {
+      "PARTIAL": 1,
+      "NO_DATA": 5
+    },
+    "failed_child_count": 0,
+    "total_tokens": 808644,
+    "candidate_claim_count": 19,
+    "accepted_claim_count": 2,
+    "rejected_claim_count": 17
+  },
+  "macro_events": [
+    {
+      "event_id": "service-pmi",
+      "provider": "calendar-provider",
+      "provider_event_id": "pmi-service-us",
+      "name": "US Service PMI",
+      "category": "Services",
+      "country": "US",
+      "date": "2026-07-24",
+      "release_at": "2026-07-24T13:45:00+00:00",
+      "time_utc": "2026-07-24T13:45:00+00:00",
+      "impact": "HIGH",
+      "actual": null,
+      "status": "PRE_RELEASE",
+      "temporal_status": "PRE_RELEASE",
+      "source": "calendar-provider",
+      "source_url": "https://www.bls.gov/schedule/",
+      "reliability": 0.9
+    },
+    {
+      "event_id": "service-pmi",
+      "provider": "calendar-provider",
+      "provider_event_id": "pmi-service-us",
+      "name": "Services Business Activity",
+      "category": "Business activity",
+      "country": "US",
+      "date": "2026-07-24",
+      "release_at": "2026-07-24T13:45:00+00:00",
+      "time_utc": "2026-07-24T13:45:00+00:00",
+      "impact": "HIGH",
+      "actual": null,
+      "status": "PRE_RELEASE",
+      "temporal_status": "PRE_RELEASE",
+      "source": "calendar-provider",
+      "source_url": "https://www.bls.gov/schedule/",
+      "reliability": 0.88
+    },
+    {
+      "event_id": "manufacturing-pmi",
+      "provider": "calendar-provider",
+      "provider_event_id": "pmi-manufacturing-us",
+      "name": "US Manufacturing PMI",
+      "category": "Manufacturing",
+      "country": "US",
+      "date": "2026-07-24",
+      "release_at": "2026-07-24T13:45:00+00:00",
+      "time_utc": "2026-07-24T13:45:00+00:00",
+      "impact": "HIGH",
+      "actual": null,
+      "status": "PRE_RELEASE",
+      "temporal_status": "PRE_RELEASE",
+      "source": "calendar-provider",
+      "source_url": "https://www.bls.gov/schedule/",
+      "reliability": 0.9
+    },
+    {
+      "event_id": "new-home-sales",
+      "provider": "calendar-provider",
+      "provider_event_id": "new-home-sales-us",
+      "name": "New Home Sales",
+      "category": "Housing",
+      "country": "US",
+      "date": "2026-07-24",
+      "release_at": "2026-07-24T14:00:00+00:00",
+      "time_utc": "2026-07-24T14:00:00+00:00",
+      "impact": "HIGH",
+      "actual": null,
+      "status": "PRE_RELEASE",
+      "temporal_status": "PRE_RELEASE",
+      "source": "calendar-provider",
+      "source_url": "https://www.census.gov/economic-indicators/",
+      "reliability": 0.9
+    }
+  ],
+  "issuer_announcement": {
+    "topic": "mega_cap_semiconductors",
+    "field_semantics": "issuer_announcement",
+    "event_key": "AMD_ISSUER_ANNOUNCEMENT_2026_07_23",
+    "issuer": "AMD",
+    "symbol": "AMD",
+    "value": "AMD published an official issuer announcement.",
+    "event_at": "2026-07-23T12:00:00+00:00",
+    "published_at": "2026-07-23T12:00:00+00:00",
+    "valid_until": "2026-07-25T12:00:00+00:00",
+    "source_url": "https://ir.amd.com/news-events/press-releases/detail/redacted"
+  },
+  "cftc_row": "\"MICRO E-MINI NASDAQ-100 INDEX - CHICAGO MERCANTILE EXCHANGE\",260714,2026-07-14,209747,CME ,00,209 ,278558,77804,80900,2486,102755,35445,3554,36796,105413,10251,6991,7940,0,240637,245989,37921,32569,13475,8614,-7097,-801,3986,-416,486,-5256,100.0,\"(MICRO E-MINI NASDAQ-100 INDEX)\",\"209747\",\"CME \",\"209 \",\"F20\",\"FutOnly\"",
+  "cboe": {
+    "selected_date": "2026-07-24",
+    "put_call": {
+      "SUM OF ALL PRODUCTS": [
+        {
+          "name": "VOLUME",
+          "call": 100,
+          "put": 82
+        }
+      ]
+    },
+    "vx_csv": "Product,Symbol,Expiration Date,Price\nVX,VX/Q6,2026-08-19,18.25\nVX,VX/U6,2026-09-16,19.10\n"
+  },
+  "nasdaq_invalid": {
+    "status": "found",
+    "source_classification": "invalid_source",
+    "reliability": 0,
+    "validation": {
+      "status": "rejected"
+    },
+    "holdings_count": 103,
+    "holdings": [
+      {
+        "symbol": "AMD",
+        "weight_pct": 99
+      }
+    ],
+    "lifecycle": {
+      "freshness_state": "DUE",
+      "currently_valid": false
+    }
+  },
+  "disabled_topics": [
+    "options_positioning",
+    "market_internals",
+    "cross_asset_context",
+    "earnings_intelligence"
+  ]
+}

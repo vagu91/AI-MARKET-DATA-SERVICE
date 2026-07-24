@@ -18,6 +18,10 @@ from app.services.market_session_service import (
     last_market_session_date,
 )
 from app.services.temporal_validation_service import TemporalValidationService
+from app.services.temporal_domain_service import (
+    canonical_event_key,
+    temporal_event_state,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -57,21 +61,29 @@ def harden_market_context(
         entity_table="market_context_input",
     )
     context_date = now.astimezone(NEW_YORK).date().isoformat()
-    existing_hardening = ((full.get("metadata") or {}).get("hardening") or {})
+    existing_hardening = (
+        (full.get("metadata") or {}).get("hardening") or {}
+    )
     if (
         not force_recalculate
-        and
-        existing_hardening.get("completed") is True
+        and existing_hardening.get("completed") is True
         and existing_hardening.get("version") == HARDENING_VERSION
         and existing_hardening.get("context_date") == context_date
+        and not _temporal_projection_changed(full, now=now)
     ):
         return dict(full)
     output = dict(full)
     output["market_schedule"] = build_session_aware_schedule(output.get("market_schedule") or {}, now=now)
     session_status = output["market_schedule"]["market_session_status"]
 
-    output["event_calendar"] = _annotate_event_calendar(output.get("event_calendar") or {})
-    output["events_today"] = [_annotate_event(item) for item in output.get("events_today") or []]
+    output["event_calendar"] = _annotate_event_calendar(
+        output.get("event_calendar") or {},
+        now=now,
+    )
+    output["events_today"] = [
+        _annotate_event(item, now=now)
+        for item in output.get("events_today") or []
+    ]
     output["events_today_context"] = events_today_context(output, session_status=session_status, now=now)
     output["event_windows"] = _event_window_status(
         output.get("event_windows") or {},
@@ -542,6 +554,43 @@ def classify_semiconductor_contribution(context: dict[str, Any], *, tolerance: f
 def _harden_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
     output = dict(nasdaq)
     qqq = dict(output.get("qqq_holdings") or {})
+    if not _operational_holdings_source(qqq):
+        invalid_reason = (
+            qqq.get("source_invalid_reason")
+            or "qqq_holdings_source_not_operational"
+        )
+        qqq = {
+            "status": (
+                "LAST_KNOWN_GOOD"
+                if _explicit_last_known_good(qqq)
+                else "NOT_AVAILABLE"
+            ),
+            "holdings": (
+                list(qqq.get("holdings") or qqq.get("top_holdings") or [])
+                if _explicit_last_known_good(qqq)
+                else []
+            ),
+            "holdings_count": (
+                int(qqq.get("holdings_count") or 0)
+                if _explicit_last_known_good(qqq)
+                else 0
+            ),
+            "source": qqq.get("source"),
+            "source_url": qqq.get("source_url"),
+            "data_as_of": qqq.get("data_as_of"),
+            "age_minutes": qqq.get("age_minutes"),
+            "valid_until": qqq.get("valid_until"),
+            "reliability": qqq.get("reliability"),
+            "last_known_good": _explicit_last_known_good(qqq),
+            "reason": invalid_reason,
+            "lifecycle": qqq.get("lifecycle") or {},
+        }
+        output["concentration"] = {}
+        output["sector_exposure"] = {}
+        output["mega_cap_breadth"] = {}
+        output["semiconductor_context"] = {}
+        if not _explicit_last_known_good(qqq):
+            output["status"] = "NOT_AVAILABLE"
     method = str(qqq.get("weight_method") or "")
     calculated = bool(qqq.get("weight_verified"))
     official = bool(qqq.get("weight_is_official"))
@@ -582,6 +631,98 @@ def _harden_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
         earnings["security_event_count"] = len(events)
     output["earnings"] = earnings
     return output
+
+
+def _temporal_projection_changed(
+    full: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    calendar = full.get("event_calendar") or {}
+    rows = [
+        item
+        for section in (
+            "critical_macro_events",
+            "fed_communications",
+            "other_economic_events",
+        )
+        for item in calendar.get(section) or []
+        if isinstance(item, dict)
+    ]
+    rows.extend(
+        item
+        for item in full.get("events_today") or []
+        if isinstance(item, dict)
+    )
+    return any(
+        str(item.get("temporal_status") or item.get("status") or "").upper()
+        != str(temporal_event_state(item, now=now)["temporal_status"]).upper()
+        for item in rows
+    )
+
+
+def _explicit_last_known_good(value: dict[str, Any]) -> bool:
+    status = str(value.get("status") or "").upper()
+    lifecycle = value.get("lifecycle") if isinstance(value.get("lifecycle"), dict) else {}
+    marked = bool(
+        value.get("last_known_good")
+        or value.get("last_known_good_used")
+        or status in {"LAST_KNOWN_GOOD", "STALE_ACCEPTABLE"}
+        or str(lifecycle.get("freshness_state") or "").upper()
+        == "STALE_LAST_KNOWN_GOOD"
+    )
+    data_as_of = value.get("data_as_of") or lifecycle.get("data_as_of")
+    valid_until = value.get("valid_until") or lifecycle.get("valid_until")
+    age = (
+        value.get("age_minutes")
+        if value.get("age_minutes") is not None
+        else value.get("age_hours")
+        if value.get("age_hours") is not None
+        else lifecycle.get("age_minutes")
+    )
+    reliability = value.get("reliability")
+    penalized = bool(
+        value.get("quality_penalty")
+        or value.get("confidence_penalty")
+        or (
+            reliability is not None
+            and float(reliability) < 1.0
+        )
+    )
+    return bool(
+        marked
+        and data_as_of
+        and valid_until
+        and age is not None
+        and penalized
+    )
+
+
+def _operational_holdings_source(value: dict[str, Any]) -> bool:
+    explicit_last_known_good = _explicit_last_known_good(value)
+    if explicit_last_known_good:
+        return bool(value.get("holdings") or value.get("top_holdings"))
+    validation = value.get("validation") if isinstance(value.get("validation"), dict) else {}
+    lifecycle = value.get("lifecycle") if isinstance(value.get("lifecycle"), dict) else {}
+    invalid = (
+        (
+            str(value.get("status") or "").upper()
+            in {"LAST_KNOWN_GOOD", "STALE_ACCEPTABLE"}
+            and not explicit_last_known_good
+        )
+        or str(value.get("source_classification") or "").lower() == "invalid_source"
+        or str(value.get("source_audit_status") or "").upper()
+        in {"QUARANTINED", "REJECTED"}
+        or str(validation.get("status") or "").lower() == "rejected"
+        or value.get("reliability") == 0
+        or lifecycle.get("currently_valid") is False
+        or str(lifecycle.get("freshness_state") or "").upper()
+        in {"DUE", "EXPIRED", "QUARANTINED"}
+    )
+    return bool(
+        not invalid
+        and (value.get("holdings") or value.get("top_holdings"))
+    )
 
 
 def _harden_corporate_events(corporate: dict[str, Any]) -> dict[str, Any]:
@@ -805,17 +946,69 @@ def _unscheduled_event(raw: Any) -> dict[str, Any]:
     }
 
 
-def _annotate_event_calendar(calendar: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: [_annotate_event(item) for item in values] if isinstance(values, list) else values
+def _annotate_event_calendar(
+    calendar: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    output = {
+        key: [] if isinstance(values, list) else values
         for key, values in calendar.items()
     }
+    selected: dict[str, tuple[str, dict[str, Any]]] = {}
+    for section in (
+        "critical_macro_events",
+        "fed_communications",
+        "other_economic_events",
+    ):
+        for raw in calendar.get(section) or []:
+            item = _annotate_event(raw, now=now)
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("canonical_event_key") or canonical_event_key(item))
+            item["canonical_event_key"] = key
+            current = selected.get(key)
+            if current is None:
+                selected[key] = (section, item)
+                continue
+            current_section, current_item = current
+            selected[key] = (
+                current_section,
+                _merge_event_projection(current_item, item),
+            )
+    for section, item in selected.values():
+        output.setdefault(section, []).append(item)
+    for section in (
+        "critical_macro_events",
+        "fed_communications",
+        "other_economic_events",
+    ):
+        output.setdefault(section, [])
+        output[section].sort(
+            key=lambda item: (
+                str(item.get("release_at") or item.get("time_utc") or ""),
+                str(item.get("name") or ""),
+            )
+        )
+    return output
 
 
-def _annotate_event(raw: Any) -> Any:
+def _annotate_event(raw: Any, *, now: datetime) -> Any:
     if not isinstance(raw, dict):
         return raw
     item = dict(raw)
+    temporal = temporal_event_state(item, now=now)
+    item.update(
+        {
+            "canonical_event_key": temporal["canonical_event_key"],
+            "event_kind": temporal["event_kind"],
+            "temporal_status": temporal["temporal_status"],
+            "status": temporal["temporal_status"],
+            "release_at": temporal["release_at"],
+            "actual": temporal["actual"],
+            "temporal_invalid_reason": temporal["temporal_invalid_reason"],
+        }
+    )
     text = " ".join(str(item.get(key) or "") for key in ("name", "event_name", "category"))
     if "EMPLOYMENT SITUATION" not in text.upper() and "NONFARM" not in text.upper() and "PAYROLL" not in text.upper():
         return item
@@ -845,6 +1038,35 @@ def _annotate_event(raw: Any) -> Any:
         }
     )
     return item
+
+
+def _merge_event_projection(
+    primary: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    output = dict(primary)
+    aliases = list(output.get("duplicate_occurrence_aliases") or [])
+    aliases.append(
+        {
+            "event_id": candidate.get("event_id"),
+            "provider_event_id": candidate.get("provider_event_id"),
+            "name": candidate.get("name"),
+            "category": candidate.get("category"),
+            "source": candidate.get("source"),
+            "source_url": candidate.get("source_url"),
+        }
+    )
+    for key, value in candidate.items():
+        if output.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+            output[key] = value
+    primary_actual = output.get("actual")
+    candidate_actual = candidate.get("actual")
+    if primary_actual in (None, "") and candidate_actual not in (None, ""):
+        output["actual"] = candidate_actual
+        output["temporal_status"] = candidate.get("temporal_status")
+        output["status"] = candidate.get("status")
+    output["duplicate_occurrence_aliases"] = aliases
+    return output
 
 
 def _walk_semantics(value: Any, *, session_status: str, now: datetime) -> None:

@@ -571,6 +571,18 @@ class Settings(BaseSettings):
         ge=5,
         validation_alias="AI_MARKET_LIFECYCLE_DUE_SCANNER_INTERVAL_SECONDS",
     )
+    lifecycle_startup_catchup_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        validation_alias="AI_MARKET_LIFECYCLE_STARTUP_CATCHUP_HOURS",
+    )
+    lifecycle_retry_deadline_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        validation_alias="AI_MARKET_LIFECYCLE_RETRY_DEADLINE_HOURS",
+    )
     lifecycle_due_lease_seconds: int = Field(
         default=120,
         ge=10,

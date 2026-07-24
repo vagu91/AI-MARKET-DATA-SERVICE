@@ -23,6 +23,7 @@ from app.services.event_driven_lifecycle_service import (
     LifecycleRepository,
     TRIGGER_CLASS_BY_ENTITY,
     compute_datum_lifecycle,
+    material_changes,
 )
 from app.services.research_agent_enablement import is_research_agent_enabled
 from app.services.research_gap_manifest import TOPIC_PROFILES
@@ -53,6 +54,7 @@ class ResearchSchedulerService:
         ai_enqueue: Callable[[list[dict[str, Any]]], Any] | None = None,
         trigger_type: str | None = None,
         force: bool = False,
+        due_since: datetime | None = None,
     ) -> dict[str, Any]:
         """Lease due work, run resolvers first, and enqueue AI once for residuals."""
         if not self.settings.lifecycle_due_scanner_enabled and not force:
@@ -63,7 +65,11 @@ class ResearchSchedulerService:
                 "claimed": 0,
             }
         now = self.clock()
-        claimed = self.lifecycle.claim_due(owner=owner, now=now)
+        claimed = self.lifecycle.claim_due(
+            owner=owner,
+            now=now,
+            due_since=due_since,
+        )
         self.telemetry.emit(
             "lease",
             identifiers={"correlation_id": owner},
@@ -148,6 +154,86 @@ class ResearchSchedulerService:
                     "reason": str(provider_result.get("reason") or ""),
                 },
             )
+            provider_status = str(
+                provider_result.get("status") or "NOT_CONFIGURED"
+            ).upper()
+            if provider_status == "PARTIAL":
+                datum = provider_result.get("datum")
+                lifecycle = provider_result.get("lifecycle")
+                missing_fields = list(
+                    provider_result.get("missing_fields")
+                    or item.get("fields_attempted")
+                    or []
+                )
+                if isinstance(lifecycle, DatumLifecycle):
+                    lifecycle_value = lifecycle.as_dict()
+                elif isinstance(lifecycle, dict):
+                    lifecycle_value = lifecycle
+                else:
+                    lifecycle_value = compute_datum_lifecycle(
+                        str(item.get("entity_type") or "unknown"),
+                        str(item.get("entity_key") or ""),
+                        datum if isinstance(datum, dict) else {},
+                        settings=self.settings,
+                        now=now,
+                        triggering_event=effective_trigger_type,
+                        refresh_reason="provider_partial_resolution",
+                    ).as_dict()
+                if isinstance(datum, dict) and datum:
+                    snapshot = self._rematerialize_provider_resolution(
+                        item=item,
+                        datum=datum,
+                        lifecycle=lifecycle_value,
+                        trigger_type=effective_trigger_type,
+                        owner=owner,
+                        now=now,
+                        final_resolution=False,
+                    )
+                    if snapshot is not None:
+                        rematerialized.append(str(snapshot["snapshot_id"]))
+                unresolved = {
+                    **item,
+                    "provider_resolver_status": "PARTIAL",
+                    "effective_trigger_type": effective_trigger_type,
+                    "trigger_correlation_id": trigger_correlation_id,
+                    "fields_attempted": missing_fields,
+                }
+                residual.append(unresolved)
+                agent_status = str(
+                    provider_result.get("agent_status")
+                    or (
+                        "ENABLED"
+                        if provider_result.get("ai_eligible") is True
+                        else "DISABLED"
+                    )
+                )
+                ai_decisions.append(
+                    {
+                        "item_id": item_id,
+                        "agent_status": agent_status,
+                        "execution_status": str(
+                            provider_result.get("execution_status")
+                            or (
+                                "ELIGIBLE"
+                                if provider_result.get("ai_eligible") is True
+                                else "NOT_REQUESTED"
+                            )
+                        ),
+                    }
+                )
+                if (
+                    missing_fields
+                    and provider_result.get("ai_eligible") is True
+                ):
+                    ai_eligible.append(unresolved)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "PARTIAL",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                continue
             if str(provider_result.get("status") or "").upper() in {
                 "RESOLVED",
                 "FRESH",
@@ -198,14 +284,14 @@ class ResearchSchedulerService:
                     }
                 )
                 continue
-            provider_status = str(
-                provider_result.get("status") or "NOT_CONFIGURED"
-            ).upper()
             unresolved = {
                 **item,
                 "provider_resolver_status": provider_status,
                 "effective_trigger_type": effective_trigger_type,
                 "trigger_correlation_id": trigger_correlation_id,
+                "retry_deadline_exhausted": bool(
+                    provider_result.get("retry_deadline_exhausted")
+                ),
             }
             if provider_status == "DEFERRED":
                 deferred_lifecycle = provider_result.get("lifecycle")
@@ -348,19 +434,25 @@ class ResearchSchedulerService:
                     ),
                     "",
                 )
+                terminal_status = (
+                    "NO_DATA"
+                    if item.get("retry_deadline_exhausted")
+                    else "DISABLED"
+                    if agent_status == "DISABLED"
+                    else "IDLE"
+                )
+                terminal_reason = (
+                    "retry_deadline_exhausted_no_data"
+                    if item.get("retry_deadline_exhausted")
+                    else "agent_disabled_ai_not_requested"
+                    if agent_status == "DISABLED"
+                    else "provider_unresolved_ai_not_configured"
+                )
                 self.lifecycle.transition(
                     str(item["item_id"]),
                     owner=owner,
-                    work_status=(
-                        "DISABLED" if agent_status == "DISABLED" else "IDLE"
-                    ),
-                    refresh_reason=(
-                        "provider_deferred_ai_not_requested"
-                        if str(item.get("provider_resolver_status")) == "DEFERRED"
-                        else "agent_disabled_ai_not_requested"
-                        if agent_status == "DISABLED"
-                        else "provider_unresolved_ai_not_configured"
-                    ),
+                    work_status=terminal_status,
+                    refresh_reason=terminal_reason,
                     next_refresh_at=(
                         now
                         + timedelta(
@@ -372,25 +464,27 @@ class ResearchSchedulerService:
                     now=now,
                 )
                 self.telemetry.emit(
-                    "retry_backoff",
+                    (
+                        "provider_call"
+                        if terminal_status == "NO_DATA"
+                        else "retry_backoff"
+                    ),
                     identifiers={"correlation_id": owner},
                     decision_summary=(
-                        "unresolved lifecycle item deferred to bounded next check"
+                        "resolver chain reached a terminal no-data outcome"
+                        if terminal_status == "NO_DATA"
+                        else "unresolved lifecycle item deferred to bounded next check"
                     ),
-                    stop_reason="DEFERRED",
+                    stop_reason=terminal_status,
                     payload={
-                        "status": "IDLE",
-                        "reason": "provider_unresolved_ai_not_requested",
+                        "status": terminal_status,
+                        "reason": terminal_reason,
                     },
                 )
                 item_outcomes.append(
                     {
                         "item_id": str(item["item_id"]),
-                        "status": (
-                            "DISABLED"
-                            if agent_status == "DISABLED"
-                            else "IDLE"
-                        ),
+                        "status": terminal_status,
                         "effective_trigger_type": item.get(
                             "effective_trigger_type"
                         ),
@@ -414,6 +508,56 @@ class ResearchSchedulerService:
             "coalesced": len(ai_eligible) > 1,
         }
 
+    def startup_catch_up(
+        self,
+        *,
+        resolver: Callable[[dict[str, Any]], dict[str, Any]],
+        ai_enqueue: Callable[[list[dict[str, Any]]], Any],
+    ) -> dict[str, Any]:
+        if not (
+            self.settings.enable_scheduler
+            and self.settings.research_scheduler_enabled
+            and self.settings.lifecycle_due_scanner_enabled
+        ):
+            return {
+                "status": "DISABLED",
+                "reason": "scheduler_or_due_scanner_disabled",
+                "claimed": 0,
+                "provider_calls": 0,
+                "ai_invocations": 0,
+                "writes": 0,
+            }
+        now = self.clock()
+        window_start = now - timedelta(
+            hours=int(self.settings.lifecycle_startup_catchup_hours)
+        )
+        result = self.scan_due_items(
+            owner="startup-lifecycle-catch-up",
+            resolver=resolver,
+            ai_enqueue=ai_enqueue,
+            due_since=window_start,
+        )
+        self.telemetry.emit(
+            "startup_catch_up",
+            identifiers={"correlation_id": "startup-lifecycle-catch-up"},
+            decision_summary="bounded startup lifecycle reconciliation completed",
+            stop_reason=str(result.get("status") or "COMPLETED"),
+            payload={
+                "status": str(result.get("status") or "COMPLETED"),
+                "reason": (
+                    f"window_hours:{self.settings.lifecycle_startup_catchup_hours};"
+                    f"claimed:{result.get('claimed', 0)}"
+                ),
+            },
+        )
+        return {
+            **result,
+            "catch_up_window_start": window_start.isoformat(),
+            "catch_up_window_hours": int(
+                self.settings.lifecycle_startup_catchup_hours
+            ),
+        }
+
     def _rematerialize_provider_resolution(
         self,
         *,
@@ -423,6 +567,7 @@ class ResearchSchedulerService:
         trigger_type: str | None,
         owner: str,
         now: datetime,
+        final_resolution: bool = True,
     ) -> dict[str, Any] | None:
         previous = self.snapshots.latest("MNQ")
         if previous is None:
@@ -448,6 +593,35 @@ class ResearchSchedulerService:
         debug["generated_at_utc"] = now.astimezone(UTC).replace(
             microsecond=0
         ).isoformat()
+        from app.services.ai_trader_consumer_v2_service import (
+            build_ai_trader_consumer_v2,
+        )
+
+        candidate_consumer = build_ai_trader_consumer_v2(
+            debug,
+            settings=self.settings,
+        )
+        changed_sections, _ = material_changes(
+            previous.get("consumer_payload") or {},
+            candidate_consumer,
+        )
+        if not changed_sections:
+            self.telemetry.emit(
+                "materialization",
+                identifiers={
+                    "correlation_id": owner,
+                    "snapshot_id": previous.get("snapshot_id"),
+                },
+                decision_summary=(
+                    "provider resolution produced no material consumer change"
+                ),
+                stop_reason="NO_CHANGE",
+                payload={
+                    "status": "UNCHANGED",
+                    "reason": str(trigger_type or ""),
+                },
+            )
+            return None
         snapshot = self.snapshots.save_next(
             symbol="MNQ",
             refresh_mode="lifecycle_provider_resolution",
@@ -456,8 +630,10 @@ class ResearchSchedulerService:
             trigger_type=trigger_type,
             trigger_entity=str(item.get("entity_key") or ""),
             correlation_id=owner,
-            resolved_lifecycle=DatumLifecycle(**lifecycle),
-            resolved_datum=datum,
+            resolved_lifecycle=(
+                DatumLifecycle(**lifecycle) if final_resolution else None
+            ),
+            resolved_datum=datum if final_resolution else None,
         )
         self.telemetry.emit(
             "materialization",
