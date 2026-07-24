@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ import pytest
 
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
+from app.main import run_lifecycle_due_scan
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_worker import AIResearchWorker
 from app.services.event_driven_lifecycle_service import (
@@ -20,6 +22,7 @@ from app.services.lifecycle_due_resolver import (
     TemporaryLifecycleProviderError,
 )
 from app.services.market_context_outbox_service import MarketContextOutboxRepository
+from app.services.market_context_outbox_service import TriggerEnvelope
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
@@ -85,6 +88,206 @@ def seed_snapshot(settings: Settings) -> dict[str, Any]:
             },
         },
         ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+
+
+def seed_due_trigger(
+    settings: Settings,
+    *,
+    entity_type: str,
+    entity_key: str,
+) -> dict[str, Any]:
+    datum = {
+        "value": 1,
+        "observed_at": (NOW - timedelta(hours=2)).isoformat(),
+        "valid_until": (NOW - timedelta(minutes=1)).isoformat(),
+    }
+    lifecycle = compute_datum_lifecycle(
+        entity_type,
+        entity_key,
+        datum,
+        settings=settings,
+        now=NOW,
+        fields_attempted=["value"],
+    )
+    assert lifecycle.trigger_class == "TRIGGER"
+    return LifecycleRepository(settings, clock=lambda: NOW).upsert(
+        lifecycle,
+        payload=datum,
+    )
+
+
+class _OfflineTriggerMaterializer:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        snapshots: MarketContextSnapshotRepository,
+    ) -> None:
+        self.settings = settings
+        self.snapshots = snapshots
+        self.calls = 0
+        self.trigger_envelopes: list[dict[str, Any]] = []
+
+    def materialize_for_job(
+        self,
+        *,
+        job: dict[str, Any],
+        ai_enrichment: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls += 1
+        envelope_value = dict(
+            (job.get("request_payload") or {}).get("trigger_envelope") or {}
+        )
+        self.trigger_envelopes.append(envelope_value)
+        trigger = TriggerEnvelope.from_mapping(envelope_value)
+        assert trigger is not None
+        previous = self.snapshots.latest("MNQ")
+        assert previous is not None
+        debug = dict(previous["debug_payload"])
+        risk = dict(debug.get("risk_context") or {})
+        risk["status"] = "AVAILABLE"
+        risk["vix"] = {
+            "value": 19.0,
+            "data_as_of": NOW.isoformat(),
+            "valid_until": (NOW + timedelta(hours=1)).isoformat(),
+        }
+        debug["risk_context"] = risk
+        debug["generated_at_utc"] = NOW.isoformat()
+        return self.snapshots.save_next(
+            symbol="MNQ",
+            refresh_mode="offline_ai_completion",
+            debug_payload=debug,
+            ai_enrichment=ai_enrichment,
+            source_job_id=str(job["job_id"]),
+            job_ids=[str(job["job_id"])],
+            **trigger.snapshot_arguments(),
+        )
+
+
+async def test_real_due_scan_preserves_trigger_through_offline_ai_completion(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    snapshots = MarketContextSnapshotRepository(settings)
+    seed_snapshot(settings)
+    seed_due_trigger(
+        settings,
+        entity_type="macro_actual",
+        entity_key="CPI:2026-07",
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+    state = {
+        "research_scheduler": scheduler,
+        "lifecycle_due_resolver": DeterministicLifecycleDueResolver(
+            settings,
+            clock=lambda: NOW,
+        ),
+    }
+
+    first = await run_lifecycle_due_scan(state)
+    jobs = AIResearchJobRepository(settings, clock=lambda: NOW).latest(limit=10)
+    assert first["ai_invocations"] == 1
+    assert len(jobs) == 1
+    assert jobs[0]["request_payload"]["trigger_envelope"] == {
+        "trigger_type": "macro_actual",
+        "trigger_entity": "CPI:2026-07",
+        "correlation_id": first["effective_triggers"][0]["correlation_id"],
+    }
+
+    backend_calls: list[str] = []
+    materializer = _OfflineTriggerMaterializer(settings, snapshots=snapshots)
+    worker = AIResearchWorker(
+        settings,
+        repository=AIResearchJobRepository(settings, clock=lambda: NOW),
+        executor=lambda *_: backend_calls.append("offline") or {
+            "status": "NO_DATA",
+            "results": [],
+        },
+        snapshots=snapshots,
+        worker_id="offline-trigger-worker",
+    )
+    worker.materializer = materializer
+    assert worker.process_once() is True
+    assert backend_calls == ["offline"]
+    assert materializer.calls == 1
+
+    second = await run_lifecycle_due_scan(state)
+    assert second["claimed"] == 0
+    assert second["ai_invocations"] == 0
+    assert worker.process_once() is False
+    with connect_sqlite(settings.database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ai_research_jobs"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM market_context_snapshots"
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM market_context_outbox"
+        ).fetchone()[0] == 1
+    event = MarketContextOutboxRepository(settings).list_events(status=None)[0]
+    assert event["trigger_type"] == "macro_actual"
+    assert event["trigger_entity"] == "CPI:2026-07"
+
+
+def test_coalesced_residuals_preserve_per_item_trigger_and_suppress_nontriggering(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path, lifecycle_due_max_concurrency=5)
+    macro = seed_due_trigger(
+        settings,
+        entity_type="macro_actual",
+        entity_key="CPI:2026-07",
+    )
+    news = seed_due_trigger(
+        settings,
+        entity_type="breaking_news",
+        entity_key="news-1",
+    )
+    nontrigger_datum = {
+        "value": "risk",
+        "observed_at": (NOW - timedelta(hours=2)).isoformat(),
+        "valid_until": (NOW - timedelta(minutes=1)).isoformat(),
+    }
+    nontrigger_lifecycle = compute_datum_lifecycle(
+        "geopolitical_regulatory_risk",
+        "risk-1",
+        nontrigger_datum,
+        settings=settings,
+        now=NOW,
+        fields_attempted=["value"],
+    )
+    assert nontrigger_lifecycle.trigger_class == "NON_TRIGGERING"
+    nontrigger = LifecycleRepository(settings, clock=lambda: NOW).upsert(
+        nontrigger_lifecycle,
+        payload=nontrigger_datum,
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+    resolver = DeterministicLifecycleDueResolver(settings, clock=lambda: NOW)
+
+    result = scheduler.scan_due_items(
+        owner="per-item-triggers",
+        resolver=resolver.resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+    assert result["ai_invocations"] == 1
+    assert result["coalesced"] is True
+    jobs = AIResearchJobRepository(settings).latest(limit=10)
+    assert len(jobs) == 3, (result, jobs)
+    by_item = {
+        job["request_payload"]["lifecycle_item_id"]: job
+        for job in jobs
+    }
+    assert by_item[macro["item_id"]]["request_payload"]["trigger_envelope"][
+        "trigger_type"
+    ] == "macro_actual"
+    assert by_item[news["item_id"]]["request_payload"]["trigger_envelope"][
+        "trigger_type"
+    ] == "breaking_news"
+    assert (
+        by_item[nontrigger["item_id"]]["request_payload"]["trigger_envelope"]
+        is None
     )
 
 
@@ -288,6 +491,76 @@ class _FailingProvider:
     def resolve(self, _: dict[str, Any]) -> dict[str, Any]:
         self.calls += 1
         raise TemporaryLifecycleProviderError("provider_timeout")
+
+
+def test_mixed_deferred_and_ai_eligible_batch_reports_backoff_consistently(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path, lifecycle_no_data_retry_seconds="60")
+    deferred_item = seed_due_trigger(
+        settings,
+        entity_type="macro_actual",
+        entity_key="CPI:2026-07",
+    )
+    eligible_item = seed_due_trigger(
+        settings,
+        entity_type="breaking_news",
+        entity_key="news-1",
+    )
+    provider = _FailingProvider()
+    resolver = DeterministicLifecycleDueResolver(
+        settings,
+        clock=lambda: NOW,
+        adapters={"macro_actual": provider},
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+
+    first = scheduler.scan_due_items(
+        owner="mixed-review-1",
+        resolver=resolver.resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+    assert first["backoff"] == [deferred_item["item_id"]]
+    assert first["ai_eligible_count"] == 1
+    assert first["ai_invocations"] == 1
+    assert first["residual_count"] == 1
+    assert {
+        item["item_id"]: item["status"]
+        for item in first["item_outcomes"]
+    } == {
+        deferred_item["item_id"]: "BACKOFF",
+        eligible_item["item_id"]: "AI_QUEUED",
+    }
+
+    stored = {
+        item["item_id"]: item
+        for item in LifecycleRepository(settings).list_items()
+    }
+    deferred = stored[deferred_item["item_id"]]
+    assert deferred["work_status"] == "BACKOFF"
+    assert deferred["next_retry_at"] == deferred["negative_cache_expires_at"]
+    with connect_sqlite(settings.database_path) as conn:
+        telemetry = [
+            json.loads(row[0])
+            for row in conn.execute(
+                """
+                SELECT payload_json FROM service_telemetry_events
+                WHERE event_name='retry_backoff'
+                ORDER BY occurred_at,telemetry_id
+                """
+            ).fetchall()
+        ]
+    assert telemetry[-1]["payload"]["status"] == "BACKOFF"
+
+    second = scheduler.scan_due_items(
+        owner="mixed-review-2",
+        resolver=resolver.resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+    assert second["claimed"] == 0
+    assert second["provider_calls"] == 0
+    assert second["ai_invocations"] == 0
+    assert provider.calls == 1
 
 
 def test_temporary_provider_error_sets_backoff_and_negative_cache(

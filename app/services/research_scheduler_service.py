@@ -83,8 +83,25 @@ class ResearchSchedulerService:
         ai_eligible: list[dict[str, Any]] = []
         ai_decisions: list[dict[str, str]] = []
         deferred: list[str] = []
+        backoff: list[str] = []
+        item_outcomes: list[dict[str, str | None]] = []
+        effective_triggers: list[dict[str, str]] = []
         for item in claimed:
             item_id = str(item["item_id"])
+            effective_trigger_type = _effective_trigger_type(
+                item,
+                explicit_trigger_type=trigger_type,
+            )
+            trigger_correlation_id = f"lifecycle-{item_id}"
+            if effective_trigger_type:
+                effective_triggers.append(
+                    {
+                        "item_id": item_id,
+                        "trigger_type": effective_trigger_type,
+                        "trigger_entity": str(item.get("entity_key") or ""),
+                        "correlation_id": trigger_correlation_id,
+                    }
+                )
             if (
                 item.get("trigger_class") == "REFRESH_ON_TRIGGER"
                 and not has_trigger
@@ -105,6 +122,13 @@ class ResearchSchedulerService:
                     now=now,
                 )
                 deferred.append(item_id)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "READY",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
                 continue
             provider_result = (
                 resolver(item)
@@ -139,22 +163,14 @@ class ResearchSchedulerService:
                             datum,
                             settings=self.settings,
                             now=now,
-                            triggering_event=trigger_type,
+                            triggering_event=effective_trigger_type,
                             refresh_reason="provider_resolution_completed",
                         )
                     snapshot = self._rematerialize_provider_resolution(
                         item=item,
                         datum=datum,
                         lifecycle=lifecycle.as_dict(),
-                        trigger_type=(
-                            trigger_type
-                            or item.get("triggering_event")
-                            or (
-                                item.get("entity_type")
-                                if item.get("trigger_class") == "TRIGGER"
-                                else None
-                            )
-                        ),
+                        trigger_type=effective_trigger_type,
                         owner=owner,
                         now=now,
                     )
@@ -174,6 +190,13 @@ class ResearchSchedulerService:
                         now=now,
                     )
                 resolved.append(item_id)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "RESOLVED",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
                 continue
             provider_status = str(
                 provider_result.get("status") or "NOT_CONFIGURED"
@@ -181,7 +204,79 @@ class ResearchSchedulerService:
             unresolved = {
                 **item,
                 "provider_resolver_status": provider_status,
+                "effective_trigger_type": effective_trigger_type,
+                "trigger_correlation_id": trigger_correlation_id,
             }
+            if provider_status == "DEFERRED":
+                deferred_lifecycle = provider_result.get("lifecycle")
+                deferred_datum = provider_result.get("datum")
+                if isinstance(deferred_lifecycle, dict):
+                    deferred_lifecycle = DatumLifecycle(**deferred_lifecycle)
+                if deferred_lifecycle is None:
+                    deferred_lifecycle = compute_datum_lifecycle(
+                        str(item.get("entity_type") or "unknown"),
+                        str(item.get("entity_key") or ""),
+                        {
+                            "refresh_reason": str(
+                                provider_result.get("reason")
+                                or "provider_temporary_failure"
+                            )
+                        },
+                        settings=self.settings,
+                        now=now,
+                        attempt_count=int(item.get("attempt_count") or 0) + 1,
+                        no_data=True,
+                        fields_attempted=list(
+                            item.get("fields_attempted") or []
+                        ),
+                        session_state=item.get("session_state"),
+                        triggering_event=effective_trigger_type,
+                        retry_class="PROVIDER_TEMPORARY",
+                        refresh_reason=str(
+                            provider_result.get("reason")
+                            or "provider_temporary_failure"
+                        ),
+                    )
+                if not isinstance(deferred_datum, dict):
+                    deferred_datum = {
+                        "reason": str(
+                            provider_result.get("reason")
+                            or "provider_temporary_failure"
+                        ),
+                        "fields_attempted": list(
+                            item.get("fields_attempted") or []
+                        ),
+                    }
+                self.lifecycle.upsert(
+                    deferred_lifecycle,
+                    payload=deferred_datum,
+                    work_status="BACKOFF",
+                )
+                deferred.append(item_id)
+                backoff.append(item_id)
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": "BACKOFF",
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                self.telemetry.emit(
+                    "retry_backoff",
+                    identifiers={"correlation_id": owner},
+                    decision_summary=(
+                        "temporary provider failure persisted as negative-cache backoff"
+                    ),
+                    stop_reason="BACKOFF",
+                    payload={
+                        "status": "BACKOFF",
+                        "reason": str(
+                            provider_result.get("reason")
+                            or "provider_temporary_failure"
+                        ),
+                    },
+                )
+                continue
             residual.append(unresolved)
             ai_decisions.append(
                 {
@@ -204,19 +299,6 @@ class ResearchSchedulerService:
                     ),
                 }
             )
-            if provider_status == "DEFERRED":
-                deferred_lifecycle = provider_result.get("lifecycle")
-                deferred_datum = provider_result.get("datum")
-                if deferred_lifecycle is not None and isinstance(
-                    deferred_datum, dict
-                ):
-                    self.lifecycle.upsert(
-                        deferred_lifecycle,
-                        payload=deferred_datum,
-                        work_status="BACKOFF",
-                    )
-                    deferred.append(item_id)
-                    continue
             if (
                 resolver is not None
                 and provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
@@ -244,6 +326,15 @@ class ResearchSchedulerService:
                     work_status="QUEUED",
                     refresh_reason="provider_exhausted_ai_queued",
                     now=now,
+                )
+                item_outcomes.append(
+                    {
+                        "item_id": str(item["item_id"]),
+                        "status": "AI_QUEUED",
+                        "effective_trigger_type": item.get(
+                            "effective_trigger_type"
+                        ),
+                    }
                 )
         else:
             for item in residual:
@@ -292,6 +383,19 @@ class ResearchSchedulerService:
                         "reason": "provider_unresolved_ai_not_requested",
                     },
                 )
+                item_outcomes.append(
+                    {
+                        "item_id": str(item["item_id"]),
+                        "status": (
+                            "DISABLED"
+                            if agent_status == "DISABLED"
+                            else "IDLE"
+                        ),
+                        "effective_trigger_type": item.get(
+                            "effective_trigger_type"
+                        ),
+                    }
+                )
         return {
             "status": "COMPLETED",
             "claimed": len(claimed),
@@ -299,9 +403,12 @@ class ResearchSchedulerService:
             "resolved": resolved,
             "rematerialized_snapshot_ids": rematerialized,
             "deferred": deferred,
+            "backoff": backoff,
             "residual_count": len(residual),
             "ai_eligible_count": len(ai_eligible),
             "ai_decisions": ai_decisions,
+            "item_outcomes": item_outcomes,
+            "effective_triggers": effective_triggers,
             "ai_invocations": ai_invocations,
             "enqueue_result": enqueue_result,
             "coalesced": len(ai_eligible) > 1,
@@ -380,6 +487,14 @@ class ResearchSchedulerService:
                 profile_id=profile_id,
             ):
                 continue
+            effective_trigger_type = _effective_trigger_type(
+                item,
+                explicit_trigger_type=trigger_type,
+            )
+            trigger_correlation_id = str(
+                item.get("trigger_correlation_id")
+                or f"lifecycle-{item.get('item_id')}"
+            )
             job, created = self.service.enqueue_explicit(
                 job_type=profile_id,
                 symbol="MNQ",
@@ -390,11 +505,11 @@ class ResearchSchedulerService:
                     "database_context": item.get("payload") or {},
                     "trigger_envelope": (
                         {
-                            "trigger_type": trigger_type,
+                            "trigger_type": effective_trigger_type,
                             "trigger_entity": item.get("entity_key"),
-                            "correlation_id": f"lifecycle-{item.get('item_id')}",
+                            "correlation_id": trigger_correlation_id,
                         }
-                        if trigger_type
+                        if effective_trigger_type
                         else None
                     ),
                 },
@@ -654,6 +769,28 @@ def _topic_for_entity(entity_type: str) -> str:
     if normalized in {"breaking_news", "news"}:
         return "news"
     return normalized
+
+
+def _effective_trigger_type(
+    item: dict[str, Any],
+    *,
+    explicit_trigger_type: str | None,
+) -> str | None:
+    if str(item.get("trigger_class") or "") == "NON_TRIGGERING":
+        return None
+    explicit = str(explicit_trigger_type or "").strip()
+    if explicit:
+        return explicit
+    preserved = str(item.get("effective_trigger_type") or "").strip()
+    if preserved:
+        return preserved
+    triggering_event = str(item.get("triggering_event") or "").strip()
+    if triggering_event:
+        return triggering_event
+    if str(item.get("trigger_class") or "") == "TRIGGER":
+        entity_type = str(item.get("entity_type") or "").strip()
+        return entity_type or None
+    return None
 
 
 def _project_resolved_datum(
