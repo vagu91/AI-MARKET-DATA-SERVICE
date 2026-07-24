@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
@@ -24,21 +24,49 @@ PROVIDERS = {"BLS": BlsProvider, "BEA": BeaProvider}
 class DeterministicActualResolver:
     """Resolve event-semantic actuals from official observations, never raw macro levels."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        providers: Mapping[str, Any] | None = None,
+    ) -> None:
         self.settings = settings
         self.candidates = EventValueCandidateRepository(settings)
         self.cache = ProviderCacheRepository(settings.database_path)
+        self.providers = dict(providers or PROVIDERS)
 
     def __call__(self, job: dict[str, Any], workspace: Path, timeout_seconds: int) -> dict[str, Any]:
         del workspace, timeout_seconds
         event_key = str(job.get("event_key") or "")
-        existing = self.candidates.accepted_official_actual(event_key) if event_key else None
-        if existing is not None:
-            return {"status": "SUCCEEDED", "results": [existing], "resolution": "persisted_candidate"}
-
         request = job.get("request_payload") or {}
         event = request.get("event") or {}
         temporal = request.get("temporal_state") or {}
+        return self.resolve_event(
+            event_key=event_key,
+            event=event,
+            temporal_state=temporal,
+            expected_period=request.get("expected_period"),
+        )
+
+    def resolve_event(
+        self,
+        *,
+        event_key: str,
+        event: dict[str, Any],
+        temporal_state: dict[str, Any],
+        expected_period: Any = None,
+    ) -> dict[str, Any]:
+        existing = (
+            self.candidates.accepted_official_actual(event_key)
+            if event_key
+            else None
+        )
+        if existing is not None:
+            return {
+                "status": "SUCCEEDED",
+                "results": [existing],
+                "resolution": "persisted_candidate",
+            }
         metric_id = _semantic_metric_id(event)
         if metric_id in UNSUPPORTED_OFFICIAL_METRICS:
             return {
@@ -51,11 +79,16 @@ class DeterministicActualResolver:
                 "status": "NO_DATA", "results": [],
                 "error": f"official_metric_unsupported:{metric_id or 'UNKNOWN'}",
             }
-        provider_type = PROVIDERS.get(spec.provider)
-        if provider_type is None:
+        provider_config = self.providers.get(spec.provider)
+        if provider_config is None:
             return {"status": "NO_DATA", "results": [], "error": "official_provider_adapter_unavailable"}
+        provider = (
+            provider_config(self.cache, self.settings)
+            if isinstance(provider_config, type)
+            else provider_config
+        )
         try:
-            result = asyncio.run(provider_type(self.cache, self.settings).fetch())
+            result = asyncio.run(provider.fetch())
         except Exception as exc:
             return _feed_delayed(f"official_provider_unavailable:{type(exc).__name__}")
         rows = result.data if isinstance(result.data, dict) else {}
@@ -75,8 +108,16 @@ class DeterministicActualResolver:
         if source_adjustment and source_adjustment != spec.seasonal_adjustment:
             return {"status": "NO_DATA", "results": [], "error": "seasonal_adjustment_mismatch"}
         retrieved_at = result.metadata.retrieved_at.isoformat()
-        release_timestamp = temporal.get("release_at") or event.get("time_utc")
-        expected_period = event.get("reference_period") or event.get("period") or request.get("expected_period")
+        release_timestamp = (
+            temporal_state.get("release_at")
+            or event.get("release_at")
+            or event.get("time_utc")
+        )
+        expected_period = (
+            event.get("reference_period")
+            or event.get("period")
+            or expected_period
+        )
         try:
             candidate = derive_official_actual(
                 spec,

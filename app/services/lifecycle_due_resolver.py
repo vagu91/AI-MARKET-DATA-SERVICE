@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
 from app.services.event_driven_lifecycle_service import compute_datum_lifecycle
 from app.services.research_agent_enablement import research_agent_enablement
+from app.services.temporal_domain_service import canonical_event_key
 
 
 class TemporaryLifecycleProviderError(RuntimeError):
@@ -72,6 +73,177 @@ class CallableLifecycleProviderAdapter:
         return {
             "status": "PARTIAL" if missing_fields else "RESOLVED",
             "reason": f"{self.name}_resolved",
+            "datum": datum,
+            "missing_fields": missing_fields,
+        }
+
+
+class MacroActualLifecycleProviderAdapter:
+    """Resolve a past macro occurrence through its official observation feed."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        event_service: Any,
+        actual_resolver: Any,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.settings = settings
+        self.event_service = event_service
+        self.actual_resolver = actual_resolver
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    def resolve(self, item: dict[str, Any]) -> dict[str, Any]:
+        now = self.clock()
+        payload = (
+            dict(item.get("payload") or {})
+            if isinstance(item.get("payload"), dict)
+            else {}
+        )
+        release = parse_datetime(
+            item.get("event_at")
+            or payload.get("release_at")
+            or payload.get("time_utc")
+        )
+        if release is None:
+            return {
+                "status": "NO_DATA",
+                "reason": "macro_actual_occurrence_time_missing",
+            }
+        if release > now:
+            return {
+                "status": "NO_DATA",
+                "reason": "macro_actual_occurrence_not_released",
+            }
+        lookback_start = now - timedelta(
+            hours=int(self.settings.lifecycle_startup_catchup_hours)
+        )
+        if release < lookback_start:
+            return {
+                "status": "NO_DATA",
+                "reason": "macro_actual_occurrence_outside_lookback",
+            }
+
+        expected_key = str(
+            payload.get("canonical_event_key")
+            or canonical_event_key(payload)
+        )
+        entity_key = str(item.get("entity_key") or "")
+        if entity_key.startswith("event:") and entity_key != expected_key:
+            return {
+                "status": "NO_DATA",
+                "reason": "macro_actual_item_identity_mismatch",
+            }
+        tolerance = timedelta(minutes=1)
+        output = asyncio.run(
+            self.event_service.list_events(
+                country=str(payload.get("country") or "US"),
+                start=max(lookback_start, release - tolerance),
+                end=min(now, release + tolerance),
+                enrich=False,
+            )
+        )
+        rows = [_model_dump(row) for row in output]
+        exact = next(
+            (
+                row
+                for row in rows
+                if canonical_event_key(row) == expected_key
+                and _same_release_minute(row, release)
+            ),
+            None,
+        )
+        if exact is None:
+            provider_results = [
+                _model_dump(result)
+                for result in getattr(
+                    self.event_service,
+                    "last_provider_results",
+                    [],
+                )
+            ]
+            if _has_temporary_provider_failure(
+                {"provider_results": provider_results}
+            ):
+                raise TemporaryLifecycleProviderError(
+                    "macro_actual_calendar_provider_temporary_failure"
+                )
+            return {
+                "status": "NO_DATA",
+                "reason": "macro_actual_exact_occurrence_not_found",
+            }
+
+        resolution = self.actual_resolver.resolve_event(
+            event_key=expected_key,
+            event={
+                **exact,
+                "canonical_event_key": expected_key,
+                "metric_id": (
+                    payload.get("metric_id")
+                    or exact.get("metric_id")
+                ),
+                "reference_period": (
+                    payload.get("reference_period")
+                    or payload.get("period")
+                    or exact.get("reference_period")
+                    or exact.get("period")
+                ),
+            },
+            temporal_state={"release_at": release.isoformat()},
+            expected_period=(
+                payload.get("reference_period")
+                or payload.get("period")
+            ),
+        )
+        status = str(resolution.get("status") or "NO_DATA").upper()
+        if status == "OFFICIAL_FEED_DELAYED" or resolution.get(
+            "retryable"
+        ) is True:
+            return {
+                "status": "DEFERRED",
+                "reason": str(
+                    resolution.get("error")
+                    or "official_macro_actual_feed_delayed"
+                ),
+            }
+        if status in {"FAILED", "TEMPORARY_ERROR"}:
+            return {
+                "status": "DEFERRED",
+                "reason": str(
+                    resolution.get("error")
+                    or "official_macro_actual_resolution_failed"
+                ),
+            }
+        candidates = [
+            candidate
+            for candidate in resolution.get("results") or []
+            if isinstance(candidate, dict)
+            and candidate.get("value") not in (None, "")
+        ]
+        if status != "SUCCEEDED" or not candidates:
+            return {
+                "status": "NO_DATA",
+                "reason": str(
+                    resolution.get("error")
+                    or "official_macro_actual_not_published"
+                ),
+            }
+
+        candidate = candidates[0]
+        datum = _official_actual_datum(
+            exact,
+            candidate=candidate,
+            canonical_key=expected_key,
+            release=release,
+        )
+        missing_fields = _missing_requested_fields(
+            datum,
+            list(item.get("fields_attempted") or []),
+        )
+        return {
+            "status": "PARTIAL" if missing_fields else "RESOLVED",
+            "reason": "official_macro_actual_resolved",
             "datum": datum,
             "missing_fields": missing_fields,
         }
@@ -335,6 +507,9 @@ def existing_lifecycle_provider_adapters(
     macro_service: Any,
     event_service: Any,
     nasdaq_data_service: Any,
+    settings: Settings | None = None,
+    official_actual_resolver: Any | None = None,
+    clock: Callable[[], datetime] | None = None,
     cftc_provider: Any | None = None,
     cboe_risk_indices_provider: Any | None = None,
     cboe_vix_futures_provider: Any | None = None,
@@ -345,7 +520,7 @@ def existing_lifecycle_provider_adapters(
     def macro(_: dict[str, Any]) -> Any:
         return macro_service.latest()
 
-    async def events(_: dict[str, Any]) -> Any:
+    async def schedule_events(_: dict[str, Any]) -> Any:
         rows = await event_service.upcoming(country="US", days=14)
         return {
             "events": [_model_dump(row) for row in rows],
@@ -362,6 +537,19 @@ def existing_lifecycle_provider_adapters(
     def nasdaq(method: str) -> Callable[[dict[str, Any]], Any]:
         return lambda _: getattr(nasdaq_data_service, method)()
 
+    macro_actual_adapter: LifecycleProviderAdapter = (
+        MacroActualLifecycleProviderAdapter(
+            settings=settings,
+            event_service=event_service,
+            actual_resolver=official_actual_resolver,
+            clock=clock,
+        )
+        if settings is not None and official_actual_resolver is not None
+        else StaticLifecycleProviderAdapter(
+            status="NOT_CONFIGURED",
+            reason="official_macro_actual_resolver_not_configured",
+        )
+    )
     adapters: dict[str, LifecycleProviderAdapter] = {
         "macro_snapshot": CallableLifecycleProviderAdapter(
             macro,
@@ -374,15 +562,11 @@ def existing_lifecycle_provider_adapters(
             name="fred_vix",
         ),
         "macro_schedule": CallableLifecycleProviderAdapter(
-            events,
+            schedule_events,
             select=_select_event,
             name="event_service",
         ),
-        "macro_actual": CallableLifecycleProviderAdapter(
-            events,
-            select=_select_event,
-            name="event_service",
-        ),
+        "macro_actual": macro_actual_adapter,
         "nasdaq_100": CallableLifecycleProviderAdapter(
             nasdaq("qqq_holdings"),
             select=_select_model,
@@ -467,6 +651,106 @@ def _model_dump(value: Any) -> dict[str, Any]:
         return dict(value)
     dump = getattr(value, "model_dump", None)
     return dump(mode="json") if callable(dump) else {}
+
+
+def _same_release_minute(
+    event: dict[str, Any],
+    expected: datetime,
+) -> bool:
+    observed = parse_datetime(
+        event.get("release_at") or event.get("time_utc")
+    )
+    return bool(
+        observed is not None
+        and observed.replace(second=0, microsecond=0)
+        == expected.replace(second=0, microsecond=0)
+    )
+
+
+def _official_actual_datum(
+    event: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    canonical_key: str,
+    release: datetime,
+) -> dict[str, Any]:
+    value = candidate.get("value")
+    source = candidate.get("source") or candidate.get("publisher")
+    source_url = (
+        candidate.get("source_url")
+        or candidate.get("canonical_url")
+    )
+    actual_lineage = {
+        "source": source,
+        "publisher": candidate.get("publisher"),
+        "source_url": source_url,
+        "canonical_url": candidate.get("canonical_url"),
+        "source_tier": candidate.get("source_tier") or 1,
+        "source_classification": (
+            candidate.get("source_classification") or "official_source"
+        ),
+        "provider_adapter": candidate.get("provider_adapter"),
+        "metric_id": (
+            candidate.get("event_metric_id")
+            or candidate.get("metric_id")
+        ),
+        "source_series_id": candidate.get("source_series_id"),
+        "reference_period": (
+            candidate.get("reference_period")
+            or candidate.get("period")
+        ),
+        "retrieved_at": candidate.get("retrieved_at"),
+        "validation_status": (
+            candidate.get("validation_status") or "accepted"
+        ),
+    }
+    enrichment = (
+        dict(event.get("enrichment") or {})
+        if isinstance(event.get("enrichment"), dict)
+        else {}
+    )
+    field_lineage = dict(enrichment.get("field_lineage") or {})
+    field_lineage["actual"] = actual_lineage
+    enrichment.update(
+        {
+            "actual": value,
+            "source": source,
+            "source_url": source_url,
+            "field_lineage": field_lineage,
+        }
+    )
+    return {
+        **event,
+        "canonical_event_key": canonical_key,
+        "release_at": release.isoformat(),
+        "time_utc": release.isoformat(),
+        "actual": value,
+        "metric_id": (
+            candidate.get("event_metric_id")
+            or candidate.get("metric_id")
+            or event.get("metric_id")
+        ),
+        "reference_period": (
+            candidate.get("reference_period")
+            or candidate.get("period")
+            or event.get("reference_period")
+            or event.get("period")
+        ),
+        "data_as_of": (
+            candidate.get("retrieved_at")
+            or candidate.get("published_at")
+            or release.isoformat()
+        ),
+        "published_at": (
+            candidate.get("published_at") or release.isoformat()
+        ),
+        "source": source,
+        "source_url": source_url,
+        "source_lineage": [actual_lineage],
+        "acquisition_method": "api_provider",
+        "actual_is_official": True,
+        "enrichment": enrichment,
+    }
 
 
 def _select_model(output: Any, _: dict[str, Any]) -> dict[str, Any] | None:

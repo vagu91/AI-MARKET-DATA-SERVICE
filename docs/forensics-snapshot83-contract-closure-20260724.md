@@ -26,6 +26,7 @@ backend operation.
 |---|---|---|
 | Past events remained `PRE_RELEASE` | persisted temporal labels were trusted during DB read-back and consumer materialization | temporal status is recalculated at read-back, hardening and consumer projection; an explicit quarantine still wins |
 | Missed actuals after downtime | no bounded startup lifecycle reconciliation existed | startup catch-up scans only the configured window, only when scheduler and due scanner are enabled, using provider-first resolution and persistent idempotency |
+| Real post-release wiring could not see the elapsed occurrence | `macro_schedule` and `macro_actual` shared `EventService.upcoming()`, whose range starts at the current clock; the official BLS/BEA actual resolver was used by the worker but not by the lifecycle adapter | schedule acquisition remains future-facing; actual acquisition uses a bounded `list_events()` window around the persisted release minute, exact canonical identity, and the existing official BLS/BEA resolver backed by the same provider instances as `MacroService` |
 | Duplicate Service PMI / New Home Sales | identity included mutable labels/categories and did not prioritize provider occurrence IDs | canonical identity uses provider, provider event ID, country, release minute and normalized provider type; aliases are conservatively merged and retained for audit |
 | Past event exposed as “next” | event projection did not separate temporal buckets | consumer now separates upcoming, awaiting actual, recently released and historical events; “next” is future-only |
 | Published AMD announcement rejected | issuer announcements with an event timestamp were treated as elapsed schedules | published issuer content is the content itself, uses published validity and is not sent through scheduled-event actual refresh |
@@ -83,6 +84,31 @@ envelopes, non-triggering refresh behavior, outbox idempotency, read-only
 `refresh=false`, migration from every supported schema version and DB reopen
 idempotency.
 
+The original `test_21_startup_one_hour_after_event_resolves_same_occurrence`
+verified scheduler orchestration with an injected final resolver. It did not
+exercise production adapter selection and therefore could not reveal that
+`EventService.upcoming()` excluded the elapsed occurrence. The concluding wiring
+suite in `tests/test_macro_actual_lifecycle_wiring.py` uses
+`existing_lifecycle_provider_adapters()`, a real `EventService`, the real
+`DeterministicActualResolver`, and controlled calendar/BLS providers. It proves:
+
+- the 09:00 occurrence is selected at a 10:00 startup through a bounded lookback;
+- the same-named next-day occurrence is not selected;
+- a calendar row alone, even if it contains an unverified value, is never promoted
+  to official actual;
+- BLS/BEA-compatible official observations resolve before AI;
+- only residual fields remain AI-eligible after a partial deterministic result;
+- delayed or temporarily unavailable official feeds enter persistent backoff and
+  negative cache;
+- an occurrence beyond the retry deadline terminates `NO_DATA` without AI;
+- snapshot/outbox creation and the second catch-up remain idempotent.
+
+Final verification after the real-wiring correction:
+
+- real macro-actual wiring suite: 7 passed;
+- pertinent integration suite: 500 passed;
+- complete repository suite: 1,414 passed.
+
 No migration was added: the required fields and tables already exist. The complete
 supported migration matrix is exercised from every migration version through the
 current schema, followed by a second no-op migration and SQLite integrity check.
@@ -90,11 +116,12 @@ current schema, followed by a second no-op migration and SQLite integrity check.
 ## Verification commands
 
 - `python -m pytest tests/test_snapshot83_contract_closure.py -q`
+- `python -m pytest tests/test_macro_actual_lifecycle_wiring.py -q`
 - pertinent integration suite (provider-first, temporal, outbox, enablement,
   consumer, CFTC/Cboe, semantics and migration matrix)
 - `python -m pytest -q`
-- `python -m ruff check app scripts/replay_snapshot83_forensics.py tests/test_snapshot83_contract_closure.py tests/test_runtime_acquisition.py`
-- `python -m compileall -q app scripts tests/test_snapshot83_contract_closure.py`
+- `python -m ruff check .`
+- `python -m compileall -q app scripts tests/test_snapshot83_contract_closure.py tests/test_macro_actual_lifecycle_wiring.py`
 - `git diff --check`
 - Windows PowerShell 5.1 AST parser over all four `.ps1` scripts
 - `python -m scripts.replay_snapshot83_forensics`
