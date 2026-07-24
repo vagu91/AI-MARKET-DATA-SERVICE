@@ -15,10 +15,30 @@ def build_ai_trader_market_context(
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
+    original_qqq = dict(
+        ((full.get("nasdaq_context") or {}).get("qqq_holdings") or {})
+    )
     full = harden_market_context(full, settings=settings)
     nasdaq = full.get("nasdaq_context") or {}
     data_quality = full.get("data_quality") or {}
-    readiness = _legacy_readiness(full.get("readiness") or _readiness(data_quality))
+    readiness = _legacy_readiness(
+        full.get("readiness") or _readiness(data_quality)
+    )
+    if _legacy_count_only_nasdaq(original_qqq):
+        blocking = [
+            reason
+            for reason in readiness.get("blocking_reasons") or []
+            if reason != "nasdaq_context_missing"
+        ]
+        readiness["blocking_reasons"] = blocking
+        readiness["critical_errors"] = (
+            int(readiness.get("critical_error_count") or 0) + len(blocking)
+        )
+        readiness["ready"] = (
+            int(readiness.get("critical_error_count") or 0) == 0
+            and not blocking
+        )
+    full["readiness"] = readiness
     consumer = {
         "contract": CONTRACT_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -67,6 +87,31 @@ def _readiness(data_quality: dict[str, Any]) -> dict[str, Any]:
         "critical_errors": len(explicit_errors) + len(blocking),
         "blocking_reasons": blocking,
     }
+
+
+def _legacy_count_only_nasdaq(value: dict[str, Any]) -> bool:
+    """Accept the schema-1.0 count-only marker unless invalidity is explicit."""
+
+    validation = (
+        value.get("validation")
+        if isinstance(value.get("validation"), dict)
+        else {}
+    )
+    lifecycle = (
+        value.get("lifecycle")
+        if isinstance(value.get("lifecycle"), dict)
+        else {}
+    )
+    invalid = bool(
+        str(value.get("source_classification") or "").lower()
+        == "invalid_source"
+        or str(value.get("source_audit_status") or "").upper()
+        in {"QUARANTINED", "REJECTED"}
+        or str(validation.get("status") or "").lower() == "rejected"
+        or value.get("reliability") == 0
+        or lifecycle.get("currently_valid") is False
+    )
+    return int(value.get("holdings_count") or 0) > 0 and not invalid
 
 
 def _compact_quality(data_quality: dict[str, Any]) -> dict[str, Any]:

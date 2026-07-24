@@ -247,6 +247,21 @@ def compute_datum_lifecycle(
     lineage = value.get("source_lineage") or value.get("lineage") or []
     if isinstance(lineage, dict):
         lineage = [lineage]
+    if (
+        not lineage
+        and _has_material_data(value)
+        and (value.get("source") or value.get("source_url"))
+    ):
+        lineage = [
+            {
+                "source": value.get("source") or value.get("provider"),
+                "source_url": value.get("source_url"),
+                "provider_type": value.get("provider_type"),
+                "retrieved_at": value.get("retrieved_at"),
+                "data_as_of": value.get("data_as_of")
+                or value.get("report_date"),
+            }
+        ]
     lineage = tuple(item for item in lineage if isinstance(item, dict))
     datum_fingerprint = materiality_fingerprint(
         {
@@ -273,7 +288,10 @@ def compute_datum_lifecycle(
         refresh_reason=refresh_reason or value.get("refresh_reason"),
         materiality_fingerprint=datum_fingerprint,
         source_lineage=lineage,
-        acquisition_method=value.get("acquisition_method"),
+        acquisition_method=(
+            value.get("acquisition_method")
+            or ("api_provider" if lineage else None)
+        ),
         retry_class=retry_class,
         retry_policy=retry_policy,
         negative_cache_key=negative_cache_key,
@@ -560,9 +578,11 @@ class LifecycleRepository:
         owner: str,
         limit: int | None = None,
         now: datetime | None = None,
+        due_since: datetime | None = None,
     ) -> list[dict[str, Any]]:
         reference = _aware(now or self.clock())
         timestamp = _iso(reference)
+        due_since_value = _iso(due_since) if due_since is not None else None
         lease_until = _iso(
             reference + timedelta(seconds=int(self.settings.lifecycle_due_lease_seconds))
         )
@@ -585,10 +605,22 @@ class LifecycleRepository:
                   OR (work_status='LEASED' AND lease_expires_at<=?)
                 )
                 AND COALESCE(next_retry_at,next_refresh_at,updated_at)<=?
+                AND (
+                  ? IS NULL
+                  OR COALESCE(event_at,next_retry_at,next_refresh_at,updated_at)>=?
+                )
                 ORDER BY COALESCE(next_retry_at,next_refresh_at,updated_at),item_id
                 LIMIT ?
                 """,
-                (timestamp, timestamp, timestamp, timestamp, limit),
+                (
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    due_since_value,
+                    due_since_value,
+                    limit,
+                ),
             ).fetchall()
             ids = [str(row["item_id"]) for row in rows]
             for item_id in ids:

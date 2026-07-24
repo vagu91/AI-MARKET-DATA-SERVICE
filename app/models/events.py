@@ -45,6 +45,10 @@ class EventEnrichment(BaseModel):
 
 class EconomicEvent(BaseModel):
     event_id: str
+    provider: str | None = None
+    provider_event_id: str | None = None
+    source_event_id: str | None = None
+    occurrence_id: str | None = None
     name: str
     country: str = "US"
     category: str
@@ -54,6 +58,7 @@ class EconomicEvent(BaseModel):
     frequency: str | None = None
     date: str
     time_utc: datetime | None = None
+    release_at: datetime | None = None
     time_local: datetime | None = None
     impact: Impact
     actual: Any | None = None

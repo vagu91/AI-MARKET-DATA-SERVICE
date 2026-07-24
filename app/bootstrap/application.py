@@ -30,6 +30,10 @@ from app.providers.fred import FredProvider
 from app.providers.mega_cap_snapshot_provider import MegaCapSnapshotProvider
 from app.providers.news_provider import NewsProvider
 from app.providers.qqq_holdings_provider import QQQHoldingsProvider
+from app.providers.cftc_cot_provider import CftcCotProvider
+from app.providers.cboe_put_call_provider import CboePutCallProvider
+from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
+from app.providers.cboe_vix_futures_provider import CboeVixFuturesProvider
 from app.providers.scraper_calendar import EconomicCalendarScraperProvider
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.event_enrichment_service import EventEnrichmentService
@@ -123,6 +127,10 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
             macro_service=macro_service,
             event_service=event_service,
             nasdaq_data_service=nasdaq_data_service,
+            cftc_provider=CftcCotProvider(settings),
+            cboe_risk_indices_provider=CboeRiskIndicesProvider(settings),
+            cboe_vix_futures_provider=CboeVixFuturesProvider(settings),
+            cboe_put_call_provider=CboePutCallProvider(settings),
         ),
     )
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
 
 from app.core.config import Settings
@@ -65,10 +65,15 @@ class CallableLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": f"{self.name}_exhausted",
             }
+        missing_fields = _missing_requested_fields(
+            datum,
+            list(item.get("fields_attempted") or []),
+        )
         return {
-            "status": "RESOLVED",
+            "status": "PARTIAL" if missing_fields else "RESOLVED",
             "reason": f"{self.name}_resolved",
             "datum": datum,
+            "missing_fields": missing_fields,
         }
 
 
@@ -186,7 +191,7 @@ class DeterministicLifecycleDueResolver:
                 status="NO_DATA" if status == "NO_DATA" else "EXHAUSTED",
                 reason=str(result.get("reason") or "deterministic_provider_exhausted"),
             )
-        if status not in {"RESOLVED", "FRESH", "SUCCEEDED"}:
+        if status not in {"RESOLVED", "FRESH", "SUCCEEDED", "PARTIAL"}:
             return self._temporary_failure(
                 item,
                 reason=f"provider_status_invalid:{status}",
@@ -215,6 +220,33 @@ class DeterministicLifecycleDueResolver:
                 status="NO_DATA",
                 reason="deterministic_provider_result_not_fresh",
             )
+        if status == "PARTIAL":
+            decision = research_agent_enablement(
+                self.settings,
+                topic=_topic_for_entity(entity_type),
+            )
+            return {
+                **result,
+                "status": "PARTIAL",
+                "datum": provider_datum,
+                "lifecycle": lifecycle,
+                "missing_fields": list(
+                    result.get("missing_fields")
+                    or _missing_requested_fields(
+                        provider_datum,
+                        list(item.get("fields_attempted") or []),
+                    )
+                ),
+                "ai_eligible": bool(decision["agent_enabled"]),
+                "agent_status": (
+                    "ENABLED" if decision["agent_enabled"] else "DISABLED"
+                ),
+                "execution_status": (
+                    "ELIGIBLE"
+                    if decision["agent_enabled"]
+                    else "NOT_REQUESTED"
+                ),
+            }
         return {
             **result,
             "status": "RESOLVED",
@@ -235,16 +267,33 @@ class DeterministicLifecycleDueResolver:
             self.settings,
             topic=_topic_for_entity(str(item.get("entity_type") or "")),
         )
+        event_at = parse_datetime(item.get("event_at"))
+        retry_deadline_exhausted = bool(
+            event_at is not None
+            and self.clock()
+            >= event_at
+            + timedelta(
+                hours=int(self.settings.lifecycle_retry_deadline_hours)
+            )
+        )
         return {
             "status": status,
             "reason": reason,
-            "ai_eligible": bool(decision["agent_enabled"]),
+            "ai_eligible": bool(
+                decision["agent_enabled"] and not retry_deadline_exhausted
+            ),
             "agent_status": (
                 "ENABLED" if decision["agent_enabled"] else "DISABLED"
             ),
             "execution_status": (
-                "ELIGIBLE" if decision["agent_enabled"] else "NOT_REQUESTED"
+                "ELIGIBLE"
+                if decision["agent_enabled"] and not retry_deadline_exhausted
+                else "NOT_REQUESTED"
             ),
+            "data_outcome": (
+                "NO_DATA" if retry_deadline_exhausted else "PENDING"
+            ),
+            "retry_deadline_exhausted": retry_deadline_exhausted,
             "enablement": decision,
         }
 
@@ -286,6 +335,10 @@ def existing_lifecycle_provider_adapters(
     macro_service: Any,
     event_service: Any,
     nasdaq_data_service: Any,
+    cftc_provider: Any | None = None,
+    cboe_risk_indices_provider: Any | None = None,
+    cboe_vix_futures_provider: Any | None = None,
+    cboe_put_call_provider: Any | None = None,
 ) -> dict[str, LifecycleProviderAdapter]:
     """Wire only provider services that already exist in application bootstrap."""
 
@@ -366,6 +419,46 @@ def existing_lifecycle_provider_adapters(
             name="news_provider",
         ),
     }
+    if cftc_provider is not None:
+        cot_adapter = CallableLifecycleProviderAdapter(
+            lambda _: cftc_provider.fetch_nasdaq(),
+            select=_select_found_payload,
+            name="cftc_cot_provider",
+        )
+        adapters["cot"] = cot_adapter
+        adapters["cot_positioning"] = cot_adapter
+        adapters["cot_publication"] = cot_adapter
+    if cboe_risk_indices_provider is not None:
+        adapters["vvix"] = CallableLifecycleProviderAdapter(
+            lambda _: cboe_risk_indices_provider.fetch(),
+            select=lambda output, item: _select_cboe_index(
+                output,
+                item,
+                key="vvix",
+            ),
+            name="cboe_vvix_provider",
+        )
+        adapters["skew"] = CallableLifecycleProviderAdapter(
+            lambda _: cboe_risk_indices_provider.fetch(),
+            select=lambda output, item: _select_cboe_index(
+                output,
+                item,
+                key="skew",
+            ),
+            name="cboe_skew_provider",
+        )
+    if cboe_vix_futures_provider is not None:
+        adapters["vix_futures"] = CallableLifecycleProviderAdapter(
+            lambda _: cboe_vix_futures_provider.fetch(),
+            select=_select_found_payload,
+            name="cboe_vix_futures_provider",
+        )
+    if cboe_put_call_provider is not None:
+        adapters["put_call"] = CallableLifecycleProviderAdapter(
+            lambda _: cboe_put_call_provider.fetch(),
+            select=_select_found_payload,
+            name="cboe_put_call_provider",
+        )
     return adapters
 
 
@@ -456,6 +549,53 @@ def _select_earnings(
     )
 
 
+def _select_found_payload(
+    output: Any,
+    _: dict[str, Any],
+) -> dict[str, Any] | None:
+    value = _model_dump(output)
+    if str(value.get("status") or "").lower() not in {
+        "found",
+        "valid",
+        "available",
+        "partial",
+    }:
+        return None
+    return {
+        **value,
+        "acquisition_method": "api_provider",
+    }
+
+
+def _select_cboe_index(
+    output: Any,
+    _: dict[str, Any],
+    *,
+    key: str,
+) -> dict[str, Any] | None:
+    value = _model_dump(output)
+    index = (value.get("indices") or {}).get(key)
+    if not isinstance(index, dict) or index.get("current_price") in (None, ""):
+        return None
+    return {
+        **index,
+        "value": index.get("current_price"),
+        "data_as_of": index.get("provider_timestamp")
+        or index.get("retrieved_at"),
+        "valid_until": index.get("valid_until")
+        or value.get("valid_until"),
+        "acquisition_method": "api_provider",
+        "source_lineage": [
+            {
+                "source": index.get("source") or value.get("source"),
+                "source_url": index.get("source_url")
+                or value.get("source_url"),
+                "provider_type": "OFFICIAL_EXCHANGE",
+            }
+        ],
+    }
+
+
 def _earnings_key(value: dict[str, Any]) -> str:
     issuer = str(
         value.get("ticker")
@@ -495,6 +635,20 @@ def _has_temporary_provider_failure(output: Any) -> bool:
         "unavailable",
         "not_found",
     }
+
+
+def _missing_requested_fields(
+    datum: dict[str, Any],
+    requested: list[str],
+) -> list[str]:
+    return sorted(
+        {
+            str(field)
+            for field in requested
+            if str(field)
+            and datum.get(str(field)) in (None, "", [], {})
+        }
+    )
 
 
 def _topic_for_entity(entity_type: str) -> str:

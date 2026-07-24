@@ -101,6 +101,22 @@ def normalize_cboe_put_call(
     ratios: list[dict[str, Any]] = []
     rejected = 0
     data_as_of = payload.get("selectedDate")
+    observed = _parsed_time(retrieved_at)
+    expiry = _parsed_time(valid_until)
+    as_of = _parsed_time(data_as_of)
+    if (
+        expiry is not None
+        and observed is not None
+        and expiry <= observed
+    ) or (
+        as_of is not None
+        and observed is not None
+        and as_of > observed + timedelta(days=1)
+    ):
+        return [], sum(
+            len(payload.get(section) or [])
+            for section in SECTION_SCOPE
+        ) or 1
     for section, scope in SECTION_SCOPE.items():
         rows = payload.get(section) or []
         for row in rows:
@@ -122,6 +138,9 @@ def normalize_cboe_put_call(
                     "call_value": call_value,
                     "ratio": ratio,
                     "data_as_of": data_as_of,
+                    "valid_from": (
+                        _iso(as_of) if as_of is not None else retrieved_at
+                    ),
                     "source": "Cboe Daily Market Statistics",
                     "source_url": "https://www.cboe.com/markets/us/options/market-statistics/daily",
                     "provider_type": "OFFICIAL_EXCHANGE_STATISTICS",
@@ -167,3 +186,20 @@ def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:
 
 def _iso(value: datetime) -> str:
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parsed_time(value: Any) -> datetime | None:
+    if value in (None, "", "now", "later"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    return (
+        parsed.astimezone(UTC)
+        if parsed.tzinfo
+        else parsed.replace(tzinfo=UTC)
+    )

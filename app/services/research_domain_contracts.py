@@ -364,6 +364,14 @@ def build_domain_projection(
 
 
 def compact_domain_projection(value: dict[str, Any]) -> dict[str, Any]:
+    if str(value.get("status") or "").upper() == "DISABLED":
+        return {
+            "status": "DISABLED",
+            "enabled": False,
+            "reason": value.get("reason")
+            or value.get("no_data_reason")
+            or "agent_disabled",
+        }
     compact_fields: dict[str, Any] = {}
     for field, item in (value.get("fields") or {}).items():
         if not isinstance(item, dict):

@@ -91,10 +91,11 @@ def normalize_research_claim(
     ).lower()
     semantics = _classify_semantics(claim, input_semantics, policy)
     claim["field_semantics"] = semantics
+    published_issuer_content = _is_published_issuer_content(claim, semantics)
     if semantics in OBSERVATION_SEMANTICS:
         claim["observation_key"] = canonical_observation_key(claim)
 
-    if semantics in EVENT_IDENTITY_SEMANTICS:
+    if semantics in EVENT_IDENTITY_SEMANTICS and not published_issuer_content:
         event_value = (
             claim.get("event_at")
             or claim.get("release_at")
@@ -125,7 +126,7 @@ def normalize_research_claim(
     if semantics in ISSUER_EVENT_SEMANTICS and not claim.get("issuer"):
         claim["issuer"] = _issuer_for_claim(claim, policy)
 
-    if semantics in CURRENT_SEMANTICS:
+    if semantics in CURRENT_SEMANTICS or published_issuer_content:
         published = parse_datetime(claim.get("published_at")) or next(
             (
                 parse_datetime(evidence.get("published_at"))
@@ -135,13 +136,30 @@ def normalize_research_claim(
             None,
         )
         if published is not None:
-            ttl_minutes = int(policy.semantic_policy(semantics).get("ttl_minutes") or 0)
-            valid_until = published + timedelta(minutes=ttl_minutes)
+            semantic_policy = policy.semantic_policy(semantics)
+            ttl_minutes = int(
+                semantic_policy.get("ttl_minutes")
+                or semantic_policy.get("lifecycle_minutes")
+                or 0
+            )
+            policy_valid_until = published + timedelta(minutes=ttl_minutes)
+            declared_valid_until = parse_datetime(claim.get("valid_until"))
+            valid_until = (
+                declared_valid_until
+                if declared_valid_until is not None
+                and declared_valid_until > published
+                else policy_valid_until
+            )
+            claim["published_at"] = _iso(published)
+            claim["valid_from"] = _iso(published)
             claim["valid_until"] = _iso(valid_until)
             claim["next_refresh_at"] = _iso(valid_until)
             claim["lifecycle_status"] = (
                 "CURRENT" if reference < valid_until else "EXPIRED"
             )
+            if published_issuer_content:
+                claim["content_status"] = "PUBLISHED"
+                claim["post_event_semantics"] = None
 
     claim["_semantic_normalization"] = {
         "original": original_semantics,
@@ -159,6 +177,7 @@ def semantic_validation_warnings(
 ) -> list[str]:
     reference = _utc(now or datetime.now(UTC))
     semantics = str(claim.get("field_semantics") or "").lower()
+    published_issuer_content = _is_published_issuer_content(claim, semantics)
     if contains_mojibake(claim):
         return ["mojibake_rejected"]
     if is_not_applicable(claim):
@@ -169,7 +188,7 @@ def semantic_validation_warnings(
         )
 
     warnings: list[str] = []
-    if semantics in EVENT_IDENTITY_SEMANTICS:
+    if semantics in EVENT_IDENTITY_SEMANTICS and not published_issuer_content:
         if not str(claim.get("event_key") or "").strip():
             warnings.append("event_key_required")
         event_at = parse_datetime(claim.get("event_at") or claim.get("release_at"))
@@ -181,6 +200,8 @@ def semantic_validation_warnings(
             warnings.append("event_valid_until_required")
     if semantics in ISSUER_EVENT_SEMANTICS and not str(claim.get("issuer") or "").strip():
         warnings.append("issuer_required")
+    if published_issuer_content and parse_datetime(claim.get("published_at")) is None:
+        warnings.append("issuer_announcement_published_at_required")
     if semantics == "current_news" and parse_datetime(claim.get("published_at")) is None:
         warnings.append("current_news_published_at_required")
     if semantics == "exploratory_context":
@@ -190,6 +211,26 @@ def semantic_validation_warnings(
     if not policy.semantic_policy(semantics):
         warnings.append("unsupported_field_semantics")
     return warnings
+
+
+def _is_published_issuer_content(
+    claim: dict[str, Any],
+    semantics: str,
+) -> bool:
+    if semantics != "issuer_announcement":
+        return False
+    published_at = parse_datetime(claim.get("published_at"))
+    if published_at is None:
+        published_at = next(
+            (
+                parse_datetime(item.get("published_at"))
+                for item in claim.get("evidence") or []
+                if isinstance(item, dict)
+                and parse_datetime(item.get("published_at")) is not None
+            ),
+            None,
+        )
+    return published_at is not None and claim.get("value") not in (None, "")
 
 
 def canonical_observation_key(claim: dict[str, Any]) -> str:

@@ -141,6 +141,14 @@ def parse_vix_futures_csv(text: str, *, data_as_of: str | None) -> tuple[list[di
     expired = duplicate = invalid = weekly = 0
     seen: set[str] = set()
     reference = date.fromisoformat(data_as_of) if data_as_of else datetime.now(UTC).date()
+    if reference > datetime.now(UTC).date() + timedelta(days=1):
+        return [], {
+            "expired_contract_count": 0,
+            "duplicate_contract_count": 0,
+            "invalid_contract_count": 0,
+            "weekly_contract_excluded_count": 0,
+            "future_timestamp_quarantined_count": 1,
+        }
     for row in csv.DictReader(io.StringIO(text.lstrip("\ufeff"))):
         if str(row.get("Product") or "").strip() != "VX":
             continue
@@ -185,6 +193,7 @@ def parse_vix_futures_csv(text: str, *, data_as_of: str | None) -> tuple[list[di
         "duplicate_contract_count": duplicate,
         "invalid_contract_count": invalid,
         "weekly_contract_excluded_count": weekly,
+        "future_timestamp_quarantined_count": 0,
     }
 
 

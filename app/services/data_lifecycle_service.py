@@ -241,7 +241,7 @@ def _record(
         source,
         {"valid_until", "consensus_valid_until"},
     )
-    data_present = _has_content(source)
+    data_present = _operational_value_present(category, source)
     if born_at is not None:
         lifecycle_input.setdefault("observed_at", born_at.isoformat())
     else:
@@ -262,11 +262,23 @@ def _record(
     next_refresh = parse_datetime(lifecycle.next_refresh_at)
     retention_days = _retention_days(category, settings)
     delete_after = valid_until + timedelta(days=retention_days) if valid_until and retention_days is not None else None
+    source_status = str(
+        source.get("status") if isinstance(source, dict) else ""
+    ).upper()
+    freshness_state = lifecycle.freshness_state
+    if not data_present and source_status in {"DISABLED", "NOT_CONFIGURED"}:
+        freshness_state = "NOT_CONFIGURED"
+    elif not data_present and source_status in {
+        "NO_DATA",
+        "NOT_FOUND",
+        "NO_DATA_AVAILABLE",
+    }:
+        freshness_state = "NO_DATA"
     return {
         "category": category,
         "born_at": lifecycle.observed_at,
         "trigger_class": lifecycle.trigger_class,
-        "freshness_state": lifecycle.freshness_state,
+        "freshness_state": freshness_state,
         "observed_at": lifecycle.observed_at,
         "data_as_of": lifecycle.data_as_of,
         "published_at": lifecycle.published_at,
@@ -290,7 +302,7 @@ def _record(
         "context_date": context_date,
         "data_present": data_present,
         "currently_valid": bool(
-            data_present and lifecycle.freshness_state == "FRESH"
+            data_present and freshness_state == "FRESH"
         ),
     }
 
@@ -463,6 +475,83 @@ def _has_content(value: Any) -> bool:
     if isinstance(value, list):
         return any(_has_content(item) for item in value)
     return value not in (None, "", False)
+
+
+def _operational_value_present(category: str, value: Any) -> bool:
+    if not isinstance(value, dict):
+        return _has_content(value)
+    status = str(value.get("status") or "").upper()
+    validation = (
+        value.get("validation")
+        if isinstance(value.get("validation"), dict)
+        else {}
+    )
+    if (
+        status in {
+            "DISABLED",
+            "NOT_CONFIGURED",
+            "NOT_FOUND",
+            "NO_DATA",
+            "NO_DATA_AVAILABLE",
+            "PROVIDER_FAILED",
+            "QUARANTINED",
+            "REJECTED",
+        }
+        or str(value.get("source_classification") or "").lower()
+        == "invalid_source"
+        or str(value.get("source_audit_status") or "").upper()
+        in {"QUARANTINED", "REJECTED"}
+        or str(validation.get("status") or "").lower() == "rejected"
+    ):
+        return False
+    if category == "news":
+        return bool(value.get("articles") or value.get("latest"))
+    if category == "cot":
+        groups = [
+            value.get("asset_managers"),
+            value.get("leveraged_funds"),
+            value.get("dealers"),
+        ]
+        return bool(
+            value.get("report_date")
+            and (
+                value.get("open_interest") not in (None, "")
+                or any(
+                    isinstance(group, dict)
+                    and any(
+                        group.get(field) not in (None, "")
+                        for field in ("long", "short", "spreading", "net")
+                    )
+                    for group in groups
+                )
+            )
+        )
+    if category == "aaii":
+        return all(
+            value.get(field) not in (None, "")
+            for field in ("bullish_pct", "neutral_pct", "bearish_pct")
+        )
+    if category == "prediction_markets":
+        return bool(value.get("markets") or value.get("items"))
+    if category == "sentiment":
+        return bool(
+            value.get("items")
+            or value.get("articles")
+            or value.get("score") not in (None, "")
+        )
+    if category == "nasdaq_weights":
+        return bool(
+            value.get("holdings") or value.get("top_holdings")
+        ) and value.get("reliability") != 0
+    if category in {"vvix", "skew"}:
+        return value.get("value") not in (None, "") or value.get(
+            "current_price"
+        ) not in (None, "")
+    if category == "vix_futures":
+        return bool(value.get("contracts") or value.get("curve"))
+    if category == "put_call":
+        return bool(value.get("ratios") or value.get("by_id"))
+    return _has_content(value)
 
 
 def _iso(value: datetime | None) -> str | None:

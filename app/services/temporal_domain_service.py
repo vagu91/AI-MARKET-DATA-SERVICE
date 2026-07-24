@@ -36,6 +36,24 @@ def canonical_event_key(event: dict[str, Any] | EconomicEvent) -> str:
     family = _family(item)
     release = parse_datetime(item.get("release_at") or item.get("time_utc"))
     release_key = release.replace(second=0, microsecond=0).isoformat() if release else str(item.get("date") or "")
+    provider = _normalized(item.get("provider") or item.get("source") or "")
+    provider_event_id = _normalized(
+        item.get("provider_event_id")
+        or item.get("source_event_id")
+        or item.get("occurrence_id")
+        or ""
+    )
+    if provider and provider_event_id:
+        normalized_type = _normalized(
+            item.get("normalized_event_type")
+            or item.get("provider_event_type")
+            or "provider_event"
+        )
+        stable = (
+            f"{provider}|{provider_event_id}|{country}|{release_key}|"
+            f"{normalized_type}"
+        )
+        return f"event:{hashlib.sha256(stable.encode('utf-8')).hexdigest()[:24]}"
     period = _normalized(item.get("reference_period") or item.get("period") or "unspecified")
     frequency = _normalized(item.get("frequency") or "unspecified")
     classified = family in FAMILY_ALIASES
@@ -59,7 +77,13 @@ def temporal_event_state(
     enrichment = item.get("enrichment") if isinstance(item.get("enrichment"), dict) else {}
     actual = item.get("actual") if item.get("actual") not in (None, "") else enrichment.get("actual")
     outcome = item.get("outcome") or enrichment.get("outcome") or (enrichment.get("summary") or {}).get("outcome")
-    if not decision.accepted:
+    explicitly_quarantined = str(
+        item.get("audit_status")
+        or item.get("source_audit_status")
+        or item.get("verification_status")
+        or ""
+    ).upper() in {"QUARANTINED", "REJECTED"}
+    if explicitly_quarantined or not decision.accepted:
         status = QUARANTINED_STATUS
     elif release is None or now < release:
         status = "PRE_RELEASE"
@@ -76,7 +100,11 @@ def temporal_event_state(
         "release_at": release.isoformat() if release else None,
         "actual": actual,
         "outcome": outcome,
-        "temporal_invalid_reason": decision.reason_code,
+        "temporal_invalid_reason": (
+            "persisted_quarantine"
+            if explicitly_quarantined
+            else decision.reason_code
+        ),
     }
 
 
@@ -191,6 +219,22 @@ def _provider_event(
     }
     event = EconomicEvent(
         event_id=str(row.get("occurrence_id") or row.get("source_event_id") or canonical_event_key(row)),
+        provider=source,
+        provider_event_id=(
+            str(row.get("provider_event_id") or row.get("event_id"))
+            if row.get("provider_event_id") or row.get("event_id")
+            else None
+        ),
+        source_event_id=(
+            str(row.get("source_event_id"))
+            if row.get("source_event_id")
+            else None
+        ),
+        occurrence_id=(
+            str(row.get("occurrence_id"))
+            if row.get("occurrence_id")
+            else None
+        ),
         name=name,
         country="US",
         category=category,
@@ -200,6 +244,7 @@ def _provider_event(
         frequency=row.get("frequency"),
         date=date_value,
         time_utc=release,
+        release_at=release,
         impact=impact,
         actual=None,
         forecast=None,
@@ -289,6 +334,33 @@ def _same_occurrence(left: EconomicEvent, right: EconomicEvent) -> bool:
     right_release = parse_datetime(right_payload.get("time_utc"))
     if not left_release or not right_release:
         return False
+    left_provider = _normalized(
+        left_payload.get("provider") or left_payload.get("source")
+    )
+    right_provider = _normalized(
+        right_payload.get("provider") or right_payload.get("source")
+    )
+    left_provider_id = _normalized(
+        left_payload.get("provider_event_id")
+        or left_payload.get("source_event_id")
+        or left_payload.get("occurrence_id")
+    )
+    right_provider_id = _normalized(
+        right_payload.get("provider_event_id")
+        or right_payload.get("source_event_id")
+        or right_payload.get("occurrence_id")
+    )
+    if (
+        left_provider
+        and left_provider == right_provider
+        and left_provider_id
+        and left_provider_id == right_provider_id
+    ):
+        return (
+            left.country.upper() == right.country.upper()
+            and left_release.replace(second=0, microsecond=0)
+            == right_release.replace(second=0, microsecond=0)
+        )
     if left.country.upper() != right.country.upper() or _family(left_payload) != _family(right_payload):
         return False
     if left_release.replace(second=0, microsecond=0) != right_release.replace(second=0, microsecond=0):
