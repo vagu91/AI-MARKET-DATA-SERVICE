@@ -121,6 +121,66 @@ function Get-SmokeParentPollingDecision {
     }
 }
 
+function Get-SmokeOutcomeClassification {
+    param(
+        [string]$ParentStatus,
+        [AllowNull()]
+        [object[]]$Children
+    )
+
+    $internalFailures = @(
+        "FAILED", "LOOP_DETECTED", "TIMED_OUT", "CANCELLED", "REJECTED"
+    )
+    $failedChildren = @(
+        ConvertTo-SmokeNonNullArray $Children |
+            Where-Object { [string]$_.status -in $internalFailures }
+    )
+    $parentFailed = $ParentStatus -in $internalFailures
+    $failed = $parentFailed -or $failedChildren.Count -gt 0
+    $policyNoData = @(
+        ConvertTo-SmokeNonNullArray $Children |
+            Where-Object { [string]$_.status -eq "NO_DATA" }
+    )
+    return [pscustomobject]@{
+        failed = $failed
+        category = if ($failed) {
+            "internal_failure"
+        }
+        elseif ($policyNoData.Count -gt 0 -or $ParentStatus -eq "NO_DATA") {
+            "policy_no_data"
+        }
+        else {
+            "success"
+        }
+        exit_code = if ($failed) { 1 } else { 0 }
+        failed_children = $failedChildren
+        policy_no_data_children = $policyNoData
+        partial_allowed = ($ParentStatus -ne "PARTIAL") -or (-not $failed)
+    }
+}
+
+function Get-SmokeThresholdExceeded {
+    param(
+        [AllowNull()]
+        [object]$Metrics
+    )
+
+    if (-not $Metrics) { return @() }
+    $items = @()
+    foreach ($warning in ConvertTo-SmokeNonNullArray $Metrics.threshold_warnings) {
+        if ($warning -is [string]) {
+            if ($warning -match '(?i)(budget|threshold|limit).*exceed') {
+                $items += $warning
+            }
+            continue
+        }
+        if ($warning.resource -and $null -ne $warning.observed_count) {
+            $items += $warning
+        }
+    }
+    return @($items)
+}
+
 function Write-SmokeFailureReport {
     param(
         [Parameter(Mandatory = $true)]

@@ -202,6 +202,63 @@ class ResearchLoopDetected(RuntimeError):
         super().__init__(self.code)
 
 
+class ResearchEmergencyCeilingExceeded(RuntimeError):
+    def __init__(
+        self,
+        *,
+        step: str,
+        run_id: str,
+        job_id: str,
+        evidence: list[dict[str, Any]],
+    ) -> None:
+        self.category = "EMERGENCY_CEILING"
+        self.retryable = False
+        self.retry_classification = "NON_RETRYABLE"
+        self.code = "research_emergency_ceiling_exceeded:tool_actions"
+        self.diagnostic = sanitize_diagnostic(
+            {
+                "category": self.category,
+                "reason": "emergency_tool_action_limit",
+                "step": step,
+                "run_id": run_id,
+                "job_id": job_id,
+                "retryable": False,
+                "retry_classification": self.retry_classification,
+                "fingerprints": [
+                    str(item.get("tool_action_fingerprint") or "")[:64]
+                    for item in evidence[-12:]
+                ],
+                "tool_events_observed": [_compact_event(item) for item in evidence[-12:]],
+                "timestamp": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            }
+        )
+        super().__init__(self.code)
+
+
+def loop_guard_exception(
+    *,
+    step: str,
+    run_id: str,
+    job_id: str,
+    reason: str,
+    evidence: list[dict[str, Any]],
+) -> RuntimeError:
+    if reason == "emergency_tool_action_limit":
+        return ResearchEmergencyCeilingExceeded(
+            step=step,
+            run_id=run_id,
+            job_id=job_id,
+            evidence=evidence,
+        )
+    return ResearchLoopDetected(
+        step=step,
+        run_id=run_id,
+        job_id=job_id,
+        reason=reason,
+        evidence=evidence,
+    )
+
+
 class ProgressLoopGuard:
     def __init__(
         self,
@@ -253,8 +310,6 @@ class ProgressLoopGuard:
             and not progress
         ):
             return progress, "repeated_action_without_progress"
-        if self.no_progress_actions >= self.settings.research_loop_no_progress_action_threshold:
-            return progress, "no_progress_action_window"
         if self._cyclic():
             return progress, "cyclic_action_sequence"
         return progress, None
@@ -441,12 +496,18 @@ def _legacy_event_type(semantic_action: str | None) -> str:
 
 
 def _semantic_signature(envelope: dict[str, Any]) -> str:
+    query = _normalize_text(envelope.get("query"))
+    source = _normalize_url(envelope.get("canonical_url") or envelope.get("source_url"))
+    fallback_identity = str(
+        envelope.get("tool_action_fingerprint") or envelope.get("item_id") or ""
+    )
     return "|".join(
         (
             str(envelope.get("phase") or ""),
             str(envelope.get("semantic_action") or ""),
-            _normalize_text(envelope.get("query")),
-            _normalize_url(envelope.get("canonical_url") or envelope.get("source_url")),
+            query,
+            source,
+            fallback_identity if not query and not source else "",
             str(envelope.get("status") or ""),
         )
     )

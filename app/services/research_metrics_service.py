@@ -117,7 +117,13 @@ class ResearchMetricsService:
             ).fetchall()
             invocation_stats = conn.execute(
                 """
-                SELECT COUNT(*) AS invocation_count,
+                SELECT COUNT(*) AS attempted_count,
+                       SUM(CASE WHEN lifecycle_status='COMPLETED' THEN 1 ELSE 0 END)
+                         AS completed_count,
+                       SUM(CASE WHEN lifecycle_status='ABORTED' THEN 1 ELSE 0 END)
+                         AS aborted_count,
+                       SUM(CASE WHEN usage_status='UNAVAILABLE' THEN 1 ELSE 0 END)
+                         AS usage_unavailable_count,
                        GROUP_CONCAT(DISTINCT backend) AS backends,
                        COALESCE(SUM(input_tokens),0) AS input_tokens,
                        COALESCE(SUM(output_tokens),0) AS output_tokens,
@@ -238,7 +244,21 @@ class ResearchMetricsService:
                 "used": sorted(
                     {value for value in str(invocation_stats["backends"] or "").split(",") if value}
                 ),
-                "invocations": int(invocation_stats["invocation_count"] or 0),
+                "invocations": int(invocation_stats["completed_count"] or 0),
+                "attempted": int(invocation_stats["attempted_count"] or 0),
+                "completed": int(invocation_stats["completed_count"] or 0),
+                "aborted": int(invocation_stats["aborted_count"] or 0),
+                "usage_status": (
+                    "partially_unavailable"
+                    if int(invocation_stats["usage_unavailable_count"] or 0)
+                    and int(invocation_stats["completed_count"] or 0)
+                    else "unavailable"
+                    if int(invocation_stats["usage_unavailable_count"] or 0)
+                    else "available"
+                ),
+                "usage_unavailable_invocations": int(
+                    invocation_stats["usage_unavailable_count"] or 0
+                ),
             },
             "tokens_per_accepted_claim": (token_total / accepted if accepted else None),
             "cost_per_accepted_claim": (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -25,6 +27,17 @@ SERVICE_ONLY_SEMANTICS = ("official_actual",)
 EVENT_SEMANTICS = {"scheduled_event", "official_calendar_event"}
 ISSUER_EVENT_SEMANTICS = {"issuer_announcement", "earnings_schedule"}
 CURRENT_SEMANTICS = {"current_news", "current_market_context"}
+EVENT_IDENTITY_SEMANTICS = EVENT_SEMANTICS | ISSUER_EVENT_SEMANTICS
+OBSERVATION_SEMANTICS = {"current_market_context"}
+EVENT_VALUE_SEMANTICS = {
+    "actual",
+    "official_actual",
+    "forecast",
+    "consensus",
+    "previous",
+    "outcome",
+    "transcript_url",
+}
 
 _ISSUERS_BY_SYMBOL = {
     "AAPL": "Apple",
@@ -61,8 +74,10 @@ def normalize_research_claim(
     ).lower()
     semantics = _classify_semantics(claim, input_semantics, policy)
     claim["field_semantics"] = semantics
+    if semantics in OBSERVATION_SEMANTICS:
+        claim["observation_key"] = canonical_observation_key(claim)
 
-    if semantics in EVENT_SEMANTICS | ISSUER_EVENT_SEMANTICS:
+    if semantics in EVENT_IDENTITY_SEMANTICS:
         event_value = (
             claim.get("event_at")
             or claim.get("release_at")
@@ -137,7 +152,9 @@ def semantic_validation_warnings(
         )
 
     warnings: list[str] = []
-    if semantics in EVENT_SEMANTICS | ISSUER_EVENT_SEMANTICS:
+    if semantics in EVENT_IDENTITY_SEMANTICS:
+        if not str(claim.get("event_key") or "").strip():
+            warnings.append("event_key_required")
         event_at = parse_datetime(claim.get("event_at") or claim.get("release_at"))
         if event_at is None:
             warnings.append("event_at_required")
@@ -156,6 +173,44 @@ def semantic_validation_warnings(
     if not policy.semantic_policy(semantics):
         warnings.append("unsupported_field_semantics")
     return warnings
+
+
+def canonical_observation_key(claim: dict[str, Any]) -> str:
+    """Return a stable service-owned identity for a non-event observation."""
+
+    observation_at = (
+        claim.get("period")
+        or claim.get("valid_from")
+        or claim.get("event_at")
+        or claim.get("release_at")
+        or _first_evidence_time(claim)
+        or "undated"
+    )
+    seed = {
+        "field_semantics": str(claim.get("field_semantics") or "").lower(),
+        "frequency": str(claim.get("frequency") or "").lower(),
+        "metric_id": str(claim.get("metric_id") or "").lower(),
+        "observation_at": str(observation_at),
+        "symbol": str(claim.get("symbol") or "MNQ").upper(),
+        "topic": str(claim.get("topic") or "").lower(),
+        "unit": str(claim.get("unit") or "").lower(),
+    }
+    digest = hashlib.sha256(
+        json.dumps(seed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return f"observation:{digest[:32]}"
+
+
+def requires_event_value_projection(claims: list[dict[str, Any]]) -> bool:
+    """Return whether accepted claims must update an identified event record."""
+
+    return any(
+        str(claim.get("field") or claim.get("field_semantics") or "").lower()
+        in EVENT_VALUE_SEMANTICS
+        for claim in claims
+    )
 
 
 def document_not_applicable_claims(
@@ -257,6 +312,17 @@ def _requires_outcome_refresh(claim: dict[str, Any]) -> bool:
     topic = str(claim.get("topic") or "").lower()
     event_key = str(claim.get("event_key") or "").lower()
     return topic == "fed_rates" or "fomc" in event_key or "speech" in event_key
+
+
+def _first_evidence_time(claim: dict[str, Any]) -> str | None:
+    for evidence in claim.get("evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        value = evidence.get("published_at") or evidence.get("retrieved_at")
+        parsed = parse_datetime(value)
+        if parsed is not None:
+            return _iso(parsed)
+    return None
 
 
 def _utc(value: datetime) -> datetime:

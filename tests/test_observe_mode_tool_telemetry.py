@@ -734,7 +734,7 @@ def test_migration_12_is_additive_from_schema_11(tmp_path: Path) -> None:
             "SELECT job_id FROM ai_research_jobs WHERE job_id='job-v11'"
         ).fetchone()
 
-    assert result["schema_version"] == 18
+    assert result["schema_version"] == 19
     assert {
         "raw_event_type",
         "lifecycle",

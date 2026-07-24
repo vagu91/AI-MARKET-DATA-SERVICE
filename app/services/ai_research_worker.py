@@ -23,6 +23,7 @@ from app.services.db_only_market_context_materializer import DBOnlyMarketContext
 from app.services.codex_runtime_contract import classify_codex_failure, sanitize_diagnostic
 from app.services.research_backend import ResearchBackend, select_research_backend
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
+from app.services.research_semantics import requires_event_value_projection
 
 
 logger = logging.getLogger(__name__)
@@ -231,9 +232,12 @@ class AIResearchWorker:
                     logger.info("ai_job_retry_scheduled", extra=context)
                 return True
             runtime_managed = bool(result.get("run_id"))
-            runtime_projection_complete = (
-                runtime_managed
-                and job.get("job_type") == "MNQ_MARKET_RESEARCH"
+            # Every agentic runtime profile uses the same atomic claim/fact
+            # projector. Only accepted event-value claims additionally update
+            # their identified economic-event record; observations stay in the
+            # generic projection and never require an event key.
+            runtime_projection_complete = runtime_managed and not (
+                requires_event_value_projection(accepted)
             )
             persistence = (
                 {

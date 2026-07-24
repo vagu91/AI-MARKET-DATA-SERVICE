@@ -256,15 +256,20 @@ function global:Invoke-RestMethod {{
         timeout=30,
         check=False,
     )
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 1
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8-sig"))
     assert summary["parent_run_id"] == "prun-redacted"
     assert summary["job_id"] is None
     assert summary["expected_child_count"] == summary["terminal_child_count"] == 6
     assert len(summary["child_statuses"]) == 6
     assert summary["failed_children"][0]["topic"] == "macro_events"
+    assert summary["outcome_category"] == "internal_failure"
     assert summary["threshold_exceeded"] == []
-    assert not (output / "failure-report.json").exists()
+    report = json.loads(
+        (output / "failure-report.json").read_text(encoding="utf-8-sig")
+    )
+    assert report["outcome_category"] == "internal_failure"
+    assert report["failed_children"][0]["status"] == "FAILED"
 
 
 def test_projection_preserves_event_identity_and_lineage_atomically(tmp_path: Path) -> None:
