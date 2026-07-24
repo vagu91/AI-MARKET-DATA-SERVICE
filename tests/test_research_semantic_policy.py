@@ -424,7 +424,7 @@ def test_schema_policy_prompt_and_migration_expose_new_semantics(
     assert policy.required_confirmations("current_news") == 2
     assert policy.semantic_policy("current_market_context")["ttl_minutes"] == 60
     result = migrate_database(cfg.database_path)
-    assert result["schema_version"] == 18
+    assert result["schema_version"] == 19
     with connect_sqlite(cfg.database_path) as conn:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(research_claims)")

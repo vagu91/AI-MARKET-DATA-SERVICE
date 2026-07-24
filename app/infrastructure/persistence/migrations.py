@@ -548,6 +548,20 @@ def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
             )
           )
         ) OR (
+          j.status='FAILED'
+          AND (
+            LOWER(COALESCE(j.last_error,'')) LIKE '%accepted event research result requires event_key%'
+            OR LOWER(COALESCE(j.last_diagnostic_json,'')) LIKE '%accepted event research result requires event_key%'
+          )
+          AND EXISTS (
+            SELECT 1 FROM research_run_steps p
+            WHERE p.run_id=r.run_id AND p.step_name='PERSIST' AND p.status='COMPLETED'
+          )
+          AND EXISTS (
+            SELECT 1 FROM research_run_steps rb
+            WHERE rb.run_id=r.run_id AND rb.step_name='READ_BACK' AND rb.status='COMPLETED'
+          )
+        ) OR (
           j.status='RETRY_SCHEDULED' AND r.status='RUNNING'
         )
         """
@@ -713,6 +727,36 @@ def _reconcile_research_run_lifecycle(conn: sqlite3.Connection) -> int:
                 """,
                 (row["job_id"],),
             )
+            quarantine_action = "QUARANTINED_INCOHERENT_TERMINAL_OUTPUT"
+            quarantine_seed = f"{row['run_id']}|{quarantine_action}"
+            quarantine_details = {
+                "action": quarantine_action,
+                "job_terminal_status": job_status,
+                "reason": str(row["last_error"] or "terminal_failure")[:500],
+                "transaction_outcome": "COMMITTED",
+                "reconciled_at": now,
+            }
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO research_reconciliation_audit(
+                  audit_id,run_id,job_id,action,transaction_outcome,details_json,created_at
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    f"rraudit-{hashlib.sha256(quarantine_seed.encode()).hexdigest()[:24]}",
+                    row["run_id"],
+                    row["job_id"],
+                    quarantine_action,
+                    "COMMITTED",
+                    json.dumps(
+                        quarantine_details,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
         required_topics = row["required_topics_json"] or "[]"
         missing_topics = required_topics if failed else None
         blocking_gaps = (
@@ -800,12 +844,23 @@ def _repair_event_projection_failure(
     ).fetchall()
     if len(claims) != counts[0]:
         return False
-    allowed_semantics = {"official_calendar_event", "scheduled_event"}
+    event_semantics = {
+        "official_calendar_event",
+        "scheduled_event",
+        "issuer_announcement",
+        "earnings_schedule",
+    }
+    observation_semantics = {"current_market_context"}
     if any(
-        str(claim["field_semantics"]) not in allowed_semantics
-        or not str(claim["event_key"] or "").strip()
-        or claim["materialization_status"] != "MATERIALIZED"
+        str(claim["field_semantics"]) not in event_semantics | observation_semantics
+        or (
+            str(claim["field_semantics"]) in event_semantics
+            and not str(claim["event_key"] or "").strip()
+        )
+        or claim["materialization_status"] not in {"MATERIALIZED", "ORPHANED"}
         or claim["source_audit_status"] != "ACTIVE"
+        or not str(claim["policy_version"] or "").strip()
+        or not str(claim["prompt_version"] or "").strip()
         for claim in claims
     ):
         return False
@@ -816,7 +871,7 @@ def _repair_event_projection_failure(
             f"""
             SELECT COUNT(*) FROM market_facts
             WHERE fact_key IN ({",".join("'research:' || ?" for _ in claim_ids)})
-              AND status='active' AND source_audit_status='ACTIVE'
+              AND status IN ('active','orphaned') AND source_audit_status='ACTIVE'
             """,
             claim_ids,
         ).fetchone()[0]
@@ -826,13 +881,24 @@ def _repair_event_projection_failure(
             f"""
             SELECT COUNT(DISTINCT claim_id) FROM research_evidence
             WHERE claim_id IN ({placeholders})
-              AND audit_status='ACTIVE' AND source_audit_status='ACTIVE'
+              AND audit_status IN ('ACTIVE','ORPHANED')
+              AND source_audit_status='ACTIVE'
             """,
             claim_ids,
         ).fetchone()[0]
     )
     if active_facts != counts[0] or evidenced_claims != counts[0]:
         return False
+    for claim in claims:
+        _restore_projection_identity(conn, claim)
+    claims = conn.execute(
+        """
+        SELECT * FROM research_claims
+        WHERE research_run_id=? AND validation_status='accepted'
+        ORDER BY rowid
+        """,
+        (row["run_id"],),
+    ).fetchall()
     projection = [
         _event_projection_result(conn, claim)
         for claim in claims
@@ -843,24 +909,50 @@ def _repair_event_projection_failure(
     repaired_status = str(persisted.get("status") or "SUCCEEDED")
     if repaired_status not in {"SUCCEEDED", "PARTIAL"}:
         return False
+    has_observations = any(
+        str(claim["field_semantics"]) in observation_semantics for claim in claims
+    )
     reconciliation = {
-        "action": "REBUILT_EVENT_PROJECTION",
+        "action": (
+            "REBUILT_OBSERVATION_PROJECTION"
+            if has_observations
+            else "REBUILT_EVENT_PROJECTION"
+        ),
         "reason": expected_error,
         "reconciled_at": now,
+        "transaction_outcome": "COMMITTED",
         "invariant": {
             "accepted_count": counts[0],
             "persisted_count": counts[1],
             "read_back_count": counts[2],
-            "official_event_keys_valid": True,
+            "event_identity_valid": all(
+                str(claim["field_semantics"]) not in event_semantics
+                or bool(str(claim["event_key"] or "").strip())
+                for claim in claims
+            ),
+            "observation_identity_service_owned": True,
         },
         "original_job_status": str(row["job_status"]),
         "original_run_status": str(row["run_status"]),
         "original_error": error_text or message,
     }
+    completed_topics = {
+        str(item) for item in persisted.get("completed_topics") or [] if item
+    }
+    missing_topics = {
+        str(item) for item in persisted.get("missing_topics") or [] if item
+    } - completed_topics
     repaired_result = {
         **persisted,
         "status": repaired_status,
         "results": results,
+        "completed_topics": sorted(completed_topics),
+        "missing_topics": sorted(missing_topics),
+        "blocking_gaps": [
+            str(item)
+            for item in persisted.get("blocking_gaps") or []
+            if str(item).removeprefix("missing_topic:") not in completed_topics
+        ],
         "event_projection": {
             "persisted_count": counts[1],
             "read_back_count": counts[2],
@@ -869,6 +961,33 @@ def _repair_event_projection_failure(
         "reconciliation": reconciliation,
     }
     persist_output = {**persisted, "results": results, "reconciliation": reconciliation}
+    conn.execute(
+        """
+        UPDATE research_claims
+        SET materialization_status='MATERIALIZED'
+        WHERE research_run_id=? AND validation_status='accepted'
+        """,
+        (row["run_id"],),
+    )
+    conn.execute(
+        """
+        UPDATE research_evidence SET audit_status='ACTIVE'
+        WHERE claim_id IN (
+          SELECT claim_id FROM research_claims WHERE research_run_id=?
+        ) AND source_audit_status='ACTIVE'
+        """,
+        (row["run_id"],),
+    )
+    conn.execute(
+        """
+        UPDATE market_facts SET status='active',updated_at=?
+        WHERE fact_key IN (
+          SELECT 'research:' || claim_id FROM research_claims
+          WHERE research_run_id=?
+        ) AND source_audit_status='ACTIVE'
+        """,
+        (now, row["run_id"]),
+    )
     conn.execute(
         """
         UPDATE research_run_steps SET output_json=?,output_checksum=?
@@ -897,10 +1016,19 @@ def _repair_event_projection_failure(
         """
         UPDATE research_runs
         SET status=?,result_json=?,completed_at=COALESCE(completed_at,?),
-            missing_topics_json='[]',blocking_gaps_json='[]',updated_at=?
+            completed_topics_json=?,missing_topics_json=?,blocking_gaps_json=?,updated_at=?
         WHERE run_id=?
         """,
-        (repaired_status, encoded, row["completed_at"] or now, now, row["run_id"]),
+        (
+            repaired_status,
+            encoded,
+            row["completed_at"] or now,
+            json.dumps(sorted(completed_topics), separators=(",", ":")),
+            json.dumps(sorted(missing_topics), separators=(",", ":")),
+            json.dumps(repaired_result["blocking_gaps"], separators=(",", ":")),
+            now,
+            row["run_id"],
+        ),
     )
     conn.execute(
         """
@@ -922,7 +1050,115 @@ def _repair_event_projection_failure(
             row["job_id"],
         ),
     )
+    audit_seed = f"{row['run_id']}|{reconciliation['action']}"
+    audit_id = f"rraudit-{hashlib.sha256(audit_seed.encode()).hexdigest()[:24]}"
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO research_reconciliation_audit(
+          audit_id,run_id,job_id,action,transaction_outcome,details_json,created_at
+        ) VALUES (?,?,?,?,?,?,?)
+        """,
+        (
+            audit_id,
+            row["run_id"],
+            row["job_id"],
+            reconciliation["action"],
+            "COMMITTED",
+            json.dumps(reconciliation, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            now,
+        ),
+    )
     return True
+
+
+def _restore_projection_identity(
+    conn: sqlite3.Connection,
+    claim: sqlite3.Row,
+) -> None:
+    try:
+        payload = json.loads(claim["payload_json"] or "{}")
+        raw_value = json.loads(claim["value_json"] or "null")
+    except (TypeError, ValueError):
+        return
+    fact_key = f"research:{claim['claim_id']}"
+    payload["fact_key"] = fact_key
+    if str(claim["field_semantics"]) == "current_market_context":
+        evidence = [
+            item
+            for item in payload.get("evidence") or []
+            if isinstance(item, dict)
+        ]
+        observation_at = (
+            claim["period"]
+            or payload.get("valid_from")
+            or claim["event_at"]
+            or claim["release_at"]
+            or next(
+                (
+                    item.get("published_at") or item.get("retrieved_at")
+                    for item in evidence
+                    if item.get("published_at") or item.get("retrieved_at")
+                ),
+                None,
+            )
+            or "undated"
+        )
+        seed = {
+            "field_semantics": str(claim["field_semantics"]).lower(),
+            "frequency": str(claim["frequency"] or "").lower(),
+            "metric_id": str(claim["metric_id"] or "").lower(),
+            "observation_at": str(observation_at),
+            "symbol": str(claim["symbol"] or "MNQ").upper(),
+            "topic": str(claim["topic"] or "").lower(),
+            "unit": str(claim["unit"] or "").lower(),
+        }
+        digest = hashlib.sha256(
+            json.dumps(seed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        payload["observation_key"] = f"observation:{digest[:32]}"
+    encoded_payload = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    conn.execute(
+        "UPDATE research_claims SET payload_json=?,checksum=? WHERE claim_id=?",
+        (
+            encoded_payload,
+            hashlib.sha256(encoded_payload.encode("utf-8")).hexdigest(),
+            claim["claim_id"],
+        ),
+    )
+    fact = conn.execute(
+        "SELECT raw_payload_json FROM market_facts WHERE fact_key=?",
+        (fact_key,),
+    ).fetchone()
+    if fact is None:
+        return
+    try:
+        raw_payload = json.loads(fact["raw_payload_json"] or "{}")
+    except (TypeError, ValueError):
+        raw_payload = {}
+    raw_payload.update(
+        {
+            "event_key": claim["event_key"],
+            "fact_key": fact_key,
+            "observation_key": payload.get("observation_key"),
+            "value": raw_value,
+        }
+    )
+    conn.execute(
+        "UPDATE market_facts SET raw_payload_json=? WHERE fact_key=?",
+        (
+            json.dumps(
+                raw_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            fact_key,
+        ),
+    )
 
 
 def _event_projection_result(
@@ -932,7 +1168,8 @@ def _event_projection_result(
     evidence = conn.execute(
         """
         SELECT * FROM research_evidence
-        WHERE claim_id=? AND audit_status='ACTIVE' AND source_audit_status='ACTIVE'
+        WHERE claim_id=? AND audit_status IN ('ACTIVE','ORPHANED')
+          AND source_audit_status='ACTIVE'
         ORDER BY source_tier,source_domain,evidence_id
         """,
         (claim["claim_id"],),
@@ -964,6 +1201,8 @@ def _event_projection_result(
         "topic": claim["topic"],
         "value": value,
         "metric_id": claim["metric_id"],
+        "observation_key": payload.get("observation_key"),
+        "fact_key": payload.get("fact_key") or f"research:{claim['claim_id']}",
         "event_key": claim["event_key"],
         "event_at": claim["event_at"],
         "release_at": claim["release_at"],

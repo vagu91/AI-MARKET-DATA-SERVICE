@@ -21,7 +21,9 @@ from app.services.research_budget import (
 )
 from app.services.research_tool_telemetry import (
     ProgressLoopGuard,
+    ResearchEmergencyCeilingExceeded,
     ResearchLoopDetected,
+    loop_guard_exception,
 )
 from app.services.research_metrics_service import ResearchMetricsService
 from app.services.research_backend import ResearchBackend, normalize_backend_payload
@@ -271,7 +273,7 @@ class AgenticResearchRuntime:
                     progress, loop_reason = guard.observe(inserted)
                     invocation_progress = invocation_progress or progress
                     if loop_reason:
-                        loop_error = ResearchLoopDetected(
+                        loop_error = loop_guard_exception(
                             step=step_name,
                             run_id=str(run["run_id"]),
                             job_id=str(job["job_id"]),
@@ -363,6 +365,7 @@ class AgenticResearchRuntime:
                     (
                         CodexCLIError,
                         ResearchBudgetExceeded,
+                        ResearchEmergencyCeilingExceeded,
                         ResearchLoopDetected,
                     ),
                 ):
@@ -554,7 +557,7 @@ class AgenticResearchRuntime:
             for inserted in counts.get("inserted_events") or []:
                 _progress, loop_reason = guard.observe(inserted)
                 if loop_reason:
-                    loop_error = ResearchLoopDetected(
+                    loop_error = loop_guard_exception(
                         step="SEARCH",
                         run_id=run_id,
                         job_id=job_id,
@@ -569,6 +572,10 @@ class AgenticResearchRuntime:
             if remaining_value <= 0:
                 return _deadline_result(run, "SEARCH")
             remaining = max(1, math.ceil(remaining_value))
+            invocation_attempt_id = self.repository.begin_backend_invocation(
+                run_id,
+                backend=backend.backend_name,
+            )
             try:
                 result = backend.execute_research(
                     job=job,
@@ -580,6 +587,10 @@ class AgenticResearchRuntime:
                     event_observer=observe_tool_event,
                 )
             except Exception as exc:
+                self.repository.abort_backend_invocation(
+                    invocation_attempt_id,
+                    reason=f"{type(exc).__name__}:{exc}",
+                )
                 diagnostic = getattr(exc, "diagnostic", None)
                 if execute_plan:
                     self.repository.fail_step(
@@ -595,10 +606,21 @@ class AgenticResearchRuntime:
                     )
                 self.metrics.snapshot(run_id, persist=True)
                 raise
-            payload = normalize_backend_payload(result.payload)
-            for event in result.tool_events:
-                observe_tool_event(dict(event))
-            self.repository.record_backend_invocation(run_id, result)
+            try:
+                payload = normalize_backend_payload(result.payload)
+                for event in result.tool_events:
+                    observe_tool_event(dict(event))
+                self.repository.record_backend_invocation(
+                    run_id,
+                    result,
+                    attempt_id=invocation_attempt_id,
+                )
+            except Exception as exc:
+                self.repository.abort_backend_invocation(
+                    invocation_attempt_id,
+                    reason=f"{type(exc).__name__}:{exc}",
+                )
+                raise
             plan_output = {
                 "status": payload.get("status") or "COMPLETED",
                 **dict(payload.get("plan") or {}),
@@ -686,7 +708,7 @@ class AgenticResearchRuntime:
                 for inserted in counts.get("inserted_events") or []:
                     _progress, loop_reason = guard.observe(inserted)
                     if loop_reason:
-                        raise ResearchLoopDetected(
+                        raise loop_guard_exception(
                             step="OPEN_SOURCE",
                             run_id=run_id,
                             job_id=job_id,

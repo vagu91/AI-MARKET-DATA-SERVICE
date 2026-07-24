@@ -116,6 +116,7 @@ def supported_claim(index: int) -> dict[str, Any]:
         "claim_ref": f"supported-{index}",
         "topic": "macro" if index == 1 else "events",
         "field_semantics": "official_calendar_event",
+        "event_key": f"OFFICIAL_EVENT_2026_07_{28 + index:02d}",
         "value": f"Official future event {index}",
         "event_at": f"2026-07-{28 + index:02d}T14:00:00+00:00",
         "confidence": 0.95,

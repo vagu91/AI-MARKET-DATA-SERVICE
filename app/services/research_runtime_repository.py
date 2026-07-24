@@ -953,10 +953,66 @@ class ResearchRuntimeRepository:
             )
             conn.commit()
 
+    def begin_backend_invocation(
+        self,
+        run_id: str,
+        *,
+        backend: str,
+        purpose: str = "AGENTIC_RESEARCH",
+    ) -> str:
+        invocation_id = f"rinvoke-attempt-{uuid.uuid4()}"
+        now = _now()
+        empty_payload = _json({})
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO research_backend_invocations(
+                  invocation_id,run_id,backend,purpose,model,input_tokens,
+                  output_tokens,cached_tokens,reasoning_tokens,total_tokens,
+                  cost_json,duration_ms,output_checksum,output_json,created_at,
+                  lifecycle_status,started_at,completed_at,aborted_reason,usage_status
+                ) VALUES (?,?,?,?,NULL,0,0,0,0,0,NULL,0,?,?,?,
+                          'ATTEMPTED',?,NULL,NULL,'UNAVAILABLE')
+                """,
+                (
+                    invocation_id,
+                    run_id,
+                    str(backend)[:120],
+                    str(purpose)[:120],
+                    _checksum({}),
+                    empty_payload,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        return invocation_id
+
+    def abort_backend_invocation(
+        self,
+        invocation_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        now = _now()
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                UPDATE research_backend_invocations
+                SET lifecycle_status='ABORTED',completed_at=COALESCE(completed_at,?),
+                    aborted_reason=?,usage_status='UNAVAILABLE'
+                WHERE invocation_id=? AND lifecycle_status='ATTEMPTED'
+                """,
+                (now, str(reason)[:500], invocation_id),
+            )
+            conn.commit()
+
     def record_backend_invocation(
         self,
         run_id: str,
         invocation: Any,
+        *,
+        attempt_id: str | None = None,
     ) -> dict[str, Any]:
         usage = dict(invocation.usage or {})
         total = int(usage.get("total_tokens") or 0)
@@ -966,32 +1022,78 @@ class ResearchRuntimeRepository:
         cost = {"total_cost_usd": _cost_value(provided_cost)} if provided_cost else None
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO research_backend_invocations(
-                  invocation_id,run_id,backend,purpose,model,input_tokens,
-                  output_tokens,cached_tokens,reasoning_tokens,total_tokens,
-                  cost_json,duration_ms,output_checksum,output_json,created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    invocation.invocation_id,
-                    run_id,
-                    str(invocation.backend)[:120],
-                    str(invocation.purpose)[:120],
-                    str(invocation.model or "")[:120] or None,
-                    int(usage.get("input_tokens") or 0),
-                    int(usage.get("output_tokens") or 0),
-                    int(usage.get("cached_tokens") or 0),
-                    int(usage.get("reasoning_tokens") or 0),
-                    total,
-                    _json(cost) if cost else None,
-                    int(invocation.duration_ms or 0),
-                    _checksum(invocation.payload),
-                    _json(invocation.payload),
-                    _now(),
-                ),
-            )
+            now = _now()
+            if attempt_id:
+                cursor = conn.execute(
+                    """
+                    UPDATE research_backend_invocations
+                    SET backend=?,purpose=?,model=?,input_tokens=?,output_tokens=?,
+                        cached_tokens=?,reasoning_tokens=?,total_tokens=?,cost_json=?,
+                        duration_ms=?,output_checksum=?,output_json=?,
+                        lifecycle_status='COMPLETED',completed_at=?,
+                        aborted_reason=NULL,usage_status=?
+                    WHERE invocation_id=? AND run_id=? AND lifecycle_status='ATTEMPTED'
+                    """,
+                    (
+                        str(invocation.backend)[:120],
+                        str(invocation.purpose)[:120],
+                        str(invocation.model or "")[:120] or None,
+                        int(usage.get("input_tokens") or 0),
+                        int(usage.get("output_tokens") or 0),
+                        int(usage.get("cached_tokens") or 0),
+                        int(usage.get("reasoning_tokens") or 0),
+                        total,
+                        _json(cost) if cost else None,
+                        int(invocation.duration_ms or 0),
+                        _checksum(invocation.payload),
+                        _json(
+                            {
+                                **invocation.payload,
+                                "_provider_invocation_id": invocation.invocation_id,
+                            }
+                        ),
+                        now,
+                        "AVAILABLE" if usage else "UNAVAILABLE",
+                        attempt_id,
+                        run_id,
+                    ),
+                )
+                if int(cursor.rowcount or 0) != 1:
+                    raise RuntimeError("backend_invocation_attempt_not_active")
+                stored_invocation_id = attempt_id
+            else:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO research_backend_invocations(
+                      invocation_id,run_id,backend,purpose,model,input_tokens,
+                      output_tokens,cached_tokens,reasoning_tokens,total_tokens,
+                      cost_json,duration_ms,output_checksum,output_json,created_at,
+                      lifecycle_status,started_at,completed_at,aborted_reason,usage_status
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                              'COMPLETED',?,?,NULL,?)
+                    """,
+                    (
+                        invocation.invocation_id,
+                        run_id,
+                        str(invocation.backend)[:120],
+                        str(invocation.purpose)[:120],
+                        str(invocation.model or "")[:120] or None,
+                        int(usage.get("input_tokens") or 0),
+                        int(usage.get("output_tokens") or 0),
+                        int(usage.get("cached_tokens") or 0),
+                        int(usage.get("reasoning_tokens") or 0),
+                        total,
+                        _json(cost) if cost else None,
+                        int(invocation.duration_ms or 0),
+                        _checksum(invocation.payload),
+                        _json(invocation.payload),
+                        now,
+                        now,
+                        now,
+                        "AVAILABLE" if usage else "UNAVAILABLE",
+                    ),
+                )
+                stored_invocation_id = str(invocation.invocation_id)
             totals = conn.execute(
                 """
                 SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,
@@ -1039,7 +1141,7 @@ class ResearchRuntimeRepository:
                 SELECT * FROM research_backend_invocations
                 WHERE invocation_id=?
                 """,
-                (invocation.invocation_id,),
+                (stored_invocation_id,),
             ).fetchone()
         return self._backend_invocation_row(row)
 
@@ -1568,11 +1670,15 @@ class ResearchRuntimeRepository:
             else "rejected"
         )
         claim_payload = {**claim, "field_semantics": semantics, "warnings": sorted(set(warnings))}
-        checksum = _checksum(claim_payload)
-        claim_seed = f"{run['run_id']}|{checksum}"
+        identity_checksum = _checksum(claim_payload)
+        claim_seed = f"{run['run_id']}|{identity_checksum}"
         claim_id = str(
             claim.get("claim_id") or f"claim-{hashlib.sha256(claim_seed.encode()).hexdigest()[:24]}"
         )
+        claim_payload["fact_key"] = str(
+            claim.get("fact_key") or f"research:{claim_id}"
+        )
+        checksum = _checksum(claim_payload)
         materialization_status = (
             "NOT_APPLICABLE"
             if not_applicable and validation == "accepted"
@@ -1688,6 +1794,8 @@ class ResearchRuntimeRepository:
         restored["payload"] = json.loads(restored.pop("payload_json"))
         restored["claim_ref"] = restored["payload"].get("claim_ref")
         restored["topic_status"] = restored["payload"].get("topic_status")
+        restored["observation_key"] = restored["payload"].get("observation_key")
+        restored["fact_key"] = restored["payload"].get("fact_key")
         restored["_bounded_search_documented"] = restored["payload"].get(
             "_bounded_search_documented"
         )
@@ -1857,7 +1965,7 @@ class ResearchRuntimeRepository:
         if not evidence:
             raise ValueError("accepted_materializable_claim_requires_evidence")
         primary = min(evidence, key=lambda item: item["source_tier"])
-        fact_key = f"research:{claim['claim_id']}"
+        fact_key = str(claim.get("fact_key") or f"research:{claim['claim_id']}")
         self.facts.upsert_fact_in_transaction(
             conn,
             {
@@ -1921,6 +2029,8 @@ class ResearchRuntimeRepository:
             "field_semantics": claim["field_semantics"],
             "value": claim["value"],
             "metric_id": claim.get("metric_id"),
+            "observation_key": claim.get("observation_key"),
+            "fact_key": claim.get("fact_key") or f"research:{claim['claim_id']}",
             "topic": claim.get("topic"),
             "period": claim.get("period"),
             "frequency": claim.get("frequency"),

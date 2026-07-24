@@ -24,6 +24,7 @@ $parentRunId = $null
 $queueContract = $null
 $children = @()
 $failedChildren = @()
+$outcome = $null
 $failureMessage = $null
 $startedAt = [DateTimeOffset]::UtcNow
 
@@ -112,6 +113,10 @@ try {
             }
         }
     }
+    $outcome = Get-SmokeOutcomeClassification `
+        -ParentStatus ([string]$run.status) `
+        -Children $children
+    $failedChildren = @($outcome.failed_children)
 
     $latest = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-research/mnq/latest"
     $context = Invoke-RestMethod -Method Get -Uri "$BaseUrl/market-context/mnq?refresh=false"
@@ -149,6 +154,8 @@ try {
             })
         } else { @() }
         failed_children = @($failedChildren)
+        outcome_category = $outcome.category
+        policy_no_data_children = @($outcome.policy_no_data_children)
         snapshot_id = $context.snapshot_id
         snapshot_revision = $context.snapshot_revision
         artifacts = $checksums
@@ -168,13 +175,8 @@ try {
             $run.metrics.budget_mode
         }
         threshold_exceeded = @(
-            ConvertTo-SmokeNonNullArray $(
-                if ($queueContract.is_parent) {
-                    $run.telemetry.warnings
-                }
-                else {
-                    $run.metrics.threshold_warnings
-                }
+            Get-SmokeThresholdExceeded $(
+                if ($queueContract.is_parent) { $run.telemetry } else { $run.metrics }
             )
         )
         checkpoint = $run.checkpoint
@@ -182,6 +184,9 @@ try {
     }
     $summary | ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath "$outputPath\summary.json" -Encoding utf8
+    if ($outcome.failed) {
+        throw "Authorized smoke contains internal child failures"
+    }
     $summary
 }
 catch {
@@ -208,7 +213,13 @@ catch {
             current_step = $currentStep.step_name
             step = $failureStep
             exit_code = $diagnostic.exit_code
-            error_category = $diagnostic.category
+            error_category = if ($diagnostic.category) {
+                $diagnostic.category
+            } elseif ($outcome) {
+                $outcome.category
+            } else {
+                "internal_failure"
+            }
             resource = $diagnostic.resource
             configured_limit = $diagnostic.configured_limit
             observed_count = $diagnostic.observed_count
@@ -222,12 +233,11 @@ catch {
             effective_budget = Get-SmokeCompactBudget $diagnostic.effective_budget
             budget_mode = $run.metrics.budget_mode
             threshold_exceeded = @(
-                ConvertTo-SmokeNonNullArray $(
+                Get-SmokeThresholdExceeded $(
                     if ($queueContract -and $queueContract.is_parent) {
-                        $run.telemetry.warnings
-                    }
-                    else {
-                        $run.metrics.threshold_warnings
+                        $run.telemetry
+                    } else {
+                        $run.metrics
                     }
                 )
             )
@@ -242,6 +252,12 @@ catch {
                 }
             } else { $null }
             failed_children = @($failedChildren)
+            outcome_category = if ($outcome) { $outcome.category } else { "internal_failure" }
+            policy_no_data_children = if ($outcome) {
+                @($outcome.policy_no_data_children)
+            } else {
+                @()
+            }
             progress = $diagnostic.progress
             loop_guard = [ordered]@{
                 category = $diagnostic.category

@@ -1058,6 +1058,37 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_source_audit
   ON market_context_snapshots(symbol,source_audit_status,revision DESC);
 """
 
+BACKEND_INVOCATION_LIFECYCLE_SCHEMA = """
+ALTER TABLE research_backend_invocations
+  ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'COMPLETED';
+ALTER TABLE research_backend_invocations ADD COLUMN started_at TEXT NULL;
+ALTER TABLE research_backend_invocations ADD COLUMN completed_at TEXT NULL;
+ALTER TABLE research_backend_invocations ADD COLUMN aborted_reason TEXT NULL;
+ALTER TABLE research_backend_invocations
+  ADD COLUMN usage_status TEXT NOT NULL DEFAULT 'AVAILABLE';
+
+UPDATE research_backend_invocations
+SET started_at=COALESCE(started_at,created_at),
+    completed_at=COALESCE(completed_at,created_at)
+WHERE lifecycle_status='COMPLETED';
+
+CREATE INDEX IF NOT EXISTS idx_research_backend_invocations_lifecycle
+  ON research_backend_invocations(run_id,lifecycle_status,created_at);
+
+CREATE TABLE IF NOT EXISTS research_reconciliation_audit (
+  audit_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  transaction_outcome TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id,action),
+  FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
+  FOREIGN KEY(job_id) REFERENCES ai_research_jobs(job_id)
+);
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -1078,4 +1109,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("016_gap_aware_parallel_research_and_temporal_audit", GAP_AWARE_PARALLEL_RESEARCH_SCHEMA),
     ("017_temporal_quarantine_runtime_reconciliation", TEMPORAL_QUARANTINE_RUNTIME_SCHEMA),
     ("018_invalid_source_quarantine_and_reconciliation", SOURCE_QUARANTINE_SCHEMA),
+    ("019_backend_invocation_lifecycle_and_reconciliation_audit", BACKEND_INVOCATION_LIFECYCLE_SCHEMA),
 )

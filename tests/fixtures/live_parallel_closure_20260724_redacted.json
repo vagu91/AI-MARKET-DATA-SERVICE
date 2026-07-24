@@ -1,0 +1,91 @@
+{
+  "parent": {
+    "parent_run_id": "prun-redacted-contract-final",
+    "manifest_id": "rgm-redacted-contract-final",
+    "snapshot_id": "mcs-redacted-contract-final",
+    "status": "PARTIAL",
+    "expected_child_count": 6,
+    "terminal_child_count": 6,
+    "wall_clock_seconds": 214,
+    "children": [
+      {"topic": "cot_positioning", "status": "FAILED"},
+      {"topic": "geopolitical_regulatory_risk", "status": "NO_DATA"},
+      {"topic": "mega_cap_semiconductors", "status": "LOOP_DETECTED"},
+      {"topic": "nasdaq_100", "status": "NO_DATA"},
+      {"topic": "news", "status": "NO_DATA"},
+      {"topic": "vix_risk", "status": "FAILED"}
+    ]
+  },
+  "cot": {
+    "status": "FAILED",
+    "error": "accepted event research result requires event_key",
+    "stack_fingerprint": "c004d279746bd0c96c8b72cf",
+    "accepted_count": 3,
+    "persisted_count": 3,
+    "read_back_count": 3,
+    "claim": {
+      "claim_ref": "candidate-redacted",
+      "topic": "cot_positioning",
+      "field_semantics": "current_market_context",
+      "metric_id": "noncommercial_net_position",
+      "period": "2026-07-14",
+      "frequency": "weekly",
+      "unit": "contracts",
+      "event_key": "CFTC_COT_209747_2026-07-14",
+      "value": "-130338"
+    }
+  },
+  "vix": {
+    "status": "FAILED",
+    "error": "accepted event research result requires event_key",
+    "stack_fingerprint": "c004d279746bd0c96c8b72cf",
+    "accepted_count": 1,
+    "persisted_count": 1,
+    "read_back_count": 1,
+    "claim": {
+      "claim_ref": "candidate-redacted",
+      "topic": "vix_risk",
+      "field_semantics": "current_market_context",
+      "metric_id": "put_call_total",
+      "frequency": "daily",
+      "unit": "ratio",
+      "value": "0.88"
+    }
+  },
+  "mega_cap": {
+    "status": "LOOP_DETECTED",
+    "searches": [
+      {
+        "item_id": "call-redacted-1",
+        "query": "site:sec.gov NVIDIA 8-K July 2026",
+        "tool_action_fingerprint": "20093aa0f3ae637a2"
+      },
+      {
+        "item_id": "call-redacted-2",
+        "query": "site:investors.example.com July 2026 semiconductor release",
+        "tool_action_fingerprint": "d2598dc3a977c098"
+      },
+      {
+        "item_id": "call-redacted-3",
+        "query": null,
+        "tool_action_fingerprint": "41655cc371be8799"
+      },
+      {
+        "item_id": "call-redacted-4",
+        "query": null,
+        "tool_action_fingerprint": "da21108c02c1dceb"
+      },
+      {
+        "item_id": "call-redacted-5",
+        "query": null,
+        "tool_action_fingerprint": "43d221f35f012e6a"
+      }
+    ]
+  },
+  "invocation_oracle": {
+    "attempted": 6,
+    "completed": 5,
+    "aborted": 1,
+    "aborted_usage_status": "unavailable"
+  }
+}

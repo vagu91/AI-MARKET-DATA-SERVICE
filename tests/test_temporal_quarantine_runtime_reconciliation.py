@@ -231,8 +231,8 @@ def test_migration_15_to_17_backfills_without_deleting_history(tmp_path: Path) -
     with connect_sqlite(path) as conn:
         row = conn.execute("SELECT * FROM economic_events_history").fetchone()
         versions = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-    assert result["schema_version"] == 18
-    assert [item["version"] for item in versions][-2:] == [17, 18]
+    assert result["schema_version"] == 19
+    assert [item["version"] for item in versions][-3:] == [17, 18, 19]
     assert row["event_key"] == REAL_KEYS[0]
     assert row["temporal_status"] == "QUARANTINED"
 
@@ -266,6 +266,7 @@ def test_migration_16_to_17_quarantines_both_real_keys_and_reopen_is_idempotent(
     assert first["applied"] == [
         "017_temporal_quarantine_runtime_reconciliation",
         "018_invalid_source_quarantine_and_reconciliation",
+        "019_backend_invocation_lifecycle_and_reconciliation_audit",
     ]
     assert len(rows) == 2
     assert {row["event_key"] for row in rows} == set(REAL_KEYS)

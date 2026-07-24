@@ -530,21 +530,34 @@ def _aggregate_parent_telemetry(
             }
         )
     run_ids = [str(child.get("child_run_id")) for child in children if child.get("child_run_id")]
-    invocation_count = 0
+    invocation_counts = {
+        "attempted": 0,
+        "completed": 0,
+        "aborted": 0,
+        "usage_unavailable": 0,
+    }
     if run_ids:
         placeholders = ",".join("?" for _ in run_ids)
-        invocation_count = int(
-            conn.execute(
-                f"""
-                SELECT COUNT(DISTINCT invocation_id)
-                FROM research_backend_invocations
-                WHERE run_id IN ({placeholders})
-                """,
-                run_ids,
-            ).fetchone()[0]
-        )
-    if invocation_count == 0:
-        invocation_count = sum(
+        invocation_row = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT invocation_id) AS attempted,
+                   COUNT(DISTINCT CASE WHEN lifecycle_status='COMPLETED'
+                                      THEN invocation_id END) AS completed,
+                   COUNT(DISTINCT CASE WHEN lifecycle_status='ABORTED'
+                                      THEN invocation_id END) AS aborted,
+                   COUNT(DISTINCT CASE WHEN usage_status='UNAVAILABLE'
+                                       THEN invocation_id END) AS usage_unavailable
+            FROM research_backend_invocations
+            WHERE run_id IN ({placeholders})
+            """,
+            run_ids,
+        ).fetchone()
+        invocation_counts = {
+            key: int(invocation_row[key] or 0)
+            for key in invocation_counts
+        }
+    if invocation_counts["attempted"] == 0:
+        completed_fallback = sum(
             int(
                 (
                     _load_json_object(child.get("metrics_json")).get("backend")
@@ -554,6 +567,12 @@ def _aggregate_parent_telemetry(
             )
             for child in children
         )
+        invocation_counts = {
+            "attempted": completed_fallback,
+            "completed": completed_fallback,
+            "aborted": 0,
+            "usage_unavailable": 0,
+        }
     wall_clock_seconds = None
     if parent.get("started_at") and completed_at:
         started = datetime.fromisoformat(str(parent["started_at"]).replace("Z", "+00:00"))
@@ -567,7 +586,21 @@ def _aggregate_parent_telemetry(
             "tools": "child_run_id/tool_action_fingerprint",
         },
         "child_statuses": child_statuses,
-        "backend_invocations": invocation_count,
+        "backend_invocations": invocation_counts["completed"],
+        "backend_invocations_attempted": invocation_counts["attempted"],
+        "backend_invocations_completed": invocation_counts["completed"],
+        "backend_invocations_aborted": invocation_counts["aborted"],
+        "backend_usage_status": (
+            "partially_unavailable"
+            if invocation_counts["usage_unavailable"]
+            and invocation_counts["completed"]
+            else "unavailable"
+            if invocation_counts["usage_unavailable"]
+            else "available"
+        ),
+        "backend_usage_unavailable_invocations": invocation_counts[
+            "usage_unavailable"
+        ],
         **totals,
         "usage": usage,
         "wall_clock_seconds": wall_clock_seconds,

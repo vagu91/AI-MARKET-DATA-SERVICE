@@ -135,7 +135,7 @@ def test_schema_17_to_18_quarantines_without_deleting_and_is_idempotent(
     monkeypatch.setattr(migrations, "MIGRATIONS", full_migrations)
     first = migrations.migrate_database(database)
     second = migrations.migrate_database(database)
-    assert first["schema_version"] == 18
+    assert first["schema_version"] == 19
     assert first["source_reconciliation"]["quarantined_count"] == 2
     assert second["applied"] == []
     with connect_sqlite(database) as conn:
