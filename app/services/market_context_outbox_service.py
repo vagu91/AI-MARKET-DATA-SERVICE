@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
 
@@ -14,6 +15,41 @@ from app.services.event_driven_lifecycle_service import (
     material_changes,
     materiality_fingerprint,
 )
+
+
+@dataclass(frozen=True)
+class TriggerEnvelope:
+    trigger_type: str
+    trigger_entity: str | None = None
+    trace_id: str | None = None
+    correlation_id: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> TriggerEnvelope | None:
+        if not isinstance(value, dict) or not value.get("trigger_type"):
+            return None
+        return cls(
+            trigger_type=str(value["trigger_type"]),
+            trigger_entity=(
+                str(value["trigger_entity"])
+                if value.get("trigger_entity") is not None
+                else None
+            ),
+            trace_id=str(value["trace_id"]) if value.get("trace_id") else None,
+            correlation_id=(
+                str(value["correlation_id"])
+                if value.get("correlation_id")
+                else None
+            ),
+        )
+
+    def snapshot_arguments(self) -> dict[str, str | None]:
+        return {
+            "trigger_type": self.trigger_type,
+            "trigger_entity": self.trigger_entity,
+            "trace_id": self.trace_id,
+            "correlation_id": self.correlation_id,
+        }
 
 
 class MarketContextOutboxRepository:

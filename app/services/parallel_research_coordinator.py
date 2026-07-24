@@ -15,6 +15,7 @@ from app.services.ai_research_job_service import AIResearchJobService
 from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.research_profiles import PROFILES
 from app.services.research_runtime_repository import ResearchRuntimeRepository
+from app.services.research_agent_enablement import is_research_agent_enabled
 
 
 class ParallelResearchCoordinator:
@@ -60,6 +61,12 @@ class ParallelResearchCoordinator:
             for item in manifest.get("items") or []
             if item.get("required_action") == "AGENT_RESEARCH"
             and item.get("ai_eligible", True)
+            and item.get("agent_enabled", True)
+            and is_research_agent_enabled(
+                self.settings,
+                topic=str(item.get("topic") or ""),
+                profile_id=TOPIC_PROFILES.get(str(item.get("topic") or "")),
+            )
         }
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -101,6 +108,12 @@ class ParallelResearchCoordinator:
         child_jobs: list[dict[str, Any]] = []
         for ordinal, topic in enumerate(sorted(items), start=1):
             profile_id = TOPIC_PROFILES[topic]
+            if not is_research_agent_enabled(
+                self.settings,
+                topic=topic,
+                profile_id=profile_id,
+            ):
+                continue
             profile = PROFILES[profile_id]
             compact_item = items[topic]
             payload = {
@@ -292,6 +305,17 @@ class ParallelResearchCoordinator:
                 statuses,
                 completed_at=completed_at,
             )
+            readiness = _research_readiness(
+                parent_status=parent_status,
+                execution_complete=execution_complete,
+                coverage_complete=coverage_complete,
+                missing_topics=missing_topics,
+                blocking_gaps=blocking_gaps,
+                child_rows=child_rows,
+                statuses=statuses,
+                telemetry=telemetry,
+            )
+            telemetry["readiness"] = readiness
             checkpoint_json = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
             telemetry_json = json.dumps(telemetry, sort_keys=True, separators=(",", ":"))
             conn.execute(
@@ -333,7 +357,7 @@ class ParallelResearchCoordinator:
                     json.dumps(missing_topics, separators=(",", ":")),
                     json.dumps(blocking_gaps, separators=(",", ":")),
                     json.dumps(policy_no_data_topics, separators=(",", ":")),
-                    0,
+                    int(readiness["ready"]),
                     parent_run_id,
                     parent_status,
                     terminal_count,
@@ -400,6 +424,14 @@ class ParallelResearchCoordinator:
                 ),
                 "ready_for_trading_context": bool(
                     output.get("ready_for_trading_context")
+                ),
+                "readiness_debug": (
+                    output.get("telemetry", {}).get("readiness") or {}
+                ),
+                "disabled_optional_topics": sorted(
+                    str(item)
+                    for item in manifest_payload.get("disabled_topics") or []
+                    if item
                 ),
                 "snapshot_status": (
                     "MATERIALIZING"
@@ -509,6 +541,61 @@ def _manifest_required_topics(manifest: dict[str, Any]) -> list[str]:
     }
     topics.update(str(item) for item in manifest.get("agent_topics") or [] if item)
     return sorted(topics)
+
+
+def _research_readiness(
+    *,
+    parent_status: str,
+    execution_complete: bool,
+    coverage_complete: bool,
+    missing_topics: list[str],
+    blocking_gaps: list[str],
+    child_rows: list[dict[str, Any]],
+    statuses: list[str],
+    telemetry: dict[str, Any],
+) -> dict[str, Any]:
+    verified_sources = int(telemetry.get("verified_sources") or 0)
+    successful_children = sum(status == "SUCCEEDED" for status in statuses)
+    warnings = [
+        str(value).lower()
+        for child in child_rows
+        for value in _load_json_list(child.get("warnings_json"))
+    ]
+    conditions = {
+        "execution_complete": bool(execution_complete),
+        "terminal_status_acceptable": parent_status
+        in {"SUCCEEDED", "PARTIAL", "NO_DATA"},
+        "no_failed_or_loop_children": not any(
+            status
+            in {
+                "FAILED",
+                "LOOP_DETECTED",
+                "TIMED_OUT",
+                "CANCELLED",
+                "REJECTED",
+            }
+            for status in statuses
+        ),
+        "critical_coverage_complete": bool(coverage_complete)
+        and not missing_topics,
+        "no_critical_blocking_gaps": not blocking_gaps,
+        "verified_sources_present": (
+            successful_children == 0 or verified_sources > 0
+        ),
+        "no_quarantined_evidence": not any(
+            "quarantin" in warning for warning in warnings
+        ),
+    }
+    failed = sorted(key for key, passed in conditions.items() if not passed)
+    return {
+        "ready": not failed,
+        "policy": "deterministic_research_context_readiness_v1",
+        "conditions": conditions,
+        "failed_conditions": failed,
+        "reasons": [
+            f"research_readiness_failed:{condition}" for condition in failed
+        ],
+    }
 
 
 def _materialized_parent_counts(

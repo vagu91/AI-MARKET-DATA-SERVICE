@@ -323,6 +323,68 @@ class Settings(BaseSettings):
     enable_ai_researcher: bool = Field(
         default=False, validation_alias="AI_MARKET_ENABLE_AI_RESEARCHER"
     )
+    research_agents_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENTS_ENABLED",
+    )
+    research_agent_macro_events_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_MACRO_EVENTS_ENABLED",
+    )
+    research_agent_fed_rates_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_FED_RATES_ENABLED",
+    )
+    research_agent_vix_risk_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_VIX_RISK_ENABLED",
+    )
+    research_agent_cot_positioning_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_COT_POSITIONING_ENABLED",
+    )
+    research_agent_nasdaq_100_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_NASDAQ_100_ENABLED",
+    )
+    research_agent_mega_cap_semiconductors_enabled: bool = Field(
+        default=True,
+        validation_alias=(
+            "AI_MARKET_RESEARCH_AGENT_MEGA_CAP_SEMICONDUCTORS_ENABLED"
+        ),
+    )
+    research_agent_earnings_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_EARNINGS_ENABLED",
+    )
+    research_agent_news_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_NEWS_ENABLED",
+    )
+    research_agent_geopolitical_regulatory_risk_enabled: bool = Field(
+        default=True,
+        validation_alias=(
+            "AI_MARKET_RESEARCH_AGENT_GEOPOLITICAL_REGULATORY_RISK_ENABLED"
+        ),
+    )
+    research_agent_options_positioning_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_OPTIONS_POSITIONING_ENABLED",
+    )
+    research_agent_market_internals_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_MARKET_INTERNALS_ENABLED",
+    )
+    research_agent_cross_asset_context_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_RESEARCH_AGENT_CROSS_ASSET_CONTEXT_ENABLED",
+    )
+    research_agent_earnings_intelligence_enabled: bool = Field(
+        default=False,
+        validation_alias=(
+            "AI_MARKET_RESEARCH_AGENT_EARNINGS_INTELLIGENCE_ENABLED"
+        ),
+    )
     ai_researcher_mode: str = Field(
         default="codex_cli", validation_alias="AI_MARKET_AI_RESEARCHER_MODE"
     )

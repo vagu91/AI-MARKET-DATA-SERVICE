@@ -22,6 +22,7 @@ from app.services.event_driven_lifecycle_service import (
     LifecycleRepository,
     negative_cache_fingerprint,
 )
+from app.services.research_agent_enablement import research_agent_enablement
 
 
 MNQ_TOPICS = (
@@ -77,6 +78,9 @@ class ResearchGapItem:
     ai_eligible: bool = True
     provider_resolver_status: str = "NOT_REQUIRED"
     lifecycle: dict[str, Any] = field(default_factory=dict)
+    agent_enabled: bool = True
+    execution_status: str = "NOT_REQUESTED"
+    data_outcome: str = "NOT_EVALUATED"
 
 
 class ResearchGapManifestBuilder:
@@ -122,8 +126,38 @@ class ResearchGapManifestBuilder:
         provider_stage = context.get("research_provider_stage") or {}
         items: list[ResearchGapItem] = []
         for item in raw_items:
+            if item.topic in TOPIC_PROFILES:
+                enablement = research_agent_enablement(
+                    self.settings,
+                    topic=item.topic,
+                    profile_id=TOPIC_PROFILES[item.topic],
+                )
+                if not enablement["agent_enabled"]:
+                    items.append(
+                        replace(
+                            item,
+                            deterministic_status="DISABLED",
+                            required_action="NONE",
+                            reason=str(enablement["reason"]),
+                            ai_eligible=False,
+                            agent_enabled=False,
+                            execution_status="NOT_REQUESTED",
+                            data_outcome="DISABLED",
+                        )
+                    )
+                    continue
             if item.required_action != "AGENT_RESEARCH":
-                items.append(item)
+                items.append(
+                    replace(
+                        item,
+                        execution_status="NOT_REQUESTED",
+                        data_outcome=(
+                            "AVAILABLE"
+                            if item.deterministic_status.startswith("SATISFIED")
+                            else "NOT_REQUIRED"
+                        ),
+                    )
+                )
                 continue
             fields = list(item.missing_fields)
             cache = self.lifecycle.negative_cache(
@@ -153,6 +187,8 @@ class ResearchGapManifestBuilder:
                         ai_eligible=False,
                         provider_resolver_status=provider_status,
                         lifecycle=cache,
+                        execution_status="NOT_REQUESTED",
+                        data_outcome="NO_DATA_BACKOFF",
                     )
                 )
                 continue
@@ -167,6 +203,12 @@ class ResearchGapManifestBuilder:
                     ),
                     ai_eligible=provider_status in {"EXHAUSTED", "NOT_CONFIGURED"},
                     provider_resolver_status=provider_status,
+                    execution_status=(
+                        "REQUESTED"
+                        if provider_status in {"EXHAUSTED", "NOT_CONFIGURED"}
+                        else "NOT_REQUESTED"
+                    ),
+                    data_outcome="PENDING",
                 )
             )
         body = {
@@ -196,6 +238,28 @@ class ResearchGapManifestBuilder:
                 for item in items
                 if item.required_action == "AGENT_RESEARCH"
                 and item.ai_eligible
+            ],
+            "configured_topics": list(TOPIC_PROFILES),
+            "enabled_topics": [
+                item.topic
+                for item in items
+                if item.topic in TOPIC_PROFILES and item.agent_enabled
+            ],
+            "disabled_topics": [
+                item.topic
+                for item in items
+                if item.topic in TOPIC_PROFILES and not item.agent_enabled
+            ],
+            "requested_topics": [
+                item.topic
+                for item in items
+                if item.execution_status == "REQUESTED"
+            ],
+            "not_requested_topics": [
+                item.topic
+                for item in items
+                if item.topic in TOPIC_PROFILES
+                and item.execution_status == "NOT_REQUESTED"
             ],
             "deterministic_refresh_topics": [
                 item.topic
@@ -492,18 +556,27 @@ def _completeness(topic: str, value: Any) -> tuple[float, list[str]]:
         )
         coverage = {
             "report_date": _has_data(
-                value.get("report_date")
-                or value.get("data_as_of")
-                or value.get("cot_report_date")
+                _first_present(
+                    value,
+                    "report_date",
+                    "data_as_of",
+                    "cot_report_date",
+                )
             ),
             "contract_code": _has_data(
-                value.get("contract_code")
-                or value.get("contract_market_code")
-                or value.get("cot_contract")
+                _first_present(
+                    value,
+                    "contract_code",
+                    "contract_market_code",
+                    "cot_contract",
+                )
             ),
             "open_interest": _has_data(
-                value.get("open_interest")
-                or value.get("cot_open_interest")
+                _first_present(
+                    value,
+                    "open_interest",
+                    "cot_open_interest",
+                )
             ),
             "group_positions": any(
                 _cot_group_has_positions(group) for group in position_groups
@@ -554,6 +627,14 @@ def _cot_group_has_positions(value: Any) -> bool:
         value.get(field) not in (None, "")
         for field in ("long", "short")
     )
+
+
+def _first_present(value: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        candidate = value.get(key)
+        if candidate is not None and candidate != "":
+            return candidate
+    return None
 
 
 def _has_data(value: Any) -> bool:

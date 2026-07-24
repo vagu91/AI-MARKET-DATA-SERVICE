@@ -10,6 +10,14 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.codex_runtime_contract import sanitize_diagnostic
+from app.services.research_agent_enablement import (
+    disabled_job_result,
+    is_research_agent_enabled,
+)
+from app.services.observability_contract_service import (
+    DeterministicAnomalyDetector,
+    TelemetryRepository,
+)
 
 
 ACTIVE_JOB_STATUSES = {"PENDING", "RUNNING", "RETRY_SCHEDULED"}
@@ -61,6 +69,41 @@ class AIResearchJobRepository:
         specialized_topic: str | None = None,
         child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if not is_research_agent_enabled(
+            self.settings,
+            topic=specialized_topic,
+            profile_id=profile_id,
+            job_type=job_type,
+        ):
+            rejected = disabled_job_result(
+                self.settings,
+                topic=specialized_topic,
+                profile_id=profile_id,
+                job_type=job_type,
+                correlation_id=correlation_id,
+            )
+            TelemetryRepository(self.settings, clock=self.clock).emit(
+                "agent_disabled",
+                identifiers={"correlation_id": correlation_id},
+                decision_summary="research job rejected by centralized enablement",
+                stop_reason="AGENT_DISABLED",
+                payload={
+                    "status": "REJECTED",
+                    "reason": "AGENT_DISABLED",
+                },
+            )
+            DeterministicAnomalyDetector(
+                self.settings,
+                clock=self.clock,
+            ).detect(
+                {
+                    "agent_invocation_attempted": True,
+                    "agent_enabled": False,
+                    "profile_id": profile_id,
+                    "job_type": job_type,
+                }
+            )
+            return rejected, False
         now = self._iso(self.clock())
         job_id = f"airj-{uuid.uuid4()}"
         with connect_sqlite(self.settings.database_path) as conn:
@@ -103,7 +146,18 @@ class AIResearchJobRepository:
                 ),
             )
             conn.commit()
-        return self.get(job_id), True
+        stored = self.get(job_id)
+        TelemetryRepository(self.settings, clock=self.clock).emit(
+            "enqueue",
+            identifiers={
+                "correlation_id": correlation_id,
+                "child_job_id": job_id,
+                "parent_run_id": parent_run_id,
+            },
+            decision_summary="persistent research job enqueued",
+            payload={"status": "PENDING", "reason": "enablement_allowed"},
+        )
+        return stored, True
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with connect_sqlite(self.settings.database_path) as conn:

@@ -72,6 +72,29 @@ API support is intentionally limited to listing/reading and controlled
 acknowledgement with consumer identity plus the exact idempotency key. There is
 no delivery worker in this change.
 
+## Central research-agent enablement
+
+`AI_MARKET_RESEARCH_AGENTS_ENABLED` is the master authority. Thirteen typed
+topic/profile/job mappings then use
+`AI_MARKET_RESEARCH_AGENT_<TOPIC>_ENABLED`. The established nine agents default
+to enabled; options positioning, market internals, cross-asset context, and
+earnings intelligence default to disabled. The registry validates that every
+specialized profile is mapped exactly once.
+
+The manifest, coordinator, job service, repository, and worker all enforce the
+same decision. A disabled topic has `required_action=NONE`,
+`ai_eligible=false`, `execution_status=NOT_REQUESTED`, and
+`data_outcome=DISABLED`. It creates no child/job/retry/recovery/backend/token or
+web work and is not a coverage denominator or blocking gap. A queued job that
+becomes disabled is terminally rejected immediately before backend execution
+with `AGENT_DISABLED` and a non-retryable classification. A running job is not
+interrupted. Disabling an agent never deletes its previously committed data.
+
+The general scheduler, research scheduler, due scanner, master agent switch,
+per-agent switches, and worker are separate controls. The scanner defaults to
+false. Changes to a local `.env` require a later service restart; this change
+does not restart the service.
+
 ## Telemetry and incidents
 
 The shared JSON schema is
@@ -88,6 +111,10 @@ The deterministic incident detector fingerprints and persists job/lease,
 loop, early NO_DATA retry, usage, accounting, source, pending actual,
 projection, readiness, future timestamp, reserved host, read-only write,
 outbox lag, and CLI/API divergence signals. It never invokes AI.
+An attempted disabled-agent path is also a deterministic anomaly. Telemetry
+contains structured identifiers, profiles, durations, usage/cost status and
+stop reasons only; it never records prompts, hidden reasoning, secrets, or
+chain-of-thought.
 
 ## Required-test traceability
 

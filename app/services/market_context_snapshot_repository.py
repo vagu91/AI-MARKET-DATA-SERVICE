@@ -25,6 +25,7 @@ from app.services.event_driven_lifecycle_service import (
     compute_datum_lifecycle,
     persist_lifecycle_in_transaction,
 )
+from app.services.observability_contract_service import TelemetryRepository
 
 
 class MarketContextSnapshotRepository:
@@ -38,6 +39,7 @@ class MarketContextSnapshotRepository:
         self.temporal_validation = TemporalValidationService(settings)
         self.source_policy = SourcePolicyService()
         self.outbox = MarketContextOutboxRepository(settings)
+        self.telemetry = TelemetryRepository(settings)
         self.allow_test_reserved_sources = settings.environment.lower() == "test"
 
     def save_next(
@@ -85,6 +87,7 @@ class MarketContextSnapshotRepository:
             "policy_version": self.source_policy.policy_version,
         }
         debug["audit"] = audit
+        outbox_event: dict[str, Any] | None = None
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute(
@@ -184,7 +187,7 @@ class MarketContextSnapshotRepository:
                 ),
             )
             if trigger_type:
-                self.outbox.emit_in_transaction(
+                outbox_event = self.outbox.emit_in_transaction(
                     conn,
                     trigger_type=trigger_type,
                     trigger_entity=trigger_entity,
@@ -224,6 +227,40 @@ class MarketContextSnapshotRepository:
                 )
                 conn.execute("UPDATE ai_research_jobs SET snapshot_id=? WHERE job_id=?", (snapshot_id, job_id))
             conn.commit()
+        if trigger_type:
+            telemetry_ids = {
+                "trace_id": trace_id,
+                "correlation_id": correlation_id,
+                "snapshot_id": snapshot_id,
+                "outbox_event_id": (
+                    outbox_event.get("event_id") if outbox_event else None
+                ),
+            }
+            self.telemetry.emit(
+                "material_diff",
+                identifiers=telemetry_ids,
+                decision_summary=(
+                    "material trigger produced snapshot section changes"
+                    if outbox_event
+                    else "trigger produced no material section changes"
+                ),
+                stop_reason="MATERIAL_CHANGE" if outbox_event else "NO_CHANGE",
+                payload={
+                    "status": "CHANGED" if outbox_event else "UNCHANGED",
+                    "reason": str(trigger_type),
+                },
+            )
+            if outbox_event:
+                self.telemetry.emit(
+                    "outbox_emission",
+                    identifiers=telemetry_ids,
+                    decision_summary="atomic market context outbox row committed",
+                    stop_reason="PENDING_DELIVERY",
+                    payload={
+                        "status": "PENDING",
+                        "reason": str(trigger_type),
+                    },
+                )
         restored = self.get(snapshot_id)
         if restored is None or restored["checksum"] != checksum:
             raise RuntimeError("market context snapshot read-back failed")

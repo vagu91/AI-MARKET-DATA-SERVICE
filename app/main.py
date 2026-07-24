@@ -12,6 +12,16 @@ from app.infrastructure.storage_retention import cleanup_storage, maybe_run_star
 from app.infrastructure.persistence.database_maintenance import run_database_maintenance
 
 
+async def run_lifecycle_due_scan(state):
+    scheduler = state["research_scheduler"]
+    return await asyncio.to_thread(
+        scheduler.scan_due_items,
+        owner="apscheduler-lifecycle-due-scanner",
+        resolver=state["lifecycle_due_resolver"].resolve,
+        ai_enqueue=scheduler.enqueue_due_residuals,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -76,10 +86,9 @@ async def lifespan(app: FastAPI):
                 )
             if settings.lifecycle_due_scanner_enabled:
                 scheduler.add_job(
-                    lambda: state["research_scheduler"].scan_due_items(
-                        owner="apscheduler-lifecycle-due-scanner"
-                    ),
+                    run_lifecycle_due_scan,
                     "interval",
+                    args=[state],
                     seconds=settings.lifecycle_due_scanner_interval_seconds,
                     id="lifecycle_due_scanner",
                     max_instances=1,

@@ -242,6 +242,10 @@ def _research(value: dict[str, Any]) -> dict[str, Any]:
         "policy_no_data_topics": list(
             value.get("policy_no_data_topics") or []
         ),
+        "disabled_optional_topics": list(
+            value.get("disabled_optional_topics") or []
+        ),
+        "readiness_debug": dict(value.get("readiness_debug") or {}),
         "ready_for_trading_context": bool(
             value.get("ready_for_trading_context")
         ),

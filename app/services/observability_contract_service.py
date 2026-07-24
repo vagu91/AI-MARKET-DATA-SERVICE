@@ -41,6 +41,7 @@ TELEMETRY_EVENTS = frozenset(
         "outbox_emission",
         "retry_backoff",
         "loop_emergency_ceiling",
+        "agent_disabled",
     }
 )
 IDENTIFIER_FIELDS = (
@@ -352,6 +353,20 @@ class DeterministicAnomalyDetector:
             findings.append(("MEDIUM", "outbox_lag", {}))
         if signals.get("backend_contract_divergence"):
             findings.append(("HIGH", "cli_api_divergence", {}))
+        if (
+            signals.get("agent_invocation_attempted")
+            and signals.get("agent_enabled") is False
+        ):
+            findings.append(
+                (
+                    "HIGH",
+                    "disabled_agent_invocation",
+                    {
+                        "profile_id": signals.get("profile_id"),
+                        "job_type": signals.get("job_type"),
+                    },
+                )
+            )
         return [
             self._persist(
                 severity,

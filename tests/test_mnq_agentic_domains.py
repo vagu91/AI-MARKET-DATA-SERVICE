@@ -65,6 +65,12 @@ def settings(tmp_path: Path, **overrides: Any) -> Settings:
         "enable_ai_researcher": True,
         "research_backend": "codex_cli",
         "research_parallelism": 2,
+        # This suite exercises the explicit enabled behavior of the four
+        # opt-in domains; production/default behavior is covered separately.
+        "research_agent_options_positioning_enabled": True,
+        "research_agent_market_internals_enabled": True,
+        "research_agent_cross_asset_context_enabled": True,
+        "research_agent_earnings_intelligence_enabled": True,
         "research_gateway_min_text_chars": 20,
         "research_gateway_respect_robots": False,
     }

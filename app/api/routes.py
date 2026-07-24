@@ -62,6 +62,7 @@ from app.services.parallel_research_coordinator import ParallelResearchCoordinat
 from app.services.market_context_outbox_service import (
     MarketContextOutboxRepository,
 )
+from app.services.research_agent_enablement import safe_research_agent_capabilities
 
 router = APIRouter()
 
@@ -93,6 +94,9 @@ async def ai_research_status(
     return {
         **repository.status(),
         "enrichment": AIResearchJobService(enrichment_orchestrator.settings).enrichment_status("MNQ"),
+        "research_agents": safe_research_agent_capabilities(
+            enrichment_orchestrator.settings
+        ),
     }
 
 
@@ -100,7 +104,14 @@ async def ai_research_status(
 async def ai_research_capabilities(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
-    return AIResearchCapabilityService(enrichment_orchestrator.settings).probe(persist=True)
+    return {
+        **AIResearchCapabilityService(
+            enrichment_orchestrator.settings
+        ).probe(persist=True),
+        "research_agents": safe_research_agent_capabilities(
+            enrichment_orchestrator.settings
+        ),
+    }
 
 
 @router.get("/ai-research/jobs/{job_id}")

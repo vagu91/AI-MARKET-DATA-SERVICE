@@ -147,8 +147,9 @@ Key post-change invariants verified:
 ## Validation evidence
 
 - Dedicated lifecycle/outbox/observability suite: 44 passed.
+- Central enablement/end-to-end closure suite: 13 passed.
 - Pertinent closure suite: 69 passed.
-- Complete repository suite: 1,342 passed in 190.68 seconds.
+- Complete repository suite: 1,355 passed in 204.87 seconds.
 - Ruff: passed.
 - `compileall`: passed.
 - Windows PowerShell 5.1 parser: four scripts parsed, zero errors.
@@ -168,6 +169,23 @@ Key post-change invariants verified:
 No test used or migrated the operational database. No Uvicorn process was
 stopped or restarted. No service AI/OpenAI/Codex, provider, browser, web,
 trading, execution, or order call was made.
+
+## End-to-end closure addendum
+
+The follow-up reproduction added red tests before implementation. They exposed
+five concrete production gaps: no centralized per-agent authority, an
+APScheduler due-scan call without resolver/enqueue dependencies, pre-event
+earnings actual retries scheduled before occurrence, a partial atomic lifecycle
+UPSERT, and numeric zero treated as missing. The fixes use one typed 13-agent
+registry, defense in depth through worker pre-backend, a real application
+resolver/enqueue wiring, event-relative earnings retry, authoritative atomic
+field replacement, and type-aware material-data checks.
+
+Migration 021 was not required. All state fits the existing migration 020 JSON
+and additive columns. The local `.env` was changed only for the requested
+master and 13 per-agent keys, remains untracked, and requires a future operator
+restart; no restart occurred. The protected consumer artifact and pre-change
+database backup were not modified.
 
 ## Residual risk and AI-TRADER follow-up
 

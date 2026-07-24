@@ -12,6 +12,10 @@ from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key, temporal_event_state
 from app.services.research_profiles import profile_for_job
+from app.services.research_agent_enablement import (
+    disabled_job_result,
+    is_research_agent_enabled,
+)
 
 
 PROMPT_VERSION = "ai_research_job_v1"
@@ -38,7 +42,13 @@ class AIResearchJobService:
         correlation_id: str | None = None,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-        if not self.settings.enable_ai_researcher:
+        if (
+            not self.settings.enable_ai_researcher
+            or not is_research_agent_enabled(
+                self.settings,
+                job_type="MISSING_EVENT_RESEARCH",
+            )
+        ):
             return []
         output: list[dict[str, Any]] = []
         for event in events:
@@ -94,6 +104,8 @@ class AIResearchJobService:
             if state["temporal_status"] not in {"AWAITING_ACTUAL", "AWAITING_OUTCOME"}:
                 continue
             job_type = "RELEASE_ACTUAL_REFRESH" if state["temporal_status"] == "AWAITING_ACTUAL" else "SPEECH_OUTCOME_REFRESH"
+            if not is_research_agent_enabled(self.settings, job_type=job_type):
+                continue
             pending = ["actual"] if job_type == "RELEASE_ACTUAL_REFRESH" else ["outcome", "transcript_url"]
             event_payload = event.model_dump(mode="json")
             event_key = state["canonical_event_key"]
@@ -152,6 +164,23 @@ class AIResearchJobService:
         specialized_topic: str | None = None,
         child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        profile = profile_for_job(job_type)
+        if not is_research_agent_enabled(
+            self.settings,
+            topic=specialized_topic,
+            profile_id=profile.profile_id,
+            job_type=job_type,
+        ):
+            return (
+                disabled_job_result(
+                    self.settings,
+                    topic=specialized_topic,
+                    profile_id=profile.profile_id,
+                    job_type=job_type,
+                    correlation_id=correlation_id,
+                ),
+                False,
+            )
         pending = pending_fields or list(request_payload.get("pending_fields") or [])
         identity = event_key or hashlib.sha256(self._canonical(request_payload).encode("utf-8")).hexdigest()[:24]
         sanitized_request = self.source_policy.sanitize_operational_payload(
@@ -168,7 +197,6 @@ class AIResearchJobService:
         }
         scope_key = self._scope_key(job_type, identity, pending)
         generation, run_window = self._generation(job_type, force=force)
-        profile = profile_for_job(job_type)
         return self.repository.enqueue(
             idempotency_key=self._idempotency_key(scope_key, generation),
             job_type=job_type,

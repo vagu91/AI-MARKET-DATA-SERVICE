@@ -169,13 +169,26 @@ def compute_datum_lifecycle(
         "earnings_intelligence",
     }:
         if event_at is not None and actual_missing:
-            next_retry_at = next_retry_at or _bounded_retry_at(
-                now,
-                attempt_count=attempt_count,
-                delays=_retry_delays(settings),
-            )
-            next_refresh_at = next_retry_at
             valid_until = valid_until or event_at
+            if event_at <= now:
+                next_retry_at = next_retry_at or _bounded_retry_at(
+                    now,
+                    attempt_count=attempt_count,
+                    delays=_retry_delays(settings),
+                )
+                next_refresh_at = next_retry_at
+            else:
+                next_retry_at = None
+                next_refresh_at = max(
+                    event_at,
+                    next_refresh_at or event_at,
+                )
+        elif not actual_missing:
+            next_retry_at = None
+            valid_until = valid_until or (
+                published_at or observed_at or now
+            ) + _default_ttl(entity_type, settings)
+            next_refresh_at = next_refresh_at or valid_until
 
     if valid_until is None:
         anchor = observed_at or data_as_of or event_at or now
@@ -732,10 +745,19 @@ def persist_lifecycle_in_transaction(
         ON CONFLICT(entity_type,entity_key) DO UPDATE SET
           trigger_class=excluded.trigger_class,
           freshness_state=excluded.freshness_state,
+          observed_at=excluded.observed_at,
+          data_as_of=excluded.data_as_of,
+          published_at=excluded.published_at,
+          event_at=excluded.event_at,
+          valid_from=excluded.valid_from,
+          valid_until=excluded.valid_until,
           next_refresh_at=excluded.next_refresh_at,
           next_retry_at=excluded.next_retry_at,
+          superseded_by=excluded.superseded_by,
           refresh_reason=excluded.refresh_reason,
           materiality_fingerprint=excluded.materiality_fingerprint,
+          source_lineage_json=excluded.source_lineage_json,
+          acquisition_method=excluded.acquisition_method,
           retry_class=excluded.retry_class,
           retry_policy_json=excluded.retry_policy_json,
           negative_cache_key=excluded.negative_cache_key,
@@ -915,7 +937,13 @@ def _has_material_data(value: Any) -> bool:
         )
     if isinstance(value, list):
         return any(_has_material_data(item) for item in value)
-    return value not in (None, "", False)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, bool):
+        return value
+    return True
 
 
 def _strip_volatile(value: Any) -> Any:
