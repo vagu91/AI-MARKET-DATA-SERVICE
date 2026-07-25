@@ -7,7 +7,13 @@ import httpx
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderResult, ProviderType
-from app.providers.base import BaseProvider, ProviderError, metadata, redact_sensitive
+from app.providers.base import (
+    BaseProvider,
+    ProviderDisabled,
+    ProviderError,
+    metadata,
+    redact_sensitive,
+)
 
 
 # BEA NIPA mappings are intentionally explicit.
@@ -32,6 +38,14 @@ BEA_SERIES = [
         "table": "T10106",
         "frequency": "Q",
         "line_number": "1",
+    },
+    {
+        "series_id": "BEA:GDP_PRICE_INDEX",
+        "name": "GDP Price Index",
+        "table": "T10101",
+        "frequency": "Q",
+        "line_number": "4",
+        "optional": True,
     },
     {
         "series_id": "BEA:PCE",
@@ -82,6 +96,8 @@ class BeaProvider(BaseProvider):
         self.settings = settings
 
     async def fetch(self) -> ProviderResult:
+        if not self.settings.bea_enabled:
+            raise ProviderDisabled("BEA provider is disabled")
         if not self.settings.bea_api_key:
             raise ProviderError("BEA API key is not configured")
 
@@ -89,7 +105,10 @@ class BeaProvider(BaseProvider):
         errors: list[str] = []
         latest_as_of: datetime | None = None
         specs = sorted(BEA_SERIES, key=itemgetter("table", "frequency"))
-        async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.bea_timeout_seconds,
+            follow_redirects=False,
+        ) as client:
             for (table, frequency), table_specs_iter in groupby(
                 specs,
                 key=itemgetter("table", "frequency"),
@@ -129,9 +148,10 @@ class BeaProvider(BaseProvider):
                     matching_rows = self._rows_for_line(rows, str(spec["line_number"]))
                     item = max(matching_rows, key=lambda row: str(row.get("TimePeriod") or ""), default=None)
                     if item is None:
-                        errors.append(
-                            f"BEA {table} line {spec['line_number']} unavailable for {spec['name']}"
-                        )
+                        if not spec.get("optional"):
+                            errors.append(
+                                f"BEA {table} line {spec['line_number']} unavailable for {spec['name']}"
+                            )
                         continue
                     value = str(item.get("DataValue", "")).replace(",", "")
                     if not value or value == "---":

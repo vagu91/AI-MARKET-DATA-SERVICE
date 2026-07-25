@@ -10,6 +10,14 @@ from urllib.parse import urlparse
 
 
 DEFAULT_POLICY_PATH = Path(__file__).resolve().parents[2] / "config" / "source_policy.json"
+PROTECTED_PROVIDER_DOMAINS = {
+    "bls.gov",
+    "bea.gov",
+    "census.gov",
+    "stlouisfed.org",
+    "finnhub.io",
+    "tradier.com",
+}
 
 
 @dataclass(frozen=True)
@@ -116,7 +124,7 @@ class SourcePolicyService:
         }
         if any(
             allowed in host and not _domain_matches(host, allowed)
-            for allowed in official_domains
+            for allowed in official_domains | PROTECTED_PROVIDER_DOMAINS
         ):
             return SourceUrlValidation(
                 False,

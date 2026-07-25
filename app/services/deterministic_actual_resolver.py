@@ -9,6 +9,7 @@ from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.providers.bea import BeaProvider
 from app.providers.bls import BlsProvider
+from app.providers.census import CensusProvider
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
 from app.services.macro_consensus_service import candidate_metric_id
 from app.services.official_actual_semantics import (
@@ -18,7 +19,7 @@ from app.services.official_actual_semantics import (
 )
 
 
-PROVIDERS = {"BLS": BlsProvider, "BEA": BeaProvider}
+PROVIDERS = {"BLS": BlsProvider, "BEA": BeaProvider, "CENSUS": CensusProvider}
 
 
 class DeterministicActualResolver:
@@ -87,8 +88,22 @@ class DeterministicActualResolver:
             if isinstance(provider_config, type)
             else provider_config
         )
+        expected_period = (
+            event.get("reference_period")
+            or event.get("period")
+            or expected_period
+        )
         try:
-            result = asyncio.run(provider.fetch())
+            if spec.provider == "CENSUS":
+                dataset = spec.source_series_id.split(":", 2)[1]
+                result = asyncio.run(
+                    provider.fetch(
+                        period=expected_period,
+                        datasets=[dataset],
+                    )
+                )
+            else:
+                result = asyncio.run(provider.fetch())
         except Exception as exc:
             return _feed_delayed(f"official_provider_unavailable:{type(exc).__name__}")
         rows = result.data if isinstance(result.data, dict) else {}
@@ -112,11 +127,6 @@ class DeterministicActualResolver:
             temporal_state.get("release_at")
             or event.get("release_at")
             or event.get("time_utc")
-        )
-        expected_period = (
-            event.get("reference_period")
-            or event.get("period")
-            or expected_period
         )
         try:
             candidate = derive_official_actual(

@@ -27,6 +27,9 @@ from app.providers.event_enrichment import (
 from app.providers.fed_calendar import FederalReserveCalendarProvider
 from app.providers.federal_reserve import FederalReserveRssProvider
 from app.providers.fred import FredProvider
+from app.providers.census import CensusProvider
+from app.providers.finnhub import FinnhubProvider
+from app.providers.tradier import TradierProvider
 from app.providers.mega_cap_snapshot_provider import MegaCapSnapshotProvider
 from app.providers.news_provider import NewsProvider
 from app.providers.qqq_holdings_provider import QQQHoldingsProvider
@@ -74,6 +77,9 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         BeaProvider(cache, settings),
     ]
     macro_service = MacroService(providers=macro_providers)
+    census_provider = CensusProvider(cache, settings)
+    finnhub_provider = FinnhubProvider(cache, settings)
+    tradier_provider = TradierProvider(cache, settings)
     event_enrichment_service = EventEnrichmentService(
         cache=cache,
         providers=[
@@ -127,8 +133,8 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         settings,
         providers={
             provider.source: provider
-            for provider in macro_providers
-            if provider.source in {"BLS", "BEA"}
+            for provider in [*macro_providers, census_provider]
+            if provider.source in {"BLS", "BEA", "CENSUS"}
         },
     )
     lifecycle_due_resolver = DeterministicLifecycleDueResolver(
@@ -150,6 +156,14 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         "settings": settings,
         "cache": cache,
         "macro_service": macro_service,
+        "deterministic_providers": {
+            "fred": macro_providers[0],
+            "bls": macro_providers[1],
+            "bea": macro_providers[2],
+            "census": census_provider,
+            "finnhub": finnhub_provider,
+            "tradier": tradier_provider,
+        },
         "event_service": event_service,
         "event_enrichment_service": event_enrichment_service,
         "event_window_service": EventWindowService(event_service),

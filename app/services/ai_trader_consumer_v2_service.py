@@ -33,6 +33,14 @@ INCLUDED_SECTIONS = [
     "news",
     "sentiment",
     "market_schedule",
+    "macro_actuals",
+    "rates_context",
+    "options_positioning",
+    "market_internals",
+    "cross_asset_context",
+    "earnings_intelligence",
+    "current_company_news",
+    "deterministic_domains",
     "agentic_domains",
     "quality",
 ]
@@ -142,6 +150,60 @@ def build_ai_trader_consumer_v2(
         ),
         "sentiment": _sentiment(hardened.get("sentiment_context") or {}),
         "market_schedule": _schedule(hardened.get("market_schedule") or {}),
+        "macro_actuals": _deterministic_section(
+            hardened.get("macro_actuals")
+            or {
+                "status": (
+                    "AVAILABLE"
+                    if _event_risk(hardened).get("recently_released_events")
+                    else "NO_DATA"
+                ),
+                "items": _event_risk(hardened).get("recently_released_events") or [],
+                "provider": "BLS/BEA/CENSUS",
+                "trigger_class": "TRIGGER",
+            }
+        ),
+        "rates_context": _deterministic_section(
+            hardened.get("rates_context")
+            or {
+                "status": "AVAILABLE" if hardened.get("macro_snapshot") else "NO_DATA",
+                "items": _macro(
+                    hardened.get("macro_snapshot") or {},
+                    now=generated_at,
+                ),
+                "provider": "FRED",
+                "trigger_class": "NON_TRIGGERING",
+            }
+        ),
+        "options_positioning": _deterministic_section(
+            hardened.get("options_positioning") or {}
+        ),
+        "market_internals": _deterministic_section(
+            hardened.get("market_internals") or {}
+        ),
+        "cross_asset_context": _deterministic_section(
+            hardened.get("cross_asset_context") or {}
+        ),
+        "earnings_intelligence": _deterministic_section(
+            hardened.get("earnings_intelligence") or {}
+        ),
+        "current_company_news": _deterministic_section(
+            hardened.get("current_company_news")
+            or {
+                "status": (hardened.get("news_context") or {}).get("status")
+                or "NO_DATA",
+                "items": (hardened.get("news_context") or {}).get("current_drivers")
+                or (hardened.get("news_context") or {}).get("articles")
+                or [],
+                "provider": "SOURCE_GATEWAY",
+                "candidate_discovery_provider": "FINNHUB",
+                "trigger_class": "TRIGGER",
+            }
+        ),
+        "deterministic_domains": _deterministic_domain_status(
+            hardened,
+            settings=settings,
+        ),
         "agentic_domains": {
             topic: (
                 {
@@ -194,6 +256,18 @@ def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> Non
     warnings.append({"code": "consumer_payload_truncated", "count": 1, "blocking": False})
     consumer["warnings"] = warnings
     if _payload_size(consumer) >= limit:
+        for key in (
+            "macro_actuals",
+            "rates_context",
+            "options_positioning",
+            "market_internals",
+            "cross_asset_context",
+            "earnings_intelligence",
+            "current_company_news",
+        ):
+            section = consumer.get(key)
+            if isinstance(section, dict) and isinstance(section.get("items"), list):
+                section["items"] = section["items"][:8]
         # Quality remains present, but verbose debug-only provider traces are not part of the consumer contract.
         quality = consumer.get("quality") or {}
         consumer["quality"] = {
@@ -252,6 +326,97 @@ def _ai_enrichment(value: dict[str, Any]) -> dict[str, Any]:
         "prompt_version": value.get("prompt_version"),
         "last_error": value.get("last_error"),
     }
+
+
+def _deterministic_section(value: dict[str, Any]) -> dict[str, Any]:
+    if not value:
+        return {
+            "status": "NO_DATA",
+            "data_coverage_status": "NO_DATA",
+            "warnings": ["deterministic_data_not_materialized"],
+        }
+    forbidden = {
+        "chains",
+        "raw_chain",
+        "raw_payload",
+        "raw_payload_json",
+        "provider_diagnostics",
+        "source_attempts",
+    }
+    output = {
+        key: item
+        for key, item in value.items()
+        if key not in forbidden
+    }
+    if isinstance(output.get("items"), list):
+        output["items"] = output["items"][:20]
+    output.setdefault("status", "AVAILABLE")
+    output.setdefault(
+        "data_coverage_status",
+        "COMPLETE" if output["status"] == "AVAILABLE" else output["status"],
+    )
+    return output
+
+
+def _deterministic_domain_status(
+    full: dict[str, Any],
+    *,
+    settings: Settings,
+) -> dict[str, dict[str, Any]]:
+    definitions = {
+        "options_positioning": (
+            settings.deterministic_options_positioning_enabled,
+            settings.tradier_enabled,
+            settings.tradier_production_token
+            if settings.tradier_environment == "production"
+            else settings.tradier_sandbox_token,
+        ),
+        "market_internals": (
+            settings.deterministic_market_internals_enabled,
+            settings.tradier_enabled,
+            settings.tradier_production_token
+            if settings.tradier_environment == "production"
+            else settings.tradier_sandbox_token,
+        ),
+        "cross_asset_context": (
+            settings.deterministic_cross_asset_context_enabled,
+            settings.tradier_enabled and settings.fred_enabled,
+            bool(
+                (
+                    settings.tradier_production_token
+                    if settings.tradier_environment == "production"
+                    else settings.tradier_sandbox_token
+                )
+                and settings.fred_api_key
+            ),
+        ),
+        "earnings_intelligence": (
+            settings.deterministic_earnings_intelligence_enabled,
+            settings.finnhub_enabled,
+            settings.finnhub_api_key,
+        ),
+    }
+    output: dict[str, dict[str, Any]] = {}
+    for domain, (domain_enabled, provider_enabled, configured) in definitions.items():
+        agent = research_agent_enablement(settings, topic=domain)
+        payload = full.get(domain) or {}
+        output[domain] = {
+            "domain_enabled": bool(domain_enabled),
+            "deterministic_provider_enabled": bool(provider_enabled),
+            "deterministic_provider_configured": bool(configured),
+            "deterministic_provider_ready": bool(
+                domain_enabled and provider_enabled and configured
+            ),
+            "ai_agent_enabled": bool(agent["agent_enabled"]),
+            "provider_coverage": payload.get("coverage")
+            or payload.get("provider_coverage")
+            or (1.0 if payload.get("status") == "AVAILABLE" else 0.0),
+            "residual_ai_coverage": payload.get("residual_ai_coverage") or 0.0,
+            "execution_status": payload.get("status") or "NOT_MATERIALIZED",
+            "data_coverage_status": payload.get("data_coverage_status")
+            or ("AVAILABLE" if payload.get("status") == "AVAILABLE" else "NO_DATA"),
+        }
+    return output
 
 
 def _research(value: dict[str, Any]) -> dict[str, Any]:

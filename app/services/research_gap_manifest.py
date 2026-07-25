@@ -136,9 +136,11 @@ class ResearchGapManifestBuilder:
                     items.append(
                         replace(
                             item,
-                            deterministic_status="DISABLED",
                             required_action="NONE",
-                            reason=str(enablement["reason"]),
+                            reason=(
+                                f"{enablement['reason']}; deterministic domain "
+                                "availability is evaluated independently"
+                            ),
                             ai_eligible=False,
                             agent_enabled=False,
                             execution_status="NOT_REQUESTED",

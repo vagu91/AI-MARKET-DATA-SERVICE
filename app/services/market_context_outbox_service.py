@@ -80,6 +80,9 @@ class MarketContextOutboxRepository:
         correlation_id: str | None,
         data_as_of: str | None,
         created_at: str,
+        parent_run_id: str | None = None,
+        component_versions: dict[str, Any] | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any] | None:
         trigger_class = TRIGGER_CLASS_BY_ENTITY.get(
             str(trigger_type or "").lower(),
@@ -107,6 +110,15 @@ class MarketContextOutboxRepository:
             idempotency_seed.encode("utf-8")
         ).hexdigest()
         event_id = f"outbox-{uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key)}"
+        persisted_changes = [
+            *changes,
+            {
+                "section": "_outbox_lineage",
+                "parent_run_id": parent_run_id,
+                "component_versions": component_versions or {},
+                "reason": reason or trigger_type,
+            },
+        ]
         conn.execute(
             """
             INSERT OR IGNORE INTO market_context_outbox(
@@ -128,7 +140,7 @@ class MarketContextOutboxRepository:
                 snapshot_revision,
                 previous_snapshot_id,
                 _json(changed_sections),
-                _json(changes),
+                _json(persisted_changes),
                 data_as_of,
                 created_at,
                 created_at,
@@ -218,9 +230,29 @@ def _row(row: Any) -> dict[str, Any]:
     output["changed_sections"] = json.loads(
         output.pop("changed_sections_json") or "[]"
     )
-    output["material_changes"] = json.loads(
+    material_changes = json.loads(
         output.pop("material_changes_json") or "[]"
     )
+    lineage = next(
+        (
+            item
+            for item in material_changes
+            if isinstance(item, dict)
+            and item.get("section") == "_outbox_lineage"
+        ),
+        {},
+    )
+    output["material_changes"] = [
+        item
+        for item in material_changes
+        if not (
+            isinstance(item, dict)
+            and item.get("section") == "_outbox_lineage"
+        )
+    ]
+    output["parent_run_id"] = lineage.get("parent_run_id")
+    output["component_versions"] = lineage.get("component_versions") or {}
+    output["reason"] = lineage.get("reason") or output.get("trigger_type")
     return output
 
 

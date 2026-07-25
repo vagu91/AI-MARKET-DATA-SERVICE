@@ -6,6 +6,12 @@ from typing import Any
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.redaction import redact_sensitive
 from app.models.common import Freshness, ProviderMetadata, ProviderResult, ProviderType
+from app.providers.deterministic import (
+    ProviderKind,
+    redact_url,
+    request_fingerprint,
+    safe_payload_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +85,76 @@ class BaseProvider(ABC):
                 data={},
             )
 
+    def provider_contract(
+        self,
+        *,
+        requested_domain: str,
+        source_url: str,
+        result: ProviderResult | None = None,
+        exact_occurrence_identity: str | None = None,
+        cache_status: str = "MISS",
+        request_method: str = "GET",
+        request_params: dict[str, Any] | None = None,
+        telemetry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project any legacy or new adapter into the common deterministic contract."""
+        source = str(self.source).upper()
+        if source in {"FRED", "BLS", "BEA", "CENSUS"}:
+            kind = ProviderKind.OFFICIAL_GOVERNMENT
+            authority_tier = 1
+        elif source == "TRADIER":
+            kind = ProviderKind.LICENSED_MARKET_DATA
+            authority_tier = 2
+        else:
+            kind = ProviderKind.STRUCTURED_VENDOR
+            authority_tier = 3
+        retrieved_at = (
+            result.metadata.retrieved_at
+            if result is not None
+            else datetime.now(UTC)
+        )
+        errors = list(result.metadata.errors) if result is not None else []
+        payload = result.data if result is not None else {}
+        return {
+            "provider_id": source.lower(),
+            "provider_kind": kind.value,
+            "authority_tier": authority_tier,
+            "requested_domain": requested_domain,
+            "retrieved_at": retrieved_at.isoformat(),
+            "provider_timestamp": (
+                result.metadata.data_as_of.isoformat()
+                if result is not None and result.metadata.data_as_of
+                else None
+            ),
+            "source_url": redact_url(source_url),
+            "request_fingerprint": request_fingerprint(
+                request_method,
+                source_url,
+                params=request_params,
+            ),
+            "cache_status": cache_status,
+            "freshness": (
+                result.metadata.freshness.value
+                if result is not None
+                else Freshness.UNKNOWN.value
+            ),
+            "exact_occurrence_identity": exact_occurrence_identity,
+            "normalized_observation_count": (
+                len(payload) if isinstance(payload, (dict, list)) else 0
+            ),
+            "warnings": [redact_sensitive(item) for item in errors],
+            "rejection_reasons": [],
+            "rate_limit": {},
+            "retry_classification": "NONE",
+            "raw_payload_hash": safe_payload_hash(payload),
+            "lineage": {
+                "provider": source,
+                "requested_domain": requested_domain,
+                "exact_occurrence_identity": exact_occurrence_identity,
+            },
+            "telemetry": telemetry or {},
+        }
+
 
 def metadata(
     source: str,
@@ -103,4 +179,4 @@ def metadata(
 
 def latest_observation(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
     valid = [item for item in observations if item.get("value") not in (None, ".")]
-    return valid[-1] if valid else None
+    return max(valid, key=lambda item: str(item.get("date") or ""), default=None)

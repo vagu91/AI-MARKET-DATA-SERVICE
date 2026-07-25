@@ -118,14 +118,37 @@ class Settings(BaseSettings):
     fred_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AI_MARKET_FRED_API_KEY", "FRED_API_KEY"),
+        repr=False,
     )
     bea_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AI_MARKET_BEA_API_KEY", "BEA_API_KEY"),
+        repr=False,
     )
     bls_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AI_MARKET_BLS_API_KEY", "BLS_API_KEY"),
+        repr=False,
+    )
+    census_api_key: str | None = Field(
+        default=None,
+        validation_alias="AI_MARKET_CENSUS_API_KEY",
+        repr=False,
+    )
+    finnhub_api_key: str | None = Field(
+        default=None,
+        validation_alias="AI_MARKET_FINNHUB_API_KEY",
+        repr=False,
+    )
+    tradier_production_token: str | None = Field(
+        default=None,
+        validation_alias="AI_MARKET_TRADIER_PRODUCTION_TOKEN",
+        repr=False,
+    )
+    tradier_sandbox_token: str | None = Field(
+        default=None,
+        validation_alias="AI_MARKET_TRADIER_SANDBOX_TOKEN",
+        repr=False,
     )
     alpha_vantage_api_key: str | None = Field(
         default=None,
@@ -137,6 +160,31 @@ class Settings(BaseSettings):
     openai_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AI_MARKET_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        repr=False,
+    )
+
+    # Deterministic providers are independent from the specialist AI-agent flags.
+    fred_enabled: bool = Field(default=True, validation_alias="AI_MARKET_FRED_ENABLED")
+    bls_enabled: bool = Field(default=True, validation_alias="AI_MARKET_BLS_ENABLED")
+    bea_enabled: bool = Field(default=True, validation_alias="AI_MARKET_BEA_ENABLED")
+    census_enabled: bool = Field(default=True, validation_alias="AI_MARKET_CENSUS_ENABLED")
+    finnhub_enabled: bool = Field(default=True, validation_alias="AI_MARKET_FINNHUB_ENABLED")
+    tradier_enabled: bool = Field(default=False, validation_alias="AI_MARKET_TRADIER_ENABLED")
+    deterministic_options_positioning_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_DETERMINISTIC_OPTIONS_POSITIONING_ENABLED",
+    )
+    deterministic_market_internals_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_DETERMINISTIC_MARKET_INTERNALS_ENABLED",
+    )
+    deterministic_cross_asset_context_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_DETERMINISTIC_CROSS_ASSET_CONTEXT_ENABLED",
+    )
+    deterministic_earnings_intelligence_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_DETERMINISTIC_EARNINGS_INTELLIGENCE_ENABLED",
     )
 
     enable_scraper_fallbacks: bool = False
@@ -962,9 +1010,120 @@ class Settings(BaseSettings):
         default=15, validation_alias="AI_MARKET_POLYMARKET_CACHE_MINUTES"
     )
 
-    fred_base_url: str = "https://api.stlouisfed.org/fred"
-    bls_base_url: str = "https://api.bls.gov/publicAPI/v2/timeseries/data"
-    bea_base_url: str = "https://apps.bea.gov/api/data"
+    fred_base_url: str = Field(
+        default="https://api.stlouisfed.org/fred",
+        validation_alias="AI_MARKET_FRED_BASE_URL",
+    )
+    fred_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_FRED_TIMEOUT_SECONDS"
+    )
+    fred_retry_attempts: int = Field(
+        default=3, ge=1, le=6, validation_alias="AI_MARKET_FRED_RETRY_ATTEMPTS"
+    )
+    fred_cache_ttl_seconds: int = Field(
+        default=900, ge=0, validation_alias="AI_MARKET_FRED_CACHE_TTL_SECONDS"
+    )
+    bls_base_url: str = Field(
+        default="https://api.bls.gov/publicAPI/v2/timeseries/data",
+        validation_alias="AI_MARKET_BLS_BASE_URL",
+    )
+    bls_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_BLS_TIMEOUT_SECONDS"
+    )
+    bls_retry_attempts: int = Field(
+        default=3, ge=1, le=6, validation_alias="AI_MARKET_BLS_RETRY_ATTEMPTS"
+    )
+    bls_cache_ttl_seconds: int = Field(
+        default=1800, ge=0, validation_alias="AI_MARKET_BLS_CACHE_TTL_SECONDS"
+    )
+    bea_base_url: str = Field(
+        default="https://apps.bea.gov/api/data",
+        validation_alias="AI_MARKET_BEA_BASE_URL",
+    )
+    bea_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_BEA_TIMEOUT_SECONDS"
+    )
+    bea_retry_attempts: int = Field(
+        default=3, ge=1, le=6, validation_alias="AI_MARKET_BEA_RETRY_ATTEMPTS"
+    )
+    bea_cache_ttl_seconds: int = Field(
+        default=1800, ge=0, validation_alias="AI_MARKET_BEA_CACHE_TTL_SECONDS"
+    )
+    census_base_url: str = Field(
+        default="https://api.census.gov",
+        validation_alias="AI_MARKET_CENSUS_BASE_URL",
+    )
+    census_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_CENSUS_TIMEOUT_SECONDS"
+    )
+    census_retry_attempts: int = Field(
+        default=3, ge=1, le=6, validation_alias="AI_MARKET_CENSUS_RETRY_ATTEMPTS"
+    )
+    census_cache_ttl_seconds: int = Field(
+        default=1800, ge=0, validation_alias="AI_MARKET_CENSUS_CACHE_TTL_SECONDS"
+    )
+    finnhub_base_url: str = Field(
+        default="https://finnhub.io/api/v1",
+        validation_alias="AI_MARKET_FINNHUB_BASE_URL",
+    )
+    finnhub_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_FINNHUB_TIMEOUT_SECONDS"
+    )
+    finnhub_retry_attempts: int = Field(
+        default=3, ge=1, le=6, validation_alias="AI_MARKET_FINNHUB_RETRY_ATTEMPTS"
+    )
+    finnhub_cache_ttl_seconds: int = Field(
+        default=900, ge=0, validation_alias="AI_MARKET_FINNHUB_CACHE_TTL_SECONDS"
+    )
+    finnhub_news_cap: int = Field(
+        default=250, ge=1, le=250, validation_alias="AI_MARKET_FINNHUB_NEWS_CAP"
+    )
+    tradier_environment: str = Field(
+        default="production", validation_alias="AI_MARKET_TRADIER_ENVIRONMENT"
+    )
+    tradier_production_base_url: str = Field(
+        default="https://api.tradier.com/v1",
+        validation_alias="AI_MARKET_TRADIER_PRODUCTION_BASE_URL",
+    )
+    tradier_sandbox_base_url: str = Field(
+        default="https://sandbox.tradier.com/v1",
+        validation_alias="AI_MARKET_TRADIER_SANDBOX_BASE_URL",
+    )
+    tradier_stream_base_url: str = Field(
+        default="https://stream.tradier.com/v1",
+        validation_alias="AI_MARKET_TRADIER_STREAM_BASE_URL",
+    )
+    tradier_streaming_enabled: bool = Field(
+        default=False, validation_alias="AI_MARKET_TRADIER_STREAMING_ENABLED"
+    )
+    tradier_market_data_enabled: bool = Field(
+        default=True, validation_alias="AI_MARKET_TRADIER_MARKET_DATA_ENABLED"
+    )
+    tradier_account_access_enabled: bool = Field(
+        default=False, validation_alias="AI_MARKET_TRADIER_ACCOUNT_ACCESS_ENABLED"
+    )
+    tradier_trading_enabled: bool = Field(
+        default=False, validation_alias="AI_MARKET_TRADIER_TRADING_ENABLED"
+    )
+    tradier_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_TRADIER_TIMEOUT_SECONDS"
+    )
+    tradier_retry_attempts: int = Field(
+        default=3, ge=1, le=6, validation_alias="AI_MARKET_TRADIER_RETRY_ATTEMPTS"
+    )
+    tradier_rate_limit_per_minute: int = Field(
+        default=100, ge=1, validation_alias="AI_MARKET_TRADIER_RATE_LIMIT_PER_MINUTE"
+    )
+    tradier_cache_ttl_seconds: int = Field(
+        default=300, ge=0, validation_alias="AI_MARKET_TRADIER_CACHE_TTL_SECONDS"
+    )
+    tradier_options_underlyings: str = Field(
+        default="QQQ", validation_alias="AI_MARKET_TRADIER_OPTIONS_UNDERLYINGS"
+    )
+    tradier_cross_asset_symbols: str = Field(
+        default="QQQ,SPY,IWM,DIA,TLT,HYG,LQD,GLD,USO,UUP",
+        validation_alias="AI_MARKET_TRADIER_CROSS_ASSET_SYMBOLS",
+    )
     federal_reserve_calendar_base_url: str = "https://www.federalreserve.gov/newsevents"
     bls_schedule_base_url: str = "https://www.bls.gov/schedule"
     bea_release_schedule_url: str = "https://www.bea.gov/news/schedule"
