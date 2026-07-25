@@ -51,6 +51,7 @@ TELEMETRY_EVENTS = frozenset(
         "loop_emergency_ceiling",
         "agent_disabled",
         "startup_catch_up",
+        "event_trigger_batch",
     }
 )
 IDENTIFIER_FIELDS = (

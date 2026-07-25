@@ -125,8 +125,16 @@ class MacroActualLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": "macro_actual_occurrence_not_released",
             }
-        lookback_start = now - timedelta(
-            hours=int(self.settings.lifecycle_startup_catchup_hours)
+        lookback_start = now - (
+            timedelta(
+                days=int(
+                    self.settings.event_calendar_catchup_lookback_days
+                )
+            )
+            if self.settings.event_calendar_catchup_enabled
+            else timedelta(
+                hours=int(self.settings.lifecycle_startup_catchup_hours)
+            )
         )
         if release < lookback_start:
             return {
@@ -299,6 +307,15 @@ class DeterministicLifecycleDueResolver:
             "provider_cache_hit": False,
             "provider_negative_cache_hit": False,
         }
+        if entity_type == "schedule_only":
+            return {
+                "status": "NOT_APPLICABLE",
+                "reason": "schedule_only_occurrence_has_no_outcome_resolver",
+                "ai_eligible": False,
+                "agent_status": "DISABLED",
+                "execution_status": "NOT_REQUESTED",
+                **telemetry,
+            }
         if isinstance(datum, dict) and datum:
             telemetry["committed_payload_hit"] = True
             committed = compute_datum_lifecycle(

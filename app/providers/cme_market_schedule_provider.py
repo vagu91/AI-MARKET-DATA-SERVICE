@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from urllib.parse import urljoin
 
@@ -54,6 +55,7 @@ class CmeMarketScheduleProvider:
             return _status("provider_failed", str(exc) or "cme_market_schedule_failed", started, provider_calls=1, source_url=self.settings.cme_market_schedule_url)
 
         parsed = parse_cme_trading_hours_page(response.text, base_url=self.settings.cme_market_schedule_url)
+        structured_schedule = parse_cme_equity_index_schedule(response.text)
         now = datetime.now(UTC)
         if not parsed["calendar_verified"]:
             return _status(
@@ -72,21 +74,37 @@ class CmeMarketScheduleProvider:
             "retrieved_at": _iso(now),
             "valid_until": _iso(now + timedelta(hours=self.settings.cme_market_schedule_ttl_hours)),
             "calendar_verified": True,
+            "official_document_discovered": bool(parsed["documents"]),
+            "official_schedule_parsed": bool(structured_schedule),
+            "session_state_verified": False,
             "is_official_source": True,
-            "data_origin_is_official": True,
+            "data_origin_is_official": bool(structured_schedule),
             "distribution_source_is_official": True,
             "source_is_primary_originator": True,
             "source_is_official_redistributor": False,
             "documents": parsed["documents"],
+            "equity_index_schedule": structured_schedule,
+            "session_overrides": (
+                structured_schedule.get("overrides", [])
+                if structured_schedule
+                else []
+            ),
             "document_count": len(parsed["documents"]),
             "regular_trading_hours_present": parsed["regular_trading_hours_present"],
             "globex_schedule_present": parsed["globex_schedule_present"],
-            "warnings": [] if parsed["documents"] else ["cme_official_page_found_without_downloadable_schedule_links"],
+            "warnings": (
+                []
+                if structured_schedule
+                else ["cme_official_document_discovered_but_schedule_not_parsed"]
+            ),
             "errors": [],
             "diagnostics": {
                 "http_status": response.status_code,
                 "actual_network_calls": 1,
                 "calendar_verified": True,
+                "official_document_discovered": bool(parsed["documents"]),
+                "official_schedule_parsed": bool(structured_schedule),
+                "session_state_verified": False,
                 "document_count": len(parsed["documents"]),
             },
             "provider_calls": 1,
@@ -124,6 +142,81 @@ def parse_cme_trading_hours_page(text: str, *, base_url: str) -> dict[str, Any]:
     }
 
 
+def parse_cme_equity_index_schedule(text: str) -> dict[str, Any] | None:
+    """Parse only the versioned structured equity-index schedule payload.
+
+    Mere document discovery is intentionally insufficient: malformed or
+    incomplete rows fail closed and produce no verified schedule.
+    """
+
+    decoded = html.unescape(text or "")
+    match = re.search(
+        r"<script\b[^>]*data-cme-equity-index-schedule[^>]*>"
+        r"\s*(\{.*?\})\s*</script>",
+        decoded,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        coverage_start = date.fromisoformat(str(payload["coverage_start"]))
+        coverage_end = date.fromisoformat(str(payload["coverage_end"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if coverage_end < coverage_start:
+        return None
+    normalized: list[dict[str, Any]] = []
+    for raw in payload.get("overrides") or []:
+        row = _normalized_equity_index_override(raw)
+        if row is None:
+            return None
+        normalized.append(row)
+    return {
+        "schema": "cme_equity_index_schedule_v1",
+        "coverage_start": coverage_start.isoformat(),
+        "coverage_end": coverage_end.isoformat(),
+        "overrides": sorted(normalized, key=lambda item: item["date"]),
+    }
+
+
+def _normalized_equity_index_override(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    try:
+        day = date.fromisoformat(str(raw["date"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    status = str(raw.get("session_status") or "").lower()
+    if status not in {"closed", "early_close", "late_open", "modified"}:
+        return None
+    output: dict[str, Any] = {
+        "date": day.isoformat(),
+        "session_status": status,
+        "holiday_name": str(raw.get("holiday_name") or "") or None,
+    }
+    for field in (
+        "open_time_local",
+        "close_time_local",
+        "maintenance_start_local",
+        "maintenance_end_local",
+    ):
+        value = raw.get(field)
+        if value in (None, ""):
+            output[field] = None
+            continue
+        try:
+            output[field] = time.fromisoformat(str(value)).isoformat()
+        except ValueError:
+            return None
+    return output
+
+
 def _status(
     status: str,
     reason: str,
@@ -141,7 +234,16 @@ def _status(
         "retrieved_at": _iso(now),
         "valid_until": None,
         "calendar_verified": False,
+        "official_document_discovered": False,
+        "official_schedule_parsed": False,
+        "session_state_verified": False,
         "is_official_source": False,
+        "data_origin_is_official": False,
+        "distribution_source_is_official": False,
+        "source_is_primary_originator": False,
+        "source_is_official_redistributor": False,
+        "equity_index_schedule": None,
+        "session_overrides": [],
         "documents": [],
         "document_count": 0,
         "warnings": [reason],

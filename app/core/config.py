@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -645,6 +646,68 @@ class Settings(BaseSettings):
         default=30,
         ge=0,
         validation_alias="AI_MARKET_LIFECYCLE_TRIGGER_COALESCE_SECONDS",
+    )
+    event_calendar_timezone: str = Field(
+        default="America/New_York",
+        validation_alias="AI_MARKET_EVENT_CALENDAR_TIMEZONE",
+    )
+    event_calendar_previous_weeks: int = Field(
+        default=1,
+        ge=1,
+        le=1,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_PREVIOUS_WEEKS",
+    )
+    event_calendar_next_weeks: int = Field(
+        default=1,
+        ge=1,
+        le=1,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_NEXT_WEEKS",
+    )
+    event_calendar_consumer_max_events: int = Field(
+        default=90,
+        ge=3,
+        le=500,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CONSUMER_MAX_EVENTS",
+    )
+    event_calendar_consumer_min_impact: Literal[
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+    ] = Field(
+        default="LOW",
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CONSUMER_MIN_IMPACT",
+    )
+    event_calendar_catchup_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CATCHUP_ENABLED",
+    )
+    event_calendar_catchup_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CATCHUP_BATCH_SIZE",
+    )
+    event_calendar_catchup_max_per_tick: int = Field(
+        default=40,
+        ge=1,
+        le=500,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CATCHUP_MAX_PER_TICK",
+    )
+    event_calendar_catchup_lookback_days: int = Field(
+        default=730,
+        ge=21,
+        le=3650,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CATCHUP_LOOKBACK_DAYS",
+    )
+    event_calendar_notification_horizon_days: int = Field(
+        default=21,
+        ge=1,
+        le=365,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_NOTIFICATION_HORIZON_DAYS",
+    )
+    event_calendar_consensus_trigger_enabled: bool = Field(
+        default=False,
+        validation_alias="AI_MARKET_EVENT_CALENDAR_CONSENSUS_TRIGGER_ENABLED",
     )
     lifecycle_no_data_retry_seconds: str = Field(
         default="900,3600,21600,86400",
