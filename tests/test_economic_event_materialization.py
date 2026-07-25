@@ -354,10 +354,10 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
         trigger="test_force_restart",
         force=True,
     )
-    assert force_metadata["data_quality"]["ai_research_requests"] == 5
+    assert force_metadata["data_quality"]["ai_research_requests"] == 0
     assert force_metadata["data_quality"]["ai_events_requested"] == 5
     assert ai.calls == 0
-    assert all("ai_enrichment_pending" in item.enrichment.warnings for item in forced)
+    assert all("ai_enrichment_pending" not in item.enrichment.warnings for item in forced)
 
     class NoNetworkService:
         calls = 0
@@ -417,7 +417,7 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
     assert len(critical) == 5
     temporal_statuses = [item.get("temporal_status") for item in critical]
     assert all(status in {"PRE_RELEASE", "AWAITING_ACTUAL"} for status in temporal_statuses), temporal_statuses
-    assert serialized["ai_enrichment"]["status"] == "PENDING"
+    assert serialized["ai_enrichment"]["status"] == "NOT_REQUIRED"
     assert no_network.calls == 0
 
 

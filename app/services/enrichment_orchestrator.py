@@ -18,6 +18,7 @@ from app.services.market_fact_repository import MarketFactRepository
 from app.services.provider_observation_repository import ProviderObservationRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.temporal_domain_service import canonical_event_key
+from app.services.execution_context import ExecutionContext
 
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
@@ -52,8 +53,13 @@ class EnrichmentOrchestrator:
         end: datetime,
         trigger: str,
         force: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> tuple[list[EconomicEvent], dict[str, Any]]:
         run_id = str(uuid.uuid4())
+        execution_context = execution_context or ExecutionContext.provider_only(
+            correlation_id=run_id,
+            allow_live_providers=True,
+        )
         metrics: dict[str, Any] = {
             "events_checked": 0,
             "db_hits": 0,
@@ -229,6 +235,7 @@ class EnrichmentOrchestrator:
                     ai_candidates,
                     correlation_id=run_id,
                     force=force,
+                    execution_context=execution_context,
                 )
                 metrics["ai_research_requests"] = len(ai_jobs)
                 metrics["ai_research_status"] = "PENDING" if ai_jobs else "not_required"
@@ -261,6 +268,7 @@ class EnrichmentOrchestrator:
             release_jobs = self.ai_jobs.enqueue_temporal_refreshes(
                 result,
                 correlation_id=run_id,
+                execution_context=execution_context,
             )
             if release_jobs:
                 metrics["ai_research_requests"] += len(release_jobs)

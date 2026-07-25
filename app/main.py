@@ -10,24 +10,42 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.infrastructure.storage_retention import cleanup_storage, maybe_run_startup_cleanup
 from app.infrastructure.persistence.database_maintenance import run_database_maintenance
+from app.services.execution_context import ExecutionContext
 
 
 async def run_lifecycle_due_scan(state):
     scheduler = state["research_scheduler"]
+    execution_context = ExecutionContext.explicit_ai(
+        correlation_id="apscheduler-lifecycle-due-scanner",
+        request_origin="research_scheduler",
+        allow_live_providers=True,
+    )
     return await asyncio.to_thread(
         scheduler.scan_due_items,
         owner="apscheduler-lifecycle-due-scanner",
         resolver=state["lifecycle_due_resolver"].resolve,
-        ai_enqueue=scheduler.enqueue_due_residuals,
+        ai_enqueue=lambda items: scheduler.enqueue_due_residuals(
+            items,
+            execution_context=execution_context,
+        ),
+        execution_context=execution_context,
     )
 
 
 async def run_startup_lifecycle_catchup(state):
     scheduler = state["research_scheduler"]
+    execution_context = ExecutionContext.explicit_ai(
+        correlation_id="startup-lifecycle-catch-up",
+        request_origin="recovery",
+        allow_live_providers=True,
+    )
     return await asyncio.to_thread(
         scheduler.startup_catch_up,
         resolver=state["lifecycle_due_resolver"].resolve,
-        ai_enqueue=scheduler.enqueue_due_residuals,
+        ai_enqueue=lambda items: scheduler.enqueue_due_residuals(
+            items,
+            execution_context=execution_context,
+        ),
     )
 
 

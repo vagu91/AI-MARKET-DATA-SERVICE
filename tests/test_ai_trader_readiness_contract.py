@@ -269,7 +269,7 @@ async def test_deterministic_enrichment_timeout_falls_through_to_ai(tmp_path: Pa
     assert "event_enrichment_timeout" not in quality.get("missing_critical_fields", [])
     assert quality["enrichment_timeout"] is False
     enrichment = model["metadata"]["event_enrichment"]
-    assert enrichment["status"] == "pending"
+    assert enrichment["status"] == "not_required"
     assert enrichment["AI_called"] is False
     assert enrichment["attempted_event_count"] == 0
     assert enrichment["timeout_event_count"] == 0
@@ -338,7 +338,7 @@ async def test_ai_stage_timeout_is_reported_without_outer_cancellation(tmp_path:
     enrichment = model["metadata"]["event_enrichment"]
     row = enrichment["events"][0]
 
-    assert enrichment["status"] == "pending"
+    assert enrichment["status"] == "not_required"
     assert enrichment["AI_called"] is False
     assert enrichment["attempted_event_count"] == 0
     assert enrichment["timeout_event_count"] == 0

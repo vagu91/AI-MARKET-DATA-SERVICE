@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -29,6 +30,18 @@ from app.services.event_driven_lifecycle_service import (
 from app.services.observability_contract_service import TelemetryRepository
 
 
+_SNAPSHOT_LOCKS: dict[str, threading.RLock] = {}
+_SNAPSHOT_LOCKS_GUARD = threading.Lock()
+
+
+def _serialized_materialization(method):
+    def wrapper(self, *args, **kwargs):
+        with self._materialization_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class MarketContextSnapshotRepository:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -42,7 +55,14 @@ class MarketContextSnapshotRepository:
         self.outbox = MarketContextOutboxRepository(settings)
         self.telemetry = TelemetryRepository(settings)
         self.allow_test_reserved_sources = settings.environment.lower() == "test"
+        lock_key = str(settings.database_path.resolve())
+        with _SNAPSHOT_LOCKS_GUARD:
+            self._materialization_lock = _SNAPSHOT_LOCKS.setdefault(
+                lock_key,
+                threading.RLock(),
+            )
 
+    @_serialized_materialization
     def save_next(
         self,
         *,
@@ -93,7 +113,6 @@ class MarketContextSnapshotRepository:
         debug["audit"] = audit
         outbox_event: dict[str, Any] | None = None
         with connect_sqlite(self.settings.database_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute(
                 """
                 SELECT snapshot_id,debug_payload_json,consumer_payload_json
@@ -166,15 +185,31 @@ class MarketContextSnapshotRepository:
                 debug.setdefault("audit", {})["source_validation"] = source_audit
             from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
             consumer = build_ai_trader_consumer_v2(debug, settings=self.settings)
+            consumer = self.temporal_validation.sanitize_payload(
+                consumer,
+                entity_table="market_context_consumer_input",
+            )
             consumer = self.source_policy.sanitize_operational_payload(
                 consumer,
                 allow_test_reserved=self.allow_test_reserved_sources,
             ) or {}
+            self._validate_prepared_payloads(debug=debug, consumer=consumer)
             generated_at = str(debug.get("generated_at_utc") or debug.get("generated_at") or now)
             data_as_of = str(consumer.get("data_as_of") or generated_at)
             debug_json = self._json(debug)
             consumer_json = self._json(consumer)
             checksum = hashlib.sha256((debug_json + consumer_json).encode("utf-8")).hexdigest()
+            # Final materialization starts only after projection, schema, byte-size,
+            # temporal and source validation have all succeeded.
+            conn.execute("BEGIN IMMEDIATE")
+            current_revision = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(revision),0)+1 FROM market_context_snapshots WHERE symbol=?",
+                    (symbol,),
+                ).fetchone()[0]
+            )
+            if current_revision != revision:
+                raise RuntimeError("snapshot_revision_changed_during_preflight")
             conn.execute(
                 """
                 INSERT INTO market_context_snapshots(
@@ -293,6 +328,29 @@ class MarketContextSnapshotRepository:
         if restored is None or restored["checksum"] != checksum:
             raise RuntimeError("market context snapshot read-back failed")
         return restored
+
+    def _validate_prepared_payloads(
+        self,
+        *,
+        debug: dict[str, Any],
+        consumer: dict[str, Any],
+    ) -> None:
+        if consumer.get("contract") != "ai_trader_market_context_consumer":
+            raise ValueError("consumer_contract_invalid")
+        if consumer.get("schema_version") != "2.1":
+            raise ValueError("consumer_schema_invalid")
+        if len(self._json(consumer).encode("utf-8")) >= 90_000:
+            raise ValueError("consumer_payload_exceeds_90kb")
+        if self.source_policy.invalid_sources(
+            debug,
+            allow_test_reserved=self.allow_test_reserved_sources,
+        ):
+            raise ValueError("debug_source_policy_validation_failed")
+        if self.source_policy.invalid_sources(
+            consumer,
+            allow_test_reserved=self.allow_test_reserved_sources,
+        ):
+            raise ValueError("consumer_source_policy_validation_failed")
 
     def latest_components(self, symbol: str = "MNQ") -> dict[str, Any]:
         with connect_sqlite(self.settings.database_path) as conn:

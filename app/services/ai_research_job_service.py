@@ -16,6 +16,12 @@ from app.services.research_agent_enablement import (
     disabled_job_result,
     is_research_agent_enabled,
 )
+from app.services.execution_context import (
+    ExecutionContext,
+    ai_authorization_decision,
+)
+from app.services.observability_contract_service import TelemetryRepository
+from app.services.research_profiles import JOB_PROFILE
 
 
 PROMPT_VERSION = "ai_research_job_v1"
@@ -34,6 +40,7 @@ class AIResearchJobService:
         self.repository = repository or AIResearchJobRepository(settings)
         self.source_policy = source_policy or SourcePolicyService(settings.source_policy_path)
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.telemetry = TelemetryRepository(settings, clock=self.clock)
 
     def enqueue_missing_events(
         self,
@@ -41,16 +48,24 @@ class AIResearchJobService:
         *,
         correlation_id: str | None = None,
         force: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> list[dict[str, Any]]:
-        if (
-            not self.settings.enable_ai_researcher
-            or not is_research_agent_enabled(
-                self.settings,
-                job_type="MISSING_EVENT_RESEARCH",
-            )
+        correlation = correlation_id or (
+            execution_context.correlation_id if execution_context else f"market-context-{uuid.uuid4()}"
+        )
+        # This method is an explicit queue command. Provider/on-demand paths must
+        # pass their provider-only context and therefore cannot inherit authority.
+        execution_context = execution_context or ExecutionContext.explicit_ai(
+            correlation_id=correlation,
+            allow_live_providers=True,
+        )
+        if not self._authorize(
+            "MISSING_EVENT_RESEARCH",
+            execution_context=execution_context,
+            correlation_id=correlation,
         ):
             return []
-        output: list[dict[str, Any]] = []
+        candidates: dict[str, tuple[dict[str, Any], list[str]]] = {}
         for event in events:
             pending = [
                 field for field in ("forecast", "consensus", "previous")
@@ -60,36 +75,70 @@ class AIResearchJobService:
                 continue
             event_payload = event.model_dump(mode="json")
             event_key = canonical_event_key(event_payload)
-            payload = self._payload(
-                job_type="MISSING_EVENT_RESEARCH",
-                symbol="MNQ",
-                event=event_payload,
-                pending_fields=pending,
-            )
-            scope_key = self._scope_key("MISSING_EVENT_RESEARCH", event_key, pending)
-            generation, run_window = self._generation("MISSING_EVENT_RESEARCH", force=force)
-            idem = self._idempotency_key(scope_key, generation)
-            profile = profile_for_job("MISSING_EVENT_RESEARCH")
-            job, _ = self.repository.enqueue(
-                idempotency_key=idem,
-                job_type="MISSING_EVENT_RESEARCH",
-                symbol="MNQ",
-                event_key=event_key,
-                correlation_id=correlation_id or f"market-context-{uuid.uuid4()}",
-                request_payload=payload,
-                policy_version=self.source_policy.policy_version,
-                prompt_version=profile.prompt_version,
-                priority=50,
-                pending_fields=pending,
-                scope_key=scope_key,
-                generation=generation,
-                run_window=run_window,
-                allow_requeue_terminal=force,
-                profile_id=profile.profile_id,
-                input_fingerprint=self._fingerprint(payload),
-            )
-            output.append(job)
-        return output
+            candidates.setdefault(event_key, (event_payload, pending))
+        bounded = sorted(candidates.items())[
+            : max(int(self.settings.ai_researcher_max_events), 1)
+        ]
+        if not bounded:
+            return []
+        event_keys = [event_key for event_key, _ in bounded]
+        pending = sorted(
+            {
+                field
+                for _, (_, fields) in bounded
+                for field in fields
+            }
+        )
+        first_event = bounded[0][1][0]
+        payload = self._payload(
+            job_type="MISSING_EVENT_RESEARCH",
+            symbol="MNQ",
+            event=first_event,
+            pending_fields=pending,
+            execution_context=execution_context,
+        )
+        payload["events"] = [
+            {
+                "event_key": event_key,
+                "event": self.source_policy.sanitize_operational_payload(event),
+                "missing_fields": fields,
+            }
+            for event_key, (event, fields) in bounded
+        ]
+        payload["event_keys"] = event_keys
+        payload["batch_size"] = len(bounded)
+        identity = (
+            event_keys[0]
+            if len(event_keys) == 1
+            else f"batch:{hashlib.sha256('|'.join(event_keys).encode('utf-8')).hexdigest()[:32]}"
+        )
+        scope_key = self._scope_key(
+            "MISSING_EVENT_RESEARCH",
+            identity,
+            pending,
+        )
+        # Force refresh never disables missing-event run-window idempotency.
+        generation, run_window = self._generation("MISSING_EVENT_RESEARCH")
+        profile = profile_for_job("MISSING_EVENT_RESEARCH")
+        job, _ = self.repository.enqueue(
+            idempotency_key=self._idempotency_key(scope_key, generation),
+            job_type="MISSING_EVENT_RESEARCH",
+            symbol="MNQ",
+            event_key=identity,
+            correlation_id=correlation,
+            request_payload=payload,
+            policy_version=self.source_policy.policy_version,
+            prompt_version=profile.prompt_version,
+            priority=50,
+            pending_fields=pending,
+            scope_key=scope_key,
+            generation=generation,
+            run_window=run_window,
+            allow_requeue_terminal=False,
+            profile_id=profile.profile_id,
+            input_fingerprint=self._fingerprint(payload),
+        )
+        return [job]
 
     def enqueue_temporal_refreshes(
         self,
@@ -97,6 +146,7 @@ class AIResearchJobService:
         *,
         correlation_id: str | None = None,
         now: datetime | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
         for event in events:
@@ -104,7 +154,21 @@ class AIResearchJobService:
             if state["temporal_status"] not in {"AWAITING_ACTUAL", "AWAITING_OUTCOME"}:
                 continue
             job_type = "RELEASE_ACTUAL_REFRESH" if state["temporal_status"] == "AWAITING_ACTUAL" else "SPEECH_OUTCOME_REFRESH"
-            if not is_research_agent_enabled(self.settings, job_type=job_type):
+            correlation = correlation_id or (
+                execution_context.correlation_id
+                if execution_context
+                else f"release-refresh-{uuid.uuid4()}"
+            )
+            execution_context = execution_context or ExecutionContext.explicit_ai(
+                correlation_id=correlation,
+                allow_live_providers=True,
+            )
+            if not self._authorize(
+                job_type,
+                execution_context=execution_context,
+                correlation_id=correlation,
+                ai_required=job_type != "RELEASE_ACTUAL_REFRESH",
+            ):
                 continue
             pending = ["actual"] if job_type == "RELEASE_ACTUAL_REFRESH" else ["outcome", "transcript_url"]
             event_payload = event.model_dump(mode="json")
@@ -115,6 +179,7 @@ class AIResearchJobService:
                 event=event_payload,
                 pending_fields=pending,
                 temporal_state=state,
+                execution_context=execution_context,
             )
             scope_key = self._scope_key(job_type, event_key, pending)
             generation, run_window = self._generation(job_type)
@@ -124,7 +189,7 @@ class AIResearchJobService:
                 job_type=job_type,
                 symbol="MNQ",
                 event_key=event_key,
-                correlation_id=correlation_id or f"release-refresh-{uuid.uuid4()}",
+                correlation_id=correlation,
                 request_payload=payload,
                 policy_version=self.source_policy.policy_version,
                 prompt_version="official_actual_semantics_v1" if job_type == "RELEASE_ACTUAL_REFRESH" else profile.prompt_version,
@@ -163,22 +228,42 @@ class AIResearchJobService:
         parent_run_id: str | None = None,
         specialized_topic: str | None = None,
         child_ordinal: int | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        execution_context = execution_context or ExecutionContext.explicit_ai(
+            correlation_id=correlation_id,
+            allow_live_providers=True,
+        )
+        self._validate_job_type(job_type)
         profile = profile_for_job(job_type)
-        if not is_research_agent_enabled(
-            self.settings,
+        if not self._authorize(
+            job_type,
+            execution_context=execution_context,
+            correlation_id=correlation_id,
             topic=specialized_topic,
             profile_id=profile.profile_id,
-            job_type=job_type,
         ):
+            enabled = is_research_agent_enabled(
+                self.settings,
+                topic=specialized_topic,
+                profile_id=profile.profile_id,
+                job_type=job_type,
+            )
             return (
-                disabled_job_result(
-                    self.settings,
-                    topic=specialized_topic,
-                    profile_id=profile.profile_id,
-                    job_type=job_type,
-                    correlation_id=correlation_id,
-                ),
+                {
+                    **disabled_job_result(
+                        self.settings,
+                        topic=specialized_topic,
+                        profile_id=profile.profile_id,
+                        job_type=job_type,
+                        correlation_id=correlation_id,
+                    ),
+                    "last_error": (
+                        "AGENT_DISABLED"
+                        if execution_context.allow_ai and not enabled
+                        else "AI_NOT_AUTHORIZED"
+                    ),
+                },
                 False,
             )
         pending = pending_fields or list(request_payload.get("pending_fields") or [])
@@ -194,6 +279,7 @@ class AIResearchJobService:
             "source_policy": self.source_policy.prompt_projection(),
             "policy_version": self.source_policy.policy_version,
             "prompt_version": profile_for_job(job_type).prompt_version,
+            "execution_context": execution_context.as_payload(),
         }
         scope_key = self._scope_key(job_type, identity, pending)
         generation, run_window = self._generation(job_type, force=force)
@@ -271,6 +357,7 @@ class AIResearchJobService:
         event: dict[str, Any],
         pending_fields: list[str],
         temporal_state: dict[str, Any] | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         prompt_version = (
             "official_actual_semantics_v1"
@@ -306,7 +393,66 @@ class AIResearchJobService:
             "source_policy": self.source_policy.prompt_projection(),
             "policy_version": self.source_policy.policy_version,
             "prompt_version": prompt_version,
+            "execution_context": (
+                execution_context.as_payload() if execution_context else None
+            ),
         }
+
+    def _authorize(
+        self,
+        job_type: str,
+        *,
+        execution_context: ExecutionContext | None,
+        correlation_id: str,
+        ai_required: bool = True,
+        topic: str | None = None,
+        profile_id: str | None = None,
+    ) -> bool:
+        self._validate_job_type(job_type)
+        decision = ai_authorization_decision(
+            execution_context,
+            ai_required=ai_required,
+        )
+        enabled = is_research_agent_enabled(
+            self.settings,
+            topic=topic,
+            profile_id=profile_id,
+            job_type=job_type,
+        )
+        if not ai_required:
+            authorized = bool(
+                execution_context
+                and execution_context.allow_live_providers
+                and enabled
+            )
+            decision = "AI_NOT_REQUIRED"
+        else:
+            authorized = (
+                decision == "AI_ALLOWED"
+                and enabled
+            )
+            if decision == "AI_ALLOWED" and not authorized:
+                decision = "AI_NOT_REQUIRED"
+        self.telemetry.emit(
+            "ai_authorization",
+            identifiers={"correlation_id": correlation_id},
+            decision_summary=decision,
+            stop_reason=None if authorized else decision,
+            payload={
+                "status": decision,
+                "reason": (
+                    "explicit_execution_context"
+                    if authorized
+                    else "provider_only_or_disabled"
+                ),
+            },
+        )
+        return authorized
+
+    @staticmethod
+    def _validate_job_type(job_type: str) -> None:
+        if str(job_type).upper() not in JOB_PROFILE:
+            raise ValueError(f"unsupported_ai_job_type:{job_type}")
 
     def _scope_key(self, job_type: str, identity: str, fields: list[str]) -> str:
         value = f"{job_type}|{identity}|{','.join(sorted(fields))}|{self.source_policy.policy_version}"

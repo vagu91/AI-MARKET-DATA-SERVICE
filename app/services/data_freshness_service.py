@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
 
@@ -32,8 +32,14 @@ def utc_now_iso() -> str:
 
 
 class DataFreshnessService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def evaluate(self, row: dict[str, Any], *, allow_stale: bool | None = None) -> FreshnessResult:
         allow_stale = self.settings.allow_stale_facts if allow_stale is None else allow_stale
@@ -45,7 +51,7 @@ class DataFreshnessService:
                 return FreshnessResult(False, "miss", ["missing_valid_until_and_retrieved_at"], stale=True)
             valid_until = retrieved_at + timedelta(hours=self.settings.default_fact_ttl_hours)
             warnings.append("valid_until_missing_default_ttl_used")
-        if datetime.now(UTC) < valid_until:
+        if self.clock() < valid_until:
             return FreshnessResult(True, "hit", warnings)
         warnings.append("stale_fact")
         if allow_stale:
@@ -73,7 +79,7 @@ class DataFreshnessService:
         medium_topics = {"mega-cap", "semiconductors", "earnings"}
         normalized_topics = {topic.lower() for topic in topics or []}
         ttl_hours = 12 if fast_topics.intersection(normalized_topics) else 18 if medium_topics.intersection(normalized_topics) else self.settings.default_news_ttl_hours
-        base = parse_datetime(published_at) or parse_datetime(retrieved_at) or datetime.now(UTC)
+        base = parse_datetime(published_at) or parse_datetime(retrieved_at) or self.clock()
         return (base + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat()
 
     def next_refresh_at(self, valid_until: str | None) -> str | None:

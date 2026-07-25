@@ -29,6 +29,7 @@ from app.services.research_metrics_service import ResearchMetricsService
 from app.services.research_backend import ResearchBackend, normalize_backend_payload
 from app.services.research_source_gateway import ResearchSourceGateway
 from app.services.temporal_validation_service import TemporalValidationService
+from app.services.execution_context import ExecutionContext
 from app.services.research_semantics import document_not_applicable_claims
 
 
@@ -66,6 +67,18 @@ class AgenticResearchRuntime:
         executor: Any,
         timeout_seconds: int,
     ) -> dict[str, Any]:
+        execution_context = ExecutionContext.from_payload(
+            (job.get("request_payload") or {}).get("execution_context")
+        )
+        if execution_context is None or not execution_context.allow_ai:
+            return {
+                "status": "REJECTED",
+                "error": "AI_NOT_AUTHORIZED",
+                "retryable": False,
+                "accepted_count": 0,
+                "persisted_count": 0,
+                "read_back_count": 0,
+            }
         job = {
             **job,
             "request_payload": self.temporal_validation.sanitize_payload(

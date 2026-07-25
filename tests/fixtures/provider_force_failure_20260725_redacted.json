@@ -1,0 +1,27 @@
+{
+  "fixture_version": 1,
+  "incident_date": "2026-07-25",
+  "market_session_status": "weekend",
+  "generated_at_utc": "2026-07-25T12:00:00+00:00",
+  "forensic_before": {
+    "consumer_over_limit": true,
+    "ai_jobs": 5,
+    "research_runs": 5,
+    "backend_invocations": 5,
+    "no_data_snapshots": 5,
+    "input_tokens": 293603,
+    "output_tokens": 6076,
+    "total_tokens": 299679,
+    "cached_tokens": 136448
+  },
+  "generator": {
+    "lifecycle_items": 420,
+    "quality_trace_items": 240,
+    "option_contracts": 1800
+  },
+  "redaction": {
+    "contains_secrets": false,
+    "contains_live_urls": false,
+    "contains_account_or_order_data": false
+  }
+}

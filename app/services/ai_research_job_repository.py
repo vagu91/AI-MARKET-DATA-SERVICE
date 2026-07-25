@@ -433,6 +433,7 @@ class AIResearchJobRepository:
         *,
         allowed_job_types: list[str] | None = None,
         authorized_smoke_only: bool = False,
+        require_execution_authorization: bool = False,
     ) -> dict[str, Any] | None:
         self.recover_abandoned()
         now_dt = self.clock()
@@ -453,6 +454,19 @@ class AIResearchJobRepository:
                 " AND (job_type='RELEASE_ACTUAL_REFRESH' OR json_extract(request_payload_json,'$.authorized_live_smoke')=1)"
                 if authorized_smoke_only else ""
             )
+            authorization_clause = (
+                """
+                AND (
+                  (job_type='RELEASE_ACTUAL_REFRESH'
+                   AND json_extract(request_payload_json,'$.execution_context.allow_live_providers')=1)
+                  OR
+                  (job_type!='RELEASE_ACTUAL_REFRESH'
+                   AND json_extract(request_payload_json,'$.execution_context.allow_ai')=1)
+                )
+                """
+                if require_execution_authorization
+                else ""
+            )
             row = conn.execute(
                 f"""
                 SELECT * FROM ai_research_jobs
@@ -461,6 +475,7 @@ class AIResearchJobRepository:
                    AND source_audit_status='ACTIVE'
                    {type_clause}
                    {smoke_clause}
+                   {authorization_clause}
                 ORDER BY priority ASC,created_at ASC
                 LIMIT 1
                 """,

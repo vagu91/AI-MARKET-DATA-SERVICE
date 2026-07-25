@@ -30,6 +30,7 @@ from app.services.observability_contract_service import (
     DeterministicAnomalyDetector,
     TelemetryRepository,
 )
+from app.services.execution_context import ExecutionContext
 
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,7 @@ class AIResearchWorker:
             self.worker_id,
             allowed_job_types=allowed_job_types,
             authorized_smoke_only=authorized_smoke_only,
+            require_execution_authorization=True,
         )
         if job is None:
             return False
@@ -133,6 +135,36 @@ class AIResearchWorker:
             "parent_run_id": job.get("parent_run_id"),
             "child_job_id": job.get("job_id"),
         }
+        execution_context = ExecutionContext.from_payload(
+            (job.get("request_payload") or {}).get("execution_context")
+        )
+        requires_ai = job.get("job_type") != "RELEASE_ACTUAL_REFRESH"
+        authorized = bool(
+            execution_context
+            and (
+                execution_context.allow_ai
+                if requires_ai
+                else execution_context.allow_live_providers
+            )
+        )
+        if not authorized:
+            self.repository.complete(
+                str(job["job_id"]),
+                self.worker_id,
+                status="REJECTED",
+                result_payload={"status": "REJECTED", "error": "AI_NOT_AUTHORIZED"},
+                accepted_fields=[],
+                rejected_fields=[],
+                error="AI_NOT_AUTHORIZED",
+            )
+            self.telemetry.emit(
+                "ai_authorization",
+                identifiers=identifiers,
+                decision_summary="AI_SUPPRESSED",
+                stop_reason="AI_SUPPRESSED",
+                payload={"status": "AI_SUPPRESSED", "reason": "worker_fail_closed"},
+            )
+            return True
         self.telemetry.emit(
             "dequeue",
             identifiers=identifiers,
@@ -383,10 +415,11 @@ class AIResearchWorker:
                     )
                 ):
                     try:
-                        materialized = self.materializer.materialize_for_parent(
-                            parent=parent,
-                            ai_enrichment=_parent_enrichment(parent),
-                        )
+                        if parent["status"] != "NO_DATA":
+                            materialized = self.materializer.materialize_for_parent(
+                                parent=parent,
+                                ai_enrichment=_parent_enrichment(parent),
+                            )
                     finally:
                         self.parallel_coordinator.finish_materialization(
                             str(parent_run_id),
@@ -397,10 +430,18 @@ class AIResearchWorker:
                             ),
                         )
             else:
-                materialized = self.materializer.materialize_for_job(
-                    job=completed,
-                    ai_enrichment=_job_enrichment(completed),
-                )
+                if not (
+                    terminal == "NO_DATA"
+                    and accepted_count == 0
+                    and int(persistence.get("persisted_count") or 0) == 0
+                    and not (completed.get("request_payload") or {}).get(
+                        "trigger_envelope"
+                    )
+                ):
+                    materialized = self.materializer.materialize_for_job(
+                        job=completed,
+                        ai_enrichment=_job_enrichment(completed),
+                    )
             if result.get("run_id"):
                 self.agentic_runtime.record_materialization(
                     str(result["run_id"]),
@@ -650,8 +691,16 @@ class AIResearchWorker:
         request = job.get("request_payload") or {}
         event = request.get("event") or {}
         temporal = request.get("temporal_state") or {}
-        event_key = str(job.get("event_key") or "")
+        default_event_key = str(job.get("event_key") or "")
+        allowed_event_keys = {
+            str(item)
+            for item in request.get("event_keys") or [default_event_key]
+            if item
+        }
         for item in accepted:
+            event_key = str(item.get("event_key") or default_event_key)
+            if event_key not in allowed_event_keys:
+                raise ValueError("accepted event research result has unknown event_key")
             if not event_key:
                 raise ValueError("accepted event research result requires event_key")
             candidate_row = self.candidates.persist_candidate(

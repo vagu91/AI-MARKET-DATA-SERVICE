@@ -180,7 +180,7 @@ def test_orchestrator_db_hit_does_not_call_provider(tmp_path):
     assert metadata["data_quality"]["db_hits"] == 1
 
 
-def test_orchestrator_force_bypasses_valid_negative_cache_and_calls_ai(tmp_path):
+def test_orchestrator_force_bypasses_negative_cache_without_authorizing_ai(tmp_path):
     cfg = settings(tmp_path, enable_ai_researcher=True)
     event = make_event()
     provider = CountingEnrichmentService()
@@ -207,10 +207,10 @@ def test_orchestrator_force_bypasses_valid_negative_cache_and_calls_ai(tmp_path)
     assert forced["data_quality"]["db_hits"] == 0
     assert forced["data_quality"]["history_event_count"] == 0
     assert forced["data_quality"]["db_bypassed_force"] == 1
-    assert forced["data_quality"]["ai_research_requests"] == 1
+    assert forced["data_quality"]["ai_research_requests"] == 0
     assert ai.calls == 0
     assert enriched[0].enrichment.previous is None
-    assert "ai_enrichment_pending" in enriched[0].enrichment.warnings
+    assert "ai_enrichment_pending" not in enriched[0].enrichment.warnings
 
 
 def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
@@ -230,7 +230,7 @@ def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
 
     assert metadata["data_quality"]["db_hits"] == 0
     assert metadata["data_quality"]["db_bypassed_force"] == 1
-    assert metadata["data_quality"]["ai_research_requests"] == 1
+    assert metadata["data_quality"]["ai_research_requests"] == 0
     assert ai.calls == 0
     assert enriched[0].enrichment.previous is None
 
@@ -260,10 +260,10 @@ def test_orchestrator_force_batches_five_valid_negative_caches(tmp_path):
     quality = metadata["data_quality"]
     assert quality["db_hits"] == 0
     assert quality["db_bypassed_force"] == 5
-    assert quality["ai_research_requests"] == 5
+    assert quality["ai_research_requests"] == 0
     assert quality["ai_events_requested"] == 5
     assert ai.calls == 0
-    assert all("ai_enrichment_pending" in item.enrichment.warnings for item in enriched)
+    assert all("ai_enrichment_pending" not in item.enrichment.warnings for item in enriched)
     assert all(repo.get_fact(orchestrator.fact_key(event))["status"] == "no_data_available" for event in events)
 
 
@@ -350,7 +350,7 @@ def test_orchestrator_ai_disabled_and_enabled_paths(tmp_path):
     )
     assert ai.calls == 0
     assert enriched[0].enrichment.forecast is None
-    assert metadata["data_quality"]["ai_research_status"] == "PENDING"
+    assert metadata["data_quality"]["ai_research_status"] == "not_required"
 
 
 def test_ai_researcher_output_validation(tmp_path):

@@ -16,6 +16,7 @@ from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.research_profiles import PROFILES
 from app.services.research_runtime_repository import ResearchRuntimeRepository
 from app.services.research_agent_enablement import is_research_agent_enabled
+from app.services.execution_context import ExecutionContext
 
 
 class ParallelResearchCoordinator:
@@ -38,12 +39,17 @@ class ParallelResearchCoordinator:
         correlation_id: str,
         force: bool = False,
         authorized_live_smoke: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         backend = str(self.settings.research_backend).lower()
         if self.jobs is None or self.runs is None:
             raise RuntimeError("read_only_parallel_coordinator_cannot_create_parent")
         if backend not in {"codex_cli", "openai_api"}:
             raise ValueError(f"unsupported_research_backend:{backend}")
+        execution_context = execution_context or ExecutionContext.explicit_ai(
+            correlation_id=correlation_id,
+            allow_live_providers=True,
+        )
         if not force:
             existing = self._active_parent_for_correlation(correlation_id)
             if existing is not None:
@@ -137,6 +143,7 @@ class ParallelResearchCoordinator:
                 parent_run_id=parent_run_id,
                 specialized_topic=topic,
                 child_ordinal=ordinal,
+                execution_context=execution_context,
             )
             child_run = self.runs.ensure_run(job, profile.profile_id, profile.prompt_version)
             with connect_sqlite(self.settings.database_path) as conn:
