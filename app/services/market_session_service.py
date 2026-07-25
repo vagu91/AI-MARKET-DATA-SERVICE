@@ -51,16 +51,45 @@ def build_session_aware_schedule(
             ),
         }
     )
-    futures = _futures_session(local)
     cme_calendar = existing.get("cme_calendar") or {}
-    official_cme = str(cme_calendar.get("status") or "").lower() == "found" and bool(cme_calendar.get("calendar_verified"))
-    if official_cme:
+    structured_cme = (
+        cme_calendar.get("equity_index_schedule")
+        if isinstance(cme_calendar.get("equity_index_schedule"), dict)
+        else {}
+    )
+    official_document_discovered = bool(
+        cme_calendar.get("official_document_discovered")
+    )
+    official_schedule_parsed = bool(
+        cme_calendar.get("official_schedule_parsed") and structured_cme
+    )
+    schedule_covered = (
+        official_schedule_parsed
+        and str(structured_cme.get("coverage_start") or "")
+        <= local.date().isoformat()
+        <= str(structured_cme.get("coverage_end") or "")
+    )
+    futures_overrides = {
+        str(item.get("date")): item
+        for item in structured_cme.get("overrides") or []
+        if isinstance(item, dict) and item.get("date")
+    }
+    futures = _futures_session(
+        local,
+        override=futures_overrides.get(local.date().isoformat()),
+        schedule_verified=schedule_covered,
+        holiday_sensitive=bool(cash_holiday),
+    )
+    if schedule_covered:
         futures.update(
             {
                 "source": cme_calendar.get("source") or "CME Group Trading Hours",
                 "source_url": cme_calendar.get("source_url"),
                 "source_classification": "official_cme_calendar",
                 "calendar_crosscheck_status": "verified",
+                "official_document_discovered": official_document_discovered,
+                "official_schedule_parsed": True,
+                "session_state_verified": True,
                 "data_origin_is_official": True,
                 "distribution_source_is_official": True,
                 "source_is_primary_originator": True,
@@ -69,7 +98,21 @@ def build_session_aware_schedule(
             }
         )
     else:
-        futures["calendar_crosscheck_status"] = str(cme_calendar.get("status") or "not_available")
+        futures.update(
+            {
+                "calendar_crosscheck_status": str(
+                    cme_calendar.get("status") or "not_available"
+                ),
+                "official_document_discovered": official_document_discovered,
+                "official_schedule_parsed": official_schedule_parsed,
+                "session_state_verified": False,
+                "data_origin_is_official": False,
+                "distribution_source_is_official": False,
+                "source_is_primary_originator": False,
+                "source_is_official_redistributor": False,
+                "is_official_source": False,
+            }
+        )
     last_session = _previous_cash_session(local.date(), closed_dates)
     next_holiday = next(
         (item for item in sorted(holidays, key=lambda row: str(row.get("date") or "")) if str(item.get("date") or "") >= local.date().isoformat()),
@@ -119,12 +162,18 @@ def build_session_aware_schedule(
             "versioned_static_last_known_good",
         ],
         "schedule_version": SCHEDULE_VERSION,
+        "official_document_discovered": official_document_discovered,
+        "official_schedule_parsed": official_schedule_parsed,
+        "session_state_verified": bool(futures["session_state_verified"]),
         "data_origin_is_official": False,
         "distribution_source_is_official": False,
         "source_is_primary_originator": False,
         "source_is_official_redistributor": False,
         "source": _schedule_source(existing),
-        "warnings": _schedule_warnings(existing, official_cme=official_cme),
+        "warnings": _schedule_warnings(
+            existing,
+            official_cme=bool(futures["session_state_verified"]),
+        ),
     }
 
 
@@ -194,7 +243,13 @@ def _cash_session(
     }
 
 
-def _futures_session(local: datetime) -> dict[str, Any]:
+def _futures_session(
+    local: datetime,
+    *,
+    override: dict[str, Any] | None = None,
+    schedule_verified: bool = False,
+    holiday_sensitive: bool = False,
+) -> dict[str, Any]:
     weekday = local.weekday()
     local_time = local.timetz().replace(tzinfo=None)
     if weekday == 5 or (weekday == 4 and local_time >= FUTURES_DAILY_CLOSE) or (weekday == 6 and local_time < FUTURES_OPEN_SUNDAY):
@@ -203,33 +258,99 @@ def _futures_session(local: datetime) -> dict[str, Any]:
         status = "maintenance_break"
     else:
         status = "open"
-    next_open = _next_futures_open(local, status)
-    next_close = _next_futures_close(local, status)
-    is_open = status == "open"
+    holiday_name = None
+    is_early_close = False
+    closed_reason = None
+    if schedule_verified and override:
+        holiday_name = override.get("holiday_name")
+        override_status = str(override.get("session_status") or "").lower()
+        open_at = _override_time(override, "open_time_local")
+        close_at = _override_time(override, "close_time_local")
+        if override_status == "closed":
+            status = "holiday"
+            closed_reason = "HOLIDAY"
+        elif override_status == "early_close":
+            is_early_close = True
+            if close_at is not None and local_time >= close_at:
+                status = "holiday_closed"
+                closed_reason = "EARLY_CLOSE"
+        elif override_status == "late_open" and open_at is not None:
+            if local_time < open_at:
+                status = "late_open"
+                closed_reason = "LATE_OPEN"
+            elif weekday != 5:
+                status = "open"
+        elif override_status == "modified":
+            maintenance_start = _override_time(
+                override,
+                "maintenance_start_local",
+            )
+            maintenance_end = _override_time(
+                override,
+                "maintenance_end_local",
+            )
+            if (
+                maintenance_start is not None
+                and maintenance_end is not None
+                and maintenance_start <= local_time < maintenance_end
+            ):
+                status = "maintenance_break"
+                closed_reason = "MAINTENANCE_BREAK"
+    elif holiday_sensitive and status == "open":
+        status = "unknown"
+        closed_reason = "UNVERIFIED_HOLIDAY_SCHEDULE"
+    is_open: bool | None = status == "open" if status != "unknown" else None
+    if closed_reason is None and is_open is False:
+        closed_reason = (
+            "MAINTENANCE_BREAK"
+            if status == "maintenance_break"
+            else "WEEKEND"
+            if status == "weekend"
+            else "HOLIDAY"
+            if status in {"holiday", "holiday_closed"}
+            else "UNVERIFIED_HOLIDAY_SCHEDULE"
+            if status == "unknown"
+            else "SESSION_CLOSED"
+        )
+    next_open = (
+        _next_futures_open(local, status)
+        if status not in {"unknown", "holiday", "holiday_closed", "late_open"}
+        else None
+    )
+    next_close = (
+        _next_futures_close(local, status)
+        if next_open is not None
+        else None
+    )
     return {
         "status": status,
         "is_open": is_open,
-        "closed_reason": (
-            None
-            if is_open
-            else "MAINTENANCE_BREAK"
-            if status == "maintenance_break"
-            else "WEEKEND"
-        ),
-        "holiday_name": None,
-        "is_early_close": False,
+        "closed_reason": closed_reason,
+        "holiday_name": holiday_name,
+        "is_early_close": is_early_close,
         "market": "CME equity index futures",
         "timezone": "America/New_York",
         "regular_trading_hours": "Sunday 18:00 through Friday 17:00 ET",
         "extended_trading_hours": "Globex electronic session",
         "maintenance_break": {"start": "17:00:00", "end": "18:00:00", "days": "Monday-Thursday"},
         "holiday_schedule": "calendar-specific overrides required",
-        "early_close": False,
-        "next_open": next_open.astimezone(UTC).isoformat(),
-        "next_open_at": next_open.astimezone(UTC).isoformat(),
-        "next_close": next_close.astimezone(UTC).isoformat(),
+        "early_close": is_early_close,
+        "next_open": (
+            next_open.astimezone(UTC).isoformat() if next_open else None
+        ),
+        "next_open_at": (
+            next_open.astimezone(UTC).isoformat() if next_open else None
+        ),
+        "next_close": (
+            next_close.astimezone(UTC).isoformat() if next_close else None
+        ),
         "source": "versioned CME Globex schedule fallback",
         "source_classification": "versioned_static_last_known_good",
+        "official_document_discovered": False,
+        "official_schedule_parsed": False,
+        "session_state_verified": False,
+        "data_origin_is_official": False,
+        "is_official_source": False,
         "freshness": "LIVE" if status == "open" else "CURRENT_SESSION",
     }
 
@@ -278,6 +399,14 @@ def _early_close_time(item: dict[str, Any] | None) -> time | None:
     value = str((item or {}).get("early_close_time_local") or "")
     try:
         return time.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def _override_time(item: dict[str, Any], key: str) -> time | None:
+    value = item.get(key)
+    try:
+        return time.fromisoformat(str(value)) if value else None
     except ValueError:
         return None
 

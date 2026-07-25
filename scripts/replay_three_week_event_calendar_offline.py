@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import gc
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +13,16 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import Settings
+from app.infrastructure.persistence.database import connect_sqlite
 from app.services.ai_trader_consumer_v2_service import (
     build_ai_trader_consumer_v2,
 )
+from app.services.event_driven_lifecycle_service import (
+    LifecycleRepository,
+    compute_datum_lifecycle,
+)
+from app.services.execution_context import ExecutionContext
+from app.services.research_scheduler_service import ResearchSchedulerService
 
 
 GENERATED_AT = "2026-07-22T15:00:00+00:00"
@@ -36,7 +45,9 @@ def replay(*, workspace: Path | None = None) -> dict[str, Any]:
         enable_scheduler=False,
         research_scheduler_enabled=False,
         lifecycle_due_scanner_enabled=False,
-        event_calendar_catchup_enabled=False,
+        event_calendar_catchup_enabled=True,
+        event_calendar_catchup_batch_size=20,
+        event_calendar_catchup_max_per_tick=40,
     )
     payload = _fixture()
     first = build_ai_trader_consumer_v2(payload, settings=settings)
@@ -44,6 +55,7 @@ def replay(*, workspace: Path | None = None) -> dict[str, Any]:
     encoded = _canonical(first)
     second_encoded = _canonical(second)
     window = first["event_calendar_window"]
+    catchup = _replay_catchup(settings)
     result = {
         "mode": "offline_three_week_event_calendar_replay",
         "schema_version": first["schema_version"],
@@ -68,10 +80,119 @@ def replay(*, workspace: Path | None = None) -> dict[str, Any]:
         "mnq_futures_session_status": first["market_schedule"][
             "mnq_futures_session"
         ]["status"],
+        "catchup": catchup,
     }
     if temporary is not None:
+        gc.collect()
         temporary.cleanup()
     return result
+
+
+def _replay_catchup(settings: Settings) -> dict[str, Any]:
+    now = datetime.fromisoformat(GENERATED_AT)
+    lifecycle = LifecycleRepository(settings, clock=lambda: now)
+    for index in range(45):
+        release = now - timedelta(days=1 + index * 16)
+        key = f"offline:macro:{index:02d}"
+        datum = {
+            "event_id": key,
+            "occurrence_id": key,
+            "canonical_event_key": key,
+            "event_type": "CPI",
+            "category": "MACRO",
+            "impact": "HIGH",
+            "release_at": release.isoformat(),
+            "scheduled_at_utc": release.isoformat(),
+            "actual": None,
+            "forecast": "2.5",
+            "source": "BLS",
+            "source_url": "https://www.bls.gov/cpi/",
+        }
+        contract = compute_datum_lifecycle(
+            "macro_actual",
+            key,
+            datum,
+            settings=settings,
+            now=now,
+            fields_attempted=["actual"],
+            triggering_event="macro_actual",
+        )
+        lifecycle.upsert(contract, payload=datum, work_status="READY")
+
+    def resolver(item: dict[str, Any]) -> dict[str, Any]:
+        datum = {
+            **dict(item.get("payload") or {}),
+            "actual": "2.7",
+            "published_at": item.get("event_at"),
+            "retrieved_at": now.isoformat(),
+            "valid_until": (now + timedelta(days=365)).isoformat(),
+            "source_lineage": [
+                {
+                    "source": "BLS",
+                    "source_url": "https://www.bls.gov/cpi/",
+                    "source_classification": "official_source",
+                    "verification_status": "VERIFIED",
+                }
+            ],
+        }
+        return {
+            "status": "RESOLVED",
+            "datum": datum,
+            "provider_request_attempted": False,
+            "provider_request_completed": False,
+            "ai_eligible": True,
+        }
+
+    scheduler = ResearchSchedulerService(settings, clock=lambda: now)
+    context = ExecutionContext.provider_only(
+        correlation_id="offline-replay-catchup",
+        allow_live_providers=True,
+    )
+    first = scheduler.startup_catch_up(
+        resolver=resolver,
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI enqueue reached during offline replay")
+        ),
+        execution_context=context,
+    )
+    second = scheduler.startup_catch_up(
+        resolver=resolver,
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI enqueue reached during offline replay")
+        ),
+        execution_context=context,
+    )
+    repeated = scheduler.startup_catch_up(
+        resolver=lambda _: (_ for _ in ()).throw(
+            AssertionError("completed backlog was reclaimed")
+        ),
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI enqueue reached during offline replay")
+        ),
+        execution_context=context,
+    )
+    with connect_sqlite(settings.database_path) as conn:
+        backend_invocations = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM research_backend_invocations"
+            ).fetchone()[0]
+        )
+    return {
+        "seeded": 45,
+        "first_tick_claimed": first["claimed"],
+        "first_tick_backlog_after": first["catch_up_backlog_after"],
+        "second_tick_claimed": second["claimed"],
+        "second_tick_backlog_after": second["catch_up_backlog_after"],
+        "completion_status": second["catch_up_completion_status"],
+        "repeat_status": repeated["status"],
+        "repeat_writes": repeated["writes"],
+        "tick_count": second["catch_up_tick_count"],
+        "live_provider_calls": 0,
+        "ai_invocations": (
+            int(first["ai_invocations"]) + int(second["ai_invocations"])
+        ),
+        "research_backend_invocations": backend_invocations,
+    }
 
 
 def _fixture() -> dict[str, Any]:

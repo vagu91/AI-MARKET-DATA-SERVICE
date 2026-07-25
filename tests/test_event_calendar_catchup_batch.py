@@ -388,6 +388,12 @@ def test_catchup_disabled_is_read_only_even_with_due_work(
         before = conn.execute(
             "SELECT COUNT(*) FROM market_context_snapshots"
         ).fetchone()[0]
+        provider_state_before = conn.execute(
+            "SELECT COUNT(*) FROM provider_state"
+        ).fetchone()[0]
+        telemetry_before = conn.execute(
+            "SELECT COUNT(*) FROM service_telemetry_events"
+        ).fetchone()[0]
 
     result = scheduler.startup_catch_up(
         resolver=lambda _: pytest.fail("resolver must stay unreachable"),
@@ -401,6 +407,12 @@ def test_catchup_disabled_is_read_only_even_with_due_work(
         after = conn.execute(
             "SELECT COUNT(*) FROM market_context_snapshots"
         ).fetchone()[0]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM provider_state"
+        ).fetchone()[0] == provider_state_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM service_telemetry_events"
+        ).fetchone()[0] == telemetry_before
     assert after == before
 
 

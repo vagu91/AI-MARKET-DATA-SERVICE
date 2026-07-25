@@ -157,7 +157,11 @@ def compute_datum_lifecycle(
         "release_at",
     )
     published_at = _first_time(value, "published_at")
-    event_at = _event_time(value, settings=settings)
+    event_at = _event_time(
+        value,
+        settings=settings,
+        entity_type=entity_type,
+    )
     valid_from = _first_time(value, "valid_from") or data_as_of or observed_at
     valid_until = _first_time(value, "valid_until", "fresh_until")
     next_refresh_at = _first_time(value, "next_refresh_at", "next_refresh")
@@ -197,10 +201,14 @@ def compute_datum_lifecycle(
         if event_at is not None and actual_missing:
             valid_until = valid_until or event_at
             if event_at <= now:
-                next_retry_at = next_retry_at or _bounded_retry_at(
-                    now,
-                    attempt_count=attempt_count,
-                    delays=_retry_delays(settings),
+                next_retry_at = next_retry_at or (
+                    now
+                    if attempt_count <= 0
+                    else _bounded_retry_at(
+                        now,
+                        attempt_count=attempt_count,
+                        delays=_retry_delays(settings),
+                    )
                 )
                 next_refresh_at = next_retry_at
             else:
@@ -819,6 +827,7 @@ class LifecycleRepository:
                   OR (work_status='BACKOFF' AND next_retry_at<=?)
                   OR (work_status='LEASED' AND lease_expires_at<=?)
                 )
+                AND entity_type!='schedule_only'
                 AND COALESCE(next_retry_at,next_refresh_at,updated_at)<=?
                 AND (
                   ? IS NULL
@@ -911,6 +920,7 @@ class LifecycleRepository:
                   OR (work_status='BACKOFF' AND next_retry_at<=?)
                   OR (work_status='LEASED' AND lease_expires_at<=?)
                 )
+                AND entity_type!='schedule_only'
                 AND COALESCE(next_retry_at,next_refresh_at,updated_at)<=?
                 AND (
                   ? IS NULL
@@ -1309,7 +1319,12 @@ def _scheduled_actual_missing(
     )
 
 
-def _event_time(value: dict[str, Any], *, settings: Settings) -> datetime | None:
+def _event_time(
+    value: dict[str, Any],
+    *,
+    settings: Settings,
+    entity_type: str,
+) -> datetime | None:
     exact = _first_time(
         value,
         "event_at",
@@ -1319,6 +1334,13 @@ def _event_time(value: dict[str, Any], *, settings: Settings) -> datetime | None
     )
     if exact is not None:
         return exact
+    if entity_type not in {
+        "earnings",
+        "earnings_schedule",
+        "earnings_actual",
+        "earnings_intelligence",
+    }:
+        return None
     raw_date = _date_value(
         value.get("earnings_date")
         or value.get("date")

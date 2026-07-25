@@ -307,6 +307,15 @@ class DeterministicLifecycleDueResolver:
             "provider_cache_hit": False,
             "provider_negative_cache_hit": False,
         }
+        if entity_type == "schedule_only":
+            return {
+                "status": "NOT_APPLICABLE",
+                "reason": "schedule_only_occurrence_has_no_outcome_resolver",
+                "ai_eligible": False,
+                "agent_status": "DISABLED",
+                "execution_status": "NOT_REQUESTED",
+                **telemetry,
+            }
         if isinstance(datum, dict) and datum:
             telemetry["committed_payload_hit"] = True
             committed = compute_datum_lifecycle(

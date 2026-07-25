@@ -57,6 +57,15 @@ async def run_startup_lifecycle_catchup(state):
     )
 
 
+async def run_event_calendar_catchup_loop(state):
+    settings = state["settings"]
+    while settings.event_calendar_catchup_enabled:
+        await asyncio.sleep(
+            max(int(settings.lifecycle_due_scanner_interval_seconds), 1)
+        )
+        await run_startup_lifecycle_catchup(state)
+
+
 def run_research_scheduler_evaluation(state, trigger_name: str):
     scheduler = state["research_scheduler"]
     execution_context = ExecutionContext.explicit_ai(
@@ -85,6 +94,13 @@ async def lifespan(app: FastAPI):
 
     scheduler = None
     ai_worker_task = None
+    event_calendar_catchup_task = None
+    if settings.event_calendar_catchup_enabled:
+        event_calendar_catchup_task = asyncio.create_task(
+            run_event_calendar_catchup_loop(state),
+            name="event-calendar-provider-catch-up",
+        )
+        app.state.event_calendar_catchup_task = event_calendar_catchup_task
     if settings.ai_worker_enabled:
         ai_worker_task = asyncio.create_task(state["ai_research_worker"].run(), name="ai-research-worker")
         app.state.ai_worker_task = ai_worker_task
@@ -175,6 +191,12 @@ async def lifespan(app: FastAPI):
         except TimeoutError:
             ai_worker_task.cancel()
             await asyncio.gather(ai_worker_task, return_exceptions=True)
+    if event_calendar_catchup_task:
+        event_calendar_catchup_task.cancel()
+        await asyncio.gather(
+            event_calendar_catchup_task,
+            return_exceptions=True,
+        )
 
 
 app = FastAPI(

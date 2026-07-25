@@ -698,3 +698,17 @@ def test_offline_replay_is_idempotent_under_90kb_and_has_zero_live_calls(
     assert result["browser_calls"] == 0
     assert result["delivery_attempts"] == 0
     assert result["trading_calls"] == 0
+    assert result["catchup"] == {
+        "seeded": 45,
+        "first_tick_claimed": 40,
+        "first_tick_backlog_after": 5,
+        "second_tick_claimed": 5,
+        "second_tick_backlog_after": 0,
+        "completion_status": "COMPLETED",
+        "repeat_status": "ALREADY_COMPLETE",
+        "repeat_writes": 0,
+        "tick_count": 2,
+        "live_provider_calls": 0,
+        "ai_invocations": 0,
+        "research_backend_invocations": 0,
+    }

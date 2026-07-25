@@ -804,6 +804,12 @@ class ResearchSchedulerService:
                 "ai_jobs_created": 0,
                 "writes": 0,
             }
+        if event_calendar_catchup:
+            return self._event_calendar_catchup_tick(
+                resolver=resolver,
+                ai_enqueue=ai_enqueue,
+                execution_context=execution_context,
+            )
         now = self.clock()
         window_start = now - (
             timedelta(
@@ -901,6 +907,251 @@ class ResearchSchedulerService:
             "catch_up_batch_size": int(result.get("claimed") or 0),
             "catch_up_provider_only": event_calendar_catchup,
         }
+
+    def _event_calendar_catchup_tick(
+        self,
+        *,
+        resolver: Callable[[dict[str, Any]], dict[str, Any]],
+        ai_enqueue: Callable[[list[dict[str, Any]]], Any],
+        execution_context: ExecutionContext | None,
+    ) -> dict[str, Any]:
+        now = self.clock()
+        window_start = now - timedelta(
+            days=int(self.settings.event_calendar_catchup_lookback_days)
+        )
+        event_entity_types = frozenset(
+            {
+                "macro_actual",
+                "earnings_actual",
+                "fomc_decision",
+                "fomc_communication",
+            }
+        )
+        priority_since = now - timedelta(
+            days=int(
+                self.settings.event_calendar_notification_horizon_days
+            )
+        )
+        checkpoint = self._read_event_calendar_catchup_checkpoint()
+        backlog_before = self.lifecycle.count_due(
+            now=now,
+            due_since=window_start,
+            entity_types=event_entity_types,
+        )
+        if (
+            backlog_before == 0
+            and checkpoint.get("completion_status") == "COMPLETED"
+        ):
+            return {
+                "status": "ALREADY_COMPLETE",
+                "claimed": 0,
+                "resolved": [],
+                "backoff": [],
+                "provider_calls": 0,
+                "resolver_evaluations": 0,
+                "actual_provider_requests": 0,
+                "successful_provider_requests": 0,
+                "failed_provider_requests": 0,
+                "ai_invocations": 0,
+                "ai_jobs_created": 0,
+                "writes": 0,
+                "checkpoint_written": False,
+                "catch_up_cursor": checkpoint.get("cursor"),
+                "catch_up_backlog_before": 0,
+                "catch_up_backlog_after": 0,
+                "catch_up_tick_count": int(
+                    checkpoint.get("tick_count") or 0
+                ),
+                "catch_up_completion_status": "COMPLETED",
+                "catch_up_provider_only": True,
+            }
+
+        aggregate = _empty_catchup_result()
+        max_per_tick = int(
+            self.settings.event_calendar_catchup_max_per_tick
+        )
+        batch_size = int(
+            self.settings.event_calendar_catchup_batch_size
+        )
+        cursor = checkpoint.get("cursor")
+        backlog_after = backlog_before
+        while (
+            aggregate["claimed"] < max_per_tick
+            and backlog_after > 0
+        ):
+            remaining = max_per_tick - int(aggregate["claimed"])
+            batch = self.scan_due_items(
+                owner="event-calendar-catch-up",
+                resolver=resolver,
+                ai_enqueue=ai_enqueue,
+                due_since=window_start,
+                execution_context=execution_context,
+                force=True,
+                limit=min(batch_size, remaining),
+                entity_types=event_entity_types,
+                priority_since=priority_since,
+                allow_ai_residual=False,
+                coalesce_provider_resolutions=True,
+            )
+            _accumulate_catchup_result(aggregate, batch)
+            if batch.get("catch_up_cursor"):
+                cursor = batch["catch_up_cursor"]
+            backlog_after = self.lifecycle.count_due(
+                now=now,
+                due_since=window_start,
+                entity_types=event_entity_types,
+            )
+            if int(batch.get("claimed") or 0) == 0:
+                break
+
+        pending_backoff = self._event_calendar_catchup_backoff_count(
+            window_start=window_start,
+            entity_types=event_entity_types,
+        )
+        completion_status = (
+            "IN_PROGRESS"
+            if backlog_after > 0
+            else "WAITING_BACKOFF"
+            if pending_backoff > 0
+            else "COMPLETED"
+        )
+        tick_count = int(checkpoint.get("tick_count") or 0) + 1
+        checkpoint_payload = {
+            "backlog_before": backlog_before,
+            "claimed": int(aggregate["claimed"]),
+            "resolved": len(aggregate["resolved"]),
+            "backoff": len(aggregate["backoff"]),
+            "backlog_after": backlog_after,
+            "pending_backoff": pending_backoff,
+            "cursor": cursor,
+            "tick_count": tick_count,
+            "completion_status": completion_status,
+            "updated_at": now.astimezone(UTC).replace(
+                microsecond=0
+            ).isoformat(),
+        }
+        self._write_event_calendar_catchup_checkpoint(checkpoint_payload)
+        telemetry_reason = ";".join(
+            f"{key}:{checkpoint_payload[key]}"
+            for key in (
+                "backlog_before",
+                "claimed",
+                "resolved",
+                "backoff",
+                "backlog_after",
+                "cursor",
+                "tick_count",
+                "completion_status",
+            )
+        )
+        self.telemetry.emit(
+            "startup_catch_up",
+            identifiers={"correlation_id": "event-calendar-catch-up"},
+            decision_summary=(
+                "persistent provider-only event calendar catch-up tick completed"
+            ),
+            stop_reason=completion_status,
+            payload={
+                "status": completion_status,
+                "reason": telemetry_reason,
+                **checkpoint_payload,
+            },
+        )
+        return {
+            **aggregate,
+            "status": "COMPLETED",
+            "writes": len(aggregate["rematerialized_snapshot_ids"]),
+            "checkpoint_written": True,
+            "catch_up_window_start": window_start.isoformat(),
+            "catch_up_window_hours": int(
+                self.settings.event_calendar_catchup_lookback_days
+            )
+            * 24,
+            "catch_up_backlog_before": backlog_before,
+            "catch_up_backlog_after": backlog_after,
+            "catch_up_pending_backoff": pending_backoff,
+            "catch_up_batch_size": batch_size,
+            "catch_up_max_per_tick": max_per_tick,
+            "catch_up_cursor": cursor,
+            "catch_up_tick_count": tick_count,
+            "catch_up_completion_status": completion_status,
+            "catch_up_provider_only": True,
+        }
+
+    def _read_event_calendar_catchup_checkpoint(self) -> dict[str, Any]:
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json FROM provider_state
+                WHERE state_key='event_calendar_lifecycle_catchup'
+                """
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_event_calendar_catchup_checkpoint(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        timestamp = str(payload["updated_at"])
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_state(
+                  state_key,provider_name,state_type,status,reason,retryable,
+                  next_retry_at,payload_json,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                  status=excluded.status,
+                  reason=excluded.reason,
+                  retryable=excluded.retryable,
+                  next_retry_at=excluded.next_retry_at,
+                  payload_json=excluded.payload_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    "event_calendar_lifecycle_catchup",
+                    "deterministic_lifecycle_due_resolver",
+                    "persistent_catchup_checkpoint",
+                    str(payload["completion_status"]),
+                    "provider_only_bounded_tick",
+                    int(payload["completion_status"] == "WAITING_BACKOFF"),
+                    None,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.commit()
+
+    def _event_calendar_catchup_backoff_count(
+        self,
+        *,
+        window_start: datetime,
+        entity_types: frozenset[str],
+    ) -> int:
+        placeholders = ",".join("?" for _ in entity_types)
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) FROM datum_lifecycle_items
+                WHERE work_status='BACKOFF'
+                  AND entity_type IN ({placeholders})
+                  AND COALESCE(event_at,updated_at)>=?
+                """,
+                (
+                    *sorted(entity_types),
+                    window_start.astimezone(UTC).replace(
+                        microsecond=0
+                    ).isoformat(),
+                ),
+            ).fetchone()
+        return int(row[0] if row else 0)
 
     def _rematerialize_provider_resolution(
         self,
@@ -1435,6 +1686,70 @@ class ResearchSchedulerService:
             )
             conn.commit()
         return result
+
+
+def _empty_catchup_result() -> dict[str, Any]:
+    return {
+        "claimed": 0,
+        "provider_calls": 0,
+        "resolver_evaluations": 0,
+        "committed_payload_hits": 0,
+        "actual_provider_requests": 0,
+        "successful_provider_requests": 0,
+        "failed_provider_requests": 0,
+        "resolved": [],
+        "rematerialized_snapshot_ids": [],
+        "deferred": [],
+        "backoff": [],
+        "item_outcomes": [],
+        "effective_triggers": [],
+        "residual_count": 0,
+        "ai_eligible_count": 0,
+        "ai_decisions": [],
+        "ai_invocations": 0,
+        "ai_jobs_created": 0,
+        "provider_resolutions_coalesced": False,
+        "actuals_recovered": 0,
+        "revisions_reconciled": 0,
+    }
+
+
+def _accumulate_catchup_result(
+    aggregate: dict[str, Any],
+    batch: dict[str, Any],
+) -> None:
+    for field in (
+        "claimed",
+        "provider_calls",
+        "resolver_evaluations",
+        "committed_payload_hits",
+        "actual_provider_requests",
+        "successful_provider_requests",
+        "failed_provider_requests",
+        "residual_count",
+        "ai_eligible_count",
+        "ai_invocations",
+        "ai_jobs_created",
+        "actuals_recovered",
+        "revisions_reconciled",
+    ):
+        aggregate[field] = int(aggregate.get(field) or 0) + int(
+            batch.get(field) or 0
+        )
+    for field in (
+        "resolved",
+        "rematerialized_snapshot_ids",
+        "deferred",
+        "backoff",
+        "item_outcomes",
+        "effective_triggers",
+        "ai_decisions",
+    ):
+        aggregate[field].extend(list(batch.get(field) or []))
+    aggregate["provider_resolutions_coalesced"] = bool(
+        aggregate["provider_resolutions_coalesced"]
+        or batch.get("provider_resolutions_coalesced")
+    )
 
 
 def _fingerprint_payload(snapshot: dict[str, Any] | None) -> dict[str, Any]:

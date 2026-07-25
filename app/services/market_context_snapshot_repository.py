@@ -32,6 +32,9 @@ from app.services.event_calendar_window_service import (
     classify_event_change,
     coalesce_event_changes,
 )
+from app.services.event_occurrence_lifecycle_service import (
+    classify_occurrence_lifecycle,
+)
 from app.services.observability_contract_service import TelemetryRepository
 
 
@@ -190,6 +193,25 @@ class MarketContextSnapshotRepository:
                     self.settings.event_calendar_consensus_trigger_enabled
                 ),
             )
+            debug["event_calendar_window"].setdefault("audit", {})[
+                "comparison"
+            ] = {
+                "removals": schedule_change_metadata.get("removals") or [],
+                "policy": (
+                    "absence_is_unconfirmed_until_allowed_source_confirms_"
+                    "cancellation_or_postponement"
+                ),
+            }
+            debug["event_calendar_window"]["removals"] = [
+                {
+                    "occurrence_id": item.get("occurrence_id"),
+                    "status": item.get("status"),
+                    "trigger_class": item.get("trigger_class"),
+                    "causes": list(item.get("causes") or []),
+                }
+                for item in schedule_change_metadata.get("removals") or []
+                if isinstance(item, dict)
+            ]
             if (
                 schedule_change_metadata["trigger_class"] == "TRIGGERING"
                 and str(trigger_type or "").lower()
@@ -206,6 +228,13 @@ class MarketContextSnapshotRepository:
                 schedule_change_metadata["trigger_class"] == "TRIGGERING"
                 and trigger_metadata is None
             ):
+                trigger_metadata = schedule_change_metadata
+            elif (
+                schedule_change_metadata.get("removals")
+                and str(trigger_type or "").lower() == "macro_schedule"
+            ):
+                trigger_type = None
+                trigger_entity = None
                 trigger_metadata = schedule_change_metadata
             final_invalid_sources = self.source_policy.invalid_sources(
                 debug,
@@ -905,14 +934,19 @@ class MarketContextSnapshotRepository:
                 )
                 if not occurrence_id:
                     continue
+                classification = classify_occurrence_lifecycle(item)
                 lifecycle = compute_datum_lifecycle(
-                    "macro_actual",
+                    classification.entity_type,
                     occurrence_id,
                     item,
                     settings=self.settings,
                     now=reference,
-                    fields_attempted=["actual"],
-                    triggering_event="macro_actual",
+                    fields_attempted=list(classification.outcome_fields),
+                    triggering_event=(
+                        classification.entity_type
+                        if classification.operational
+                        else None
+                    ),
                     refresh_reason="event_calendar_occurrence_projection",
                 )
                 persist_lifecycle_in_transaction(
@@ -921,7 +955,8 @@ class MarketContextSnapshotRepository:
                     payload=item,
                     work_status=(
                         "READY"
-                        if lifecycle.freshness_state
+                        if classification.operational
+                        and lifecycle.freshness_state
                         in {"DUE", "AWAITING_ACTUAL"}
                         else "IDLE"
                     ),
@@ -1208,6 +1243,22 @@ def _event_window_changes(
     ):
         return coalesce_event_changes([])
     previous = _event_window_index(previous_window)
+    for removal in (
+        ((previous_window.get("audit") or {}).get("comparison") or {}).get(
+            "removals"
+        )
+        or []
+    ):
+        if not isinstance(removal, dict):
+            continue
+        prior = removal.get("previous_occurrence")
+        occurrence_id = str(removal.get("occurrence_id") or "")
+        if (
+            occurrence_id
+            and isinstance(prior, dict)
+            and removal.get("status") == "UNCONFIRMED_REMOVAL"
+        ):
+            previous.setdefault(occurrence_id, prior)
     current = _event_window_index(current_window)
     changes = [
         classify_event_change(
@@ -1217,7 +1268,53 @@ def _event_window_changes(
         )
         for occurrence_id, occurrence in sorted(current.items())
     ]
-    return coalesce_event_changes(changes)
+    confirmations = {
+        str(item.get("occurrence_id") or ""): item
+        for item in (
+            ((current_window.get("audit") or {}).get("removal_confirmations"))
+            or []
+        )
+        if isinstance(item, dict) and item.get("occurrence_id")
+    }
+    removals: list[dict[str, Any]] = []
+    for occurrence_id in sorted(previous.keys() - current.keys()):
+        prior = previous[occurrence_id]
+        confirmation = confirmations.get(occurrence_id)
+        if confirmation is None:
+            change = classify_event_change(prior, None)
+        else:
+            change = classify_event_change(
+                prior,
+                {
+                    **prior,
+                    "release_status": confirmation["release_status"],
+                    "removal_status": "REMOVED_FROM_CALENDAR",
+                    "comparison_lineage": {
+                        "previous_source": prior.get("source"),
+                        "previous_source_domain": prior.get("source_domain"),
+                        "confirmation_source": confirmation.get("source"),
+                        "confirmation_source_url": confirmation.get("source_url"),
+                        "confirmation_retrieved_at": confirmation.get(
+                            "retrieved_at"
+                        ),
+                    },
+                },
+                consensus_trigger_enabled=consensus_trigger_enabled,
+            )
+        removals.append(
+            {
+                "occurrence_id": occurrence_id,
+                "status": change.get("removal_status"),
+                "trigger_class": change.get("trigger_class"),
+                "causes": list(change.get("causes") or []),
+                "comparison_lineage": change.get("comparison_lineage"),
+                "previous_occurrence": prior,
+            }
+        )
+        changes.append(change)
+    output = coalesce_event_changes(changes)
+    output["removals"] = removals
+    return output
 
 
 def _event_window_index(window: dict[str, Any]) -> dict[str, dict[str, Any]]:

@@ -11,6 +11,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
+from app.services.event_occurrence_lifecycle_service import (
+    classify_occurrence_lifecycle,
+)
+from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key
 
 
@@ -108,15 +112,22 @@ def build_event_calendar_window(
     ]
     candidates.sort(key=_event_sort_key)
     configured_limit = max(int(settings.event_calendar_consumer_max_events), 1)
-    retained = _retain_deterministically(candidates, limit=configured_limit)
+    retained = _retain_bucket_aware(candidates, limit=configured_limit)
+    nonempty_candidate_buckets = {
+        str(item["week_bucket"]) for item in candidates
+    }
+    minimum_bucket_coverage_possible = True
     while (
-        len(retained) > 1
+        len(retained) > len(nonempty_candidate_buckets)
         and _compact_events_size(retained) > _CONSUMER_EVENT_BYTES_LIMIT
     ):
-        retained = _retain_deterministically(
+        retained = _retain_bucket_aware(
             candidates,
             limit=len(retained) - 1,
         )
+    while retained and _compact_events_size(retained) > _CONSUMER_EVENT_BYTES_LIMIT:
+        minimum_bucket_coverage_possible = False
+        retained = _drop_lowest_retention_priority(retained)
     retained_event_bytes = _compact_events_size(retained)
     retained_ids = {str(item["occurrence_id"]) for item in retained}
     overflow_count = max(len(candidates) - len(retained), 0)
@@ -125,6 +136,9 @@ def build_event_calendar_window(
     status_counts = {status: 0 for status in sorted(RELEASE_STATUSES)}
     for bucket_name in WEEK_BUCKETS:
         start, end = bucket_bounds[bucket_name]
+        bucket_candidates = [
+            item for item in candidates if item["week_bucket"] == bucket_name
+        ]
         events = [
             item
             for item in retained
@@ -138,6 +152,9 @@ def build_event_calendar_window(
             "start": start.isoformat(),
             "end": end.isoformat(),
             "event_count": len(events),
+            "candidate_count": len(bucket_candidates),
+            "retained_count": len(events),
+            "omitted_count": max(len(bucket_candidates) - len(events), 0),
             "events": events,
         }
 
@@ -153,6 +170,21 @@ def build_event_calendar_window(
     revised_count = sum(
         item["release_status"] == "REVISED" for item in retained
     )
+    coverage_status = (
+        "COMPLETE"
+        if overflow_count == 0
+        else "TRUNCATED"
+        if minimum_bucket_coverage_possible
+        else "DEGRADED"
+    )
+    bucket_coverage = {
+        bucket_name: {
+            "candidate_count": buckets[bucket_name]["candidate_count"],
+            "retained_count": buckets[bucket_name]["retained_count"],
+            "omitted_count": buckets[bucket_name]["omitted_count"],
+        }
+        for bucket_name in WEEK_BUCKETS
+    }
     result = {
         "timezone": timezone_name,
         "generated_at": now_utc.replace(microsecond=0).isoformat(),
@@ -167,10 +199,23 @@ def build_event_calendar_window(
             "total": len(retained),
         },
         "coverage": {
-            "status": "COMPLETE" if overflow_count == 0 else "TRUNCATED",
+            "status": coverage_status,
             "candidate_count": len(candidates),
             "retained_count": len(retained),
+            "omitted_count": overflow_count,
             "overflow_count": overflow_count,
+            "by_bucket": bucket_coverage,
+            "minimum_per_nonempty_bucket_preserved": all(
+                not details["candidate_count"] or details["retained_count"] >= 1
+                for details in bucket_coverage.values()
+            ),
+            "truncation_reason": (
+                None
+                if overflow_count == 0
+                else "configured_event_limit_or_byte_budget"
+                if minimum_bucket_coverage_possible
+                else "byte_budget_insufficient_for_nonempty_bucket_minimum"
+            ),
             "outside_window_count": outside_window_count,
             "minimum_impact": impact_floor,
             "deterministic_limit": configured_limit,
@@ -192,8 +237,35 @@ def build_event_calendar_window(
             "ordering": "scheduled_at,impact_desc,occurrence_id",
             "date_only_policy": "preserve_date_without_inventing_release_time",
             "unscheduled_news_policy": "excluded_from_scheduled_calendar_window",
+            "removal_confirmations": _removal_confirmations(
+                full,
+                settings=settings,
+            ),
         },
     }
+    existing_comparison = (
+        (
+            (
+                full.get("event_calendar_window")
+                if isinstance(full.get("event_calendar_window"), dict)
+                else {}
+            ).get("audit")
+            or {}
+        ).get("comparison")
+        or {}
+    )
+    if existing_comparison:
+        result["audit"]["comparison"] = existing_comparison
+    result["removals"] = [
+        {
+            "occurrence_id": item.get("occurrence_id"),
+            "status": item.get("status"),
+            "trigger_class": item.get("trigger_class"),
+            "causes": list(item.get("causes") or []),
+        }
+        for item in existing_comparison.get("removals") or []
+        if isinstance(item, dict)
+    ]
     logger.info(
         "event_calendar_window_materialized",
         extra={
@@ -224,6 +296,7 @@ def compact_event_calendar_window(window: dict[str, Any]) -> dict[str, Any]:
             "counts",
             "coverage",
             "telemetry",
+            "removals",
         )
     }
     for key in ("previous_week", "current_week", "next_week"):
@@ -232,6 +305,9 @@ def compact_event_calendar_window(window: dict[str, Any]) -> dict[str, Any]:
             "start": raw_bucket.get("start"),
             "end": raw_bucket.get("end"),
             "event_count": int(raw_bucket.get("event_count") or 0),
+            "candidate_count": int(raw_bucket.get("candidate_count") or 0),
+            "retained_count": int(raw_bucket.get("retained_count") or 0),
+            "omitted_count": int(raw_bucket.get("omitted_count") or 0),
             "events": [
                 _compact_occurrence(item)
                 for item in raw_bucket.get("events") or []
@@ -243,13 +319,28 @@ def compact_event_calendar_window(window: dict[str, Any]) -> dict[str, Any]:
 
 def classify_event_change(
     previous: dict[str, Any] | None,
-    current: dict[str, Any],
+    current: dict[str, Any] | None,
     *,
     consensus_trigger_enabled: bool = False,
 ) -> dict[str, Any]:
     """Classify semantic event changes independently from volatile refreshes."""
 
     previous = dict(previous or {})
+    if current is None:
+        previous = dict(previous or {})
+        return {
+            "trigger_class": "NON_TRIGGERING",
+            "changed_event_id": (
+                previous.get("occurrence_id") or previous.get("event_id")
+            ),
+            "causes": [],
+            "removal_status": "UNCONFIRMED_REMOVAL",
+            "comparison_lineage": {
+                "previous_source": previous.get("source"),
+                "previous_source_domain": previous.get("source_domain"),
+                "confirmation_source": None,
+            },
+        }
     current = dict(current)
     causes: list[str] = []
     old_actual = _nullable(previous.get("actual"))
@@ -285,6 +376,8 @@ def classify_event_change(
         "trigger_class": "TRIGGERING" if causes else "NON_TRIGGERING",
         "changed_event_id": current.get("occurrence_id") or current.get("event_id"),
         "causes": causes,
+        "removal_status": current.get("removal_status"),
+        "comparison_lineage": current.get("comparison_lineage"),
     }
 
 
@@ -334,10 +427,15 @@ def _scheduled_rows(
         if isinstance(full.get("event_calendar"), dict)
         else {}
     )
+    section_hints = {
+        "fed_communications": "FOMC_COMMUNICATION",
+        "scheduled_regulatory_events": "REGULATORY",
+        "scheduled_geopolitical_events": "GEOPOLITICAL",
+    }
     for section in _SCHEDULED_CALENDAR_SECTIONS:
         for raw in calendar.get(section) or []:
             if isinstance(raw, dict) and _is_scheduled_occurrence(raw):
-                yield raw, None
+                yield raw, section_hints.get(section)
 
     earnings = (
         (full.get("nasdaq_context") or {}).get("earnings")
@@ -586,6 +684,16 @@ def _canonical_occurrence(
         "trigger_class": _occurrence_trigger_class(item, release_status),
         "lineage": _full_lineage(item),
     }
+    lifecycle_classification = classify_occurrence_lifecycle(
+        {
+            **item,
+            **occurrence,
+            "classification_hint": event_type_hint,
+        }
+    )
+    occurrence["lifecycle"] = lifecycle_classification.as_dict()
+    occurrence["lifecycle_entity_type"] = lifecycle_classification.entity_type
+    occurrence["outcome_contract"] = lifecycle_classification.outcome_contract
     return occurrence, None
 
 
@@ -858,6 +966,8 @@ def _compact_occurrence(item: dict[str, Any]) -> dict[str, Any]:
             "valid_until",
             "next_refresh_at",
             "trigger_class",
+            "lifecycle_entity_type",
+            "outcome_contract",
         )
     }
 
@@ -880,21 +990,170 @@ def _compact_events_size(items: list[dict[str, Any]]) -> int:
     )
 
 
-def _retain_deterministically(
+def _retain_bucket_aware(
     items: list[dict[str, Any]],
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
     if len(items) <= limit:
         return list(items)
-    ranked = sorted(
-        items,
-        key=lambda item: (
-            -_IMPACT_ORDER.get(str(item.get("impact") or "UNKNOWN"), 0),
-            _event_sort_key(item),
-        ),
-    )[:limit]
-    return sorted(ranked, key=_event_sort_key)
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for bucket_name in WEEK_BUCKETS:
+        bucket = [
+            item for item in items if item.get("week_bucket") == bucket_name
+        ]
+        if not bucket or len(selected) >= limit:
+            continue
+        winner = min(bucket, key=_bucket_quota_priority)
+        selected.append(winner)
+        selected_ids.add(str(winner.get("occurrence_id") or ""))
+    for item in sorted(items, key=_retention_priority):
+        identity = str(item.get("occurrence_id") or "")
+        if identity in selected_ids:
+            continue
+        if len(selected) >= limit:
+            break
+        selected.append(item)
+        selected_ids.add(identity)
+    return sorted(selected, key=_event_sort_key)
+
+
+def _retention_priority(item: dict[str, Any]) -> tuple[int, int, int, str, str]:
+    bucket = str(item.get("week_bucket") or "")
+    status = str(item.get("release_status") or "")
+    actual_priority = (
+        0
+        if bucket == "PREVIOUS_WEEK"
+        and (
+            item.get("actual") not in (None, "")
+            or status in {"PUBLISHED", "REVISED"}
+        )
+        else 1
+    )
+    current_priority = (
+        0
+        if bucket == "CURRENT_WEEK"
+        and (bool(item.get("is_today")) or status == "AWAITING_ACTUAL")
+        else 1
+    )
+    next_priority = (
+        0
+        if bucket == "NEXT_WEEK"
+        and str(item.get("impact") or "").upper() == "HIGH"
+        else 1
+    )
+    semantic_priority = min(actual_priority, current_priority, next_priority)
+    impact = -_IMPACT_ORDER.get(str(item.get("impact") or "UNKNOWN"), 0)
+    return (
+        impact,
+        semantic_priority,
+        WEEK_BUCKETS.index(bucket) if bucket in WEEK_BUCKETS else 99,
+        str(item.get("scheduled_at") or "9999-12-31"),
+        str(item.get("occurrence_id") or ""),
+    )
+
+
+def _bucket_quota_priority(
+    item: dict[str, Any],
+) -> tuple[int, int, str, str]:
+    bucket = str(item.get("week_bucket") or "")
+    status = str(item.get("release_status") or "")
+    if bucket == "PREVIOUS_WEEK":
+        semantic = int(
+            not (
+                item.get("actual") not in (None, "")
+                or status in {"PUBLISHED", "REVISED"}
+            )
+        )
+    elif bucket == "CURRENT_WEEK":
+        semantic = int(
+            not (
+                bool(item.get("is_today"))
+                or status == "AWAITING_ACTUAL"
+            )
+        )
+    elif bucket == "NEXT_WEEK":
+        semantic = int(
+            str(item.get("impact") or "").upper() != "HIGH"
+        )
+    else:
+        semantic = 1
+    return (
+        semantic,
+        -_IMPACT_ORDER.get(str(item.get("impact") or "UNKNOWN"), 0),
+        str(item.get("scheduled_at") or "9999-12-31"),
+        str(item.get("occurrence_id") or ""),
+    )
+
+
+def _drop_lowest_retention_priority(
+    retained: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not retained:
+        return []
+    worst = max(retained, key=_retention_priority)
+    removed = False
+    output: list[dict[str, Any]] = []
+    for item in retained:
+        if not removed and item is worst:
+            removed = True
+            continue
+        output.append(item)
+    return output
+
+
+def _removal_confirmations(
+    full: dict[str, Any],
+    *,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    calendar = (
+        full.get("event_calendar")
+        if isinstance(full.get("event_calendar"), dict)
+        else {}
+    )
+    rows = (
+        calendar.get("removal_confirmations")
+        or calendar.get("removed_events")
+        or []
+    )
+    confirmations: list[dict[str, Any]] = []
+    source_policy = SourcePolicyService(settings.source_policy_path)
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        occurrence_id = str(
+            raw.get("occurrence_id")
+            or raw.get("event_id")
+            or raw.get("canonical_event_key")
+            or ""
+        )
+        status = str(
+            raw.get("release_status") or raw.get("status") or ""
+        ).upper()
+        source = raw.get("source")
+        source_url = raw.get("source_url")
+        admitted = source_policy.validate(
+            raw,
+            field_semantics="event",
+        ).accepted
+        if (
+            occurrence_id
+            and status in {"CANCELLED", "POSTPONED"}
+            and (source or source_url)
+            and admitted
+        ):
+            confirmations.append(
+                {
+                    "occurrence_id": occurrence_id,
+                    "release_status": status,
+                    "source": source,
+                    "source_url": source_url,
+                    "retrieved_at": _iso_or_none(raw.get("retrieved_at")),
+                }
+            )
+    return sorted(confirmations, key=lambda item: item["occurrence_id"])
 
 
 def _merge_occurrences(
