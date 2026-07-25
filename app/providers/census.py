@@ -33,7 +33,6 @@ class CensusSeriesMapping:
     category_code: str
     data_type_code: str
     seasonally_adjusted: bool
-    time_slot_epoch: str
     unit: str
     frequency: str
     seasonal_adjustment: str
@@ -52,7 +51,6 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "44X72",
         "SM",
         True,
-        "1992-01",
         "millions_usd",
         "monthly",
         "SA",
@@ -66,7 +64,6 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "MDM",
         "NO",
         True,
-        "1992-01",
         "millions_usd",
         "monthly",
         "SA",
@@ -80,7 +77,6 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "ASTARTS",
         "TOTAL",
         True,
-        "1959-01",
         "thousands_annual_rate",
         "monthly",
         "SAAR",
@@ -94,7 +90,6 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "APERMITS",
         "TOTAL",
         True,
-        "1959-01",
         "thousands_annual_rate",
         "monthly",
         "SAAR",
@@ -108,7 +103,6 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "BOPGS",
         "BAL",
         True,
-        "1992-01",
         "millions_usd",
         "monthly",
         "SA",
@@ -127,7 +121,9 @@ EITS_OUTPUT_FIELDS = (
     "error_data",
     "program_code",
     "seasonally_adj",
+    "time_slot_date",
     "time_slot_id",
+    "time_slot_name",
 )
 EITS_PREDICATE_ONLY_FIELDS = frozenset({"time", "for", "in", "ucgid"})
 CENSUS_QUERY_PREDICATES = {
@@ -277,11 +273,6 @@ class CensusProvider(BaseProvider):
         rejection_reasons: list[str] = []
         rejected_row_hashes: list[str] = []
         for spec in specs:
-            expected_time_slot_id = _expected_time_slot_id(
-                period,
-                epoch=spec.time_slot_epoch,
-                frequency=spec.frequency,
-            )
             matches = [
                 row
                 for row in rows
@@ -289,7 +280,6 @@ class CensusProvider(BaseProvider):
                     row,
                     spec=spec,
                     period=period,
-                    expected_time_slot_id=expected_time_slot_id,
                 )
             ]
             if not matches:
@@ -324,9 +314,7 @@ class CensusProvider(BaseProvider):
                 or row.get("status")
                 or "published"
             )
-            occurrence_id = (
-                f"{spec.series_id}:{period}:slot-{expected_time_slot_id}"
-            )
+            occurrence_id = f"{spec.series_id}:{period}"
             observations.append(
                 NormalizedObservation(
                     observation_id=spec.series_id,
@@ -348,12 +336,15 @@ class CensusProvider(BaseProvider):
                     revision=revision,
                     metadata={
                         "dataset": normalized_dataset,
-                        "program_code": spec.program_code,
-                        "category_code": spec.category_code,
-                        "data_type_code": spec.data_type_code,
+                        "program_code": row.get("program_code"),
+                        "category_code": row.get("category_code"),
+                        "data_type_code": row.get("data_type_code"),
                         "seasonally_adjusted": spec.seasonally_adjusted,
                         "seasonally_adj_raw": row.get("seasonally_adj"),
-                        "time_slot_id": expected_time_slot_id,
+                        "time": row.get("time"),
+                        "time_slot_date": row.get("time_slot_date"),
+                        "time_slot_id": row.get("time_slot_id"),
+                        "time_slot_name": row.get("time_slot_name"),
                         "reference_period": period,
                         "frequency": spec.frequency,
                         "unit": spec.unit,
@@ -385,10 +376,7 @@ class CensusProvider(BaseProvider):
             request_fingerprint=request_meta["request_fingerprint"],
             cache_status=CacheStatus.MISS,
             freshness="CURRENT_RELEASE" if observations else "NO_DATA",
-            exact_occurrence_identity=(
-                f"CENSUS:{normalized_dataset}:{period}:"
-                f"slot-{_expected_time_slot_id(period, epoch=specs[0].time_slot_epoch, frequency=specs[0].frequency)}"
-            ),
+            exact_occurrence_identity=f"CENSUS:{normalized_dataset}:{period}",
             observations=observations,
             warnings=warnings,
             rejection_reasons=rejection_reasons,
@@ -400,6 +388,7 @@ class CensusProvider(BaseProvider):
                 "period": period,
                 "trigger_class": "TRIGGER",
                 "normalization": "exact_semantic_tuple",
+                "temporal_identity": "time+parsed_time_slot_date",
                 "output_fields": list(fields),
                 "predicate_fields": sorted(
                     {"time", *CENSUS_QUERY_PREDICATES.get(normalized_dataset, {})}
@@ -460,7 +449,6 @@ def _matches_mapping(
     *,
     spec: CensusSeriesMapping,
     period: str,
-    expected_time_slot_id: str,
 ) -> bool:
     observed_program = str(row.get("program_code") or "").strip().upper()
     return bool(
@@ -470,15 +458,11 @@ def _matches_mapping(
         == spec.data_type_code
         and _seasonally_adjusted(row.get("seasonally_adj"))
         is spec.seasonally_adjusted
-        and str(row.get("time") or row.get("period") or "").strip() == period
-        and str(row.get("time_slot_id") or "").strip()
-        == expected_time_slot_id
-        and not _error_data_row(row.get("error_data"))
-        and observed_program
-        in {
-            spec.program_code,
-            spec.dataset.upper(),
-        }
+        and str(row.get("time") or "").strip() == period
+        and _time_slot_date_matches(row.get("time_slot_date"), period)
+        and _error_data_clear(row.get("error_data"))
+        and _valid_cell_value(row.get("cell_value"))
+        and observed_program == spec.program_code
     )
 
 
@@ -507,33 +491,34 @@ def _seasonally_adjusted(value: Any) -> bool | None:
     return None
 
 
-def _error_data_row(value: Any) -> bool:
-    return str(value or "").strip().lower() not in {
-        "",
+def _error_data_clear(value: Any) -> bool:
+    return str(value or "").strip().lower() in {
         "0",
         "0.0",
         "false",
         "no",
         "n",
-        "none",
-        "null",
     }
 
 
-def _expected_time_slot_id(
-    period: str,
-    *,
-    epoch: str,
-    frequency: str,
-) -> str:
-    if frequency != "monthly" or "-Q" in period:
-        raise ProviderError("unsupported Census time-slot frequency")
-    period_year, period_month = (int(item) for item in period.split("-", 1))
-    epoch_year, epoch_month = (int(item) for item in epoch.split("-", 1))
-    offset = (period_year - epoch_year) * 12 + period_month - epoch_month
-    if offset < 0:
-        raise ProviderError("Census period predates mapped time-slot epoch")
-    return str(offset + 1)
+def _time_slot_date_matches(value: Any, period: str) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.date() == _period_start(period).date()
+
+
+def _valid_cell_value(value: Any) -> bool:
+    if value in (None, "", "null", "NA", "(X)"):
+        return False
+    try:
+        number = Decimal(str(value).replace(",", ""))
+    except InvalidOperation:
+        return False
+    return number.is_finite()
 
 
 def _precision(value: Any) -> int:

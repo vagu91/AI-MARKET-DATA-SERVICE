@@ -166,7 +166,9 @@ async def test_census_all_explicit_datasets_exact_period_and_compaction(
             rows = [
                 {
                     "time": period,
-                    "time_slot_id": "414",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
                     "program_code": "MARTS",
                     "category_code": "44X72",
                     "data_type_code": "SM",
@@ -179,7 +181,9 @@ async def test_census_all_explicit_datasets_exact_period_and_compaction(
             rows = [
                 {
                     "time": period,
-                    "time_slot_id": "414",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
                     "program_code": "M3ADV",
                     "category_code": "MDM",
                     "data_type_code": "NO",
@@ -192,7 +196,9 @@ async def test_census_all_explicit_datasets_exact_period_and_compaction(
             rows = [
                 {
                     "time": period,
-                    "time_slot_id": "810",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
                     "program_code": "RESCONST",
                     "category_code": "ASTARTS",
                     "data_type_code": "TOTAL",
@@ -202,7 +208,9 @@ async def test_census_all_explicit_datasets_exact_period_and_compaction(
                 },
                 {
                     "time": period,
-                    "time_slot_id": "810",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
                     "program_code": "RESCONST",
                     "category_code": "APERMITS",
                     "data_type_code": "TOTAL",
@@ -215,7 +223,9 @@ async def test_census_all_explicit_datasets_exact_period_and_compaction(
             rows = [
                 {
                     "time": period,
-                    "time_slot_id": "414",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
                     "program_code": "FTD",
                     "category_code": "BOPGS",
                     "data_type_code": "BAL",

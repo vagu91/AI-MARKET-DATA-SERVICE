@@ -140,11 +140,17 @@ There is no historical `time=2012` default.
 `time`, `for`, `in`, and `ucgid` are predicate-only and cannot enter `get`.
 The adapter requests only the value and exact discriminants, including
 `program_code`, `data_type_code`, `seasonally_adj`, `error_data`, and
-`time_slot_id`. Period, program, category, data type, seasonal variant, and the
-period-derived time slot must all match. Zero matches are deterministic `NO_DATA`;
-multiple exact matches are `ambiguous_census_mapping`. Neither case is materialized.
-Raw multi-row data is represented by hashes in audit lineage and is never copied to
-the consumer.
+the three `time_slot_*` audit fields. Temporal identity comes from the exact
+`time=YYYY-MM` predicate and the returned `time` value. `time_slot_date` is parsed
+and must equal the first day of that month. `time_slot_id` is a response-window
+offset (commonly `"0"` for a one-month query), is never calculated, and does not
+identify the calendar month. `time_slot_name` is descriptive only.
+
+Program, category, data type, seasonal variant, non-error state, exact time,
+parsed month start, and a valid `cell_value` must all match. Zero matches are
+deterministic `NO_DATA`; multiple exact matches are `ambiguous_census_mapping`.
+Neither case is materialized. Raw multi-row data is represented by hashes in audit
+lineage and is never copied to the consumer.
 
 The mapping is sourced from the official EITS variable definitions and program data
 dictionaries:
