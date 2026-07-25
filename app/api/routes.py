@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from app.api.deps import (
+    get_deterministic_provider_runtime,
     get_enrichment_orchestrator,
     get_event_service,
     get_event_window_service,
@@ -282,6 +283,7 @@ async def market_context_mnq(
     event_window_service: EventWindowService = Depends(get_event_window_service),
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+    deterministic_runtime=Depends(get_deterministic_provider_runtime),
 ) -> dict[str, object]:
     settings = enrichment_orchestrator.settings
     snapshots = MarketContextSnapshotRepository(settings)
@@ -307,6 +309,10 @@ async def market_context_mnq(
             days=30,
             symbol="MNQ",
             fetch_missing_nasdaq=refresh == "force",
+            refresh=refresh,
+        )
+        contract = await deterministic_runtime.enrich_market_context(
+            contract,
             refresh=refresh,
         )
         return _materialize_market_context(contract, refresh=refresh, view=view, settings=settings)
@@ -451,6 +457,10 @@ async def market_context_mnq(
     contract["risk_sentiment"] = risk_sentiment
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
     contract = harden_market_context(contract, settings=enrichment_orchestrator.settings)
+    contract = await deterministic_runtime.enrich_market_context(
+        contract,
+        refresh=refresh,
+    )
     return _materialize_market_context(contract, refresh=refresh, view=view, settings=settings)
 
 
@@ -462,6 +472,7 @@ async def market_context_mnq_debug(
     event_window_service: EventWindowService = Depends(get_event_window_service),
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+    deterministic_runtime=Depends(get_deterministic_provider_runtime),
 ) -> dict[str, object]:
     return await market_context_mnq(
         refresh=refresh,
@@ -471,6 +482,7 @@ async def market_context_mnq_debug(
         event_window_service=event_window_service,
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
+        deterministic_runtime=deterministic_runtime,
     )
 
 
@@ -482,6 +494,7 @@ async def market_context_mnq_consumer(
     event_window_service: EventWindowService = Depends(get_event_window_service),
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
+    deterministic_runtime=Depends(get_deterministic_provider_runtime),
 ) -> dict[str, object]:
     return await market_context_mnq(
         refresh=refresh,
@@ -491,6 +504,7 @@ async def market_context_mnq_consumer(
         event_window_service=event_window_service,
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
+        deterministic_runtime=deterministic_runtime,
     )
 
 

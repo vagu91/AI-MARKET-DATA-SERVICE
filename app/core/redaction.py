@@ -4,7 +4,10 @@ import re
 from typing import Any
 
 SENSITIVE_QUERY_RE = re.compile(
-    r"(?i)(api_key|apikey|userid|registrationkey|alpha_vantage_api_key|ai_market_alpha_vantage_api_key|openai_api_key|ai_market_openai_api_key|authorization|bearer|codex_token|auth\.json)=([^&\s]+)",
+    r"(?i)(api_key|apikey|key|userid|registrationkey|token|x-finnhub-token|"
+    r"alpha_vantage_api_key|ai_market_alpha_vantage_api_key|openai_api_key|"
+    r"ai_market_openai_api_key|authorization|bearer|codex_token|auth\.json)"
+    r"=([^&\s]+)",
 )
 SENSITIVE_PHRASE_RE = re.compile(
     r"(?i)((?:api\s*key|apikey|token|secret|authorization|cookie)"
@@ -25,11 +28,13 @@ SENSITIVE_KEYS = {
     "authorization",
     "cookie",
     "credentials",
+    "key",
     "openai_api_key",
     "password",
     "registrationkey",
     "secret",
     "token",
+    "userid",
 }
 
 

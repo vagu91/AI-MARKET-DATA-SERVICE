@@ -5,7 +5,7 @@ import httpx
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderResult, ProviderType
-from app.providers.base import BaseProvider, metadata
+from app.providers.base import BaseProvider, ProviderDisabled, metadata
 
 
 BLS_SERIES = {
@@ -18,6 +18,7 @@ BLS_SERIES = {
     "CES0000000001": "Total Nonfarm Payrolls",
     "LNS14000000": "Unemployment Rate",
     "CES0500000003": "Average Hourly Earnings of All Employees: Total Private",
+    "CIU1010000000000A": "Employment Cost Index: Total Compensation",
 }
 
 BLS_SERIES_META = {
@@ -27,6 +28,7 @@ BLS_SERIES_META = {
     "CES0000000001": ("thousands of jobs", "SA"),
     "LNS14000000": ("percent", "SA"),
     "CES0500000003": ("dollars per hour", "SA"),
+    "CIU1010000000000A": ("index", "NSA"),
 }
 
 BLS_FRED_FALLBACK_SERIES = {
@@ -53,6 +55,8 @@ class BlsProvider(BaseProvider):
         self.settings = settings
 
     async def fetch(self) -> ProviderResult:
+        if not self.settings.bls_enabled:
+            raise ProviderDisabled("BLS provider is disabled")
         end_year = datetime.now(UTC).year
         body: dict[str, object] = {
             "seriesid": list(BLS_SERIES.keys()),
@@ -62,7 +66,10 @@ class BlsProvider(BaseProvider):
         if self.settings.bls_api_key:
             body["registrationkey"] = self.settings.bls_api_key
 
-        async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.bls_timeout_seconds,
+            follow_redirects=False,
+        ) as client:
             response = await client.post(self.settings.bls_base_url, json=body)
             response.raise_for_status()
             payload = response.json()
@@ -84,25 +91,35 @@ class BlsProvider(BaseProvider):
             observations = []
             for row in rows:
                 raw_period = str(row.get("period") or "")
-                if not raw_period.startswith("M") or not raw_period[1:].isdigit() or int(raw_period[1:]) not in range(1, 13):
+                if raw_period.startswith("M") and raw_period[1:].isdigit():
+                    number = int(raw_period[1:])
+                    if number not in range(1, 13):
+                        continue
+                    normalized_period = f"{row.get('year')}-{number:02d}"
+                    frequency = "monthly"
+                elif raw_period.startswith("Q") and raw_period[1:] in {"01", "02", "03", "04"}:
+                    normalized_period = f"{row.get('year')}-Q{int(raw_period[1:])}"
+                    frequency = "quarterly"
+                else:
                     continue
                 observations.append({
-                    "period": f"{row.get('year')}-{int(raw_period[1:]):02d}",
+                    "period": normalized_period,
                     "value": row.get("value"),
                     "release_vintage": row.get("latest") or row.get("revision") or "initial",
+                    "frequency": frequency,
                 })
             observations.sort(key=lambda row: str(row["period"]))
             if not observations:
                 continue
             latest_observation = observations[-1]
-            data_as_of = datetime.fromisoformat(f"{latest_observation['period']}-01").replace(tzinfo=UTC)
+            data_as_of = _period_datetime(str(latest_observation["period"]))
             latest_as_of = max(latest_as_of, data_as_of) if latest_as_of else data_as_of
             series[series_id] = {
                 "series_id": series_id,
                 "name": BLS_SERIES.get(series_id, series_id),
                 "value": float(latest_observation["value"]),
                 "units": unit,
-                "frequency": "monthly",
+                "frequency": latest_observation.get("frequency") or "monthly",
                 "seasonal_adjustment": seasonal_adjustment,
                 "data_as_of": data_as_of.date().isoformat(),
                 "observations": observations,
@@ -131,7 +148,10 @@ class BlsProvider(BaseProvider):
     async def _fetch_via_fred_fallback(self, reason: str) -> ProviderResult:
         data: dict[str, dict[str, object]] = {}
         latest_as_of: datetime | None = None
-        async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.fred_timeout_seconds,
+            follow_redirects=False,
+        ) as client:
             for bls_series_id, fred_series_id in BLS_FRED_FALLBACK_SERIES.items():
                 response = await client.get(
                     f"{self.settings.fred_base_url}/series/observations",
@@ -193,3 +213,10 @@ class BlsProvider(BaseProvider):
 def _is_bls_daily_threshold(message: str) -> bool:
     lowered = message.lower()
     return "daily threshold" in lowered or "request could not be serviced" in lowered
+
+
+def _period_datetime(period: str) -> datetime:
+    if "-Q" in period:
+        year, quarter = period.split("-Q", 1)
+        return datetime(int(year), (int(quarter) - 1) * 3 + 1, 1, tzinfo=UTC)
+    return datetime.fromisoformat(f"{period}-01").replace(tzinfo=UTC)

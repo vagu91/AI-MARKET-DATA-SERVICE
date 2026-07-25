@@ -1,5 +1,11 @@
 # AI-MARKET-DATA-SERVICE
 
+Deterministic provider behavior, source authority, freshness, trigger classes, and
+read-only boundaries are specified in
+[`docs/deterministic-provider-contract.md`](docs/deterministic-provider-contract.md).
+The offline integration evidence is recorded in
+[`docs/forensics-deterministic-provider-integration-20260724.md`](docs/forensics-deterministic-provider-integration-20260724.md).
+
 Python FastAPI service that collects official macro data, economic events, and Federal Reserve news, normalizes responses, caches the latest valid payloads in SQLite, and exposes REST endpoints for AI-TRADER.
 
 This service does **not** implement trading logic, choose trades, or place orders.

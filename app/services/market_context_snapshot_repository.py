@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import Settings
+from app.core.redaction import redact_payload
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.temporal_validation_service import TemporalValidationService
@@ -66,7 +67,7 @@ class MarketContextSnapshotRepository:
         snapshot_id = f"mcs-{uuid.uuid4()}"
         symbol = symbol.upper()
         temporal_debug = self.temporal_validation.sanitize_payload(
-            dict(debug_payload),
+            redact_payload(dict(debug_payload)),
             entity_table="market_context_snapshot_input",
         )
         invalid_sources = self.source_policy.invalid_sources(
@@ -209,6 +210,22 @@ class MarketContextSnapshotRepository:
                     correlation_id=correlation_id,
                     data_as_of=data_as_of,
                     created_at=now,
+                    parent_run_id=parent_run_id,
+                    component_versions={
+                        key: revision
+                        for key in (
+                            "macro_actuals",
+                            "rates_context",
+                            "options_positioning",
+                            "market_internals",
+                            "cross_asset_context",
+                            "earnings_intelligence",
+                            "current_company_news",
+                        )
+                        if isinstance(consumer.get(key), dict)
+                        and consumer[key].get("status") == "AVAILABLE"
+                    },
+                    reason=trigger_type,
                 )
             if resolved_lifecycle is not None:
                 persist_lifecycle_in_transaction(

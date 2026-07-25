@@ -61,6 +61,10 @@ OFFICIAL_METRICS: dict[str, OfficialMetricSpec] = {
         "average_hourly_earnings_yoy", "BLS", "CES0500000003", "pct_change_yoy", "SA",
         "monthly", "percent", 12, "0.1", "https://www.bls.gov/ces/",
     ),
+    "employment_cost_index_qoq": OfficialMetricSpec(
+        "employment_cost_index_qoq", "BLS", "CIU1010000000000A", "pct_change_qoq", "NSA",
+        "quarterly", "percent", 1, "0.1", "https://www.bls.gov/eci/",
+    ),
     "real_gdp_annualized_qoq": OfficialMetricSpec(
         "real_gdp_annualized_qoq", "BEA", "BEA:GDP", "official_annualized_qoq_rate", "SAAR",
         "quarterly", "percent", 0, "0.1", "https://www.bea.gov/data/gdp/gross-domestic-product",
@@ -92,6 +96,26 @@ OFFICIAL_METRICS: dict[str, OfficialMetricSpec] = {
     "personal_spending_mom": OfficialMetricSpec(
         "personal_spending_mom", "BEA", "BEA:PERSONAL_SPENDING", "pct_change_mom", "SAAR",
         "monthly", "percent", 1, "0.1", "https://www.bea.gov/data/consumer-spending/main",
+    ),
+    "advance_retail_sales": OfficialMetricSpec(
+        "advance_retail_sales", "CENSUS", "CENSUS:MARTS:RETAIL_SALES", "level", "SA",
+        "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/retail/",
+    ),
+    "advance_durable_goods_orders": OfficialMetricSpec(
+        "advance_durable_goods_orders", "CENSUS", "CENSUS:ADVM3:DURABLE_GOODS", "level", "SA",
+        "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/manufacturing/m3/",
+    ),
+    "housing_starts": OfficialMetricSpec(
+        "housing_starts", "CENSUS", "CENSUS:RESCONST:HOUSING_STARTS", "level", "SAAR",
+        "monthly", "thousands_annual_rate", 0, "1", "https://www.census.gov/construction/nrc/",
+    ),
+    "building_permits": OfficialMetricSpec(
+        "building_permits", "CENSUS", "CENSUS:RESCONST:BUILDING_PERMITS", "level", "SAAR",
+        "monthly", "thousands_annual_rate", 0, "1", "https://www.census.gov/construction/nrc/",
+    ),
+    "international_trade_balance": OfficialMetricSpec(
+        "international_trade_balance", "CENSUS", "CENSUS:FTD:TRADE_BALANCE", "level", "SA",
+        "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/foreign-trade/",
     ),
 }
 
@@ -211,7 +235,7 @@ def _transform(spec: OfficialMetricSpec, current: Decimal, previous: Decimal | N
         raise ValueError("insufficient_official_observations")
     elif spec.transformation == "delta":
         value = current - previous
-    elif spec.transformation in {"pct_change_mom", "pct_change_yoy"}:
+    elif spec.transformation in {"pct_change_mom", "pct_change_yoy", "pct_change_qoq"}:
         value = ((current / previous) - Decimal("1")) * Decimal("100")
     else:
         raise ValueError("unsupported_official_transformation")
@@ -243,6 +267,7 @@ def _formula(transformation: str) -> str:
         "delta": "current - comparison",
         "pct_change_mom": "((current / previous_month) - 1) * 100",
         "pct_change_yoy": "((current / prior_year_period) - 1) * 100",
+        "pct_change_qoq": "((current / previous_quarter) - 1) * 100",
         "official_annualized_qoq_rate": "official_published_annualized_qoq_rate",
     }.get(transformation, transformation)
 
