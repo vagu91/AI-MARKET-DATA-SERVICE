@@ -166,42 +166,76 @@ async def test_census_all_explicit_datasets_exact_period_and_compaction(
             rows = [
                 {
                     "time": period,
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
+                    "program_code": "MARTS",
                     "category_code": "44X72",
+                    "data_type_code": "SM",
+                    "error_data": "no",
                     "cell_value": "0.00",
-                    "seasonally_adj": "SA",
+                    "seasonally_adj": "yes",
                 }
             ]
         elif path.endswith("/advm3"):
             rows = [
                 {
                     "time": period,
-                    "category_code": "00",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
+                    "program_code": "M3ADV",
+                    "category_code": "MDM",
+                    "data_type_code": "NO",
+                    "error_data": "no",
                     "cell_value": "300123.45",
-                    "seasonally_adj": "SA",
+                    "seasonally_adj": "yes",
                 }
             ]
         elif path.endswith("/resconst"):
             rows = [
                 {
                     "time": period,
-                    "category_code": "APERMITS",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
+                    "program_code": "RESCONST",
+                    "category_code": "ASTARTS",
+                    "data_type_code": "TOTAL",
+                    "error_data": "no",
+                    "geo_level_code": "US",
+                    "us": "1",
                     "cell_value": "1400",
-                    "seasonally_adj": "SAAR",
+                    "seasonally_adj": "yes",
                 },
                 {
                     "time": period,
-                    "category_code": "PERMITS",
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
+                    "program_code": "RESCONST",
+                    "category_code": "APERMITS",
+                    "data_type_code": "TOTAL",
+                    "error_data": "no",
+                    "geo_level_code": "US",
+                    "us": "1",
                     "cell_value": "1450",
-                    "seasonally_adj": "SAAR",
+                    "seasonally_adj": "yes",
                 },
             ]
         else:
             rows = [
                 {
                     "time": period,
+                    "time_slot_id": "0",
+                    "time_slot_date": "2026-06-01 00:00:00.0",
+                    "time_slot_name": "June2026",
+                    "program_code": "FTD",
                     "category_code": "BOPGS",
+                    "data_type_code": "BAL",
+                    "error_data": "no",
                     "cell_value": "-71234.5",
-                    "seasonally_adj": "SA",
+                    "seasonally_adj": "yes",
                 }
             ]
         return httpx.Response(200, json={"data": rows})

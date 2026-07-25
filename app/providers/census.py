@@ -28,26 +28,29 @@ class CensusSeriesMapping:
     series_id: str
     semantic_field: str
     dataset: str
-    program: str
-    value_field: str
-    code_field: str
-    code: str
+    program_code: str
+    source_program: str
+    category_code: str
+    data_type_code: str
+    seasonally_adjusted: bool
     unit: str
     frequency: str
     seasonal_adjustment: str
 
 
-# Codes are explicit service-owned identities. Unknown rows are retained only in audit,
-# never projected into the operational consumer.
+# Exact identities come from the official EITS program dictionaries. Unknown or
+# ambiguous rows are represented by redacted hashes in audit lineage only and
+# are never projected into the operational consumer.
 CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
     CensusSeriesMapping(
         "CENSUS:MARTS:RETAIL_SALES",
         "advance_retail_sales",
         "marts",
+        "MARTS",
         "Advance Monthly Retail Trade and Food Services",
-        "cell_value",
-        "category_code",
         "44X72",
+        "SM",
+        True,
         "millions_usd",
         "monthly",
         "SA",
@@ -56,10 +59,11 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "CENSUS:ADVM3:DURABLE_GOODS",
         "advance_durable_goods_orders",
         "advm3",
+        "M3ADV",
         "Advance Report on Durable Goods",
-        "cell_value",
-        "category_code",
-        "00",
+        "MDM",
+        "NO",
+        True,
         "millions_usd",
         "monthly",
         "SA",
@@ -68,10 +72,11 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "CENSUS:RESCONST:HOUSING_STARTS",
         "housing_starts",
         "resconst",
+        "RESCONST",
         "New Residential Construction",
-        "cell_value",
-        "category_code",
-        "APERMITS",
+        "ASTARTS",
+        "TOTAL",
+        True,
         "thousands_annual_rate",
         "monthly",
         "SAAR",
@@ -80,10 +85,11 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "CENSUS:RESCONST:BUILDING_PERMITS",
         "building_permits",
         "resconst",
+        "RESCONST",
         "New Residential Construction",
-        "cell_value",
-        "category_code",
-        "PERMITS",
+        "APERMITS",
+        "TOTAL",
+        True,
         "thousands_annual_rate",
         "monthly",
         "SAAR",
@@ -92,10 +98,11 @@ CENSUS_SERIES: tuple[CensusSeriesMapping, ...] = (
         "CENSUS:FTD:TRADE_BALANCE",
         "international_trade_balance",
         "ftd",
+        "FTD",
         "International Trade in Goods and Services",
-        "cell_value",
-        "category_code",
         "BOPGS",
+        "BAL",
+        True,
         "millions_usd",
         "monthly",
         "SA",
@@ -106,6 +113,29 @@ CENSUS_DATASETS = {
     "ADVM3": "advm3",
     "RESCONST": "resconst",
     "FTD": "ftd",
+}
+EITS_OUTPUT_FIELDS = (
+    "category_code",
+    "cell_value",
+    "data_type_code",
+    "error_data",
+    "program_code",
+    "seasonally_adj",
+    "time_slot_date",
+    "time_slot_id",
+    "time_slot_name",
+)
+EITS_PREDICATE_ONLY_FIELDS = frozenset({"time", "for", "in", "ucgid"})
+CENSUS_DATASET_OUTPUT_FIELDS = {
+    "RESCONST": ("geo_level_code",),
+}
+CENSUS_QUERY_PREDICATES = {
+    # ADVM3's sole official API example requires the national geography
+    # predicate. Predicate-only fields remain outside ``get``.
+    "ADVM3": {"for": "us:*"},
+    # RESCONST otherwise returns national plus four Census regions for the same
+    # economic tuple. The official national predicate is part of its identity.
+    "RESCONST": {"for": "us:*"},
 }
 _PERIOD_RE = re.compile(r"^\d{4}-(?:\d{2}|Q[1-4])$")
 
@@ -156,6 +186,10 @@ class CensusProvider(BaseProvider):
             except DeterministicProviderError as exc:
                 errors.append(f"Census {dataset} failed: {exc}")
                 continue
+            errors.extend(
+                f"Census {dataset} rejected: {reason}"
+                for reason in envelope.rejection_reasons
+            )
             for observation in envelope.observations:
                 item = {
                     **observation.model_dump(mode="json"),
@@ -214,44 +248,70 @@ class CensusProvider(BaseProvider):
             else f"{base}{expected_suffix}"
         )
         specs = [item for item in CENSUS_SERIES if item.dataset == dataset_path]
-        fields = sorted(
-            {
-                "time",
-                "seasonally_adj",
-                "data_type_code",
-                *(item.value_field for item in specs),
-                *(item.code_field for item in specs),
-            }
-        )
+        if any(item.frequency == "monthly" for item in specs) and "-Q" in period:
+            raise ProviderError(
+                f"Census {normalized_dataset} requires an exact YYYY-MM occurrence"
+            )
+        fields = _output_fields(normalized_dataset)
+        if EITS_PREDICATE_ONLY_FIELDS.intersection(fields):
+            raise RuntimeError("predicate-only Census variable present in get")
+        params = {
+            "get": ",".join(fields),
+            "time": period,
+            **CENSUS_QUERY_PREDICATES.get(normalized_dataset, {}),
+            "key": self.settings.census_api_key,
+        }
         payload, telemetry, request_meta = await self.http.request(
             "GET",
             url,
             endpoint_category="economic_indicators",
             provider=self.source,
-            params={
-                "get": ",".join(fields),
-                "time": period,
-                "key": self.settings.census_api_key,
-            },
+            params=params,
         )
+        telemetry.dataset_or_series = normalized_dataset
         rows = _tabular_rows(payload)
         retrieved_at = datetime.now(UTC)
+        raw_payload_hash = safe_payload_hash(payload)
+        refresh_at = retrieved_at + timedelta(
+            seconds=max(int(self.settings.census_cache_ttl_seconds), 1)
+        )
         observations: list[NormalizedObservation] = []
-        rejected = 0
+        rejection_reasons: list[str] = []
+        rejected_row_hashes: list[str] = []
         for spec in specs:
             matches = [
                 row
                 for row in rows
-                if str(row.get(spec.code_field) or row.get("series_code") or "") == spec.code
-                and str(row.get("time") or row.get("period") or "") == period
+                if _matches_mapping(
+                    row,
+                    spec=spec,
+                    period=period,
+                )
             ]
             if not matches:
-                rejected += 1
+                rejection_reasons.append(
+                    f"no_exact_census_mapping:{spec.series_id}"
+                )
+                rejected_row_hashes.extend(
+                    safe_payload_hash(row) for row in rows
+                )
                 continue
-            row = matches[-1]
-            value = _decimal_value(row.get(spec.value_field) or row.get("value"))
+            if len(matches) > 1:
+                telemetry.anomalies.append("ambiguous_census_mapping")
+                rejection_reasons.append(
+                    f"ambiguous_census_mapping:{spec.series_id}"
+                )
+                rejected_row_hashes.extend(
+                    safe_payload_hash(row) for row in matches
+                )
+                continue
+            row = matches[0]
+            raw_value = row.get("cell_value")
+            value = _decimal_value(raw_value)
             if value is None:
-                rejected += 1
+                rejection_reasons.append(
+                    f"missing_census_value:{spec.series_id}"
+                )
                 continue
             observed_at = _period_start(period)
             revision = str(
@@ -260,7 +320,7 @@ class CensusProvider(BaseProvider):
                 or row.get("status")
                 or "published"
             )
-            occurrence_id = f"CENSUS:{normalized_dataset}:{period}"
+            occurrence_id = f"{spec.series_id}:{period}"
             observations.append(
                 NormalizedObservation(
                     observation_id=spec.series_id,
@@ -268,31 +328,58 @@ class CensusProvider(BaseProvider):
                     value=value,
                     unit=spec.unit,
                     frequency=spec.frequency,
-                    seasonal_adjustment=str(
-                        row.get("seasonally_adj") or spec.seasonal_adjustment
-                    ),
+                    seasonal_adjustment=spec.seasonal_adjustment,
                     reference_period=period,
                     occurrence_id=occurrence_id,
                     observed_at=observed_at,
                     retrieved_at=retrieved_at,
                     provider_timestamp=_parse_timestamp(row.get("updated_at")),
-                    valid_until=observed_at + timedelta(days=62),
-                    next_refresh_at=observed_at + timedelta(days=31),
+                    valid_until=refresh_at,
+                    next_refresh_at=refresh_at,
                     freshness_state="CURRENT_RELEASE",
                     lifecycle_state="PUBLISHED",
-                    source_program=spec.program,
+                    source_program=spec.source_program,
                     revision=revision,
                     metadata={
                         "dataset": normalized_dataset,
-                        "code": spec.code,
-                        "precision": _precision(row.get(spec.value_field) or row.get("value")),
+                        "program_code": row.get("program_code"),
+                        "category_code": row.get("category_code"),
+                        "data_type_code": row.get("data_type_code"),
+                        "seasonally_adjusted": spec.seasonally_adjusted,
+                        "seasonally_adj_raw": row.get("seasonally_adj"),
+                        "time": row.get("time"),
+                        "time_slot_date": row.get("time_slot_date"),
+                        "time_slot_id": row.get("time_slot_id"),
+                        "time_slot_name": row.get("time_slot_name"),
+                        "query_geography_predicate": (
+                            CENSUS_QUERY_PREDICATES.get(
+                                normalized_dataset,
+                                {},
+                            ).get("for")
+                        ),
+                        "geo_level_code": row.get("geo_level_code"),
+                        "us": row.get("us"),
+                        "reference_period": period,
+                        "frequency": spec.frequency,
+                        "unit": spec.unit,
+                        "semantic_field": spec.semantic_field,
+                        "original_value": str(raw_value),
+                        "precision": _precision(raw_value),
+                        "raw_payload_hash": raw_payload_hash,
+                        "request_fingerprint": request_meta[
+                            "request_fingerprint"
+                        ],
+                        "source_url": request_meta["source_url"],
                     },
                 )
             )
         telemetry.accepted = len(observations)
-        telemetry.rejected = rejected
+        telemetry.rejected = len(rejection_reasons)
         if rows and not observations:
             telemetry.anomalies.append("raw_normalized_count_mismatch")
+        warnings = list(dict.fromkeys(
+            reason.split(":", 1)[0] for reason in rejection_reasons
+        ))
         return ProviderEnvelope(
             provider_id="census",
             provider_kind=ProviderKind.OFFICIAL_GOVERNMENT,
@@ -305,16 +392,22 @@ class CensusProvider(BaseProvider):
             freshness="CURRENT_RELEASE" if observations else "NO_DATA",
             exact_occurrence_identity=f"CENSUS:{normalized_dataset}:{period}",
             observations=observations,
-            warnings=[] if observations else ["no_mapped_observation"],
-            rejection_reasons=[] if observations else ["mapping_or_period_mismatch"],
+            warnings=warnings,
+            rejection_reasons=rejection_reasons,
             retry_classification="NONE",
-            raw_payload_hash=safe_payload_hash(payload),
+            raw_payload_hash=raw_payload_hash,
             lineage={
                 "provider": "CENSUS",
                 "dataset": normalized_dataset,
                 "period": period,
                 "trigger_class": "TRIGGER",
-                "normalization": "explicit_code_mapping",
+                "normalization": "exact_semantic_tuple",
+                "temporal_identity": "time+parsed_time_slot_date",
+                "output_fields": list(fields),
+                "predicate_fields": sorted(
+                    {"time", *CENSUS_QUERY_PREDICATES.get(normalized_dataset, {})}
+                ),
+                "rejected_row_hashes": sorted(set(rejected_row_hashes)),
             },
             telemetry=telemetry.as_dict(),
         )
@@ -326,6 +419,17 @@ def _dataset_names(values: Iterable[str] | None) -> list[str]:
     if unknown:
         raise ProviderError(f"unknown Census dataset mapping: {','.join(unknown)}")
     return list(dict.fromkeys(output))
+
+
+def _output_fields(dataset: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *EITS_OUTPUT_FIELDS,
+                *CENSUS_DATASET_OUTPUT_FIELDS.get(dataset, ()),
+            )
+        )
+    )
 
 
 def _validate_period(period: str) -> None:
@@ -363,6 +467,97 @@ def _decimal_value(value: Any) -> int | float | None:
     if not number.is_finite():
         raise DeterministicProviderError("Census non-finite numeric value")
     return int(number) if number == number.to_integral_value() else float(number)
+
+
+def _matches_mapping(
+    row: dict[str, Any],
+    *,
+    spec: CensusSeriesMapping,
+    period: str,
+) -> bool:
+    observed_program = str(row.get("program_code") or "").strip().upper()
+    return bool(
+        str(row.get("category_code") or "").strip().upper()
+        == spec.category_code
+        and str(row.get("data_type_code") or "").strip().upper()
+        == spec.data_type_code
+        and _seasonally_adjusted(row.get("seasonally_adj"))
+        is spec.seasonally_adjusted
+        and str(row.get("time") or "").strip() == period
+        and _time_slot_date_matches(row.get("time_slot_date"), period)
+        and _error_data_clear(row.get("error_data"))
+        and _valid_cell_value(row.get("cell_value"))
+        and observed_program == spec.program_code
+        and _geography_matches(row, spec=spec)
+    )
+
+
+def _geography_matches(
+    row: dict[str, Any],
+    *,
+    spec: CensusSeriesMapping,
+) -> bool:
+    if spec.dataset != "resconst":
+        return True
+    return bool(
+        str(row.get("geo_level_code") or "").strip().upper() == "US"
+        and str(row.get("us") or "").strip() == "1"
+    )
+
+
+def _seasonally_adjusted(value: Any) -> bool | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "sa",
+        "saar",
+        "seasonally adjusted",
+    }:
+        return True
+    if normalized in {
+        "0",
+        "0.0",
+        "false",
+        "no",
+        "n",
+        "nsa",
+        "not seasonally adjusted",
+    }:
+        return False
+    return None
+
+
+def _error_data_clear(value: Any) -> bool:
+    return str(value or "").strip().lower() in {
+        "0",
+        "0.0",
+        "false",
+        "no",
+        "n",
+    }
+
+
+def _time_slot_date_matches(value: Any, period: str) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.date() == _period_start(period).date()
+
+
+def _valid_cell_value(value: Any) -> bool:
+    if value in (None, "", "null", "NA", "(X)"):
+        return False
+    try:
+        number = Decimal(str(value).replace(",", ""))
+    except InvalidOperation:
+        return False
+    return number.is_finite()
 
 
 def _precision(value: Any) -> int:
