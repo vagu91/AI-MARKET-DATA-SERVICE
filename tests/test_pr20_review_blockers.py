@@ -59,14 +59,19 @@ def contains_key(value: Any, target: str) -> bool:
     return False
 
 
-def latest_authorization(settings: Settings) -> str:
+def latest_authorization(
+    settings: Settings,
+    *,
+    event_name: str = "ai_authorization",
+) -> str:
     with sqlite3.connect(settings.database_path) as connection:
         row = connection.execute(
             """
             SELECT payload_json FROM service_telemetry_events
-            WHERE event_name='ai_authorization'
+            WHERE event_name=?
             ORDER BY rowid DESC LIMIT 1
-            """
+            """,
+            (event_name,),
         ).fetchone()
     assert row is not None
     return str(row[0])
@@ -140,12 +145,24 @@ def test_execution_context_rejects_unknown_origin_at_construction() -> None:
 
 
 @pytest.mark.parametrize(
-    "case",
-    ["omitted", "none", "incomplete", "allow_ai_false", "unknown_origin"],
-)
-@pytest.mark.parametrize(
-    "method",
-    ["enqueue_missing_events", "enqueue_temporal_refreshes", "enqueue_explicit"],
+    ("method", "case"),
+    [
+        *[
+            (method, case)
+            for method in ("enqueue_missing_events", "enqueue_explicit")
+            for case in (
+                "omitted",
+                "none",
+                "incomplete",
+                "allow_ai_false",
+                "unknown_origin",
+            )
+        ],
+        *[
+            ("enqueue_temporal_refreshes", case)
+            for case in ("omitted", "none", "incomplete", "unknown_origin")
+        ],
+    ],
 )
 def test_job_service_public_methods_fail_closed_for_invalid_context(
     tmp_path: Path,
@@ -184,7 +201,13 @@ def test_job_service_public_methods_fail_closed_for_invalid_context(
     assert table_count(settings, "ai_research_jobs") == 0
     assert table_count(settings, "research_runs") == 0
     assert table_count(settings, "research_backend_invocations") == 0
-    assert "AI_SUPPRESSED" in latest_authorization(settings)
+    if method == "enqueue_temporal_refreshes":
+        assert "PROVIDER_SUPPRESSED" in latest_authorization(
+            settings,
+            event_name="resolver_evaluation",
+        )
+    else:
+        assert "AI_SUPPRESSED" in latest_authorization(settings)
 
 
 @pytest.mark.parametrize(

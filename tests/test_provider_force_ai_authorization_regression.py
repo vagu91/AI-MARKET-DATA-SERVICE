@@ -21,6 +21,7 @@ from app.services.market_context_snapshot_repository import (
 )
 from app.services.research_runtime_repository import ResearchRuntimeRepository
 from scripts.reconcile_unauthorized_no_data_snapshots import (
+    DEFAULT_SERVICE_PORT,
     EXPECTED_SNAPSHOTS,
     reconcile,
 )
@@ -64,6 +65,28 @@ def missing_event(index: int = 1) -> EconomicEvent:
     )
 
 
+def released_event() -> EconomicEvent:
+    release = datetime.now(UTC) - timedelta(minutes=1)
+    return EconomicEvent(
+        event_id="released-cpi",
+        name="Consumer Price Index",
+        country="US",
+        category="CPI",
+        date=release.date().isoformat(),
+        time_utc=release,
+        impact=Impact.HIGH,
+        source="BLS",
+        source_url="https://bls.gov/cpi",
+        reliability=0.99,
+        enrichment=EventEnrichment(
+            forecast="0.3",
+            consensus="0.3",
+            previous="0.2",
+            actual=None,
+        ),
+    )
+
+
 def table_count(settings: Settings, table: str) -> int:
     with sqlite3.connect(settings.database_path) as connection:
         return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -97,6 +120,213 @@ def test_force_provider_context_cannot_enqueue_or_create_runtime_rows(
         ).fetchone()
     assert decision is not None
     assert "AI_SUPPRESSED" in decision[0]
+
+
+def telemetry_counts(settings: Settings) -> dict[str, int]:
+    with sqlite3.connect(settings.database_path) as connection:
+        return {
+            str(name): int(count)
+            for name, count in connection.execute(
+                """
+                SELECT event_name,COUNT(*)
+                FROM service_telemetry_events
+                GROUP BY event_name
+                """
+            ).fetchall()
+        }
+
+
+def test_provider_only_release_actual_executes_resolver_without_ai(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(
+        tmp_path,
+        research_agents_enabled=False,
+        research_agent_macro_events_enabled=False,
+    )
+    context = ExecutionContext.provider_only(
+        correlation_id="provider-only-actual",
+        allow_live_providers=True,
+    )
+    jobs = AIResearchJobService(settings).enqueue_temporal_refreshes(
+        [released_event()],
+        correlation_id=context.correlation_id,
+        now=datetime.now(UTC),
+        execution_context=context,
+    )
+    assert len(jobs) == 1
+    assert jobs[0]["job_type"] == "RELEASE_ACTUAL_REFRESH"
+    assert jobs[0]["request_payload"]["execution_context"] == context.as_payload()
+    resolver_calls: list[str] = []
+    backend_calls: list[str] = []
+
+    def resolver(job, _workspace, _timeout):
+        resolver_calls.append(str(job["job_id"]))
+        return {
+            "status": "NO_DATA",
+            "retryable": False,
+            "results": [],
+            "error": "official_actual_not_available",
+        }
+
+    def forbidden_backend(job, _workspace, _timeout):
+        backend_calls.append(str(job["job_id"]))
+        raise AssertionError("provider-only actual reached AI backend")
+
+    worker = AIResearchWorker(
+        settings,
+        executor=forbidden_backend,
+        actual_resolver=resolver,
+        worker_id="provider-only-worker",
+    )
+    assert worker.process_once() is True
+    completed = AIResearchJobRepository(settings).get(jobs[0]["job_id"])
+    assert completed["attempts"] == 1
+    assert completed["status"] == "NO_DATA"
+    assert resolver_calls == [jobs[0]["job_id"]]
+    assert backend_calls == []
+    counts = telemetry_counts(settings)
+    assert counts.get("resolver_evaluation", 0) >= 1
+    assert counts.get("provider_request_attempted", 0) == 1
+    assert counts.get("provider_request_completed", 0) == 1
+    assert counts.get("provider_request_failed", 0) == 0
+    assert counts.get("ai_authorization", 0) == 0
+    assert counts.get("ai_invocation_attempted", 0) == 0
+    assert counts.get("ai_invocation_completed", 0) == 0
+    assert counts.get("ai_invocation_aborted", 0) == 0
+    assert table_count(settings, "research_backend_invocations") == 0
+    with sqlite3.connect(settings.database_path) as connection:
+        tokens = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(json_extract(payload_json,'$.input_tokens')),0),
+              COALESCE(SUM(json_extract(payload_json,'$.output_tokens')),0),
+              COALESCE(SUM(json_extract(payload_json,'$.cached_tokens')),0)
+            FROM service_telemetry_events
+            WHERE event_name LIKE 'provider_request_%'
+            """
+        ).fetchone()
+    assert tokens == (0, 0, 0)
+
+
+def test_provider_failure_retries_deterministically_without_ai_fallback(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(
+        tmp_path,
+        official_actual_retry_seconds="17,31",
+        research_agents_enabled=False,
+        research_agent_macro_events_enabled=False,
+    )
+    fixed_now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    repository = AIResearchJobRepository(settings, clock=lambda: fixed_now)
+    context = ExecutionContext.provider_only(
+        correlation_id="provider-retry",
+        allow_live_providers=True,
+    )
+    jobs = AIResearchJobService(
+        settings,
+        repository=repository,
+        clock=lambda: fixed_now,
+    ).enqueue_temporal_refreshes(
+        [released_event()],
+        correlation_id=context.correlation_id,
+        now=datetime.now(UTC),
+        execution_context=context,
+    )
+    backend_calls: list[str] = []
+
+    def failed_resolver(_job, _workspace, _timeout):
+        return {
+            "status": "FAILED",
+            "retryable": True,
+            "results": [],
+            "error": "official_provider_transport_failed",
+        }
+
+    def forbidden_backend(job, _workspace, _timeout):
+        backend_calls.append(str(job["job_id"]))
+        raise AssertionError("provider failure triggered implicit AI fallback")
+
+    assert AIResearchWorker(
+        settings,
+        repository=repository,
+        executor=forbidden_backend,
+        actual_resolver=failed_resolver,
+        worker_id="provider-retry-worker",
+    ).process_once()
+    restored = repository.get(jobs[0]["job_id"])
+    assert restored["status"] == "RETRY_SCHEDULED"
+    assert restored["attempts"] == 1
+    assert restored["next_retry_at"] == (
+        fixed_now + timedelta(seconds=17)
+    ).isoformat()
+    assert restored["last_retry_reason"] == "official_provider_transport_failed"
+    assert backend_calls == []
+    counts = telemetry_counts(settings)
+    assert counts.get("resolver_evaluation", 0) >= 1
+    assert counts.get("provider_request_attempted", 0) == 1
+    assert counts.get("provider_request_failed", 0) == 1
+    assert counts.get("ai_authorization", 0) == 0
+    assert counts.get("ai_invocation_attempted", 0) == 0
+    assert counts.get("ai_invocation_completed", 0) == 0
+    assert counts.get("ai_invocation_aborted", 0) == 0
+    assert table_count(settings, "research_backend_invocations") == 0
+
+
+def test_persisted_test_origin_cannot_authorize_ai_outside_test_environment(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path, environment="production")
+    context_payload = {
+        "allow_live_providers": False,
+        "allow_ai": True,
+        "request_origin": "test",
+        "correlation_id": "persisted-test-origin",
+    }
+    context = ExecutionContext.from_payload(context_payload)
+    assert context is not None
+    assert AIResearchJobService(settings).enqueue_missing_events(
+        [missing_event()],
+        correlation_id="non-test-service-gate",
+        execution_context=context,
+    ) == []
+    repository = AIResearchJobRepository(settings)
+    job, created = repository.enqueue(
+        idempotency_key="persisted-test-origin",
+        job_type="MISSING_EVENT_RESEARCH",
+        symbol="MNQ",
+        correlation_id="persisted-test-origin",
+        request_payload={
+            "job_type": "MISSING_EVENT_RESEARCH",
+            "execution_context": context_payload,
+        },
+        policy_version="test",
+        prompt_version="test",
+    )
+    assert created is True
+    backend_calls: list[str] = []
+
+    def forbidden_backend(acquired, _workspace, _timeout):
+        backend_calls.append(str(acquired["job_id"]))
+        raise AssertionError("production accepted persisted test authority")
+
+    worker = AIResearchWorker(
+        settings,
+        repository=repository,
+        executor=forbidden_backend,
+        worker_id="non-test-worker",
+    )
+    assert worker.process_once() is False
+    rejected = repository.get(job["job_id"])
+    assert rejected["status"] == "REJECTED"
+    assert rejected["last_error"] == "AI_NOT_AUTHORIZED"
+    assert rejected["result_payload"]["diagnostic"][
+        "backend_invocation_attempted"
+    ] is False
+    assert backend_calls == []
+    assert table_count(settings, "research_backend_invocations") == 0
+    assert telemetry_counts(settings).get("ai_invocation_attempted", 0) == 0
 
 
 def test_explicit_context_is_persisted_and_worker_acquisition_is_fail_closed(
@@ -301,7 +531,12 @@ def _seed_reconciliation_database(settings: Settings) -> None:
 
 def test_reconciliation_is_read_only_guarded_and_idempotent(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        "scripts.reconcile_unauthorized_no_data_snapshots.socket.create_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()),
+    )
     settings = cfg(tmp_path)
     _seed_reconciliation_database(settings)
     before = settings.database_path.read_bytes()
@@ -361,4 +596,128 @@ def test_reconciliation_apply_refuses_configured_listening_port(
             )
     finally:
         listener.close()
+    assert settings.database_path.read_bytes() == before
+
+
+def _closed_database_backup(settings: Settings, tmp_path: Path) -> Path:
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    backup = tmp_path / "guard.backup.sqlite"
+    shutil.copy2(settings.database_path, backup)
+    return backup
+
+
+def _fake_listener_on(port: int):
+    def connect(address, timeout):
+        del timeout
+        if int(address[1]) == port:
+            return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raise OSError("listener absent")
+
+    return connect
+
+
+def test_reconciliation_default_8053_listener_refuses_apply(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert DEFAULT_SERVICE_PORT == 8053
+    settings = cfg(tmp_path)
+    _seed_reconciliation_database(settings)
+    backup = _closed_database_backup(settings, tmp_path)
+    monkeypatch.setattr(
+        "scripts.reconcile_unauthorized_no_data_snapshots.socket.create_connection",
+        _fake_listener_on(8053),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="service_must_be_stopped_before_apply",
+    ):
+        reconcile(settings.database_path, apply=True, backup=backup)
+
+
+def test_reconciliation_absent_8053_proceeds_to_expected_state_guard(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = cfg(tmp_path)
+    _seed_reconciliation_database(settings)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE market_context_snapshots
+            SET refresh_mode='unexpected'
+            WHERE revision=86
+            """
+        )
+        connection.commit()
+    backup = _closed_database_backup(settings, tmp_path)
+    monkeypatch.setattr(
+        "scripts.reconcile_unauthorized_no_data_snapshots.socket.create_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="expected_state_guard_refresh_mode_mismatch",
+    ):
+        reconcile(settings.database_path, apply=True, backup=backup)
+
+
+def test_ai_trader_listener_on_8000_does_not_affect_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = cfg(tmp_path)
+    _seed_reconciliation_database(settings)
+    backup = _closed_database_backup(settings, tmp_path)
+    monkeypatch.setattr(
+        "scripts.reconcile_unauthorized_no_data_snapshots.socket.create_connection",
+        _fake_listener_on(8000),
+    )
+    result = reconcile(settings.database_path, apply=True, backup=backup)
+    assert result["service_listener_guard"]["port"] == 8053
+    assert result["changed_snapshot_count"] == 5
+
+
+def test_reconciliation_service_port_override_is_respected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = cfg(tmp_path)
+    _seed_reconciliation_database(settings)
+    backup = _closed_database_backup(settings, tmp_path)
+    monkeypatch.setattr(
+        "scripts.reconcile_unauthorized_no_data_snapshots.socket.create_connection",
+        _fake_listener_on(18053),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="service_must_be_stopped_before_apply",
+    ):
+        reconcile(
+            settings.database_path,
+            apply=True,
+            backup=backup,
+            service_port=18053,
+        )
+
+
+def test_reconciliation_dry_run_is_read_only_and_skips_listener_guard(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = cfg(tmp_path)
+    _seed_reconciliation_database(settings)
+    before = settings.database_path.read_bytes()
+
+    def forbidden_probe(*_args, **_kwargs):
+        raise AssertionError("dry-run probed service listener")
+
+    monkeypatch.setattr(
+        "scripts.reconcile_unauthorized_no_data_snapshots._assert_service_not_listening",
+        forbidden_probe,
+    )
+    result = reconcile(settings.database_path)
+    assert result["mode"] == "DRY_RUN"
+    assert result["changed_snapshot_count"] == 0
     assert settings.database_path.read_bytes() == before

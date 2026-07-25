@@ -88,10 +88,24 @@ python -m scripts.replay_provider_force_regression_offline
 
 - Provider refresh routes construct an immutable provider-only execution
   context. `force` cannot change `allow_ai`.
+- `RELEASE_ACTUAL_REFRESH` is a deterministic resolver/provider job, not an AI
+  job. A structurally valid context with `allow_live_providers=true` is
+  sufficient; AI agent flags and `allow_ai` are irrelevant to this path.
+  Acquisition, recovery, and the worker enforce the same split.
+- Actual refresh emits `resolver_evaluation` and `provider_request_*`
+  telemetry only. It creates no research backend invocation, emits no
+  `ai_invocation_*` event, and records zero AI tokens. A provider failure uses
+  the configured deterministic official-actual backoff and cannot implicitly
+  fall through to Codex/OpenAI. Any later residual AI research must be a new,
+  explicitly authorized job.
 - Only trusted API, configured scheduler, and configured recovery entrypoints
   construct AI authority. Queue services, coordinators, due scanners, startup
   catch-up, and scheduler evaluation receive it explicitly and never infer it
   from `force` or an `ai_enqueue` callback.
+- The synthetic `test` request origin can authorize AI only when
+  `settings.environment == "test"`. A persisted `allow_ai=true`,
+  `request_origin=test` payload is rejected before acquisition in every other
+  environment.
 - Execution-context payloads require all four fields, strict booleans, a
   non-empty correlation ID, and a whitelisted origin. Missing, incomplete,
   `allow_ai=false`, or unknown-origin contexts emit `AI_SUPPRESSED` and create
@@ -115,9 +129,9 @@ python -m scripts.replay_provider_force_regression_offline
 
 ## Validation results
 
-- complete suite: `1532 passed`;
-- focused PR-review blocker suite: `52 passed`;
-- provider/consumer/scheduler/recovery/worker suites: passed;
+- complete suite: `1539 passed`;
+- focused PR-review blocker suite: `59 passed`;
+- selected provider/actual/recovery/worker/telemetry suites: `138 passed`;
 - migration matrix `1 -> 20` and schema-20 reopen: passed;
 - Ruff: passed;
 - `py_compile` and `compileall`: passed;
@@ -144,16 +158,18 @@ python -m scripts.reconcile_unauthorized_no_data_snapshots `
   --backup C:\path\market.pre-reconcile.sqlite `
   --audit-output C:\path\reconcile-audit.json `
   --service-host 127.0.0.1 `
-  --service-port 8000
+  --service-port 8053
 ```
 
 Apply changes only the five snapshot `audit_status` values from `ACTIVE` to
 the existing semantic state `ORPHANED`. It deletes nothing and does not alter
 jobs, runs, token usage, or telemetry. Repeated apply is idempotent. The
 expected-state guard aborts on any identity, revision, status, job, or run
-mismatch. `AI_MARKET_SERVICE_HOST` and `AI_MARKET_SERVICE_PORT` provide the CLI
-defaults; the explicit arguments should match the actual Uvicorn bind
-configuration.
+mismatch. The canonical default port is `8053`;
+`AI_MARKET_SERVICE_HOST`/`AI_MARKET_SERVICE_PORT` and explicit CLI arguments
+remain supported overrides. A listener belonging to AI-TRADER on `8000` does
+not affect this guard. Dry-run opens SQLite read-only and does not require the
+service to be stopped.
 
 ## Future single live-smoke checklist
 

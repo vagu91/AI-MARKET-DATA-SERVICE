@@ -222,18 +222,24 @@ class AIResearchJobService:
     ) -> tuple[dict[str, Any], bool]:
         self._validate_job_type(job_type)
         profile = profile_for_job(job_type)
+        ai_required = job_type != "RELEASE_ACTUAL_REFRESH"
         if not self._authorize(
             job_type,
             execution_context=execution_context,
             correlation_id=correlation_id,
+            ai_required=ai_required,
             topic=specialized_topic,
             profile_id=profile.profile_id,
         ):
-            enabled = is_research_agent_enabled(
-                self.settings,
-                topic=specialized_topic,
-                profile_id=profile.profile_id,
-                job_type=job_type,
+            enabled = (
+                True
+                if not ai_required
+                else is_research_agent_enabled(
+                    self.settings,
+                    topic=specialized_topic,
+                    profile_id=profile.profile_id,
+                    job_type=job_type,
+                )
             )
             return (
                 {
@@ -245,7 +251,9 @@ class AIResearchJobService:
                         correlation_id=correlation_id,
                     ),
                     "last_error": (
-                        "AGENT_DISABLED"
+                        "PROVIDER_NOT_AUTHORIZED"
+                        if not ai_required
+                        else "AGENT_DISABLED"
                         if execution_context is not None
                         and execution_context.allow_ai
                         and not enabled
@@ -400,29 +408,36 @@ class AIResearchJobService:
         decision = ai_authorization_decision(
             execution_context,
             ai_required=ai_required,
-        )
-        enabled = is_research_agent_enabled(
-            self.settings,
-            topic=topic,
-            profile_id=profile_id,
-            job_type=job_type,
+            environment=self.settings.environment,
         )
         if not ai_required:
-            authorized = decision == "AI_NOT_REQUIRED" and enabled
+            authorized = decision == "AI_NOT_REQUIRED"
+            telemetry_event = "resolver_evaluation"
+            telemetry_decision = (
+                "PROVIDER_ALLOWED" if authorized else "PROVIDER_SUPPRESSED"
+            )
         else:
+            enabled = is_research_agent_enabled(
+                self.settings,
+                topic=topic,
+                profile_id=profile_id,
+                job_type=job_type,
+            )
             authorized = (
                 decision == "AI_ALLOWED"
                 and enabled
             )
             if decision == "AI_ALLOWED" and not authorized:
                 decision = "AI_NOT_REQUIRED"
+            telemetry_event = "ai_authorization"
+            telemetry_decision = decision
         self.telemetry.emit(
-            "ai_authorization",
+            telemetry_event,
             identifiers={"correlation_id": correlation_id},
-            decision_summary=decision,
-            stop_reason=None if authorized else decision,
+            decision_summary=telemetry_decision,
+            stop_reason=None if authorized else telemetry_decision,
             payload={
-                "status": decision,
+                "status": telemetry_decision,
                 "reason": (
                     "explicit_execution_context"
                     if authorized

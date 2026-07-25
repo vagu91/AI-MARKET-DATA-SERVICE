@@ -74,11 +74,14 @@ class AIResearchJobRepository:
         specialized_topic: str | None = None,
         child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        if not is_research_agent_enabled(
-            self.settings,
-            topic=specialized_topic,
-            profile_id=profile_id,
-            job_type=job_type,
+        if (
+            job_type != "RELEASE_ACTUAL_REFRESH"
+            and not is_research_agent_enabled(
+                self.settings,
+                topic=specialized_topic,
+                profile_id=profile_id,
+                job_type=job_type,
+            )
         ):
             rejected = disabled_job_result(
                 self.settings,
@@ -367,7 +370,11 @@ class AIResearchJobRepository:
                         conn,
                         job_id=str(row["job_id"]),
                         now=now,
-                        reason="AI_NOT_AUTHORIZED",
+                        reason=(
+                            "PROVIDER_NOT_AUTHORIZED"
+                            if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH"
+                            else "AI_NOT_AUTHORIZED"
+                        ),
                     )
                     continue
                 if not self._row_agent_enabled(row):
@@ -519,6 +526,8 @@ class AIResearchJobRepository:
         return self.get(str(row["job_id"]))
 
     def _row_agent_enabled(self, row: Any) -> bool:
+        if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH":
+            return True
         return is_research_agent_enabled(
             self.settings,
             topic=row["specialized_topic"],
@@ -526,8 +535,7 @@ class AIResearchJobRepository:
             job_type=row["job_type"],
         )
 
-    @staticmethod
-    def _row_execution_authorized(row: Any) -> bool:
+    def _row_execution_authorized(self, row: Any) -> bool:
         try:
             payload = json.loads(str(row["request_payload_json"]))
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -536,8 +544,11 @@ class AIResearchJobRepository:
             payload.get("execution_context") if isinstance(payload, dict) else None
         )
         if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH":
-            return authorizes_ai(context) and authorizes_live_providers(context)
-        return authorizes_ai(context)
+            return authorizes_live_providers(context)
+        return authorizes_ai(
+            context,
+            environment=self.settings.environment,
+        )
 
     def _reject_unauthorized_waiting_in_transaction(
         self,
@@ -561,7 +572,11 @@ class AIResearchJobRepository:
                 conn,
                 job_id=str(row["job_id"]),
                 now=now,
-                reason="AI_NOT_AUTHORIZED",
+                reason=(
+                    "PROVIDER_NOT_AUTHORIZED"
+                    if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH"
+                    else "AI_NOT_AUTHORIZED"
+                ),
             )
             rejected += 1
         return rejected
@@ -605,7 +620,13 @@ class AIResearchJobRepository:
             "error": reason,
             "diagnostic": {
                 "category": reason,
-                "decision": "AI_SUPPRESSED" if reason == "AI_NOT_AUTHORIZED" else "AI_NOT_REQUIRED",
+                "decision": (
+                    "AI_SUPPRESSED"
+                    if reason == "AI_NOT_AUTHORIZED"
+                    else "PROVIDER_SUPPRESSED"
+                    if reason == "PROVIDER_NOT_AUTHORIZED"
+                    else "AI_NOT_REQUIRED"
+                ),
                 "retryable": False,
                 "backend_invocation_attempted": False,
                 "terminalized_at": now,

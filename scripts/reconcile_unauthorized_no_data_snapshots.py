@@ -18,6 +18,7 @@ EXPECTED_SNAPSHOTS = {
     89: "mcs-bec58c91-8405-46a5-9668-29fde9edc4c8",
     90: "mcs-faa3aff2-17e5-4578-b0c0-7066a1e0aecc",
 }
+DEFAULT_SERVICE_PORT = 8053
 
 
 def _sha256(path: Path) -> str:
@@ -101,7 +102,7 @@ def reconcile(
     apply: bool = False,
     backup: Path | None = None,
     service_host: str = "127.0.0.1",
-    service_port: int = 8000,
+    service_port: int = DEFAULT_SERVICE_PORT,
 ) -> dict[str, Any]:
     database = database.resolve()
     if not database.is_file():
@@ -204,7 +205,7 @@ def main() -> int:
     parser.add_argument(
         "--service-port",
         type=int,
-        default=int(os.getenv("AI_MARKET_SERVICE_PORT", "8000")),
+        default=int(os.getenv("AI_MARKET_SERVICE_PORT", str(DEFAULT_SERVICE_PORT))),
         help="Configured service port to probe before --apply.",
     )
     args = parser.parse_args()

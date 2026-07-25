@@ -899,7 +899,10 @@ class ResearchSchedulerService:
         if not (
             self.settings.enable_scheduler
             and self.settings.research_scheduler_enabled
-            and authorizes_ai(execution_context)
+            and authorizes_ai(
+                execution_context,
+                environment=self.settings.environment,
+            )
             and execution_context is not None
             and execution_context.request_origin == "research_scheduler"
         ):
@@ -1035,7 +1038,10 @@ class ResearchSchedulerService:
             self.settings.enable_scheduler
             and self.settings.research_scheduler_enabled
             and self.settings.lifecycle_due_scanner_enabled
-            and authorizes_ai(execution_context)
+            and authorizes_ai(
+                execution_context,
+                environment=self.settings.environment,
+            )
             and execution_context is not None
             and execution_context.request_origin in {"research_scheduler", "recovery"}
         )

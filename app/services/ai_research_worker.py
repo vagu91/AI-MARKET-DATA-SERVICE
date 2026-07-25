@@ -144,29 +144,43 @@ class AIResearchWorker:
         )
         requires_ai = job.get("job_type") != "RELEASE_ACTUAL_REFRESH"
         authorized = bool(
-            authorizes_ai(execution_context)
-            if requires_ai
-            else (
-                authorizes_ai(execution_context)
-                and authorizes_live_providers(execution_context)
+            authorizes_ai(
+                execution_context,
+                environment=self.settings.environment,
             )
+            if requires_ai
+            else authorizes_live_providers(execution_context)
         )
         if not authorized:
+            authorization_event = (
+                "ai_authorization" if requires_ai else "resolver_evaluation"
+            )
+            authorization_status = (
+                "AI_SUPPRESSED" if requires_ai else "PROVIDER_SUPPRESSED"
+            )
+            authorization_error = (
+                "AI_NOT_AUTHORIZED"
+                if requires_ai
+                else "PROVIDER_NOT_AUTHORIZED"
+            )
             self.repository.complete(
                 str(job["job_id"]),
                 self.worker_id,
                 status="REJECTED",
-                result_payload={"status": "REJECTED", "error": "AI_NOT_AUTHORIZED"},
+                result_payload={"status": "REJECTED", "error": authorization_error},
                 accepted_fields=[],
                 rejected_fields=[],
-                error="AI_NOT_AUTHORIZED",
+                error=authorization_error,
             )
             self.telemetry.emit(
-                "ai_authorization",
+                authorization_event,
                 identifiers=identifiers,
-                decision_summary="AI_SUPPRESSED",
-                stop_reason="AI_SUPPRESSED",
-                payload={"status": "AI_SUPPRESSED", "reason": "worker_fail_closed"},
+                decision_summary=authorization_status,
+                stop_reason=authorization_status,
+                payload={
+                    "status": authorization_status,
+                    "reason": "worker_fail_closed",
+                },
             )
             return True
         self.telemetry.emit(
@@ -181,7 +195,7 @@ class AIResearchWorker:
             decision_summary="worker lease acquired",
             payload={"status": "RUNNING"},
         )
-        if not is_research_agent_enabled(
+        if requires_ai and not is_research_agent_enabled(
             self.settings,
             topic=job.get("specialized_topic"),
             profile_id=job.get("profile_id"),
@@ -243,24 +257,68 @@ class AIResearchWorker:
         backend_started = time.monotonic()
         try:
             logger.info("ai_job_provider_started", extra=context)
-            self.telemetry.emit(
-                "ai_invocation_attempted",
-                identifiers=identifiers,
-                decision_summary="enabled backend invocation started",
-                payload={
-                    "status": "RUNNING",
-                    "reason": str(job.get("profile_id") or job.get("job_type")),
-                },
-            )
             if job["job_type"] == "RELEASE_ACTUAL_REFRESH":
+                self.telemetry.emit(
+                    "provider_request_attempted",
+                    identifiers=identifiers,
+                    decision_summary="official actual resolver started",
+                    payload={
+                        "status": "RUNNING",
+                        "reason": "OFFICIAL_ACTUAL_RESOLVER",
+                    },
+                )
                 result = self.actual_resolver(job, workspace, self.settings.ai_job_max_runtime_seconds)
+                provider_status = str(result.get("status") or "FAILED").upper()
+                self.telemetry.emit(
+                    (
+                        "provider_request_failed"
+                        if provider_status in {"FAILED", "TIMED_OUT"}
+                        else "provider_request_completed"
+                    ),
+                    identifiers=identifiers,
+                    decision_summary="official actual resolver completed",
+                    stop_reason=provider_status,
+                    error=(
+                        str(result.get("error") or provider_status)
+                        if provider_status in {"FAILED", "TIMED_OUT"}
+                        else None
+                    ),
+                    payload={
+                        "status": provider_status,
+                        "duration_ms": int(
+                            (time.monotonic() - backend_started) * 1000
+                        ),
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cached_tokens": 0,
+                        "cost_status": "not_applicable",
+                    },
+                )
             elif isinstance(self.executor, ResearchBackend) or hasattr(
                 self.executor, "execute_step"
             ):
+                self.telemetry.emit(
+                    "ai_invocation_attempted",
+                    identifiers=identifiers,
+                    decision_summary="enabled backend invocation started",
+                    payload={
+                        "status": "RUNNING",
+                        "reason": str(job.get("profile_id") or job.get("job_type")),
+                    },
+                )
                 result = self.agentic_runtime.run(
                     job, workspace, self.executor, self.settings.ai_job_max_runtime_seconds
                 )
             else:
+                self.telemetry.emit(
+                    "ai_invocation_attempted",
+                    identifiers=identifiers,
+                    decision_summary="enabled backend invocation started",
+                    payload={
+                        "status": "RUNNING",
+                        "reason": str(job.get("profile_id") or job.get("job_type")),
+                    },
+                )
                 result = self.executor(job, workspace, self.settings.ai_job_max_runtime_seconds)
             logger.info("ai_job_validation_started", extra=context)
             accepted, rejected = self._validate_results(job, result)
@@ -465,32 +523,33 @@ class AIResearchWorker:
                         }, executable_version=self._capability_report.get("executable_version"))
                         self._capability_report = None
             logger.info("ai_job_completed", extra={**context, "status": terminal})
-            self.telemetry.emit(
-                "ai_invocation_completed",
-                identifiers={
-                    **identifiers,
-                    "child_run_id": result.get("run_id"),
-                    "snapshot_id": (
-                        materialized.get("snapshot_id") if materialized else None
-                    ),
-                },
-                decision_summary="backend, persistence and materialization completed",
-                stop_reason=terminal,
-                payload={
-                    "status": terminal,
-                    "duration_ms": int(
-                        (time.monotonic() - backend_started) * 1000
-                    ),
-                    "input_tokens": int(result.get("input_tokens") or 0),
-                    "output_tokens": int(result.get("output_tokens") or 0),
-                    "cached_tokens": int(result.get("cached_tokens") or 0),
-                    "cost_status": str(
-                        (result.get("cost") or {}).get("cost_status")
-                        or result.get("cost_status")
-                        or "unavailable"
-                    ),
-                },
-            )
+            if requires_ai:
+                self.telemetry.emit(
+                    "ai_invocation_completed",
+                    identifiers={
+                        **identifiers,
+                        "child_run_id": result.get("run_id"),
+                        "snapshot_id": (
+                            materialized.get("snapshot_id") if materialized else None
+                        ),
+                    },
+                    decision_summary="backend, persistence and materialization completed",
+                    stop_reason=terminal,
+                    payload={
+                        "status": terminal,
+                        "duration_ms": int(
+                            (time.monotonic() - backend_started) * 1000
+                        ),
+                        "input_tokens": int(result.get("input_tokens") or 0),
+                        "output_tokens": int(result.get("output_tokens") or 0),
+                        "cached_tokens": int(result.get("cached_tokens") or 0),
+                        "cost_status": str(
+                            (result.get("cost") or {}).get("cost_status")
+                            or result.get("cost_status")
+                            or "unavailable"
+                        ),
+                    },
+                )
             return True
         except Exception as exc:
             diagnostic = getattr(exc, "diagnostic", None)
@@ -557,15 +616,33 @@ class AIResearchWorker:
                 },
             )
             self.telemetry.emit(
-                "ai_invocation_aborted",
+                (
+                    "ai_invocation_aborted"
+                    if requires_ai
+                    else "provider_request_failed"
+                ),
                 identifiers=identifiers,
-                decision_summary="backend or persistence path aborted",
+                decision_summary=(
+                    "backend or persistence path aborted"
+                    if requires_ai
+                    else "official actual resolver or persistence path aborted"
+                ),
                 stop_reason=error_code,
                 error=error_code,
                 payload={
                     "status": "FAILED",
                     "duration_ms": int(
                         (time.monotonic() - backend_started) * 1000
+                    ),
+                    **(
+                        {}
+                        if requires_ai
+                        else {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cached_tokens": 0,
+                            "cost_status": "not_applicable",
+                        }
                     ),
                 },
             )

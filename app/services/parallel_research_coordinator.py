@@ -48,7 +48,10 @@ class ParallelResearchCoordinator:
             raise RuntimeError("read_only_parallel_coordinator_cannot_create_parent")
         if backend not in {"codex_cli", "openai_api"}:
             raise ValueError(f"unsupported_research_backend:{backend}")
-        if not authorizes_ai(execution_context):
+        if not authorizes_ai(
+            execution_context,
+            environment=self.settings.environment,
+        ):
             self.telemetry.emit(
                 "ai_authorization",
                 identifiers={"correlation_id": correlation_id},

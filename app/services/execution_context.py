@@ -110,11 +110,19 @@ class ExecutionContext:
             return None
 
 
-def authorizes_ai(context: ExecutionContext | None) -> bool:
+def authorizes_ai(
+    context: ExecutionContext | None,
+    *,
+    environment: str | None,
+) -> bool:
     return bool(
         context
         and context.allow_ai
         and context.request_origin in AI_AUTHORIZED_REQUEST_ORIGINS
+        and (
+            context.request_origin != "test"
+            or str(environment or "").strip().lower() == "test"
+        )
     )
 
 
@@ -126,9 +134,14 @@ def ai_authorization_decision(
     context: ExecutionContext | None,
     *,
     ai_required: bool,
+    environment: str | None,
 ) -> str:
     if ai_required:
-        return "AI_ALLOWED" if authorizes_ai(context) else "AI_SUPPRESSED"
-    if not authorizes_ai(context) or not authorizes_live_providers(context):
+        return (
+            "AI_ALLOWED"
+            if authorizes_ai(context, environment=environment)
+            else "AI_SUPPRESSED"
+        )
+    if not authorizes_live_providers(context):
         return "AI_SUPPRESSED"
     return "AI_NOT_REQUIRED"
