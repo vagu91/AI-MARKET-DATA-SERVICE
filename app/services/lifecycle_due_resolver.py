@@ -125,8 +125,16 @@ class MacroActualLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": "macro_actual_occurrence_not_released",
             }
-        lookback_start = now - timedelta(
-            hours=int(self.settings.lifecycle_startup_catchup_hours)
+        lookback_start = now - (
+            timedelta(
+                days=int(
+                    self.settings.event_calendar_catchup_lookback_days
+                )
+            )
+            if self.settings.event_calendar_catchup_enabled
+            else timedelta(
+                hours=int(self.settings.lifecycle_startup_catchup_hours)
+            )
         )
         if release < lookback_start:
             return {

@@ -27,6 +27,11 @@ from app.services.event_driven_lifecycle_service import (
     compute_datum_lifecycle,
     persist_lifecycle_in_transaction,
 )
+from app.services.event_calendar_window_service import (
+    build_event_calendar_window,
+    classify_event_change,
+    coalesce_event_changes,
+)
 from app.services.observability_contract_service import TelemetryRepository
 
 
@@ -81,6 +86,11 @@ class MarketContextSnapshotRepository:
         resolved_lifecycle: DatumLifecycle | None = None,
         resolved_datum: dict[str, Any] | None = None,
         resolved_work_status: str = "COMPLETED",
+        resolved_items: list[
+            tuple[DatumLifecycle, dict[str, Any], str]
+        ]
+        | None = None,
+        trigger_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Allocate revision and persist both payloads in one SQLite write transaction."""
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -157,6 +167,46 @@ class MarketContextSnapshotRepository:
                 "research_run_id": research_run_id,
                 "parent_run_id": parent_run_id,
             })
+            debug["event_calendar_window"] = build_event_calendar_window(
+                debug,
+                settings=self.settings,
+                now=(
+                    parse_datetime(
+                        debug.get("generated_at_utc")
+                        or debug.get("generated_at")
+                    )
+                    or datetime.now(UTC)
+                ),
+            )
+            previous_debug = (
+                json.loads(previous["debug_payload_json"] or "{}")
+                if previous
+                else {}
+            )
+            schedule_change_metadata = _event_window_changes(
+                previous_debug.get("event_calendar_window"),
+                debug["event_calendar_window"],
+                consensus_trigger_enabled=(
+                    self.settings.event_calendar_consensus_trigger_enabled
+                ),
+            )
+            if (
+                schedule_change_metadata["trigger_class"] == "TRIGGERING"
+                and str(trigger_type or "").lower()
+                in {"", "macro_schedule"}
+            ):
+                trigger_type = _trigger_type_for_causes(
+                    schedule_change_metadata["causes"]
+                )
+                trigger_entity = ",".join(
+                    schedule_change_metadata["changed_event_ids"]
+                )
+                trigger_metadata = schedule_change_metadata
+            elif (
+                schedule_change_metadata["trigger_class"] == "TRIGGERING"
+                and trigger_metadata is None
+            ):
+                trigger_metadata = schedule_change_metadata
             final_invalid_sources = self.source_policy.invalid_sources(
                 debug,
                 allow_test_reserved=self.allow_test_reserved_sources,
@@ -261,6 +311,7 @@ class MarketContextSnapshotRepository:
                         and consumer[key].get("status") == "AVAILABLE"
                     },
                     reason=trigger_type,
+                    trigger_metadata=trigger_metadata,
                 )
             if resolved_lifecycle is not None:
                 persist_lifecycle_in_transaction(
@@ -268,6 +319,14 @@ class MarketContextSnapshotRepository:
                     resolved_lifecycle,
                     payload=dict(resolved_datum or {}),
                     work_status=resolved_work_status,
+                    timestamp=now,
+                )
+            for lifecycle, datum, work_status in resolved_items or []:
+                persist_lifecycle_in_transaction(
+                    conn,
+                    lifecycle,
+                    payload=dict(datum),
+                    work_status=work_status,
                     timestamp=now,
                 )
             self._persist_projected_lifecycle(conn, debug, timestamp=now)
@@ -317,10 +376,22 @@ class MarketContextSnapshotRepository:
                 self.telemetry.emit(
                     "outbox_emission",
                     identifiers=telemetry_ids,
-                    decision_summary="atomic market context outbox row committed",
-                    stop_reason="PENDING_DELIVERY",
+                    decision_summary=(
+                        "atomic market context outbox row committed"
+                        if outbox_event.get("created") is True
+                        else "market context outbox idempotency key deduplicated"
+                    ),
+                    stop_reason=(
+                        "PENDING_DELIVERY"
+                        if outbox_event.get("created") is True
+                        else "DEDUPLICATED"
+                    ),
                     payload={
-                        "status": "PENDING",
+                        "status": (
+                            "PENDING"
+                            if outbox_event.get("created") is True
+                            else "DEDUPLICATED"
+                        ),
                         "reason": str(trigger_type),
                     },
                 )
@@ -771,8 +842,8 @@ class MarketContextSnapshotRepository:
                 ),
             )
 
-    @staticmethod
     def _persist_projected_lifecycle(
+        self,
         conn: Any,
         debug: dict[str, Any],
         *,
@@ -804,6 +875,54 @@ class MarketContextSnapshotRepository:
                             "DUE",
                             "AWAITING_ACTUAL",
                         }
+                        else "IDLE"
+                    ),
+                    timestamp=timestamp,
+                )
+        calendar_window = debug.get("event_calendar_window") or {}
+        reference = (
+            parse_datetime(
+                debug.get("generated_at_utc")
+                or debug.get("generated_at")
+            )
+            or parse_datetime(timestamp)
+            or datetime.now(UTC)
+        )
+        for bucket in (
+            "previous_week",
+            "current_week",
+            "next_week",
+        ):
+            for item in (calendar_window.get(bucket) or {}).get(
+                "events"
+            ) or []:
+                if not isinstance(item, dict):
+                    continue
+                occurrence_id = str(
+                    item.get("occurrence_id")
+                    or item.get("event_id")
+                    or ""
+                )
+                if not occurrence_id:
+                    continue
+                lifecycle = compute_datum_lifecycle(
+                    "macro_actual",
+                    occurrence_id,
+                    item,
+                    settings=self.settings,
+                    now=reference,
+                    fields_attempted=["actual"],
+                    triggering_event="macro_actual",
+                    refresh_reason="event_calendar_occurrence_projection",
+                )
+                persist_lifecycle_in_transaction(
+                    conn,
+                    lifecycle,
+                    payload=item,
+                    work_status=(
+                        "READY"
+                        if lifecycle.freshness_state
+                        in {"DUE", "AWAITING_ACTUAL"}
                         else "IDLE"
                     ),
                     timestamp=timestamp,
@@ -1075,6 +1194,63 @@ class MarketContextSnapshotRepository:
         data["debug_payload"] = json.loads(data.pop("debug_payload_json"))
         data["consumer_payload"] = json.loads(data.pop("consumer_payload_json"))
         return data
+
+
+def _event_window_changes(
+    previous_window: Any,
+    current_window: Any,
+    *,
+    consensus_trigger_enabled: bool,
+) -> dict[str, Any]:
+    if not isinstance(previous_window, dict) or not isinstance(
+        current_window,
+        dict,
+    ):
+        return coalesce_event_changes([])
+    previous = _event_window_index(previous_window)
+    current = _event_window_index(current_window)
+    changes = [
+        classify_event_change(
+            previous.get(occurrence_id),
+            occurrence,
+            consensus_trigger_enabled=consensus_trigger_enabled,
+        )
+        for occurrence_id, occurrence in sorted(current.items())
+    ]
+    return coalesce_event_changes(changes)
+
+
+def _event_window_index(window: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item["occurrence_id"]): item
+        for bucket in (
+            "previous_week",
+            "current_week",
+            "next_week",
+        )
+        for item in (window.get(bucket) or {}).get("events") or []
+        if isinstance(item, dict) and item.get("occurrence_id")
+    }
+
+
+def _trigger_type_for_causes(causes: list[str]) -> str:
+    mapping = {
+        "ACTUAL_FIRST_PUBLICATION": "macro_actual_published",
+        "ACTUAL_MATERIAL_REVISION": "macro_actual_revised",
+        "EVENT_CANCELLED": "event_cancelled",
+        "EVENT_POSTPONED": "event_postponed",
+        "MATERIAL_TIME_CHANGE": "event_time_changed",
+        "NEW_HIGH_IMPACT_FUTURE_EVENT": "high_impact_event_added",
+        "MATERIAL_CONSENSUS_CHANGE": "consensus_material_change",
+    }
+    return next(
+        (
+            mapping[cause]
+            for cause in causes
+            if cause in mapping
+        ),
+        "market_schedule_change",
+    )
 
 
 def _same_issuer_event(item: dict[str, Any], claim: dict[str, Any]) -> bool:

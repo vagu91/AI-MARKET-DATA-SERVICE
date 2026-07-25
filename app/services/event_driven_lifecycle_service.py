@@ -32,11 +32,18 @@ FRESHNESS_STATES = frozenset(
 
 TRIGGER_CLASS_BY_ENTITY = {
     "macro_actual": "TRIGGER",
+    "macro_actual_published": "TRIGGER",
+    "macro_actual_revised": "TRIGGER",
     "fomc_decision": "TRIGGER",
     "fomc_communication": "TRIGGER",
     "earnings_actual": "TRIGGER",
     "earnings_guidance": "TRIGGER",
     "market_schedule_change": "TRIGGER",
+    "event_cancelled": "TRIGGER",
+    "event_postponed": "TRIGGER",
+    "event_time_changed": "TRIGGER",
+    "high_impact_event_added": "TRIGGER",
+    "consensus_material_change": "TRIGGER",
     "cot_publication": "TRIGGER",
     "breaking_news": "TRIGGER",
     "official_correction": "TRIGGER",
@@ -156,9 +163,26 @@ def compute_datum_lifecycle(
     next_refresh_at = _first_time(value, "next_refresh_at", "next_refresh")
     next_retry_at = _first_time(value, "next_retry_at")
     retry_policy = _retry_policy(settings, retry_class or "NO_DATA")
-    actual_missing = _earnings_actual_missing(entity_type, value)
+    actual_missing = _scheduled_actual_missing(entity_type, value)
 
-    if entity_type in {"cot", "cot_positioning", "cot_publication"}:
+    if entity_type in {"macro_actual", "fomc_decision"}:
+        if event_at is not None and actual_missing:
+            valid_until = valid_until or event_at
+            if event_at <= now:
+                next_retry_at = next_retry_at or (
+                    now
+                    if attempt_count <= 0
+                    else _bounded_retry_at(
+                        now,
+                        attempt_count=attempt_count,
+                        delays=_retry_delays(settings),
+                    )
+                )
+                next_refresh_at = next_retry_at
+            else:
+                next_retry_at = None
+                next_refresh_at = event_at
+    elif entity_type in {"cot", "cot_positioning", "cot_publication"}:
         report_date = _date_value(value.get("report_date") or value.get("data_as_of"))
         if report_date is not None:
             cftc_due = next_cftc_publication(report_date, settings=settings, now=now)
@@ -227,7 +251,14 @@ def compute_datum_lifecycle(
         freshness_state = "NO_DATA_BACKOFF"
     elif (
         entity_type
-        in {"earnings", "earnings_schedule", "earnings_actual", "earnings_intelligence"}
+        in {
+            "macro_actual",
+            "fomc_decision",
+            "earnings",
+            "earnings_schedule",
+            "earnings_actual",
+            "earnings_intelligence",
+        }
         and event_at is not None
         and event_at <= now
         and actual_missing
@@ -524,6 +555,41 @@ class LifecycleRepository:
         persisted_payload = dict(payload or {})
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if lifecycle.entity_type in {
+                "macro_actual",
+                "fomc_decision",
+            }:
+                aliases = conn.execute(
+                    """
+                    SELECT item_id,entity_key,payload_json
+                    FROM datum_lifecycle_items
+                    WHERE entity_type=? AND entity_key<>?
+                    """,
+                    (lifecycle.entity_type, lifecycle.entity_key),
+                ).fetchall()
+                for alias in aliases:
+                    try:
+                        alias_payload = json.loads(
+                            alias["payload_json"] or "{}"
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if not _same_lifecycle_occurrence(
+                        alias_payload,
+                        persisted_payload,
+                    ):
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE datum_lifecycle_items
+                        SET work_status='SUPERSEDED',superseded_by=?,
+                            next_refresh_at=NULL,next_retry_at=NULL,
+                            lease_owner=NULL,lease_expires_at=NULL,
+                            heartbeat_at=NULL,updated_at=?
+                        WHERE item_id=? AND work_status<>'LEASED'
+                        """,
+                        (item_id, now, alias["item_id"]),
+                    )
             existing = conn.execute(
                 """
                 SELECT * FROM datum_lifecycle_items
@@ -706,6 +772,8 @@ class LifecycleRepository:
         limit: int | None = None,
         now: datetime | None = None,
         due_since: datetime | None = None,
+        entity_types: set[str] | frozenset[str] | None = None,
+        priority_since: datetime | None = None,
     ) -> list[dict[str, Any]]:
         reference = _aware(now or self.clock())
         timestamp = _iso(reference)
@@ -715,12 +783,32 @@ class LifecycleRepository:
         )
         limit = min(
             int(limit or self.settings.lifecycle_due_max_concurrency),
-            int(self.settings.lifecycle_due_max_concurrency),
+            max(
+                int(self.settings.lifecycle_due_max_concurrency),
+                int(self.settings.event_calendar_catchup_max_per_tick),
+            ),
+        )
+        normalized_types = sorted(
+            {
+                str(entity_type).lower()
+                for entity_type in entity_types or set()
+                if entity_type
+            }
+        )
+        type_clause = (
+            "AND entity_type IN ("
+            + ",".join("?" for _ in normalized_types)
+            + ")"
+            if normalized_types
+            else ""
+        )
+        priority_value = (
+            _iso(priority_since) if priority_since is not None else None
         )
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                """
+                f"""
                 SELECT * FROM datum_lifecycle_items
                 WHERE (
                   work_status='READY'
@@ -736,7 +824,20 @@ class LifecycleRepository:
                   ? IS NULL
                   OR COALESCE(event_at,next_retry_at,next_refresh_at,updated_at)>=?
                 )
-                ORDER BY COALESCE(next_retry_at,next_refresh_at,updated_at),item_id
+                {type_clause}
+                ORDER BY
+                  CASE
+                    WHEN ? IS NOT NULL AND COALESCE(event_at,updated_at)>=?
+                      THEN 0
+                    ELSE 1
+                  END,
+                  CASE UPPER(COALESCE(json_extract(payload_json,'$.impact'),''))
+                    WHEN 'HIGH' THEN 0
+                    WHEN 'MEDIUM' THEN 1
+                    WHEN 'LOW' THEN 2
+                    ELSE 3
+                  END,
+                  COALESCE(next_retry_at,next_refresh_at,updated_at),item_id
                 LIMIT ?
                 """,
                 (
@@ -746,6 +847,9 @@ class LifecycleRepository:
                     timestamp,
                     due_since_value,
                     due_since_value,
+                    *normalized_types,
+                    priority_value,
+                    priority_value,
                     limit,
                 ),
             ).fetchall()
@@ -769,6 +873,62 @@ class LifecycleRepository:
                 for item_id in ids
             ]
         return [_restore_item(row) for row in claimed if row is not None]
+
+    def count_due(
+        self,
+        *,
+        now: datetime | None = None,
+        due_since: datetime | None = None,
+        entity_types: set[str] | frozenset[str] | None = None,
+    ) -> int:
+        reference = _iso(now or self.clock())
+        due_since_value = _iso(due_since) if due_since is not None else None
+        normalized_types = sorted(
+            {
+                str(entity_type).lower()
+                for entity_type in entity_types or set()
+                if entity_type
+            }
+        )
+        type_clause = (
+            "AND entity_type IN ("
+            + ",".join("?" for _ in normalized_types)
+            + ")"
+            if normalized_types
+            else ""
+        )
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS due_count
+                FROM datum_lifecycle_items
+                WHERE (
+                  work_status='READY'
+                  OR (
+                    work_status IN ('COMPLETED','IDLE')
+                    AND COALESCE(next_retry_at,next_refresh_at)<=?
+                  )
+                  OR (work_status='BACKOFF' AND next_retry_at<=?)
+                  OR (work_status='LEASED' AND lease_expires_at<=?)
+                )
+                AND COALESCE(next_retry_at,next_refresh_at,updated_at)<=?
+                AND (
+                  ? IS NULL
+                  OR COALESCE(event_at,next_retry_at,next_refresh_at,updated_at)>=?
+                )
+                {type_clause}
+                """,
+                (
+                    reference,
+                    reference,
+                    reference,
+                    reference,
+                    due_since_value,
+                    due_since_value,
+                    *normalized_types,
+                ),
+            ).fetchone()
+        return int(row["due_count"] if row else 0)
 
     def heartbeat(
         self,
@@ -1080,7 +1240,62 @@ def _bounded_retry_at(
     return _aware(now) + timedelta(seconds=delays[index])
 
 
-def _earnings_actual_missing(entity_type: str, value: dict[str, Any]) -> bool:
+def _same_lifecycle_occurrence(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    left_lineage = (
+        left.get("lineage")
+        if isinstance(left.get("lineage"), dict)
+        else {}
+    )
+    right_lineage = (
+        right.get("lineage")
+        if isinstance(right.get("lineage"), dict)
+        else {}
+    )
+    left_id = str(
+        left.get("provider_event_id")
+        or left_lineage.get("provider_event_id")
+        or left.get("event_id")
+        or ""
+    )
+    right_id = str(
+        right.get("provider_event_id")
+        or right_lineage.get("provider_event_id")
+        or right.get("event_id")
+        or ""
+    )
+    if not left_id or left_id != right_id:
+        return False
+    left_release = _first_time(
+        left,
+        "event_at",
+        "release_at",
+        "time_utc",
+        "scheduled_at_utc",
+    )
+    right_release = _first_time(
+        right,
+        "event_at",
+        "release_at",
+        "time_utc",
+        "scheduled_at_utc",
+    )
+    return bool(
+        left_release is not None
+        and right_release is not None
+        and left_release.replace(second=0, microsecond=0)
+        == right_release.replace(second=0, microsecond=0)
+    )
+
+
+def _scheduled_actual_missing(
+    entity_type: str,
+    value: dict[str, Any],
+) -> bool:
+    if entity_type in {"macro_actual", "fomc_decision"}:
+        return value.get("actual") in (None, "")
     if entity_type not in {
         "earnings",
         "earnings_schedule",
@@ -1095,11 +1310,20 @@ def _earnings_actual_missing(entity_type: str, value: dict[str, Any]) -> bool:
 
 
 def _event_time(value: dict[str, Any], *, settings: Settings) -> datetime | None:
-    exact = _first_time(value, "event_at", "release_at", "time_utc")
+    exact = _first_time(
+        value,
+        "event_at",
+        "release_at",
+        "time_utc",
+        "scheduled_at_utc",
+    )
     if exact is not None:
         return exact
     raw_date = _date_value(
-        value.get("earnings_date") or value.get("date") or value.get("event_date")
+        value.get("earnings_date")
+        or value.get("date")
+        or value.get("event_date")
+        or value.get("scheduled_at")
     )
     if raw_date is None:
         return None

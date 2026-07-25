@@ -25,6 +25,10 @@ from app.services.event_driven_lifecycle_service import (
     compute_datum_lifecycle,
     material_changes,
 )
+from app.services.event_calendar_window_service import (
+    classify_event_change,
+    coalesce_event_changes,
+)
 from app.services.research_agent_enablement import is_research_agent_enabled
 from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.observability_contract_service import TelemetryRepository
@@ -59,9 +63,17 @@ class ResearchSchedulerService:
         force: bool = False,
         due_since: datetime | None = None,
         execution_context: ExecutionContext | None = None,
+        limit: int | None = None,
+        entity_types: set[str] | frozenset[str] | None = None,
+        priority_since: datetime | None = None,
+        allow_ai_residual: bool = True,
+        coalesce_provider_resolutions: bool = False,
     ) -> dict[str, Any]:
         """Lease due work, run resolvers first, and enqueue AI once for residuals."""
-        ai_authorized = self._scanner_ai_authorized(execution_context)
+        ai_authorized = (
+            allow_ai_residual
+            and self._scanner_ai_authorized(execution_context)
+        )
         if not ai_authorized:
             self.telemetry.emit(
                 "ai_authorization",
@@ -91,6 +103,9 @@ class ResearchSchedulerService:
             owner=owner,
             now=now,
             due_since=due_since,
+            limit=limit,
+            entity_types=entity_types,
+            priority_since=priority_since,
         )
         self.telemetry.emit(
             "lease",
@@ -118,12 +133,31 @@ class ResearchSchedulerService:
         backoff: list[str] = []
         item_outcomes: list[dict[str, str | None]] = []
         effective_triggers: list[dict[str, str]] = []
+        provider_resolution_batch: list[
+            tuple[
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                str | None,
+            ]
+        ] = []
         for item in claimed:
             item_id = str(item["item_id"])
             effective_trigger_type = _effective_trigger_type(
                 item,
                 explicit_trigger_type=trigger_type,
             )
+            if (
+                coalesce_provider_resolutions
+                and not _inside_notification_horizon(
+                    item,
+                    now=now,
+                    horizon_days=int(
+                        self.settings.event_calendar_notification_horizon_days
+                    ),
+                )
+            ):
+                effective_trigger_type = None
             trigger_correlation_id = f"lifecycle-{item_id}"
             if effective_trigger_type:
                 effective_triggers.append(
@@ -378,6 +412,7 @@ class ResearchSchedulerService:
                 if (
                     missing_fields
                     and provider_result.get("ai_eligible") is True
+                    and allow_ai_residual
                 ):
                     ai_eligible.append(unresolved)
                 continue
@@ -399,22 +434,34 @@ class ResearchSchedulerService:
                             triggering_event=effective_trigger_type,
                             refresh_reason="provider_resolution_completed",
                         )
-                    snapshot = self._rematerialize_provider_resolution(
-                        item=item,
-                        datum=datum,
-                        lifecycle=lifecycle.as_dict(),
-                        trigger_type=effective_trigger_type,
-                        owner=owner,
-                        now=now,
-                    )
-                    if snapshot is not None:
-                        rematerialized.append(str(snapshot["snapshot_id"]))
-                    else:
-                        self.lifecycle.upsert(
-                            lifecycle,
-                            payload=datum,
-                            work_status="COMPLETED",
+                    if coalesce_provider_resolutions:
+                        provider_resolution_batch.append(
+                            (
+                                item,
+                                datum,
+                                lifecycle.as_dict(),
+                                effective_trigger_type,
+                            )
                         )
+                    else:
+                        snapshot = self._rematerialize_provider_resolution(
+                            item=item,
+                            datum=datum,
+                            lifecycle=lifecycle.as_dict(),
+                            trigger_type=effective_trigger_type,
+                            owner=owner,
+                            now=now,
+                        )
+                        if snapshot is not None:
+                            rematerialized.append(
+                                str(snapshot["snapshot_id"])
+                            )
+                        else:
+                            self.lifecycle.upsert(
+                                lifecycle,
+                                payload=datum,
+                                work_status="COMPLETED",
+                            )
                 else:
                     self.lifecycle.complete(
                         item_id,
@@ -536,8 +583,24 @@ class ResearchSchedulerService:
                 resolver is not None
                 and provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
                 and provider_result.get("ai_eligible", True) is True
+                and allow_ai_residual
             ):
                 ai_eligible.append(unresolved)
+        if provider_resolution_batch:
+            snapshot = self._rematerialize_provider_resolution_batch(
+                resolutions=provider_resolution_batch,
+                owner=owner,
+                now=now,
+            )
+            if snapshot is not None:
+                rematerialized.append(str(snapshot["snapshot_id"]))
+            else:
+                for _, datum, lifecycle, _ in provider_resolution_batch:
+                    self.lifecycle.upsert(
+                        DatumLifecycle(**lifecycle),
+                        payload=datum,
+                        work_status="COMPLETED",
+                    )
         ai_invocations = 0
         ai_jobs_created = 0
         enqueue_result: Any = None
@@ -680,6 +743,36 @@ class ResearchSchedulerService:
             "ai_jobs_created": ai_jobs_created,
             "enqueue_result": enqueue_result,
             "coalesced": len(ai_eligible) > 1,
+            "provider_resolutions_coalesced": (
+                len(provider_resolution_batch) > 1
+            ),
+            "actuals_recovered": sum(
+                1
+                for item, datum, _, _ in provider_resolution_batch
+                if (
+                    (item.get("payload") or {}).get("actual")
+                    if isinstance(item.get("payload"), dict)
+                    else None
+                )
+                in (None, "")
+                and datum.get("actual") not in (None, "")
+            ),
+            "revisions_reconciled": sum(
+                1
+                for item, datum, _, _ in provider_resolution_batch
+                if (
+                    (item.get("payload") or {}).get("actual")
+                    if isinstance(item.get("payload"), dict)
+                    else None
+                )
+                not in (None, "")
+                and datum.get("actual") not in (None, "")
+                and str((item.get("payload") or {}).get("actual"))
+                != str(datum.get("actual"))
+            ),
+            "catch_up_cursor": (
+                str(claimed[-1]["item_id"]) if claimed else None
+            ),
         }
 
     def startup_catch_up(
@@ -689,7 +782,10 @@ class ResearchSchedulerService:
         ai_enqueue: Callable[[list[dict[str, Any]]], Any],
         execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
-        if not (
+        event_calendar_catchup = bool(
+            self.settings.event_calendar_catchup_enabled
+        )
+        if not event_calendar_catchup and not (
             self.settings.enable_scheduler
             and self.settings.research_scheduler_enabled
             and self.settings.lifecycle_due_scanner_enabled
@@ -709,8 +805,43 @@ class ResearchSchedulerService:
                 "writes": 0,
             }
         now = self.clock()
-        window_start = now - timedelta(
-            hours=int(self.settings.lifecycle_startup_catchup_hours)
+        window_start = now - (
+            timedelta(
+                days=int(
+                    self.settings.event_calendar_catchup_lookback_days
+                )
+            )
+            if event_calendar_catchup
+            else timedelta(
+                hours=int(self.settings.lifecycle_startup_catchup_hours)
+            )
+        )
+        event_entity_types = (
+            frozenset(
+                {
+                    "macro_actual",
+                    "earnings_actual",
+                    "fomc_decision",
+                    "fomc_communication",
+                }
+            )
+            if event_calendar_catchup
+            else None
+        )
+        priority_since = (
+            now
+            - timedelta(
+                days=int(
+                    self.settings.event_calendar_notification_horizon_days
+                )
+            )
+            if event_calendar_catchup
+            else None
+        )
+        backlog_before = self.lifecycle.count_due(
+            now=now,
+            due_since=window_start,
+            entity_types=event_entity_types,
         )
         result = self.scan_due_items(
             owner="startup-lifecycle-catch-up",
@@ -718,6 +849,32 @@ class ResearchSchedulerService:
             ai_enqueue=ai_enqueue,
             due_since=window_start,
             execution_context=execution_context,
+            force=event_calendar_catchup,
+            limit=(
+                min(
+                    int(self.settings.event_calendar_catchup_batch_size),
+                    int(
+                        self.settings.event_calendar_catchup_max_per_tick
+                    ),
+                )
+                if event_calendar_catchup
+                else None
+            ),
+            entity_types=event_entity_types,
+            priority_since=priority_since,
+            allow_ai_residual=not event_calendar_catchup,
+            coalesce_provider_resolutions=event_calendar_catchup,
+        )
+        backlog_after = self.lifecycle.count_due(
+            now=now,
+            due_since=window_start,
+            entity_types=event_entity_types,
+        )
+        catch_up_window_hours = (
+            int(self.settings.lifecycle_startup_catchup_hours)
+            if not event_calendar_catchup
+            else int(self.settings.event_calendar_catchup_lookback_days)
+            * 24
         )
         self.telemetry.emit(
             "startup_catch_up",
@@ -727,17 +884,22 @@ class ResearchSchedulerService:
             payload={
                 "status": str(result.get("status") or "COMPLETED"),
                 "reason": (
-                    f"window_hours:{self.settings.lifecycle_startup_catchup_hours};"
-                    f"claimed:{result.get('claimed', 0)}"
+                    f"window_hours:{catch_up_window_hours};"
+                    f"claimed:{result.get('claimed', 0)};"
+                    f"backlog_before:{backlog_before};"
+                    f"backlog_after:{backlog_after};"
+                    f"cursor:{result.get('catch_up_cursor') or 'none'}"
                 ),
             },
         )
         return {
             **result,
             "catch_up_window_start": window_start.isoformat(),
-            "catch_up_window_hours": int(
-                self.settings.lifecycle_startup_catchup_hours
-            ),
+            "catch_up_window_hours": catch_up_window_hours,
+            "catch_up_backlog_before": backlog_before,
+            "catch_up_backlog_after": backlog_after,
+            "catch_up_batch_size": int(result.get("claimed") or 0),
+            "catch_up_provider_only": event_calendar_catchup,
         }
 
     def _rematerialize_provider_resolution(
@@ -834,6 +996,166 @@ class ResearchSchedulerService:
             },
             decision_summary="provider resolution rematerialized from committed data",
             payload={"status": "SUCCEEDED", "reason": str(trigger_type or "")},
+        )
+        return snapshot
+
+    def _rematerialize_provider_resolution_batch(
+        self,
+        *,
+        resolutions: list[
+            tuple[
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                str | None,
+            ]
+        ],
+        owner: str,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Commit one snapshot/outbox envelope for a bounded catch-up batch."""
+
+        previous = self.snapshots.latest("MNQ")
+        if previous is None:
+            return None
+        components = self.snapshots.latest_components("MNQ")
+        if not components:
+            return None
+        debug = dict(components)
+        changes: list[dict[str, Any]] = []
+        persisted: list[
+            tuple[DatumLifecycle, dict[str, Any], str]
+        ] = []
+        trigger_types: list[str] = []
+        lifecycle_resolutions = dict(
+            debug.get("lifecycle_resolutions") or {}
+        )
+        for item, datum, lifecycle, trigger_type in resolutions:
+            entity_key = str(item.get("entity_key") or "")
+            debug = _project_resolved_datum(
+                debug,
+                entity_type=str(item.get("entity_type") or ""),
+                entity_key=entity_key,
+                datum=datum,
+                lifecycle=lifecycle,
+            )
+            lifecycle_resolutions[entity_key or str(item["item_id"])] = {
+                "entity_type": item.get("entity_type"),
+                "value": datum,
+                "lifecycle": lifecycle,
+            }
+            persisted.append(
+                (DatumLifecycle(**lifecycle), datum, "COMPLETED")
+            )
+            if trigger_type:
+                trigger_types.append(trigger_type)
+                previous_occurrence = {
+                    **(
+                        item.get("payload")
+                        if isinstance(item.get("payload"), dict)
+                        else {}
+                    ),
+                    "occurrence_id": entity_key,
+                }
+                current_occurrence = {
+                    **datum,
+                    "occurrence_id": entity_key,
+                    "release_status": (
+                        datum.get("release_status")
+                        or (
+                            "PUBLISHED"
+                            if datum.get("actual") not in (None, "")
+                            else None
+                        )
+                    ),
+                    "is_future": False,
+                }
+                changes.append(
+                    classify_event_change(
+                        previous_occurrence,
+                        current_occurrence,
+                        consensus_trigger_enabled=(
+                            self.settings
+                            .event_calendar_consensus_trigger_enabled
+                        ),
+                    )
+                )
+        debug["lifecycle_resolutions"] = lifecycle_resolutions
+        trigger_metadata = coalesce_event_changes(changes)
+        debug["event_change_batch"] = {
+            **trigger_metadata,
+            "batch_size": len(resolutions),
+            "provider_first": True,
+            "ai_invocations": 0,
+            "delivery_attempted": False,
+        }
+        debug["generated_at_utc"] = now.astimezone(UTC).replace(
+            microsecond=0
+        ).isoformat()
+        coalesced_trigger = (
+            trigger_types[0]
+            if trigger_metadata["trigger_class"] == "TRIGGERING"
+            else None
+        )
+        if (
+            self.deterministic_runtime is not None
+            and coalesced_trigger is not None
+        ):
+            debug = self.deterministic_runtime.enrich_market_context_sync(
+                debug,
+                refresh="auto",
+                trigger_type=coalesced_trigger,
+            )
+        from app.services.ai_trader_consumer_v2_service import (
+            build_ai_trader_consumer_v2,
+        )
+
+        candidate_consumer = build_ai_trader_consumer_v2(
+            debug,
+            settings=self.settings,
+        )
+        changed_sections, _ = material_changes(
+            previous.get("consumer_payload") or {},
+            candidate_consumer,
+        )
+        if not changed_sections:
+            return None
+        snapshot = self.snapshots.save_next(
+            symbol="MNQ",
+            refresh_mode="event_calendar_catchup_batch",
+            debug_payload=debug,
+            ai_enrichment={"status": "NOT_REQUIRED"},
+            trigger_type=coalesced_trigger,
+            trigger_entity=(
+                ",".join(trigger_metadata["changed_event_ids"])
+                if coalesced_trigger
+                else None
+            ),
+            correlation_id=owner,
+            resolved_items=persisted,
+            trigger_metadata=trigger_metadata,
+        )
+        self.telemetry.emit(
+            "event_trigger_batch",
+            identifiers={
+                "correlation_id": owner,
+                "snapshot_id": snapshot.get("snapshot_id"),
+            },
+            decision_summary=(
+                "provider resolutions committed in one coalesced batch"
+            ),
+            stop_reason=(
+                "TRIGGERING"
+                if coalesced_trigger
+                else "ARCHIVED_WITHOUT_NOTIFICATION"
+            ),
+            payload={
+                "status": "COMPLETED",
+                "reason": (
+                    f"batch_size:{len(resolutions)};"
+                    f"trigger_count:{trigger_metadata['trigger_count']}"
+                ),
+            },
         )
         return snapshot
 
@@ -1224,6 +1546,25 @@ def _effective_trigger_type(
         entity_type = str(item.get("entity_type") or "").strip()
         return entity_type or None
     return None
+
+
+def _inside_notification_horizon(
+    item: dict[str, Any],
+    *,
+    now: datetime,
+    horizon_days: int,
+) -> bool:
+    event_at = parse_datetime(
+        item.get("event_at")
+        or (
+            (item.get("payload") or {}).get("release_at")
+            if isinstance(item.get("payload"), dict)
+            else None
+        )
+    )
+    if event_at is None:
+        return False
+    return event_at >= now - timedelta(days=max(int(horizon_days), 1))
 
 
 def _project_resolved_datum(

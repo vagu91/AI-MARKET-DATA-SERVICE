@@ -83,6 +83,7 @@ class MarketContextOutboxRepository:
         parent_run_id: str | None = None,
         component_versions: dict[str, Any] | None = None,
         reason: str | None = None,
+        trigger_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         trigger_class = TRIGGER_CLASS_BY_ENTITY.get(
             str(trigger_type or "").lower(),
@@ -117,9 +118,33 @@ class MarketContextOutboxRepository:
                 "parent_run_id": parent_run_id,
                 "component_versions": component_versions or {},
                 "reason": reason or trigger_type,
+                "changed_event_ids": sorted(
+                    {
+                        str(value)
+                        for value in (
+                            (trigger_metadata or {}).get(
+                                "changed_event_ids"
+                            )
+                            or []
+                        )
+                        if value
+                    }
+                ),
+                "trigger_causes": sorted(
+                    {
+                        str(value)
+                        for value in (
+                            (trigger_metadata or {}).get("causes") or []
+                        )
+                        if value
+                    }
+                ),
+                "coalesced": bool(
+                    (trigger_metadata or {}).get("coalesced")
+                ),
             },
         ]
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT OR IGNORE INTO market_context_outbox(
               event_id,event_type,trace_id,correlation_id,trigger_type,
@@ -152,7 +177,12 @@ class MarketContextOutboxRepository:
             "SELECT * FROM market_context_outbox WHERE idempotency_key=?",
             (idempotency_key,),
         ).fetchone()
-        return _row(row) if row else None
+        if row is None:
+            return None
+        output = _row(row)
+        output["created"] = int(cursor.rowcount or 0) == 1
+        output["deduplicated"] = not output["created"]
+        return output
 
     def list_events(
         self,
@@ -253,6 +283,9 @@ def _row(row: Any) -> dict[str, Any]:
     output["parent_run_id"] = lineage.get("parent_run_id")
     output["component_versions"] = lineage.get("component_versions") or {}
     output["reason"] = lineage.get("reason") or output.get("trigger_type")
+    output["changed_event_ids"] = lineage.get("changed_event_ids") or []
+    output["trigger_causes"] = lineage.get("trigger_causes") or []
+    output["coalesced"] = bool(lineage.get("coalesced"))
     return output
 
 

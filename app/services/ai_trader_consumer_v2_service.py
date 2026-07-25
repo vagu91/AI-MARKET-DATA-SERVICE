@@ -9,6 +9,9 @@ from typing import Any
 from app.core.config import Settings
 from app.core.redaction import redact_sensitive
 from app.services.data_freshness_service import parse_datetime
+from app.services.event_calendar_window_service import (
+    compact_event_calendar_window,
+)
 from app.services.market_context_hardening_service import harden_market_context
 from app.services.market_session_service import NEW_YORK
 from app.services.temporal_domain_service import temporal_event_state
@@ -27,6 +30,7 @@ INCLUDED_SECTIONS = [
     "snapshot_summary",
     "macro",
     "event_risk",
+    "event_calendar_window",
     "rates",
     "risk",
     "positioning",
@@ -141,6 +145,9 @@ def build_ai_trader_consumer_v2(
         "snapshot_summary": _snapshot_summary(hardened),
         "macro": _macro(hardened.get("macro_snapshot") or {}, now=generated_at),
         "event_risk": _event_risk(hardened),
+        "event_calendar_window": compact_event_calendar_window(
+            hardened.get("event_calendar_window") or {}
+        ),
         "rates": _rates(hardened.get("rates_expectations") or {}),
         "risk": _risk(hardened.get("risk_context") or {}),
         "positioning": _positioning(hardened.get("positioning") or {}),
@@ -241,6 +248,7 @@ SECTION_BYTE_BUDGETS = {
     "snapshot_summary": 1_500,
     "macro": 6_500,
     "event_risk": 9_000,
+    "event_calendar_window": 18_000,
     "rates": 4_500,
     "risk": 5_500,
     "positioning": 2_500,
@@ -248,7 +256,7 @@ SECTION_BYTE_BUDGETS = {
     "earnings": 4_000,
     "news": 4_000,
     "sentiment": 2_500,
-    "market_schedule": 3_500,
+    "market_schedule": 6_000,
     "macro_actuals": 2_000,
     "rates_context": 2_000,
     "options_positioning": 2_500,
@@ -1191,6 +1199,11 @@ def _schedule(schedule: dict[str, Any]) -> dict[str, Any]:
         "market_session_status": schedule.get("market_session_status"),
         "last_market_session_date": schedule.get("last_market_session_date"),
         "mnq_session": _session(schedule.get("mnq_session") or {}),
+        "mnq_futures_session": _session(
+            schedule.get("mnq_futures_session")
+            or schedule.get("mnq_session")
+            or {}
+        ),
         "nasdaq_cash_session": _session(schedule.get("nasdaq_cash_session") or {}),
         "cme_equity_futures_session": _session(schedule.get("cme_equity_futures_session") or {}),
         "next_open": (schedule.get("mnq_session") or {}).get("next_open"),
@@ -1459,6 +1472,10 @@ def _session(session: dict[str, Any]) -> dict[str, Any]:
     return _select(
         session,
         "status",
+        "is_open",
+        "closed_reason",
+        "holiday_name",
+        "is_early_close",
         "market",
         "instrument",
         "venue",
@@ -1469,6 +1486,7 @@ def _session(session: dict[str, Any]) -> dict[str, Any]:
         "holiday_schedule",
         "early_close",
         "next_open",
+        "next_open_at",
         "next_close",
         "source",
         "source_classification",

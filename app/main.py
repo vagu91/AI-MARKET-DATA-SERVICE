@@ -34,10 +34,17 @@ async def run_lifecycle_due_scan(state):
 
 async def run_startup_lifecycle_catchup(state):
     scheduler = state["research_scheduler"]
-    execution_context = ExecutionContext.explicit_ai(
-        correlation_id="startup-lifecycle-catch-up",
-        request_origin="recovery",
-        allow_live_providers=True,
+    execution_context = (
+        ExecutionContext.provider_only(
+            correlation_id="startup-lifecycle-catch-up",
+            allow_live_providers=True,
+        )
+        if scheduler.settings.event_calendar_catchup_enabled
+        else ExecutionContext.explicit_ai(
+            correlation_id="startup-lifecycle-catch-up",
+            request_origin="recovery",
+            allow_live_providers=True,
+        )
     )
     return await asyncio.to_thread(
         scheduler.startup_catch_up,

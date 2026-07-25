@@ -11,6 +11,9 @@ from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
 from app.services.data_integrity_service import classify_source
 from app.services.data_lifecycle_service import attach_lifecycle_metadata
+from app.services.event_calendar_window_service import (
+    build_event_calendar_window,
+)
 from app.services.market_session_service import (
     NEW_YORK,
     build_session_aware_schedule,
@@ -69,6 +72,7 @@ def harden_market_context(
         and existing_hardening.get("completed") is True
         and existing_hardening.get("version") == HARDENING_VERSION
         and existing_hardening.get("context_date") == context_date
+        and isinstance(full.get("event_calendar_window"), dict)
         and not _temporal_projection_changed(full, now=now)
     ):
         return dict(full)
@@ -78,6 +82,11 @@ def harden_market_context(
 
     output["event_calendar"] = _annotate_event_calendar(
         output.get("event_calendar") or {},
+        now=now,
+    )
+    output["event_calendar_window"] = build_event_calendar_window(
+        output,
+        settings=settings,
         now=now,
     )
     output["events_today"] = [

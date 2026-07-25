@@ -23,6 +23,11 @@ def build_session_aware_schedule(
     local = now.astimezone(NEW_YORK)
     existing = dict(schedule or {})
     holidays = list(existing.get("holidays") or [])
+    holidays_by_date = {
+        str(item.get("date")): item
+        for item in holidays
+        if isinstance(item, dict) and item.get("date")
+    }
     closed_dates = {
         str(item.get("date"))
         for item in holidays
@@ -34,6 +39,18 @@ def build_session_aware_schedule(
         if isinstance(item, dict) and str(item.get("session_status") or "").lower() == "early_close"
     }
     cash = _cash_session(local, closed_dates, early_closes)
+    cash_holiday = holidays_by_date.get(local.date().isoformat())
+    cash.update(
+        {
+            "holiday_name": (
+                cash_holiday.get("holiday_name")
+                or cash_holiday.get("name")
+                or cash_holiday.get("title")
+                if cash_holiday
+                else None
+            ),
+        }
+    )
     futures = _futures_session(local)
     cme_calendar = existing.get("cme_calendar") or {}
     official_cme = str(cme_calendar.get("status") or "").lower() == "found" and bool(cme_calendar.get("calendar_verified"))
@@ -87,6 +104,11 @@ def build_session_aware_schedule(
         "nasdaq_cash_session": cash_view,
         "cme_equity_futures_session": futures,
         "mnq_session": {**futures, "instrument": "MNQ", "venue": "CME Globex"},
+        "mnq_futures_session": {
+            **futures,
+            "instrument": "MNQ",
+            "venue": "CME Globex",
+        },
         "next_holiday": next_holiday,
         "next_early_close": next_early_close,
         "calendar_source_ranking": [
@@ -141,8 +163,21 @@ def _cash_session(
     close_time = _early_close_time(early_closes.get(next_open_day.isoformat())) or CASH_CLOSE
     current_close_time = _early_close_time(early_closes.get(day_key)) or CASH_CLOSE
     current_close = datetime.combine(day, current_close_time, NEW_YORK)
+    is_open = status == "open"
     return {
         "status": status,
+        "is_open": is_open,
+        "closed_reason": (
+            None
+            if is_open
+            else "WEEKEND"
+            if status == "weekend"
+            else "HOLIDAY"
+            if status == "holiday"
+            else "OUTSIDE_REGULAR_HOURS"
+        ),
+        "holiday_name": None,
+        "is_early_close": day_key in early_closes,
         "market": "NASDAQ cash",
         "timezone": "America/New_York",
         "regular_trading_hours": {"open": "09:30:00", "close": "16:00:00"},
@@ -150,6 +185,7 @@ def _cash_session(
         "maintenance_break": None,
         "early_close": day_key in early_closes,
         "next_open": datetime.combine(next_open_day, CASH_OPEN, NEW_YORK).astimezone(UTC).isoformat(),
+        "next_open_at": datetime.combine(next_open_day, CASH_OPEN, NEW_YORK).astimezone(UTC).isoformat(),
         "next_close": (
             current_close if status == "open" else datetime.combine(next_open_day, close_time, NEW_YORK)
         ).astimezone(UTC).isoformat(),
@@ -169,8 +205,19 @@ def _futures_session(local: datetime) -> dict[str, Any]:
         status = "open"
     next_open = _next_futures_open(local, status)
     next_close = _next_futures_close(local, status)
+    is_open = status == "open"
     return {
         "status": status,
+        "is_open": is_open,
+        "closed_reason": (
+            None
+            if is_open
+            else "MAINTENANCE_BREAK"
+            if status == "maintenance_break"
+            else "WEEKEND"
+        ),
+        "holiday_name": None,
+        "is_early_close": False,
         "market": "CME equity index futures",
         "timezone": "America/New_York",
         "regular_trading_hours": "Sunday 18:00 through Friday 17:00 ET",
@@ -179,6 +226,7 @@ def _futures_session(local: datetime) -> dict[str, Any]:
         "holiday_schedule": "calendar-specific overrides required",
         "early_close": False,
         "next_open": next_open.astimezone(UTC).isoformat(),
+        "next_open_at": next_open.astimezone(UTC).isoformat(),
         "next_close": next_close.astimezone(UTC).isoformat(),
         "source": "versioned CME Globex schedule fallback",
         "source_classification": "versioned_static_last_known_good",
