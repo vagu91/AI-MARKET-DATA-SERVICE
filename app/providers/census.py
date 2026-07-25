@@ -126,10 +126,16 @@ EITS_OUTPUT_FIELDS = (
     "time_slot_name",
 )
 EITS_PREDICATE_ONLY_FIELDS = frozenset({"time", "for", "in", "ucgid"})
+CENSUS_DATASET_OUTPUT_FIELDS = {
+    "RESCONST": ("geo_level_code",),
+}
 CENSUS_QUERY_PREDICATES = {
     # ADVM3's sole official API example requires the national geography
     # predicate. Predicate-only fields remain outside ``get``.
     "ADVM3": {"for": "us:*"},
+    # RESCONST otherwise returns national plus four Census regions for the same
+    # economic tuple. The official national predicate is part of its identity.
+    "RESCONST": {"for": "us:*"},
 }
 _PERIOD_RE = re.compile(r"^\d{4}-(?:\d{2}|Q[1-4])$")
 
@@ -246,7 +252,7 @@ class CensusProvider(BaseProvider):
             raise ProviderError(
                 f"Census {normalized_dataset} requires an exact YYYY-MM occurrence"
             )
-        fields = EITS_OUTPUT_FIELDS
+        fields = _output_fields(normalized_dataset)
         if EITS_PREDICATE_ONLY_FIELDS.intersection(fields):
             raise RuntimeError("predicate-only Census variable present in get")
         params = {
@@ -345,6 +351,14 @@ class CensusProvider(BaseProvider):
                         "time_slot_date": row.get("time_slot_date"),
                         "time_slot_id": row.get("time_slot_id"),
                         "time_slot_name": row.get("time_slot_name"),
+                        "query_geography_predicate": (
+                            CENSUS_QUERY_PREDICATES.get(
+                                normalized_dataset,
+                                {},
+                            ).get("for")
+                        ),
+                        "geo_level_code": row.get("geo_level_code"),
+                        "us": row.get("us"),
                         "reference_period": period,
                         "frequency": spec.frequency,
                         "unit": spec.unit,
@@ -407,6 +421,17 @@ def _dataset_names(values: Iterable[str] | None) -> list[str]:
     return list(dict.fromkeys(output))
 
 
+def _output_fields(dataset: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *EITS_OUTPUT_FIELDS,
+                *CENSUS_DATASET_OUTPUT_FIELDS.get(dataset, ()),
+            )
+        )
+    )
+
+
 def _validate_period(period: str) -> None:
     if not _PERIOD_RE.fullmatch(str(period)):
         raise ProviderError("Census period must be an exact YYYY-MM or YYYY-Qn occurrence")
@@ -463,6 +488,20 @@ def _matches_mapping(
         and _error_data_clear(row.get("error_data"))
         and _valid_cell_value(row.get("cell_value"))
         and observed_program == spec.program_code
+        and _geography_matches(row, spec=spec)
+    )
+
+
+def _geography_matches(
+    row: dict[str, Any],
+    *,
+    spec: CensusSeriesMapping,
+) -> bool:
+    if spec.dataset != "resconst":
+        return True
+    return bool(
+        str(row.get("geo_level_code") or "").strip().upper() == "US"
+        and str(row.get("us") or "").strip() == "1"
     )
 
 

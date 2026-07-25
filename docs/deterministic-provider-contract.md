@@ -138,6 +138,11 @@ There is no historical `time=2012` default.
   millions of dollars: goods-and-services balance.
 
 `time`, `for`, `in`, and `ucgid` are predicate-only and cannot enter `get`.
+ADVM3 and RESCONST use the official national `for=us:*` predicate. RESCONST
+additionally requests `geo_level_code` as a dataset-specific output and requires
+both `geo_level_code=US` and the returned predicate column `us=1`. Regional
+`MW`, `NO`, `SO`, and `WE` rows are never eligible for national observations.
+
 The adapter requests only the value and exact discriminants, including
 `program_code`, `data_type_code`, `seasonally_adj`, `error_data`, and
 the three `time_slot_*` audit fields. Temporal identity comes from the exact
@@ -147,10 +152,10 @@ offset (commonly `"0"` for a one-month query), is never calculated, and does not
 identify the calendar month. `time_slot_name` is descriptive only.
 
 Program, category, data type, seasonal variant, non-error state, exact time,
-parsed month start, and a valid `cell_value` must all match. Zero matches are
-deterministic `NO_DATA`; multiple exact matches are `ambiguous_census_mapping`.
-Neither case is materialized. Raw multi-row data is represented by hashes in audit
-lineage and is never copied to the consumer.
+parsed month start, applicable national geography, and a valid `cell_value` must
+all match. Zero matches are deterministic `NO_DATA`; multiple exact matches are
+`ambiguous_census_mapping`. Neither case is materialized. Raw multi-row data is
+represented by hashes in audit lineage and is never copied to the consumer.
 
 The mapping is sourced from the official EITS variable definitions and program data
 dictionaries:

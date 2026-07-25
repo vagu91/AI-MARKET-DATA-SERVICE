@@ -30,6 +30,14 @@ RESCONST, and FTD all return `time_slot_id="0"` when the response window contain
 one month. The field is a response-window offset, not a calendar identity. The
 calculated values 413/809 therefore rejected valid exact economic tuples.
 
+A subsequent read-only validation of that corrected temporal HEAD found a final
+dataset-specific ambiguity. MARTS, ADVM3, and FTD each materialized one
+observation, but RESCONST returned five otherwise exact rows per series, one for
+each `geo_level_code` in `MW`, `NO`, `SO`, `US`, and `WE`. Without a geography
+predicate, both housing starts and building permits correctly failed closed as
+ambiguous. The conclusive diagnosis was
+`RESCONST_REQUIRES_NATIONAL_GEOGRAPHY`.
+
 ## Official mapping decision
 
 The official Census EITS variable definitions establish that `time` is a predicate
@@ -104,6 +112,13 @@ and reports.
 secondary consistency check; the requested and returned `time` value is the
 primary temporal identity.
 
+RESCONST additionally sends the predicate-only `for=us:*`, requests the
+dataset-specific `geo_level_code` output, and requires both
+`geo_level_code="US"` and `us="1"`. A mixed national/regional response selects
+only the national row. Zero national rows produce `NO_DATA`; multiple exact
+national rows produce `ambiguous_census_mapping`. No region can be substituted
+for the national series.
+
 Zero exact matches produce audited `NO_DATA`. Multiple exact matches produce
 `ambiguous_census_mapping`; only redacted SHA-256 row hashes remain in lineage.
 No arbitrary value reaches the consumer.
@@ -114,9 +129,11 @@ Accepted observations preserve the provider, dataset, program, exact period,
 category, data type, raw and canonical seasonal adjustment, returned `time`,
 `time_slot_id`, `time_slot_date`, `time_slot_name`, semantic field, frequency,
 unit, original decimal text and precision, retrieval time, raw-payload hash,
-request fingerprint, and redacted source URL. Occurrence IDs include series and
-period, so the two RESCONST measures cannot collapse into one occurrence and a
-relative slot offset cannot redefine the month.
+request fingerprint, and redacted source URL. RESCONST observations additionally
+preserve the `for=us:*` query predicate, `geo_level_code`, and returned `us`
+column. Occurrence IDs include series and period, so the two RESCONST measures
+cannot collapse into one occurrence and a relative slot offset cannot redefine
+the month.
 
 Census does not provide a release timestamp in this response contract, so none is
 invented. `valid_until` and `next_refresh_at` are computed from retrieval time and
@@ -133,14 +150,18 @@ query predicates, credential redaction, order independence, wrong categories,
 wrong data types, SA/NSA, provider error flags, wrong returned periods, wrong
 parsed month starts, invalid values, zero/ambiguous matches, 400/401/403 terminal
 behavior, historical lifecycle scheduling, and zero AI job/backend persistence.
+RESCONST tests reproduce five synthetic geographies per series, assert the
+national query/output contract, exclude every region, preserve geography
+lineage, fail closed without US or with duplicate US rows, and verify five total
+observations across the four datasets.
 
 Final offline validation:
 
-- dedicated Census regression file: 25 passed;
-- Census plus deterministic-provider targets: 47 passed;
+- dedicated Census regression file: 28 passed;
+- Census plus deterministic-provider targets: 50 passed;
 - provider/actual/recovery/lifecycle/freshness/consumer/snapshot/atomicity
-  selection: 569 passed;
-- complete suite: 1,564 passed in 259.01 seconds;
+  selection: 572 passed;
+- complete suite: 1,567 passed in 243.15 seconds;
 - explicit schema-20 compatibility and preservation matrix: 5 passed;
 - Ruff (whole repository), `py_compile`, `compileall`, and `git diff --check`:
   passed;
@@ -152,3 +173,6 @@ Final offline validation:
 No Census, deterministic provider, AI backend, Codex CLI, OpenAI, browser,
 Uvicorn, trading, account, or order endpoint was invoked during implementation
 or validation.
+
+The six-file PR diff contains no PowerShell harness, so no operational smoke
+script was added or changed for this correction.

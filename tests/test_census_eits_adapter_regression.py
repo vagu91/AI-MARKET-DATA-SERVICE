@@ -109,12 +109,19 @@ def row(
         "error_data": "no",
         "cell_value": case["value"],
     }
+    if case["dataset"] == "RESCONST":
+        output.update(
+            {
+                "geo_level_code": "US",
+                "us": "1",
+            }
+        )
     output.update(overrides)
     return output
 
 
 def competing_rows(case: dict[str, str]) -> list[dict[str, str]]:
-    return [
+    output = [
         row(case, program_code="WRONG_PROGRAM"),
         row(case, category_code="WRONG_CATEGORY"),
         row(case, data_type_code="WRONG_TYPE"),
@@ -127,6 +134,14 @@ def competing_rows(case: dict[str, str]) -> list[dict[str, str]]:
         row(case, time_slot_date="2026-05-02 00:00:00.0"),
         row(case, cell_value="not-a-number"),
     ]
+    if case["dataset"] == "RESCONST":
+        output.extend(
+            [
+                row(case, geo_level_code="MW", us=""),
+                row(case, geo_level_code="US", us="2"),
+            ]
+        )
+    return output
 
 
 def sibling_resconst_row(case: dict[str, str]) -> list[dict[str, str]]:
@@ -177,6 +192,11 @@ def test_redacted_forensic_fixture_reproduces_live_temporal_shape() -> None:
         "time_slot_name": TIME_SLOT_NAME,
     }
     assert len(fixture["official_tuples"]) == 5
+    assert fixture["resconst_national_query"] == {
+        "for": "us:*",
+        "expected_geo_level_code": "US",
+        "expected_us": "1",
+    }
     assert {
         (
             item["dataset"],
@@ -210,6 +230,24 @@ def test_redacted_forensic_fixture_reproduces_live_temporal_shape() -> None:
         item["time_slot_date"] == TIME_SLOT_DATE
         for item in fixture["ambiguous_exact_rows"]
     )
+    for category in ("ASTARTS", "APERMITS"):
+        geography_rows = [
+            item
+            for item in fixture["resconst_geography_rows"]
+            if item["category_code"] == category
+        ]
+        assert {item["geo_level_code"] for item in geography_rows} == {
+            "MW",
+            "NO",
+            "SO",
+            "US",
+            "WE",
+        }
+        national = [
+            item for item in geography_rows if item["geo_level_code"] == "US"
+        ]
+        assert len(national) == 1
+        assert national[0]["us"] == "1"
     assert SENTINEL not in encoded
     assert "api_key" not in encoded.lower()
 
@@ -260,6 +298,10 @@ async def test_all_indicators_select_exact_live_shape_order_independently(
             "time+parsed_time_slot_date"
         )
         assert SENTINEL not in envelope.model_dump_json()
+        if case["dataset"] == "RESCONST":
+            assert observation.metadata["query_geography_predicate"] == "us:*"
+            assert observation.metadata["geo_level_code"] == "US"
+            assert observation.metadata["us"] == "1"
 
     first_observation = observation_for(first, case["series_id"])
     reversed_observation = observation_for(reversed_result, case["series_id"])
@@ -346,7 +388,7 @@ async def test_census_query_keeps_time_predicate_separate_and_requests_value(
     assert len(requests) == 1
     params = requests[0].url.params
     get_fields = tuple(params["get"].split(","))
-    assert get_fields == EITS_OUTPUT_FIELDS
+    assert get_fields[: len(EITS_OUTPUT_FIELDS)] == EITS_OUTPUT_FIELDS
     assert "cell_value" in get_fields
     assert "time_slot_date" in get_fields
     assert "time_slot_name" in get_fields
@@ -354,11 +396,120 @@ async def test_census_query_keeps_time_predicate_separate_and_requests_value(
     assert not EITS_PREDICATE_ONLY_FIELDS.intersection(get_fields)
     assert params["time"] == PERIOD
     assert params["key"] == SENTINEL
-    if dataset == "ADVM3":
+    if dataset in {"ADVM3", "RESCONST"}:
         assert params["for"] == "us:*"
     else:
         assert "for" not in params
+    if dataset == "RESCONST":
+        assert "geo_level_code" in get_fields
+    else:
+        assert "geo_level_code" not in get_fields
     assert SENTINEL not in envelope.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_resconst_mixed_geographies_select_only_national_rows(
+    tmp_path: Path,
+) -> None:
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    rows = fixture["resconst_geography_rows"]
+    first = await fetch_dataset(
+        tmp_path,
+        dataset="RESCONST",
+        rows=rows,
+        database_name="resconst-geography-first.sqlite",
+    )
+    reversed_result = await fetch_dataset(
+        tmp_path,
+        dataset="RESCONST",
+        rows=list(reversed(rows)),
+        database_name="resconst-geography-reversed.sqlite",
+    )
+
+    expected_ids = {
+        "CENSUS:RESCONST:HOUSING_STARTS",
+        "CENSUS:RESCONST:BUILDING_PERMITS",
+    }
+    regional_values = {
+        float(item["cell_value"])
+        for item in rows
+        if item["geo_level_code"] != "US"
+    }
+    for envelope in (first, reversed_result):
+        assert {item.observation_id for item in envelope.observations} == expected_ids
+        assert len(envelope.observations) == 2
+        assert all(item.value not in regional_values for item in envelope.observations)
+        assert all(
+            item.metadata["geo_level_code"] == "US"
+            and item.metadata["us"] == "1"
+            and item.metadata["query_geography_predicate"] == "us:*"
+            for item in envelope.observations
+        )
+        assert envelope.lineage["predicate_fields"] == ["for", "time"]
+        assert SENTINEL not in envelope.model_dump_json()
+
+    assert {
+        item.observation_id: item.value for item in first.observations
+    } == {
+        item.observation_id: item.value for item in reversed_result.observations
+    }
+
+
+@pytest.mark.asyncio
+async def test_resconst_without_national_rows_is_no_data(tmp_path: Path) -> None:
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    regional_rows = [
+        item
+        for item in fixture["resconst_geography_rows"]
+        if item["geo_level_code"] != "US"
+    ]
+    envelope = await fetch_dataset(
+        tmp_path,
+        dataset="RESCONST",
+        rows=regional_rows,
+        database_name="resconst-geography-no-us.sqlite",
+    )
+
+    assert envelope.observations == []
+    assert envelope.freshness == "NO_DATA"
+    assert set(envelope.rejection_reasons) == {
+        "no_exact_census_mapping:CENSUS:RESCONST:HOUSING_STARTS",
+        "no_exact_census_mapping:CENSUS:RESCONST:BUILDING_PERMITS",
+    }
+    assert envelope.lineage["rejected_row_hashes"]
+
+
+@pytest.mark.asyncio
+async def test_four_dataset_simulation_materializes_five_observations(
+    tmp_path: Path,
+) -> None:
+    rows_by_dataset = {
+        dataset: [
+            row(case)
+            for case in INDICATOR_CASES
+            if case["dataset"] == dataset
+        ]
+        for dataset in ("MARTS", "ADVM3", "RESCONST", "FTD")
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        dataset = request.url.path.rsplit("/", 1)[-1].upper()
+        return httpx.Response(200, json={"data": rows_by_dataset[dataset]})
+
+    configured = settings(tmp_path)
+    provider = CensusProvider(
+        ProviderCacheRepository(configured.database_path),
+        configured,
+        transport=httpx.MockTransport(handler),
+    )
+    envelopes = [
+        await provider.fetch_dataset(dataset, period=PERIOD)
+        for dataset in ("MARTS", "ADVM3", "RESCONST", "FTD")
+    ]
+
+    assert [len(item.observations) for item in envelopes] == [1, 1, 2, 1]
+    assert sum(len(item.observations) for item in envelopes) == 5
+    assert all(SENTINEL not in item.model_dump_json() for item in envelopes)
 
 
 def test_absolute_time_slot_semantics_are_completely_removed() -> None:
@@ -441,6 +592,12 @@ async def test_historical_period_refreshes_from_retrieval_without_ai_state(
         ).fetchone()[0] == 0
         assert connection.execute(
             "SELECT COUNT(*) FROM research_backend_invocations"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM market_context_snapshots"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM market_context_outbox"
         ).fetchone()[0] == 0
 
     created = {path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")}
