@@ -11,11 +11,13 @@ from app.infrastructure.persistence.provider_cache_repository import ProviderCac
 from app.models.common import Freshness, ProviderResult, ProviderType
 from app.providers.base import BaseProvider, ProviderDisabled, ProviderError, metadata
 from app.providers.deterministic import (
+    AsyncSlidingWindowRateLimiter,
     DeterministicHttpClient,
     DeterministicProviderError,
     as_list,
     safe_payload_hash,
 )
+from app.providers.parametric_cache import CacheResolution, ParametricProviderCache
 
 
 TRADIER_ALLOWED_HOSTS = {"api.tradier.com", "sandbox.tradier.com"}
@@ -45,11 +47,23 @@ class TradierProvider(BaseProvider):
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         clock=lambda: datetime.now(UTC),
+        sleeper=None,
     ) -> None:
         super().__init__(cache)
         self.settings = settings
         self.clock = clock
         self.environment, self.base_url, self.token = _configuration(settings)
+        import asyncio
+
+        actual_sleeper = sleeper or asyncio.sleep
+        self.parametric_cache = ParametricProviderCache(cache, clock=clock)
+        self.rate_limiter = AsyncSlidingWindowRateLimiter(
+            settings.tradier_rate_limit_per_minute,
+            clock=clock,
+            sleeper=actual_sleeper,
+        )
+        self.last_telemetry: dict[str, Any] = {}
+        self._uncached_telemetry: dict[str, dict[str, Any]] = {}
         self.http = DeterministicHttpClient(
             allowed_hosts=TRADIER_ALLOWED_HOSTS,
             timeout_seconds=settings.tradier_timeout_seconds,
@@ -57,6 +71,7 @@ class TradierProvider(BaseProvider):
             allowed_methods={"GET"},
             transport=transport,
             clock=clock,
+            sleeper=actual_sleeper,
         )
 
     async def fetch(self) -> ProviderResult:
@@ -125,6 +140,7 @@ class TradierProvider(BaseProvider):
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
             },
+            before_attempt=self.rate_limiter.acquire,
         )
         return payload, telemetry.as_dict(), request
 
@@ -132,6 +148,17 @@ class TradierProvider(BaseProvider):
         requested = list(dict.fromkeys(_symbol(item) for item in symbols))
         if not requested:
             raise ValueError("at least one Tradier quote symbol is required")
+        resolution = await self.parametric_cache.resolve(
+            provider=self.source,
+            endpoint="quotes",
+            environment=self.environment,
+            parameters={"symbols": sorted(requested), "greeks": False},
+            ttl_seconds=self.settings.tradier_cache_ttl_seconds,
+            loader=lambda: self._quotes_uncached(requested),
+        )
+        return self._with_cache_telemetry(resolution)
+
+    async def _quotes_uncached(self, requested: list[str]) -> list[dict[str, Any]]:
         payload, telemetry, request = await self.request(
             "/markets/quotes",
             params={"symbols": ",".join(requested), "greeks": "false"},
@@ -191,11 +218,40 @@ class TradierProvider(BaseProvider):
 
     async def expirations(self, symbol: str) -> list[date]:
         normalized = _symbol(symbol)
-        payload, _, _ = await self.request(
+        resolution = await self.parametric_cache.resolve(
+            provider=self.source,
+            endpoint="option_expirations",
+            environment=self.environment,
+            parameters={"symbol": normalized},
+            ttl_seconds=self.settings.tradier_cache_ttl_seconds,
+            loader=lambda: self._expirations_uncached(normalized),
+        )
+        network_telemetry = (
+            self._uncached_telemetry.get("option_expirations", {})
+            if resolution.cache_status == "REFRESHED"
+            else {}
+        )
+        self.last_telemetry[
+            f"option_expirations:{resolution.cache_key}"
+        ] = {
+            **resolution.telemetry,
+            **network_telemetry,
+            "cache_status": resolution.cache_status,
+            "cache_key": resolution.cache_key,
+        }
+        return [
+            parsed
+            for value in (resolution.value or [])
+            if (parsed := _date_value(value)) is not None
+        ]
+
+    async def _expirations_uncached(self, normalized: str) -> list[str]:
+        payload, telemetry, _ = await self.request(
             "/markets/options/expirations",
             params={"symbol": normalized, "includeAllRoots": "true", "strikes": "false"},
             endpoint_category="option_expirations",
         )
+        self._uncached_telemetry["option_expirations"] = telemetry
         container = payload.get("expirations") if isinstance(payload, dict) else None
         values = container.get("date") if isinstance(container, dict) else container
         if isinstance(values, str):
@@ -208,12 +264,31 @@ class TradierProvider(BaseProvider):
                 continue
             if parsed >= self.clock().date():
                 output.append(parsed)
-        return sorted(set(output))
+        return [item.isoformat() for item in sorted(set(output))]
 
     async def option_chain(self, symbol: str, expiration: date) -> list[dict[str, Any]]:
         normalized = _symbol(symbol)
         if expiration < self.clock().date():
             raise DeterministicProviderError("past Tradier expiration rejected")
+        resolution = await self.parametric_cache.resolve(
+            provider=self.source,
+            endpoint="option_chain",
+            environment=self.environment,
+            parameters={
+                "symbol": normalized,
+                "expiration": expiration.isoformat(),
+                "greeks": True,
+            },
+            ttl_seconds=self.settings.tradier_cache_ttl_seconds,
+            loader=lambda: self._option_chain_uncached(normalized, expiration),
+        )
+        return self._with_cache_telemetry(resolution)
+
+    async def _option_chain_uncached(
+        self,
+        normalized: str,
+        expiration: date,
+    ) -> list[dict[str, Any]]:
         payload, telemetry, request = await self.request(
             "/markets/options/chains",
             params={
@@ -254,6 +329,30 @@ class TradierProvider(BaseProvider):
             telemetry.setdefault("anomalies", []).append("chain_empty_after_validation")
         for item in output:
             item["telemetry"] = telemetry
+        return output
+
+    def _with_cache_telemetry(self, resolution: CacheResolution) -> list[dict[str, Any]]:
+        endpoint = str(resolution.telemetry["endpoint_category"])
+        telemetry_key = (
+            f"{endpoint}:{resolution.cache_key}"
+            if endpoint == "option_chain"
+            else endpoint
+        )
+        output = [dict(item) for item in (resolution.value or [])]
+        network_telemetry = (
+            dict((output[0].get("telemetry") or {}))
+            if resolution.cache_status == "REFRESHED" and output
+            else {}
+        )
+        self.last_telemetry[telemetry_key] = {
+            **resolution.telemetry,
+            **network_telemetry,
+            "cache_status": resolution.cache_status,
+            "cache_key": resolution.cache_key,
+        }
+        if resolution.cache_status != "REFRESHED":
+            for item in output:
+                item["telemetry"] = dict(self.last_telemetry[telemetry_key])
         return output
 
     async def relevant_option_chains(
@@ -414,3 +513,10 @@ def _quote_freshness(observed_at: datetime | None, now: datetime) -> str:
     if age <= timedelta(minutes=20):
         return "DELAYED"
     return "STALE"
+
+
+def _date_value(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None

@@ -5,6 +5,9 @@ from app.services.event_service import EventService
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.macro_service import MacroService
 from app.services.nasdaq_data_service import NasdaqDataService
+from app.services.deterministic_provider_runtime_service import (
+    DeterministicProviderRuntimeService,
+)
 
 
 def get_macro_service(request: Request) -> MacroService:
@@ -25,3 +28,9 @@ def get_nasdaq_data_service(request: Request) -> NasdaqDataService:
 
 def get_enrichment_orchestrator(request: Request) -> EnrichmentOrchestrator:
     return request.app.state.enrichment_orchestrator
+
+
+def get_deterministic_provider_runtime(
+    request: Request,
+) -> DeterministicProviderRuntimeService:
+    return request.app.state.deterministic_provider_runtime

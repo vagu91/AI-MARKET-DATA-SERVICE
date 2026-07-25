@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
@@ -12,6 +12,7 @@ from app.providers.deterministic import (
     request_fingerprint,
     safe_payload_hash,
 )
+from app.providers.parametric_cache import ParametricProviderCache
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +38,50 @@ class BaseProvider(ABC):
     async def fetch(self) -> ProviderResult:
         raise NotImplementedError
 
-    async def fetch_safe(self) -> ProviderResult:
+    async def fetch_safe(self, *, force: bool = False) -> ProviderResult:
+        now = datetime.now(UTC)
+        operational_cache_key = ParametricProviderCache.key(
+            self.source,
+            "fetch",
+            environment=str(
+                getattr(getattr(self, "settings", None), "environment", "default")
+            ),
+            parameters={"dataset_or_series": self.cache_key},
+        )
+        ttl = max(
+            0,
+            int(
+                getattr(
+                    getattr(self, "settings", None),
+                    f"{str(self.source).lower()}_cache_ttl_seconds",
+                    0,
+                )
+            ),
+        )
+        if not force and ttl:
+            entry = self.cache.get_entry(operational_cache_key)
+            if entry is None:
+                entry = self.cache.get_entry(self.cache_key)
+            if entry and entry.get("status") in {"valid_cache", "last_known_good"}:
+                valid_until = _parse_cache_time(entry.get("valid_until"))
+                if valid_until is not None and valid_until > now:
+                    result = ProviderResult.model_validate(entry["payload"])
+                    result.metadata.provider_type = ProviderType.CACHE
+                    result.metadata.retrieved_at = now
+                    return result
         try:
             result = await self.fetch()
-            self.cache.set(self.cache_key, result.model_dump(mode="json"))
+            valid_until = now + timedelta(seconds=ttl)
+            self.cache.set(
+                operational_cache_key,
+                result.model_dump(mode="json"),
+                provider_name=self.source,
+                valid_until=valid_until.isoformat() if ttl else None,
+                stale_until=(
+                    valid_until + timedelta(seconds=max(ttl, 60))
+                ).isoformat() if ttl else None,
+                status="valid_cache",
+            )
             return result
         except ProviderDisabled as exc:
             detail = redact_sensitive(str(exc) or f"{self.source} disabled")
@@ -63,9 +104,12 @@ class BaseProvider(ABC):
                 "provider_failed",
                 extra={"_provider": self.source, "_error": error},
             )
-            cached = self.cache.get(self.cache_key)
-            if cached:
-                result = ProviderResult.model_validate(cached)
+            entry = self.cache.get_entry(operational_cache_key)
+            if entry is None:
+                entry = self.cache.get_entry(self.cache_key)
+            stale_until = _parse_cache_time(entry.get("stale_until")) if entry else None
+            if entry and (stale_until is None or stale_until > now):
+                result = ProviderResult.model_validate(entry["payload"])
                 result.metadata.provider_type = ProviderType.CACHE
                 result.metadata.is_fallback = True
                 result.metadata.freshness = Freshness.STALE
@@ -180,3 +224,13 @@ def metadata(
 def latest_observation(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
     valid = [item for item in observations if item.get("value") not in (None, ".")]
     return max(valid, key=lambda item: str(item.get("date") or ""), default=None)
+
+
+def _parse_cache_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)

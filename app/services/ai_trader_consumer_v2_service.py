@@ -363,6 +363,16 @@ def _deterministic_domain_status(
     *,
     settings: Settings,
 ) -> dict[str, dict[str, Any]]:
+    runtime = (
+        full.get("deterministic_domains")
+        if isinstance(full.get("deterministic_domains"), dict)
+        else {}
+    )
+    runtime_domains = (
+        runtime.get("domains")
+        if isinstance(runtime.get("domains"), dict)
+        else {}
+    )
     definitions = {
         "options_positioning": (
             settings.deterministic_options_positioning_enabled,
@@ -415,6 +425,19 @@ def _deterministic_domain_status(
             "execution_status": payload.get("status") or "NOT_MATERIALIZED",
             "data_coverage_status": payload.get("data_coverage_status")
             or ("AVAILABLE" if payload.get("status") == "AVAILABLE" else "NO_DATA"),
+        }
+        if isinstance(runtime_domains.get(domain), dict):
+            output[domain].update(runtime_domains[domain])
+    for domain, payload in runtime_domains.items():
+        if domain not in output and isinstance(payload, dict):
+            output[domain] = dict(payload)
+    if runtime:
+        output["_runtime"] = {
+            "execution_status": runtime.get("execution_status"),
+            "data_coverage_status": runtime.get("data_coverage_status"),
+            "refresh_mode": runtime.get("refresh_mode"),
+            "telemetry": runtime.get("telemetry") or {},
+            "numeric_gaps_sent_to_ai": runtime.get("numeric_gaps_sent_to_ai", 0),
         }
     return output
 

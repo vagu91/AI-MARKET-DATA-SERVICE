@@ -36,6 +36,7 @@ class ResearchSchedulerService:
         settings: Settings,
         *,
         clock: Callable[[], datetime] | None = None,
+        deterministic_runtime=None,
     ) -> None:
         self.settings = settings
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -44,6 +45,7 @@ class ResearchSchedulerService:
         self.snapshots = MarketContextSnapshotRepository(settings)
         self.lifecycle = LifecycleRepository(settings, clock=self.clock)
         self.telemetry = TelemetryRepository(settings, clock=self.clock)
+        self.deterministic_runtime = deterministic_runtime
         migrate_database(settings.database_path)
 
     def scan_due_items(
@@ -753,6 +755,12 @@ class ResearchSchedulerService:
         debug["generated_at_utc"] = now.astimezone(UTC).replace(
             microsecond=0
         ).isoformat()
+        if self.deterministic_runtime is not None:
+            debug = self.deterministic_runtime.enrich_market_context_sync(
+                debug,
+                refresh="auto",
+                trigger_type=trigger_type,
+            )
         from app.services.ai_trader_consumer_v2_service import (
             build_ai_trader_consumer_v2,
         )

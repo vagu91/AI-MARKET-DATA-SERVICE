@@ -145,3 +145,116 @@ Run exactly one separately authorized read-only smoke as documented in
 `docs/deterministic-provider-contract.md`. Never include secret values in command
 output or reports. Do not enable Tradier account access, trading, or streaming, and
 do not deliver the generated outbox envelope to AI-TRADER as part of that smoke.
+
+## PR #19 runtime-wiring review closure — 2026-07-25
+
+### Blocker before the closure
+
+At commit `7bcd7ef4780c91481b763b679836e4ea5480e25e`, the provider
+adapters and `compute_options_positioning()`, `compute_market_internals()`, and
+`compute_cross_asset_context()` were implemented, but the production route did not
+call them. The consumer contract could therefore expose the new section names while
+correctly returning `NO_DATA`.
+
+### Production path after the closure
+
+`build_application_state()` now constructs and injects
+`DeterministicProviderRuntimeService` with the FRED, BLS, BEA, Census, Finnhub, and
+Tradier adapters. Both `auto` and `force` branches of
+`GET /market-context/mnq` call the runtime service after the legacy contract has
+been built and before `_materialize_market_context()` commits the immutable
+snapshot. The lifecycle scheduler calls the same service before assessing and
+persisting a material provider resolution, so a triggering actual also refreshes
+the enabled `REFRESH_ON_TRIGGER` components in the same cycle.
+
+The runtime inserts these debug components before snapshot projection:
+
+- `macro_actuals`;
+- `rates_context`;
+- `options_positioning`;
+- `market_internals`;
+- `cross_asset_context`;
+- `earnings_intelligence`;
+- `current_company_news`;
+- `deterministic_domains`.
+
+QQQ is explicitly identified as the liquid Nasdaq-100 ETF proxy for MNQ. Finnhub
+news remains discovery-only inside earnings intelligence. `current_company_news`
+accepts only the already verified Source Gateway projection and never promotes a
+Finnhub candidate.
+
+`refresh=false` returns before constructing diagnostics or invoking the
+deterministic runtime. Tests compare the SQLite file before and after the request
+and confirm that only the latest valid snapshot is returned, with fail-closed 404
+behavior when none exists.
+
+### Operational cache and Tradier controls
+
+The shared parameterized cache identity includes provider, endpoint/dataset,
+environment, symbols, date range/reference period, and option expiration. Configured
+TTLs now populate `valid_until` and `stale_until`. The resolution policy is:
+
+`valid cache -> deterministic provider -> stale grace/LKG -> qualitative residual AI only -> NO_DATA`.
+
+Valid empty responses and terminal failures receive bounded negative-cache entries;
+retryable failures remain distinct and may use an explicitly labeled stale grace.
+Base FRED/BLS/BEA fetches consume their configured TTLs. Census and Finnhub runtime
+calls consume their configured TTLs. Tradier independently caches quote sets,
+expiration lists, and each option chain.
+
+Tradier applies a sliding-window limiter to every actual HTTP attempt, including
+retries. HTTP 429 handling honors `Retry-After` before exponential fallback.
+Telemetry separates `actual_provider_requests`, cache hits, negative-cache hits,
+stale grace, and AI invocations. The maximum option-expiration count remains three,
+and the adapter still exposes only GET on the three existing allowlisted
+market-data paths.
+
+### Real snapshot/consumer/outbox evidence
+
+`scripts/replay_deterministic_runtime_e2e.py` executes:
+
+`real bootstrap -> runtime orchestrator -> HTTP MockTransport providers -> lifecycle -> snapshot repository -> consumer 2.1 -> local transactional outbox`.
+
+It does not call the pure compute functions directly. The runtime invokes them only
+after provider/cache resolution. The resulting consumer is restored from the real
+snapshot repository, and one triggering Census actual atomically produces one
+snapshot, lifecycle row, component set, and outbox envelope.
+
+Offline replay counters:
+
+- first run: **8 mocked provider requests**, 3 committed official-data/cache hits,
+  **0 AI invocations**;
+- second run with valid cache: **0 provider requests**, 11 cache hits,
+  **0 AI invocations**;
+- endpoint distribution on the first run: quotes 1, expirations 1, option chains 3,
+  Census 1, Finnhub earnings 1, Finnhub candidate news 1;
+- transactional result: 1 snapshot and 1 pending local outbox envelope.
+
+The redacted consumer fixture is
+`tests/fixtures/deterministic_consumer_v21_redacted.json`:
+
+- UTF-8 size: **77,168 bytes**;
+- SHA-256:
+  **75d05989d987e74efc94890535951bde3463efbc4051091633c673492f748050**;
+- all seven populated deterministic data sections report values rather than
+  contract-only `NO_DATA`;
+- execution status is distinct from data coverage status;
+- no raw chain, full Census dataset, bearer token, API key, authorization header,
+  account, order, preview, streaming, or trading field is present.
+
+### Closure validation
+
+- new runtime-wiring tests: **9 passed**;
+- provider/security/lifecycle/snapshot/outbox/consumer/quarantine suites:
+  **542 passed**;
+- complete suite: **1,479 passed**, one pre-existing dependency deprecation warning;
+- Ruff: passed;
+- `py_compile`: passed;
+- `compileall`: passed;
+- `git diff --check`: passed;
+- offline end-to-end replay: passed;
+- schema unchanged, so no migration matrix was required.
+
+No live provider, AI, browser, service restart, operational database, account,
+trading, or order call was made. `.env`, AI-TRADER, and the untracked
+`ai-trader-consumer-payload.json` were not modified.

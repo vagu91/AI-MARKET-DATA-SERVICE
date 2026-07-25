@@ -116,8 +116,17 @@ class ProviderCacheRepository:
         now = datetime.now(UTC).isoformat()
         with connect_sqlite(self.database_path) as conn:
             cursor = conn.execute(
-                "DELETE FROM provider_cache_entries WHERE valid_until IS NOT NULL AND valid_until <= ?",
-                (now,),
+                """
+                DELETE FROM provider_cache_entries
+                WHERE (
+                  stale_until IS NOT NULL AND stale_until <= ?
+                ) OR (
+                  stale_until IS NULL
+                  AND valid_until IS NOT NULL
+                  AND valid_until <= ?
+                )
+                """,
+                (now, now),
             )
             conn.commit()
             return int(cursor.rowcount or 0)

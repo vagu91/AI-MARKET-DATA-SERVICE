@@ -66,10 +66,12 @@ class DeterministicProviderError(RuntimeError):
         *,
         classification: RetryClassification = RetryClassification.TERMINAL,
         status_code: int | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(redact_sensitive(message))
         self.classification = classification
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class NormalizedObservation(BaseModel):
@@ -235,6 +237,7 @@ class DeterministicHttpClient:
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         json_body: Any = None,
+        before_attempt: Callable[[], Awaitable[float | None]] | None = None,
     ) -> tuple[Any, ProviderTelemetry, dict[str, str]]:
         normalized_method = str(method).upper()
         if normalized_method not in self.allowed_methods:
@@ -249,6 +252,10 @@ class DeterministicHttpClient:
         last_error: Exception | None = None
         for attempt in range(self.retry_attempts):
             self.circuit_breaker.check(self.clock())
+            if before_attempt is not None:
+                waited = await before_attempt()
+                if waited:
+                    telemetry.anomalies.append("client_rate_limit_wait")
             telemetry.actual_provider_requests += 1
             started = self.clock()
             try:
@@ -283,10 +290,15 @@ class DeterministicHttpClient:
                     )
                 if response.status_code == 429:
                     telemetry.anomalies.append("rate_limit_exhausted")
+                    retry_after = _retry_after_seconds(
+                        response.headers.get("Retry-After"),
+                        now=self.clock(),
+                    )
                     raise DeterministicProviderError(
                         "provider rate limited request",
                         classification=RetryClassification.RATE_LIMITED,
                         status_code=response.status_code,
+                        retry_after_seconds=retry_after,
                     )
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     raise DeterministicProviderError(
@@ -339,11 +351,65 @@ class DeterministicHttpClient:
             )
             if retryable and attempt + 1 < self.retry_attempts:
                 telemetry.retries += 1
-                await self.sleeper(min(0.25 * (2**attempt), 2.0))
+                retry_after = getattr(last_error, "retry_after_seconds", None)
+                await self.sleeper(
+                    retry_after
+                    if retry_after is not None
+                    else min(0.25 * (2**attempt), 2.0)
+                )
                 continue
             self.circuit_breaker.failed(self.clock())
             raise last_error
         raise last_error or DeterministicProviderError("provider request failed")
+
+
+class AsyncSlidingWindowRateLimiter:
+    def __init__(
+        self,
+        limit_per_minute: int,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.limit = max(1, int(limit_per_minute))
+        self.clock = clock
+        self.sleeper = sleeper
+        self._timestamps: list[datetime] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> float:
+        async with self._lock:
+            now = self.clock()
+            cutoff = now - timedelta(seconds=60)
+            self._timestamps = [item for item in self._timestamps if item > cutoff]
+            waited = 0.0
+            if len(self._timestamps) >= self.limit:
+                waited = max(
+                    0.0,
+                    60.0 - (now - self._timestamps[0]).total_seconds(),
+                )
+                await self.sleeper(waited)
+                now = self.clock()
+                cutoff = now - timedelta(seconds=60)
+                self._timestamps = [item for item in self._timestamps if item > cutoff]
+                if len(self._timestamps) >= self.limit:
+                    self._timestamps.pop(0)
+            self._timestamps.append(now)
+            return waited
+
+
+def _retry_after_seconds(value: str | None, *, now: datetime) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(value, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=UTC)
+        except ValueError:
+            return None
+        aware_now = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+        return max(0.0, (parsed - aware_now).total_seconds())
 
 
 def validate_endpoint_url(url: str, allowed_hosts: Iterable[str]) -> str:

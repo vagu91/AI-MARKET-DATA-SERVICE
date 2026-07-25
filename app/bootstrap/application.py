@@ -60,9 +60,16 @@ from app.services.deterministic_actual_resolver import (
     DeterministicActualResolver,
 )
 from app.services.research_agent_enablement import validate_research_agent_mapping
+from app.services.deterministic_provider_runtime_service import (
+    DeterministicProviderRuntimeService,
+)
 
 
-def build_application_state(settings: Settings) -> dict[str, Any]:
+def build_application_state(
+    settings: Settings,
+    *,
+    deterministic_provider_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     validate_research_agent_mapping()
     assert_test_database_isolated(
         settings.database_path,
@@ -71,15 +78,22 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
     cache = ProviderCacheRepository(settings.database_path)
     init_market_db(settings)
 
+    deterministic_providers = {
+        "fred": FredProvider(cache, settings),
+        "bls": BlsProvider(cache, settings),
+        "bea": BeaProvider(cache, settings),
+        "census": CensusProvider(cache, settings),
+        "finnhub": FinnhubProvider(cache, settings),
+        "tradier": TradierProvider(cache, settings),
+    }
+    deterministic_providers.update(deterministic_provider_overrides or {})
     macro_providers = [
-        FredProvider(cache, settings),
-        BlsProvider(cache, settings),
-        BeaProvider(cache, settings),
+        deterministic_providers["fred"],
+        deterministic_providers["bls"],
+        deterministic_providers["bea"],
     ]
     macro_service = MacroService(providers=macro_providers)
-    census_provider = CensusProvider(cache, settings)
-    finnhub_provider = FinnhubProvider(cache, settings)
-    tradier_provider = TradierProvider(cache, settings)
+    census_provider = deterministic_providers["census"]
     event_enrichment_service = EventEnrichmentService(
         cache=cache,
         providers=[
@@ -128,13 +142,21 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         repository=ai_job_repository,
         snapshots=market_context_snapshots,
     )
-    research_scheduler = ResearchSchedulerService(settings)
+    deterministic_provider_runtime = DeterministicProviderRuntimeService(
+        settings,
+        providers=deterministic_providers,
+        cache=cache,
+    )
+    research_scheduler = ResearchSchedulerService(
+        settings,
+        deterministic_runtime=deterministic_provider_runtime,
+    )
     official_actual_resolver = DeterministicActualResolver(
         settings,
         providers={
-            provider.source: provider
+            getattr(provider, "source", ""): provider
             for provider in [*macro_providers, census_provider]
-            if provider.source in {"BLS", "BEA", "CENSUS"}
+            if getattr(provider, "source", "") in {"BLS", "BEA", "CENSUS"}
         },
     )
     lifecycle_due_resolver = DeterministicLifecycleDueResolver(
@@ -156,14 +178,8 @@ def build_application_state(settings: Settings) -> dict[str, Any]:
         "settings": settings,
         "cache": cache,
         "macro_service": macro_service,
-        "deterministic_providers": {
-            "fred": macro_providers[0],
-            "bls": macro_providers[1],
-            "bea": macro_providers[2],
-            "census": census_provider,
-            "finnhub": finnhub_provider,
-            "tradier": tradier_provider,
-        },
+        "deterministic_providers": deterministic_providers,
+        "deterministic_provider_runtime": deterministic_provider_runtime,
         "event_service": event_service,
         "event_enrichment_service": event_enrichment_service,
         "event_window_service": EventWindowService(event_service),
