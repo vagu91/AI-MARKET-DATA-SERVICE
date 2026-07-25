@@ -1,0 +1,99 @@
+{
+  "schema_version": "census_eits_adapter_regression_v1",
+  "period": "2026-05",
+  "credential": "<redacted>",
+  "broken_query": {
+    "get": "category_code,cell_value,data_type_code,seasonally_adj,time",
+    "time": "2026-05",
+    "result": "HTTP 400 unknown variable time"
+  },
+  "corrected_query": {
+    "get": "category_code,cell_value,data_type_code,error_data,program_code,seasonally_adj,time_slot_id",
+    "time": "2026-05"
+  },
+  "marts_rows": [
+    {
+      "time": "2026-05",
+      "time_slot_id": "413",
+      "program_code": "MARTS",
+      "category_code": "44X72",
+      "data_type_code": "MPCSM",
+      "seasonally_adj": "yes",
+      "error_data": "no",
+      "cell_value": "1.10"
+    },
+    {
+      "time": "2026-05",
+      "time_slot_id": "413",
+      "program_code": "MARTS",
+      "category_code": "44X72",
+      "data_type_code": "SM",
+      "seasonally_adj": "no",
+      "error_data": "no",
+      "cell_value": "2.20"
+    },
+    {
+      "time": "2026-05",
+      "time_slot_id": "413",
+      "program_code": "MARTS",
+      "category_code": "441",
+      "data_type_code": "SM",
+      "seasonally_adj": "yes",
+      "error_data": "no",
+      "cell_value": "3.30"
+    },
+    {
+      "time": "2026-05",
+      "time_slot_id": "412",
+      "program_code": "MARTS",
+      "category_code": "44X72",
+      "data_type_code": "SM",
+      "seasonally_adj": "yes",
+      "error_data": "no",
+      "cell_value": "4.40"
+    },
+    {
+      "time": "2026-05",
+      "time_slot_id": "413",
+      "program_code": "MARTS",
+      "category_code": "44X72",
+      "data_type_code": "SM",
+      "seasonally_adj": "yes",
+      "error_data": "no",
+      "cell_value": "750123.40"
+    }
+  ],
+  "expected_exact_tuple": {
+    "dataset": "MARTS",
+    "program_code": "MARTS",
+    "category_code": "44X72",
+    "data_type_code": "SM",
+    "seasonally_adjusted": true,
+    "time_slot_id": "413",
+    "period": "2026-05",
+    "semantic_field": "advance_retail_sales",
+    "value": "750123.40"
+  },
+  "ambiguous_exact_rows": [
+    {
+      "time": "2026-05",
+      "time_slot_id": "413",
+      "program_code": "MARTS",
+      "category_code": "44X72",
+      "data_type_code": "SM",
+      "seasonally_adj": "yes",
+      "error_data": "no",
+      "cell_value": "750123.40"
+    },
+    {
+      "time": "2026-05",
+      "time_slot_id": "413",
+      "program_code": "MARTS",
+      "category_code": "44X72",
+      "data_type_code": "SM",
+      "seasonally_adj": "yes",
+      "error_data": "no",
+      "cell_value": "750124.40"
+    }
+  ]
+}

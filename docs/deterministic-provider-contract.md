@@ -126,14 +126,41 @@ available; it is not inferred from array order.
 Production requests require an exact lifecycle period (`YYYY-MM` or `YYYY-Qn`).
 There is no historical `time=2012` default.
 
-- MARTS `44X72`: advance retail and food-services sales;
-- ADVM3 `00`: advance durable-goods orders;
-- RESCONST `APERMITS`: housing starts;
-- RESCONST `PERMITS`: building permits;
-- FTD `BOPGS`: international trade balance.
+- MARTS: program `MARTS`, category `44X72`, data type `SM`, adjusted, monthly,
+  millions of dollars: advance retail and food-services sales;
+- ADVM3: program `M3ADV`, category `MDM`, data type `NO`, adjusted, monthly,
+  millions of dollars: advance durable-goods new orders;
+- RESCONST housing starts: program `RESCONST`, category `ASTARTS`, data type
+  `TOTAL`, adjusted, monthly SAAR, thousands of units;
+- RESCONST building permits: program `RESCONST`, category `APERMITS`, data type
+  `TOTAL`, adjusted, monthly SAAR, thousands of units;
+- FTD: program `FTD`, category `BOPGS`, data type `BAL`, adjusted, monthly,
+  millions of dollars: goods-and-services balance.
 
-Only mapped observations are projected. The raw multi-row dataset is never copied to
+`time`, `for`, `in`, and `ucgid` are predicate-only and cannot enter `get`.
+The adapter requests only the value and exact discriminants, including
+`program_code`, `data_type_code`, `seasonally_adj`, `error_data`, and
+`time_slot_id`. Period, program, category, data type, seasonal variant, and the
+period-derived time slot must all match. Zero matches are deterministic `NO_DATA`;
+multiple exact matches are `ambiguous_census_mapping`. Neither case is materialized.
+Raw multi-row data is represented by hashes in audit lineage and is never copied to
 the consumer.
+
+The mapping is sourced from the official EITS variable definitions and program data
+dictionaries:
+
+- [MARTS variables](https://api.census.gov/data/timeseries/eits/marts/variables.html)
+  and [MARTS dictionary](https://www.census.gov/econ_getzippedfile/?programCode=MARTS);
+- [ADVM3 variables](https://api.census.gov/data/timeseries/eits/advm3/variables.html)
+  and [M3ADV dictionary](https://www.census.gov/econ_getzippedfile/?programCode=M3ADV);
+- [RESCONST variables](https://api.census.gov/data/timeseries/eits/resconst/variables.html)
+  and [RESCONST dictionary](https://www.census.gov/econ_getzippedfile/?programCode=RESCONST);
+- [FTD variables](https://api.census.gov/data/timeseries/eits/ftd/variables.html)
+  and [FTD dictionary](https://www.census.gov/econ_getzippedfile/?programCode=FTD).
+
+Historical observations refresh relative to retrieval/cache policy. They never
+schedule a permanent loop by deriving `next_refresh_at` from an old reference period,
+and no release timestamp is invented when Census does not supply one.
 
 ## Tradier read-only boundary
 
