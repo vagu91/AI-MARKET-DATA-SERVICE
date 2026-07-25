@@ -20,7 +20,9 @@ from app.models.events import EconomicEvent, EventEnrichment
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_capability_service import AIResearchCapabilityService
 from app.services.ai_research_job_repository import AIResearchJobRepository
-from app.services.ai_research_job_service import AIResearchJobService
+from app.services.ai_research_job_service import (
+    AIResearchJobService as BaseAIResearchJobService,
+)
 from app.services.ai_research_worker import AIResearchWorker
 from app.services.deterministic_actual_resolver import DeterministicActualResolver
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
@@ -28,11 +30,53 @@ from app.services.market_fact_repository import MarketFactRepository, connect_ma
 from app.services.official_actual_semantics import OFFICIAL_METRICS, derive_official_actual
 from app.services.research_budget import ResearchBudgetExceeded
 from app.services.research_runtime_repository import ResearchRuntimeRepository
-from app.services.research_scheduler_service import ResearchSchedulerService
+from app.services.execution_context import ExecutionContext
+from app.services.research_scheduler_service import (
+    ResearchSchedulerService as BaseResearchSchedulerService,
+)
 from app.services.temporal_domain_service import canonical_event_key
 
 
 POLICY = Path(__file__).resolve().parents[1] / "config" / "source_policy.json"
+
+
+class AIResearchJobService(BaseAIResearchJobService):
+    """Test caller that supplies the explicit authority production entrypoints own."""
+
+    @staticmethod
+    def _authorized(kwargs: dict) -> dict:
+        if "execution_context" in kwargs:
+            return kwargs
+        correlation_id = str(kwargs.get("correlation_id") or "semantic-runtime-test")
+        return {
+            **kwargs,
+            "execution_context": ExecutionContext.explicit_ai(
+                correlation_id=correlation_id,
+                allow_live_providers=True,
+            ),
+        }
+
+    def enqueue_explicit(self, *args, **kwargs):
+        return super().enqueue_explicit(*args, **self._authorized(kwargs))
+
+    def enqueue_missing_events(self, *args, **kwargs):
+        return super().enqueue_missing_events(*args, **self._authorized(kwargs))
+
+    def enqueue_temporal_refreshes(self, *args, **kwargs):
+        return super().enqueue_temporal_refreshes(*args, **self._authorized(kwargs))
+
+
+class ResearchSchedulerService(BaseResearchSchedulerService):
+    def evaluate(self, trigger_name: str, **kwargs):
+        kwargs.setdefault(
+            "execution_context",
+            ExecutionContext.explicit_ai(
+                correlation_id=f"scheduler-{trigger_name}-test",
+                request_origin="research_scheduler",
+                allow_live_providers=True,
+            ),
+        )
+        return super().evaluate(trigger_name, **kwargs)
 
 
 def settings(tmp_path: Path, **overrides) -> Settings:
@@ -43,6 +87,8 @@ def settings(tmp_path: Path, **overrides) -> Settings:
         "enable_ai_researcher": True,
         "ai_worker_enabled": False,
         "research_single_invocation_enabled": False,
+        "enable_scheduler": True,
+        "research_scheduler_enabled": True,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)

@@ -95,9 +95,13 @@ DB hits do not call providers or AI. Facts carry source, source URL, `retrieved_
 
 ## DB-first snapshots and refresh modes
 
-- `refresh=false` returns the latest materialized SQLite snapshot byte-for-byte when one exists: no provider, browser or AI call, no job and no write. If the database has no snapshot yet, it performs one DB/cache-only cold materialization and persists revision 1; it still performs no network, browser or AI call and creates no job.
+- `refresh=false` returns the latest materialized SQLite snapshot byte-for-byte:
+  no provider, browser or AI call, no job and no write. If no snapshot exists,
+  it fails closed with `404` and still performs no write.
 - `refresh=auto` reads valid DB data first, refreshes only missing or expired deterministic data, persists and reads it back, then queues only missing AI fields. The response contains `ai_enrichment.status=PENDING|RUNNING|NOT_REQUIRED` immediately.
-- `refresh=force` refreshes deterministic providers and idempotently queues missing research, but still does not wait for AI.
+- `refresh=force` refreshes deterministic providers only. It never grants AI
+  authority or queues research unless the caller entered through an explicit
+  AI endpoint carrying `allow_ai=true`.
 
 The consumer remains `ai_trader_market_context_consumer` schema `2.1` and includes snapshot identity/revision, lifecycle, section availability, readiness/confidence and structured AI status. `ready_for_full_analysis` is fail-closed while critical temporal data or AI enrichment is pending.
 

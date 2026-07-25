@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.services.data_freshness_service import DataFreshnessService
@@ -16,10 +16,17 @@ NEWS_SNAPSHOT_TYPE = "news_context_snapshot"
 
 
 class NewsIntelligenceRuntimeService:
-    def __init__(self, settings: Settings, *, facts: MarketFactRepository | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        facts: MarketFactRepository | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
         self.facts = facts or MarketFactRepository(settings)
-        self.freshness = DataFreshnessService(settings)
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.freshness = DataFreshnessService(settings, clock=self.clock)
 
     def materialize(
         self,
@@ -40,14 +47,15 @@ class NewsIntelligenceRuntimeService:
                     return output, _runtime_metrics(output, cache_status=freshness.cache_status, persisted=0, read_back=1)
 
         if refresh_mode == "false":
-            context = build_news_context(news_items, limit=limit)
+            context = build_news_context(news_items, limit=limit, now=self.clock())
             output = _with_runtime(context, refresh_mode="false", cache_status="legacy_db_materialized")
             logger.info("news_digest_materialized", extra=_runtime_log(output, cache_status="legacy_db_materialized"))
             return output, _runtime_metrics(output, cache_status="legacy_db_materialized", persisted=0, read_back=0)
 
-        context = build_news_context(news_items, limit=limit)
-        now = datetime.now(UTC).replace(microsecond=0).isoformat()
-        valid_until = news_snapshot_valid_until(context)
+        current = self.clock()
+        context = build_news_context(news_items, limit=limit, now=current)
+        now = current.replace(microsecond=0).isoformat()
+        valid_until = news_snapshot_valid_until(context, now=current)
         payload = {
             "news_context": context,
             "news_digest": context.get("digest") or {},

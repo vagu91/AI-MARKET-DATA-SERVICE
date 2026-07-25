@@ -27,6 +27,10 @@ def cfg(tmp_path) -> Settings:
     return Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
 
 
+def runtime(settings: Settings) -> NewsIntelligenceRuntimeService:
+    return NewsIntelligenceRuntimeService(settings, clock=lambda: NOW)
+
+
 def article(
     title: str,
     *,
@@ -333,53 +337,55 @@ def _runtime_rows() -> list[dict]:
 
 
 def test_force_persists_digest(tmp_path):
-    runtime = NewsIntelligenceRuntimeService(cfg(tmp_path))
-    context, metrics = runtime.materialize(_runtime_rows(), refresh_mode="force")
+    context, metrics = runtime(cfg(tmp_path)).materialize(
+        _runtime_rows(),
+        refresh_mode="force",
+    )
     assert metrics["persisted_count"] == 1
     assert context["digest"]["accepted_article_count"] == 2
 
 
 def test_new_connection_reads_digest(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
     fact = MarketFactRepository(settings).get_fact(NEWS_SNAPSHOT_KEY)
     assert fact["raw_payload"]["news_digest"]["accepted_article_count"] == 2
 
 
 def test_new_runtime_instance_materializes_digest(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    context, metrics = NewsIntelligenceRuntimeService(settings).materialize([], refresh_mode="false")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    context, metrics = runtime(settings).materialize([], refresh_mode="false")
     assert metrics["cache_status"] == "hit"
     assert context["latest"]
 
 
 def test_simulated_restart_false_preserves_values(tmp_path):
     settings = cfg(tmp_path)
-    force, _ = NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    cached, _ = NewsIntelligenceRuntimeService(settings).materialize([], refresh_mode="false")
+    force, _ = runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    cached, _ = runtime(settings).materialize([], refresh_mode="false")
     assert force["digest"]["drivers"] == cached["digest"]["drivers"]
 
 
 def test_provenance_survives_persistence(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    cached, _ = NewsIntelligenceRuntimeService(settings).materialize([], refresh_mode="false")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    cached, _ = runtime(settings).materialize([], refresh_mode="false")
     assert cached["latest"][0]["source_classification"]
     assert "original_publisher" in cached["latest"][0]
 
 
 def test_clusters_survive_persistence(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    cached, _ = NewsIntelligenceRuntimeService(settings).materialize([], refresh_mode="false")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    cached, _ = runtime(settings).materialize([], refresh_mode="false")
     assert cached["clusters"]
 
 
 def test_excluded_breakdown_survives_persistence(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    cached, _ = NewsIntelligenceRuntimeService(settings).materialize([], refresh_mode="false")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    cached, _ = runtime(settings).materialize([], refresh_mode="false")
     assert cached["diagnostics"]["exclusion_breakdown"]["deposit_rates"] == 1
 
 
@@ -390,8 +396,8 @@ def test_legacy_news_rows_remain_readable():
 
 def test_refresh_false_declares_zero_network_browser_and_ai(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    context, _ = NewsIntelligenceRuntimeService(settings).materialize([], refresh_mode="false")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    context, _ = runtime(settings).materialize([], refresh_mode="false")
     assert context["metadata"]["provider_calls"] == 0
     assert context["metadata"]["browser_calls"] == 0
     assert context["metadata"]["AI_called"] is False
@@ -399,33 +405,33 @@ def test_refresh_false_declares_zero_network_browser_and_ai(tmp_path):
 
 def test_refresh_auto_uses_valid_snapshot(tmp_path):
     settings = cfg(tmp_path)
-    force, _ = NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    auto, metrics = NewsIntelligenceRuntimeService(settings).materialize([article("Apple reports earnings")], refresh_mode="auto")
+    force, _ = runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    auto, metrics = runtime(settings).materialize([article("Apple reports earnings")], refresh_mode="auto")
     assert metrics["cache_status"] == "hit"
     assert auto["digest"]["drivers"] == force["digest"]["drivers"]
 
 
 def test_refresh_force_bypasses_valid_snapshot(tmp_path):
     settings = cfg(tmp_path)
-    NewsIntelligenceRuntimeService(settings).materialize(_runtime_rows(), refresh_mode="force")
-    forced, metrics = NewsIntelligenceRuntimeService(settings).materialize([article("Apple reports earnings")], refresh_mode="force")
+    runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
+    forced, metrics = runtime(settings).materialize([article("Apple reports earnings")], refresh_mode="force")
     assert metrics["cache_status"] == "refreshed"
     assert forced["latest"][0]["symbols"] == ["AAPL"]
 
 
 def test_single_runtime_materialization_has_one_persistence(tmp_path):
-    _, metrics = NewsIntelligenceRuntimeService(cfg(tmp_path)).materialize(_runtime_rows(), refresh_mode="force")
+    _, metrics = runtime(cfg(tmp_path)).materialize(_runtime_rows(), refresh_mode="force")
     assert metrics["persisted_count"] == 1
     assert metrics["read_back_count"] == 1
 
 
 def test_expired_snapshot_refreshes_in_auto(tmp_path):
     settings = cfg(tmp_path)
-    runtime = NewsIntelligenceRuntimeService(settings)
-    runtime.materialize(_runtime_rows(), refresh_mode="force")
+    service = runtime(settings)
+    service.materialize(_runtime_rows(), refresh_mode="force")
     fact = MarketFactRepository(settings).get_fact(NEWS_SNAPSHOT_KEY)
     MarketFactRepository(settings).upsert_fact({**fact, "valid_until": (NOW - timedelta(hours=1)).isoformat(), "raw_payload_json": fact["raw_payload"], "warnings_json": fact["warnings"], "errors_json": fact["errors"]})
-    refreshed, metrics = NewsIntelligenceRuntimeService(settings).materialize([article("Apple reports earnings")], refresh_mode="auto")
+    refreshed, metrics = runtime(settings).materialize([article("Apple reports earnings")], refresh_mode="auto")
     assert metrics["cache_status"] == "refreshed"
     assert refreshed["latest"][0]["symbols"] == ["AAPL"]
 
@@ -438,7 +444,7 @@ def test_high_impact_ttl_is_shorter_than_context_ttl():
 
 
 def test_false_with_legacy_db_rows_still_has_no_external_calls(tmp_path):
-    context, metrics = NewsIntelligenceRuntimeService(cfg(tmp_path)).materialize(_runtime_rows(), refresh_mode="false")
+    context, metrics = runtime(cfg(tmp_path)).materialize(_runtime_rows(), refresh_mode="false")
     assert metrics["cache_status"] == "legacy_db_materialized"
     assert context["metadata"]["provider_calls"] == 0
 

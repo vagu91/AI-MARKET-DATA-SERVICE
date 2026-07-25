@@ -15,6 +15,7 @@ from app.infrastructure.persistence.schema import MIGRATIONS
 from app.main import app
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
@@ -95,6 +96,9 @@ def make_run(
         },
         pending_fields=list(PROFILES[profile_id].required_fields),
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     repository = ResearchRuntimeRepository(cfg, now=lambda: NOW)
@@ -532,6 +536,9 @@ def test_parent_creates_exactly_four_specialized_residual_children(
     parent = ParallelResearchCoordinator(cfg).create_parent(
         manifest,
         correlation_id="four-domain-parent",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="four-domain-parent",
+        ),
     )
     assert parent["concurrency_limit"] == 2
     assert [job["specialized_topic"] for job in parent["child_jobs"]] == sorted(
@@ -717,6 +724,9 @@ def test_retry_recovery_idempotency_and_bounded_parallelism(
         correlation_id="retry-domain",
         request_payload={"gap": {"topic": "options_positioning"}},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="retry-domain",
+        ),
     )
     acquired = repository.acquire_next("worker-retry")
     assert acquired and acquired["job_id"] == job["job_id"]
@@ -746,10 +756,16 @@ def test_retry_recovery_idempotency_and_bounded_parallelism(
     first = coordinator.create_parent(
         manifest,
         correlation_id="idempotent-parent",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="idempotent-parent",
+        ),
     )
     second = coordinator.create_parent(
         manifest,
         correlation_id="idempotent-parent",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="idempotent-parent",
+        ),
     )
     assert first["parent_run_id"] == second["parent_run_id"]
     assert second["created"] is False

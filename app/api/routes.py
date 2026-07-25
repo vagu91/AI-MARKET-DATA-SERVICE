@@ -64,6 +64,7 @@ from app.services.market_context_outbox_service import (
     MarketContextOutboxRepository,
 )
 from app.services.research_agent_enablement import safe_research_agent_capabilities
+from app.services.execution_context import ExecutionContext
 
 router = APIRouter()
 
@@ -131,6 +132,9 @@ async def enqueue_ai_research_job(
     request: AIResearchEnqueueRequest,
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
 ) -> dict[str, object]:
+    execution_context = ExecutionContext.explicit_ai(
+        correlation_id=request.correlation_id,
+    )
     job, created = AIResearchJobService(enrichment_orchestrator.settings).enqueue_explicit(
         job_type=request.job_type,
         symbol=request.symbol,
@@ -139,6 +143,7 @@ async def enqueue_ai_research_job(
         event_key=request.event_key,
         pending_fields=request.pending_fields,
         force=request.force_requeue,
+        execution_context=execution_context,
     )
     return {"created": created, "job": job, "trading_actions": "not_supported"}
 
@@ -156,14 +161,18 @@ async def enqueue_mnq_market_research(
         snapshot=latest,
         components=components,
     )
+    correlation_id = (
+        request.correlation_id
+        or f"mnq-research-{datetime.now(UTC).isoformat()}"
+    )
     parent = ParallelResearchCoordinator(settings).create_parent(
         manifest,
-        correlation_id=(
-            request.correlation_id
-            or f"mnq-research-{datetime.now(UTC).isoformat()}"
-        ),
+        correlation_id=correlation_id,
         force=request.force_requeue,
         authorized_live_smoke=request.authorized_live_smoke,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=correlation_id,
+        ),
     )
     return {
         "created": bool(parent.get("created", True)),

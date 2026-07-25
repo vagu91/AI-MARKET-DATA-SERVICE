@@ -16,6 +16,8 @@ from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.research_profiles import PROFILES
 from app.services.research_runtime_repository import ResearchRuntimeRepository
 from app.services.research_agent_enablement import is_research_agent_enabled
+from app.services.execution_context import ExecutionContext, authorizes_ai
+from app.services.observability_contract_service import TelemetryRepository
 
 
 class ParallelResearchCoordinator:
@@ -29,6 +31,7 @@ class ParallelResearchCoordinator:
             return
         self.jobs = AIResearchJobService(settings)
         self.runs = ResearchRuntimeRepository(settings)
+        self.telemetry = TelemetryRepository(settings)
         migrate_database(settings.database_path)
 
     def create_parent(
@@ -38,12 +41,38 @@ class ParallelResearchCoordinator:
         correlation_id: str,
         force: bool = False,
         authorized_live_smoke: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         backend = str(self.settings.research_backend).lower()
         if self.jobs is None or self.runs is None:
             raise RuntimeError("read_only_parallel_coordinator_cannot_create_parent")
         if backend not in {"codex_cli", "openai_api"}:
             raise ValueError(f"unsupported_research_backend:{backend}")
+        if not authorizes_ai(
+            execution_context,
+            environment=self.settings.environment,
+        ):
+            self.telemetry.emit(
+                "ai_authorization",
+                identifiers={"correlation_id": correlation_id},
+                decision_summary="AI_SUPPRESSED",
+                stop_reason="AI_SUPPRESSED",
+                payload={
+                    "status": "AI_SUPPRESSED",
+                    "reason": "parallel_coordinator_requires_explicit_context",
+                },
+            )
+            return {
+                "created": False,
+                "parent_run_id": None,
+                "run_id": None,
+                "status": "AI_SUPPRESSED",
+                "manifest_id": manifest.get("manifest_id"),
+                "backend": backend,
+                "child_jobs": [],
+                "child_job_ids": [],
+                "concurrency_limit": int(self.settings.research_parallelism),
+            }
         if not force:
             existing = self._active_parent_for_correlation(correlation_id)
             if existing is not None:
@@ -137,6 +166,7 @@ class ParallelResearchCoordinator:
                 parent_run_id=parent_run_id,
                 specialized_topic=topic,
                 child_ordinal=ordinal,
+                execution_context=execution_context,
             )
             child_run = self.runs.ensure_run(job, profile.profile_id, profile.prompt_version)
             with connect_sqlite(self.settings.database_path) as conn:

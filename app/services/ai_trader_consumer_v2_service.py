@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.config import Settings
+from app.core.redaction import redact_sensitive
 from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_hardening_service import harden_market_context
 from app.services.market_session_service import NEW_YORK
@@ -43,6 +45,7 @@ INCLUDED_SECTIONS = [
     "deterministic_domains",
     "agentic_domains",
     "quality",
+    "compaction",
 ]
 EXCLUDED_DEBUG_SECTIONS = [
     "provider_diagnostics",
@@ -233,81 +236,284 @@ def build_ai_trader_consumer_v2(
     return consumer
 
 
+SECTION_BYTE_BUDGETS = {
+    "readiness": 2_500,
+    "snapshot_summary": 1_500,
+    "macro": 6_500,
+    "event_risk": 9_000,
+    "rates": 4_500,
+    "risk": 5_500,
+    "positioning": 2_500,
+    "nasdaq": 9_000,
+    "earnings": 4_000,
+    "news": 4_000,
+    "sentiment": 2_500,
+    "market_schedule": 3_500,
+    "macro_actuals": 2_000,
+    "rates_context": 2_000,
+    "options_positioning": 2_500,
+    "market_internals": 2_000,
+    "cross_asset_context": 2_000,
+    "earnings_intelligence": 2_000,
+    "current_company_news": 2_000,
+    "deterministic_domains": 3_500,
+    "agentic_domains": 3_500,
+    "quality": 3_000,
+    "lifecycle": 2_500,
+    "ai_enrichment": 1_500,
+    "research": 3_000,
+    "warnings": 1_500,
+}
+_CONSUMER_FORBIDDEN_KEYS = frozenset(
+    {
+        "chains",
+        "contracts",
+        "raw_chain",
+        "raw_contracts",
+        "raw_payload",
+        "raw_payload_json",
+        "provider_diagnostics",
+        "source_attempts",
+        "fallback_chain",
+        "request_headers",
+        "response_headers",
+        "authorization",
+        "api_key",
+        "token",
+    }
+)
+_SUMMARY_KEYS = (
+    "status",
+    "data_coverage_status",
+    "as_of",
+    "data_as_of",
+    "freshness",
+    "fresh_until",
+    "valid_until",
+    "provider",
+    "source",
+    "lineage",
+    "underlying",
+    "target_context",
+    "proxy_used",
+    "expirations_considered",
+    "put_call_ratio",
+    "put_call_volume_ratio",
+    "put_call_open_interest_ratio",
+    "open_interest_aggregate",
+    "volume_aggregate",
+    "dominant_strikes",
+    "top_strikes",
+    "implied_volatility",
+    "reason",
+    "no_data_reason",
+    "warnings",
+    "coverage",
+    "quality",
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"(?i)\bbearer\s+[A-Za-z0-9_\-./+=]{4,}"
+)
+
+
 def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> None:
-    if _payload_size(consumer) < limit:
-        return
-    consumer.pop("lifecycle", None)
-    news = consumer.get("news") or {}
-    event_risk = consumer.get("event_risk") or {}
-    earnings = consumer.get("earnings") or {}
-    for container, key, keep in (
-        (news, "articles", 4),
-        (news, "clusters", 4),
-        (news, "current_drivers", 4),
-        (news, "previous_session_drivers", 4),
-        (event_risk, "critical_events", 4),
-        (event_risk.get("xtb_us_macro_calendar") or {}, "events", 8),
-        (earnings, "upcoming_mega_cap_earnings_14d", 10),
-        (earnings, "released_earnings", 10),
-    ):
-        if isinstance(container.get(key), list):
-            container[key] = container[key][:keep]
-    warnings = list(consumer.get("warnings") or [])
-    warnings.append({"code": "consumer_payload_truncated", "count": 1, "blocking": False})
-    consumer["warnings"] = warnings
-    if _payload_size(consumer) >= limit:
-        for key in (
-            "macro_actuals",
-            "rates_context",
-            "options_positioning",
-            "market_internals",
-            "cross_asset_context",
-            "earnings_intelligence",
-            "current_company_news",
-        ):
-            section = consumer.get(key)
-            if isinstance(section, dict) and isinstance(section.get("items"), list):
-                section["items"] = section["items"][:8]
-        # Quality remains present, but verbose debug-only provider traces are not part of the consumer contract.
-        quality = consumer.get("quality") or {}
-        consumer["quality"] = {
-            key: value for key, value in quality.items()
-            if key in {"section_quality", "overall_data_quality", "pipeline_integrity", "consumer_quality"}
+    """Apply stable semantic section budgets before validating canonical bytes."""
+    originals = {
+        key: value
+        for key, value in consumer.items()
+    }
+    sanitized = _sanitize_consumer_value(consumer)
+    if not isinstance(sanitized, dict):
+        raise ValueError("consumer_payload_must_be_object")
+    consumer.clear()
+    consumer.update(sanitized)
+    section_metrics: dict[str, dict[str, Any]] = {}
+    for key, budget in SECTION_BYTE_BUDGETS.items():
+        if key not in consumer:
+            continue
+        original = originals.get(key)
+        before_bytes = _value_size(original)
+        before_items = _recursive_item_count(original)
+        sanitized_section = consumer[key]
+        sanitized_bytes = _value_size(sanitized_section)
+        compacted = (
+            _fit_section(sanitized_section, budget=budget)
+            if sanitized_bytes > budget
+            else sanitized_section
+        )
+        consumer[key] = compacted
+        after_bytes = _value_size(compacted)
+        after_items = _recursive_item_count(compacted)
+        section_metrics[key] = {
+            "budget_bytes": budget,
+            "before_bytes": before_bytes,
+            "sanitized_bytes": sanitized_bytes,
+            "after_bytes": after_bytes,
+            "items_before": before_items,
+            "items_after": after_items,
+            "items_removed_or_deduplicated": max(before_items - after_items, 0),
+            "reason": (
+                "section_budget_semantic_compaction"
+                if sanitized_bytes > budget
+                else "sanitized_within_section_budget"
+            ),
         }
-    if _payload_size(consumer) >= limit:
-        compact = _drop_nulls(consumer)
-        consumer.clear()
-        consumer.update(compact)
-        for domain in (consumer.get("agentic_domains") or {}).values():
-            if not isinstance(domain, dict):
-                continue
-            if isinstance(domain.get("items"), list):
-                domain["items"] = domain["items"][:8]
-            if isinstance(domain.get("fields"), dict):
-                domain["fields"] = {
-                    key: value
-                    for key, value in domain["fields"].items()
-                    if value not in (None, {}, [])
-                }
-    if _payload_size(consumer) >= limit:
-        for container, key, keep in (
-            (consumer.get("news") or {}, "articles", 2),
-            (consumer.get("news") or {}, "current_drivers", 2),
-            (consumer.get("news") or {}, "previous_session_drivers", 2),
-            (consumer.get("event_risk") or {}, "critical_events", 2),
-            (consumer.get("event_risk") or {}, "historical_events", 2),
-            (consumer.get("earnings") or {}, "upcoming_mega_cap_earnings_14d", 4),
-            (consumer.get("earnings") or {}, "released_earnings", 4),
-        ):
-            if isinstance(container.get(key), list):
-                container[key] = container[key][:keep]
-        consumer["quality"] = {}
-    if _payload_size(consumer) >= limit:
-        bounded = _bound_strings(consumer, limit=512)
-        consumer.clear()
-        consumer.update(bounded)
+    consumer["compaction"] = {
+        "serialization": "utf8_json_compact_separators",
+        "limit_bytes": limit,
+        "total_size_bytes": 0,
+        "sections": section_metrics,
+    }
+    for _ in range(3):
+        consumer["compaction"]["total_size_bytes"] = _payload_size(consumer)
+    _validate_consumer_security(consumer)
     if _payload_size(consumer) >= limit:
         raise ValueError("consumer_payload_exceeds_90kb")
+
+
+def _sanitize_consumer_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            normalized_key = str(key)
+            if normalized_key.lower() in _CONSUMER_FORBIDDEN_KEYS:
+                continue
+            output[normalized_key] = _sanitize_consumer_value(item)
+        return output
+    if isinstance(value, list):
+        output: list[Any] = []
+        seen: set[str] = set()
+        for item in value:
+            sanitized = _sanitize_consumer_value(item)
+            canonical = json.dumps(
+                sanitized,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            output.append(sanitized)
+        return output
+    if isinstance(value, str):
+        redacted = redact_sensitive(value)
+        return _BEARER_TOKEN_RE.sub("Bearer <redacted>", redacted)
+    return value
+
+
+def _validate_consumer_security(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in _CONSUMER_FORBIDDEN_KEYS:
+                raise ValueError(f"consumer_forbidden_key:{key}")
+            _validate_consumer_security(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_consumer_security(item)
+        return
+    if isinstance(value, str) and _BEARER_TOKEN_RE.search(value):
+        raise ValueError("consumer_secret_pattern_detected")
+
+
+def _fit_section(value: Any, *, budget: int) -> Any:
+    for keep in (16, 8, 4, 2):
+        compacted = _semantic_compact(value, list_limit=keep)
+        if _value_size(compacted) <= budget:
+            return compacted
+    summarized = _semantic_summary(value)
+    if _value_size(summarized) <= budget:
+        return summarized
+    return _bound_strings(summarized, limit=160)
+
+
+def _semantic_compact(value: Any, *, list_limit: int) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _semantic_compact(item, list_limit=list_limit)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key).lower() not in _CONSUMER_FORBIDDEN_KEYS
+            and item not in (None, {}, [])
+        }
+    if isinstance(value, list):
+        deduplicated: dict[str, Any] = {}
+        for item in value:
+            compacted = _semantic_compact(item, list_limit=list_limit)
+            deduplicated.setdefault(
+                json.dumps(compacted, sort_keys=True, default=str, separators=(",", ":")),
+                compacted,
+            )
+        ordered = sorted(
+            deduplicated.values(),
+            key=_semantic_rank,
+            reverse=True,
+        )
+        return ordered[:list_limit]
+    if isinstance(value, str):
+        return value if len(value) <= 512 else f"{value[:509]}..."
+    return value
+
+
+def _semantic_summary(value: Any) -> Any:
+    if isinstance(value, dict):
+        output = {
+            key: _semantic_compact(value[key], list_limit=2)
+            for key in _SUMMARY_KEYS
+            if key in value and value[key] not in (None, {}, [])
+        }
+        output["compacted_item_count"] = _recursive_item_count(value)
+        return output
+    if isinstance(value, list):
+        return {
+            "items": _semantic_compact(value, list_limit=2),
+            "compacted_item_count": len(value),
+        }
+    return value
+
+
+def _semantic_rank(value: Any) -> tuple[float, str, str]:
+    if not isinstance(value, dict):
+        canonical = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+        return 0.0, "", canonical
+    scores = []
+    for key in (
+        "relevance",
+        "mnq_relevance_score",
+        "market_impact_score",
+        "importance",
+        "weight_pct",
+        "open_interest",
+        "volume",
+    ):
+        try:
+            scores.append(float(value.get(key) or 0))
+        except (TypeError, ValueError):
+            continue
+    score = max(scores, default=0.0)
+    timestamp = str(
+        value.get("as_of")
+        or value.get("published_at")
+        or value.get("release_at")
+        or value.get("date")
+        or ""
+    )
+    canonical = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    return score, timestamp, canonical
+
+
+def _recursive_item_count(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value) + sum(_recursive_item_count(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_recursive_item_count(item) for item in value.values())
+    return 0
+
+
+def _value_size(value: Any) -> int:
+    return len(
+        json.dumps(value, default=str, separators=(",", ":")).encode("utf-8")
+    )
 
 
 def _ai_enrichment(value: dict[str, Any]) -> dict[str, Any]:

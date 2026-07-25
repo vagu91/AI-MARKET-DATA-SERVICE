@@ -50,6 +50,7 @@ from app.services.risk_context_runtime_service import RiskContextRuntimeService
 from app.services.social_sentiment_service import SocialSentimentService
 from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
+from app.services.execution_context import ExecutionContext
 
 
 class DiagnosticsService:
@@ -130,6 +131,10 @@ class DiagnosticsService:
         now = datetime.now(UTC)
         fetch_missing = refresh != "false"
         force = refresh == "force"
+        request_context = ExecutionContext.provider_only(
+            correlation_id=f"market-context-{uuid.uuid4()}",
+            allow_live_providers=fetch_missing,
+        )
 
         async def load_macro() -> tuple[MacroLatestResponse, dict[str, Any]]:
             try:
@@ -201,6 +206,7 @@ class DiagnosticsService:
                         end=now + timedelta(days=days),
                         trigger="diagnostics_full_model" if not force else "diagnostics_full_model_force",
                         force=force,
+                        execution_context=request_context,
                     ),
                     timeout=enrichment_timeout,
                 )

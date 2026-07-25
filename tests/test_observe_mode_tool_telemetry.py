@@ -20,6 +20,7 @@ from app.services.ai_research_job_executor import (
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_worker import AIResearchWorker
+from app.services.execution_context import ExecutionContext
 from app.services.codex_runtime_contract import step_output_schema
 from app.services.research_budget import (
     ResearchBudgetExceeded,
@@ -62,6 +63,9 @@ def enqueue(cfg: Settings, identity: str) -> dict[str, Any]:
         correlation_id=identity,
         request_payload={"database_context": {}, "identity": identity},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     return job

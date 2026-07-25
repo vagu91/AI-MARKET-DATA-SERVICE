@@ -13,6 +13,41 @@ particular, options positioning, market internals, cross-asset context, and earn
 intelligence remain deterministic domains when their corresponding AI flags are
 false.
 
+## Provider and AI authority
+
+Every refresh carries one immutable execution context with
+`allow_live_providers`, `allow_ai`, `request_origin`, and `correlation_id`.
+`refresh=false|auto|force` may affect deterministic-provider authority only;
+none of those values can set `allow_ai=true`. Provider refresh routes always
+construct a provider-only context.
+
+The final persistent queue method validates the context, known job type,
+research master switch, and per-agent switch. Scheduler, recovery, lifecycle
+resolver, retry, worker acquisition, and the agentic runtime preserve and
+re-check the same context. An explicit queue API is an authority boundary;
+provider/on-demand services must pass their provider-only context. Decisions
+are recorded as `AI_ALLOWED`, `AI_SUPPRESSED`, or `AI_NOT_REQUIRED` without
+prompts, credentials, headers, or source content.
+
+Resolution order is cache/provider, normalization and validation, residual-gap
+calculation, optional explicitly authorized AI, coalescing/idempotency, then
+persistence. A legitimately empty weekend/holiday calendar is not a gap.
+
+## Consumer and materialization budgets
+
+Consumer 2.1 uses canonical compact JSON (`UTF-8`, separators `,` and `:`) and
+deterministic per-section byte budgets. Oversized sections are semantically
+deduplicated, relevance/recency sorted, item-bounded, stripped of raw provider
+and diagnostic records, and summarized if still above their budget. Option
+chains expose verified aggregates only; individual contracts remain in
+debug/audit storage. The `compaction` section records total bytes, section
+bytes, item counts before/after, removed/deduplicated counts, and reason.
+
+Snapshot preflight builds and validates debug and consumer projections,
+contract/schema, canonical byte size, source policy, and temporal policy before
+the snapshot/component/link/outbox transaction begins. Provider cache and
+observation writes are reusable fetch evidence and remain separate.
+
 ## Common envelope
 
 Every adapter can project a result through `BaseProvider.provider_contract`. New

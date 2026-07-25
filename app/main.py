@@ -10,24 +10,56 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.infrastructure.storage_retention import cleanup_storage, maybe_run_startup_cleanup
 from app.infrastructure.persistence.database_maintenance import run_database_maintenance
+from app.services.execution_context import ExecutionContext
 
 
 async def run_lifecycle_due_scan(state):
     scheduler = state["research_scheduler"]
+    execution_context = ExecutionContext.explicit_ai(
+        correlation_id="apscheduler-lifecycle-due-scanner",
+        request_origin="research_scheduler",
+        allow_live_providers=True,
+    )
     return await asyncio.to_thread(
         scheduler.scan_due_items,
         owner="apscheduler-lifecycle-due-scanner",
         resolver=state["lifecycle_due_resolver"].resolve,
-        ai_enqueue=scheduler.enqueue_due_residuals,
+        ai_enqueue=lambda items: scheduler.enqueue_due_residuals(
+            items,
+            execution_context=execution_context,
+        ),
+        execution_context=execution_context,
     )
 
 
 async def run_startup_lifecycle_catchup(state):
     scheduler = state["research_scheduler"]
+    execution_context = ExecutionContext.explicit_ai(
+        correlation_id="startup-lifecycle-catch-up",
+        request_origin="recovery",
+        allow_live_providers=True,
+    )
     return await asyncio.to_thread(
         scheduler.startup_catch_up,
         resolver=state["lifecycle_due_resolver"].resolve,
-        ai_enqueue=scheduler.enqueue_due_residuals,
+        ai_enqueue=lambda items: scheduler.enqueue_due_residuals(
+            items,
+            execution_context=execution_context,
+        ),
+        execution_context=execution_context,
+    )
+
+
+def run_research_scheduler_evaluation(state, trigger_name: str):
+    scheduler = state["research_scheduler"]
+    execution_context = ExecutionContext.explicit_ai(
+        correlation_id=f"apscheduler-research-{trigger_name}",
+        request_origin="research_scheduler",
+        allow_live_providers=True,
+    )
+    return scheduler.evaluate(
+        trigger_name,
+        execution_context=execution_context,
     )
 
 
@@ -66,18 +98,21 @@ async def lifespan(app: FastAPI):
             post_hour, post_minute = (int(item) for item in settings.research_postmarket_time.split(":"))
             if settings.research_premarket_enabled:
                 scheduler.add_job(
-                    lambda: state["research_scheduler"].evaluate("premarket"), "cron",
+                    run_research_scheduler_evaluation, "cron",
+                    args=[state, "premarket"],
                     hour=pre_hour, minute=pre_minute, id="research_premarket", max_instances=1, coalesce=True,
                 )
             if settings.research_session_enabled:
                 scheduler.add_job(
-                    lambda: state["research_scheduler"].evaluate("session"), "interval",
+                    run_research_scheduler_evaluation, "interval",
+                    args=[state, "session"],
                     minutes=settings.research_session_interval_minutes, id="research_session",
                     max_instances=1, coalesce=True,
                 )
             if settings.research_postmarket_enabled:
                 scheduler.add_job(
-                    lambda: state["research_scheduler"].evaluate("postmarket"), "cron",
+                    run_research_scheduler_evaluation, "cron",
+                    args=[state, "postmarket"],
                     hour=post_hour, minute=post_minute, id="research_postmarket", max_instances=1, coalesce=True,
                 )
             if settings.research_event_triggers_enabled:
@@ -86,13 +121,15 @@ async def lifespan(app: FastAPI):
                     "temporary_source_retry",
                 ):
                     scheduler.add_job(
-                        lambda selected=trigger: state["research_scheduler"].evaluate(selected),
+                        run_research_scheduler_evaluation,
                         "interval", minutes=settings.research_session_interval_minutes,
+                        args=[state, trigger],
                         id=f"research_{trigger}", max_instances=1, coalesce=True,
                     )
             if settings.research_news_enabled:
                 scheduler.add_job(
-                    lambda: state["research_scheduler"].evaluate("news_refresh"), "interval",
+                    run_research_scheduler_evaluation, "interval",
+                    args=[state, "news_refresh"],
                     minutes=settings.ai_run_window_news_minutes, id="research_news_refresh",
                     max_instances=1, coalesce=True,
                 )

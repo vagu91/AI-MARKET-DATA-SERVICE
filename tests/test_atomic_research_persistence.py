@@ -17,6 +17,7 @@ from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import _split_sql, migrate_database
 from app.infrastructure.persistence.schema import MIGRATIONS
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
@@ -100,6 +101,9 @@ def make_run(
         correlation_id=identity,
         request_payload={"database_context": {"data_as_of": REFERENCE_NOW.isoformat()}},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     repository = repository_type(cfg, now=lambda: REFERENCE_NOW)

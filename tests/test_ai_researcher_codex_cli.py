@@ -252,7 +252,7 @@ async def test_batch_of_five_events_is_one_codex_call_and_next_run_db_hit(tmp_pa
     )
     assert calls == 0
     queued = orchestrator.ai_jobs.repository.latest(symbol="MNQ")
-    assert len(queued) == 1 and queued[0]["status"] == "PENDING"
+    assert queued == []
 
     await orchestrator.enrich_events(
         events=[event()],
@@ -262,7 +262,7 @@ async def test_batch_of_five_events_is_one_codex_call_and_next_run_db_hit(tmp_pa
         trigger="test",
     )
     assert calls == 0
-    assert len(orchestrator.ai_jobs.repository.latest(symbol="MNQ")) == 1
+    assert orchestrator.ai_jobs.repository.latest(symbol="MNQ") == []
 
 
 def test_no_data_ai_result_creates_negative_cache(tmp_path):

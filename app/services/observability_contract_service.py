@@ -33,6 +33,7 @@ TELEMETRY_EVENTS = frozenset(
         "ai_invocation_attempted",
         "ai_invocation_completed",
         "ai_invocation_aborted",
+        "ai_authorization",
         "search",
         "source_discovery",
         "fetch",

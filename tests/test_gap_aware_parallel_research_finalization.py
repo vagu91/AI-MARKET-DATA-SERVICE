@@ -18,6 +18,7 @@ from app.infrastructure.persistence.schema import MIGRATIONS
 from app.services.agentic_research_runtime import ALL_STEPS
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
+from app.services.execution_context import ExecutionContext
 from app.services.db_only_market_context_materializer import (
     DBOnlyMarketContextMaterializer,
 )
@@ -182,6 +183,9 @@ def make_run(
         correlation_id=identity,
         request_payload={"gap": {"topic": "vix_risk"}},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     repository = ResearchRuntimeRepository(settings, now=lambda: NOW)
@@ -329,6 +333,9 @@ def test_05_fresh_db_earnings_creates_no_earnings_agent(tmp_path: Path) -> None:
     parent = ParallelResearchCoordinator(settings).create_parent(
         manifest,
         correlation_id="earnings-fresh",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="earnings-fresh",
+        ),
     )
     assert all(
         child.get("specialized_topic") != "earnings"
@@ -347,6 +354,9 @@ def test_06_missing_vix_creates_only_risk_child(tmp_path: Path) -> None:
     parent = ParallelResearchCoordinator(settings).create_parent(
         manifest,
         correlation_id="vix-only",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="vix-only",
+        ),
     )
     assert [job["profile_id"] for job in parent["child_jobs"]] == [
         "VIX_RISK_RESEARCH"
@@ -363,6 +373,9 @@ def test_07_missing_cot_creates_only_cot_child(tmp_path: Path) -> None:
     parent = ParallelResearchCoordinator(settings).create_parent(
         manifest,
         correlation_id="cot-only",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="cot-only",
+        ),
     )
     assert [job["profile_id"] for job in parent["child_jobs"]] == [
         "COT_POSITIONING_RESEARCH"
