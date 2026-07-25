@@ -15,6 +15,7 @@ from app.infrastructure.persistence.migrations import _split_sql, migrate_databa
 from app.infrastructure.persistence.schema import MIGRATIONS
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
@@ -373,6 +374,9 @@ def test_child_agent_prompt_context_never_receives_impossible_event(
             },
             "missing_fields": ["current_events"],
         },
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="temporal-prompt",
+        ),
     )
     assert created
     executor = _CapturingExecutor()

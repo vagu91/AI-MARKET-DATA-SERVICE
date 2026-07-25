@@ -30,7 +30,11 @@ from app.services.observability_contract_service import (
     DeterministicAnomalyDetector,
     TelemetryRepository,
 )
-from app.services.execution_context import ExecutionContext
+from app.services.execution_context import (
+    ExecutionContext,
+    authorizes_ai,
+    authorizes_live_providers,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -140,11 +144,11 @@ class AIResearchWorker:
         )
         requires_ai = job.get("job_type") != "RELEASE_ACTUAL_REFRESH"
         authorized = bool(
-            execution_context
-            and (
-                execution_context.allow_ai
-                if requires_ai
-                else execution_context.allow_live_providers
+            authorizes_ai(execution_context)
+            if requires_ai
+            else (
+                authorizes_ai(execution_context)
+                and authorizes_live_providers(execution_context)
             )
         )
         if not authorized:

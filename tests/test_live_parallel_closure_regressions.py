@@ -14,6 +14,7 @@ import pytest
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.parallel_research_coordinator import _aggregate_parent_telemetry
 from app.services.research_backend import ResearchBackendResult
 from app.services.research_metrics_service import ResearchMetricsService
@@ -116,6 +117,9 @@ def make_run(
         correlation_id=identity,
         request_payload={"gap": {"topic": topic}},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     repository = OfflineEvidenceRepository(cfg, now=lambda: REFERENCE_NOW)

@@ -20,6 +20,7 @@ from app.services.event_driven_lifecycle_service import (
     materiality_fingerprint,
     next_cftc_publication,
 )
+from app.services.execution_context import ExecutionContext
 from app.services.market_context_hardening_service import _event_window_status
 from app.services.market_context_outbox_service import MarketContextOutboxRepository
 from app.services.market_context_snapshot_repository import (
@@ -138,7 +139,12 @@ def test_provider_resolution_results_in_zero_ai(tmp_path: Path) -> None:
 
 
 def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:
-    settings = cfg(tmp_path, lifecycle_due_scanner_enabled=True)
+    settings = cfg(
+        tmp_path,
+        enable_scheduler=True,
+        research_scheduler_enabled=True,
+        lifecycle_due_scanner_enabled=True,
+    )
     _due_item(settings, "VIX")
     calls: list[list[dict[str, Any]]] = []
     result = ResearchSchedulerService(settings, clock=lambda: NOW).scan_due_items(
@@ -146,6 +152,10 @@ def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:
         resolver=lambda _: {"status": "EXHAUSTED"},
         ai_enqueue=lambda items: calls.append(items),
         trigger_type="macro_actual",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="test",
+            request_origin="research_scheduler",
+        ),
     )
     assert result["ai_invocations"] == len(calls) == 1
 
@@ -208,7 +218,12 @@ def test_expired_negative_cache_allows_new_attempt(tmp_path: Path) -> None:
 
 
 def test_two_due_items_are_coalesced_into_one_ai_enqueue(tmp_path: Path) -> None:
-    settings = cfg(tmp_path, lifecycle_due_scanner_enabled=True)
+    settings = cfg(
+        tmp_path,
+        enable_scheduler=True,
+        research_scheduler_enabled=True,
+        lifecycle_due_scanner_enabled=True,
+    )
     _due_item(settings, "VIX")
     _due_item(settings, "VVIX", "vvix")
     calls: list[Any] = []
@@ -217,6 +232,10 @@ def test_two_due_items_are_coalesced_into_one_ai_enqueue(tmp_path: Path) -> None
         resolver=lambda _: {"status": "EXHAUSTED"},
         ai_enqueue=lambda items: calls.append(items),
         trigger_type="macro_actual",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="test",
+            request_origin="research_scheduler",
+        ),
     )
     assert result["coalesced"] is True
     assert len(calls) == 1 and len(calls[0]) == 2

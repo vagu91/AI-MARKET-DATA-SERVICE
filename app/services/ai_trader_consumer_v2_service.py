@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.config import Settings
+from app.core.redaction import redact_sensitive
 from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_hardening_service import harden_market_context
 from app.services.market_session_service import NEW_YORK
@@ -309,21 +311,35 @@ _SUMMARY_KEYS = (
     "coverage",
     "quality",
 )
+_BEARER_TOKEN_RE = re.compile(
+    r"(?i)\bbearer\s+[A-Za-z0-9_\-./+=]{4,}"
+)
 
 
 def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> None:
     """Apply stable semantic section budgets before validating canonical bytes."""
+    originals = {
+        key: value
+        for key, value in consumer.items()
+    }
+    sanitized = _sanitize_consumer_value(consumer)
+    if not isinstance(sanitized, dict):
+        raise ValueError("consumer_payload_must_be_object")
+    consumer.clear()
+    consumer.update(sanitized)
     section_metrics: dict[str, dict[str, Any]] = {}
     for key, budget in SECTION_BYTE_BUDGETS.items():
         if key not in consumer:
             continue
-        original = consumer[key]
+        original = originals.get(key)
         before_bytes = _value_size(original)
         before_items = _recursive_item_count(original)
+        sanitized_section = consumer[key]
+        sanitized_bytes = _value_size(sanitized_section)
         compacted = (
-            _fit_section(original, budget=budget)
-            if before_bytes > budget
-            else original
+            _fit_section(sanitized_section, budget=budget)
+            if sanitized_bytes > budget
+            else sanitized_section
         )
         consumer[key] = compacted
         after_bytes = _value_size(compacted)
@@ -331,14 +347,15 @@ def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> Non
         section_metrics[key] = {
             "budget_bytes": budget,
             "before_bytes": before_bytes,
+            "sanitized_bytes": sanitized_bytes,
             "after_bytes": after_bytes,
             "items_before": before_items,
             "items_after": after_items,
             "items_removed_or_deduplicated": max(before_items - after_items, 0),
             "reason": (
                 "section_budget_semantic_compaction"
-                if before_bytes > budget
-                else "within_section_budget"
+                if sanitized_bytes > budget
+                else "sanitized_within_section_budget"
             ),
         }
     consumer["compaction"] = {
@@ -349,8 +366,55 @@ def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> Non
     }
     for _ in range(3):
         consumer["compaction"]["total_size_bytes"] = _payload_size(consumer)
+    _validate_consumer_security(consumer)
     if _payload_size(consumer) >= limit:
         raise ValueError("consumer_payload_exceeds_90kb")
+
+
+def _sanitize_consumer_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            normalized_key = str(key)
+            if normalized_key.lower() in _CONSUMER_FORBIDDEN_KEYS:
+                continue
+            output[normalized_key] = _sanitize_consumer_value(item)
+        return output
+    if isinstance(value, list):
+        output: list[Any] = []
+        seen: set[str] = set()
+        for item in value:
+            sanitized = _sanitize_consumer_value(item)
+            canonical = json.dumps(
+                sanitized,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            output.append(sanitized)
+        return output
+    if isinstance(value, str):
+        redacted = redact_sensitive(value)
+        return _BEARER_TOKEN_RE.sub("Bearer <redacted>", redacted)
+    return value
+
+
+def _validate_consumer_security(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in _CONSUMER_FORBIDDEN_KEYS:
+                raise ValueError(f"consumer_forbidden_key:{key}")
+            _validate_consumer_security(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_consumer_security(item)
+        return
+    if isinstance(value, str) and _BEARER_TOKEN_RE.search(value):
+        raise ValueError("consumer_secret_pattern_detected")
 
 
 def _fit_section(value: Any, *, budget: int) -> Any:

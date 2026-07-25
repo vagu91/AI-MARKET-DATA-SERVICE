@@ -12,6 +12,7 @@ from app.models.events import EconomicEvent, EventEnrichment
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.ai_research_worker import AIResearchWorker
+from app.services.execution_context import ExecutionContext
 from app.services.ai_trader_consumer_v2_service import build_ai_trader_consumer_v2
 from app.services.market_fact_repository import MarketFactRepository, connect_market_db
 from app.services.market_news_repository import MarketNewsRepository
@@ -85,6 +86,9 @@ def test_job_queue_is_persistent_idempotent_and_recovers_expired_lease(tmp_path:
         correlation_id="corr-1",
         request_payload={"pending_fields": ["forecast"]},
         pending_fields=["forecast"],
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="corr-1",
+        ),
     )
     duplicate, created_again = service.enqueue_explicit(
         job_type="MISSING_EVENT_RESEARCH",
@@ -92,6 +96,9 @@ def test_job_queue_is_persistent_idempotent_and_recovers_expired_lease(tmp_path:
         correlation_id="corr-2",
         request_payload={"pending_fields": ["forecast"]},
         pending_fields=["forecast"],
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="corr-2",
+        ),
     )
     assert created is True and created_again is False
     assert duplicate["job_id"] == first["job_id"]
@@ -111,7 +118,12 @@ def test_release_retry_backoff_is_exact_and_survives_repository_reopen(tmp_path:
         symbol="MNQ",
         correlation_id="release-corr",
         event_key="event:1",
-        request_payload={},
+        request_payload={
+            "execution_context": ExecutionContext.explicit_ai(
+                correlation_id="release-corr",
+                allow_live_providers=True,
+            ).as_payload()
+        },
         policy_version="source-policy-v1",
         prompt_version="v1",
         max_attempts=7,
@@ -187,6 +199,9 @@ def test_worker_uses_unique_workspaces_and_never_waits_in_http_path(tmp_path: Pa
             correlation_id=f"corr-{index}",
             request_payload={"pending_fields": [f"field-{index}"]},
             pending_fields=[f"field-{index}"],
+            execution_context=ExecutionContext.explicit_ai(
+                correlation_id=f"corr-{index}",
+            ),
         )
     seen: list[Path] = []
 
@@ -208,7 +223,15 @@ def test_official_actual_worker_updates_history_and_fact_with_surprise(
     key = canonical_event_key(released)
     facts = MarketFactRepository(cfg)
     facts.upsert_economic_event(released, key)
-    jobs = AIResearchJobService(cfg).enqueue_temporal_refreshes([released])
+    context = ExecutionContext.explicit_ai(
+        correlation_id="official-actual",
+        allow_live_providers=True,
+    )
+    jobs = AIResearchJobService(cfg).enqueue_temporal_refreshes(
+        [released],
+        correlation_id=context.correlation_id,
+        execution_context=context,
+    )
     assert len(jobs) == 1 and jobs[0]["job_type"] == "RELEASE_ACTUAL_REFRESH"
     snapshots = MarketContextSnapshotRepository(cfg)
     debug = {

@@ -15,6 +15,7 @@ from app.services.event_driven_lifecycle_service import (
     compute_datum_lifecycle,
     persist_lifecycle_in_transaction,
 )
+from app.services.execution_context import ExecutionContext
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.lifecycle_due_resolver import (
     DeterministicLifecycleDueResolver,
@@ -458,6 +459,9 @@ def test_mixed_ai_eligible_and_disabled_residuals_finalize_every_lease(
 ) -> None:
     settings = cfg(
         tmp_path,
+        enable_scheduler=True,
+        research_scheduler_enabled=True,
+        lifecycle_due_scanner_enabled=True,
         research_agent_macro_events_enabled=True,
         research_agent_vix_risk_enabled=False,
     )
@@ -482,11 +486,20 @@ def test_mixed_ai_eligible_and_disabled_residuals_finalize_every_lease(
         clock=lambda: NOW,
         adapters={},
     )
+    context = ExecutionContext.explicit_ai(
+        correlation_id="mixed-ai-disabled",
+        request_origin="research_scheduler",
+        allow_live_providers=True,
+    )
 
     first = scheduler.scan_due_items(
         owner="mixed-ai-disabled-first",
         resolver=resolver.resolve,
-        ai_enqueue=scheduler.enqueue_due_residuals,
+        ai_enqueue=lambda items: scheduler.enqueue_due_residuals(
+            items,
+            execution_context=context,
+        ),
+        execution_context=context,
     )
     jobs = AIResearchJobRepository(settings).latest(limit=10)
     outcomes = {
@@ -524,7 +537,11 @@ def test_mixed_ai_eligible_and_disabled_residuals_finalize_every_lease(
     second = scheduler.scan_due_items(
         owner="mixed-ai-disabled-second",
         resolver=resolver.resolve,
-        ai_enqueue=scheduler.enqueue_due_residuals,
+        ai_enqueue=lambda items: scheduler.enqueue_due_residuals(
+            items,
+            execution_context=context,
+        ),
+        execution_context=context,
     )
     assert second["claimed"] == 0
     assert second["ai_invocations"] == 0

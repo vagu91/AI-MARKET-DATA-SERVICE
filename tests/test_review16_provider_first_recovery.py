@@ -26,13 +26,34 @@ from app.services.market_context_outbox_service import TriggerEnvelope
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
+from app.services.execution_context import ExecutionContext
 from app.services.research_agent_enablement import research_agent_enablement
 from app.services.research_profiles import JOB_PROFILE
-from app.services.research_scheduler_service import ResearchSchedulerService
+from app.services.research_scheduler_service import (
+    ResearchSchedulerService as BaseResearchSchedulerService,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+
+class ResearchSchedulerService(BaseResearchSchedulerService):
+    @staticmethod
+    def _context() -> ExecutionContext:
+        return ExecutionContext.explicit_ai(
+            correlation_id="review16-scheduler-test",
+            request_origin="research_scheduler",
+            allow_live_providers=True,
+        )
+
+    def scan_due_items(self, **kwargs):
+        kwargs.setdefault("execution_context", self._context())
+        return super().scan_due_items(**kwargs)
+
+    def enqueue_due_residuals(self, items, **kwargs):
+        kwargs.setdefault("execution_context", self._context())
+        return super().enqueue_due_residuals(items, **kwargs)
 
 
 def cfg(tmp_path: Path, **overrides: Any) -> Settings:
@@ -43,6 +64,8 @@ def cfg(tmp_path: Path, **overrides: Any) -> Settings:
         "ai_job_workspace_root": tmp_path / "jobs",
         "codex_workspace_dir": tmp_path / "codex",
         "environment": "test",
+        "enable_scheduler": True,
+        "research_scheduler_enabled": True,
         "lifecycle_due_scanner_enabled": True,
     }
     values.update(overrides)
@@ -605,7 +628,11 @@ def _enqueue_news(settings: Settings, suffix: str) -> dict[str, Any]:
         job_type="NEWS_RESEARCH",
         symbol="MNQ",
         correlation_id=f"review-e-{suffix}",
-        request_payload={},
+        request_payload={
+            "execution_context": ExecutionContext.explicit_ai(
+                correlation_id=f"review-e-{suffix}",
+            ).as_payload()
+        },
         policy_version="test",
         prompt_version="test",
         profile_id="NEWS_RESEARCH",

@@ -53,12 +53,6 @@ class AIResearchJobService:
         correlation = correlation_id or (
             execution_context.correlation_id if execution_context else f"market-context-{uuid.uuid4()}"
         )
-        # This method is an explicit queue command. Provider/on-demand paths must
-        # pass their provider-only context and therefore cannot inherit authority.
-        execution_context = execution_context or ExecutionContext.explicit_ai(
-            correlation_id=correlation,
-            allow_live_providers=True,
-        )
         if not self._authorize(
             "MISSING_EVENT_RESEARCH",
             execution_context=execution_context,
@@ -159,10 +153,6 @@ class AIResearchJobService:
                 if execution_context
                 else f"release-refresh-{uuid.uuid4()}"
             )
-            execution_context = execution_context or ExecutionContext.explicit_ai(
-                correlation_id=correlation,
-                allow_live_providers=True,
-            )
             if not self._authorize(
                 job_type,
                 execution_context=execution_context,
@@ -230,10 +220,6 @@ class AIResearchJobService:
         child_ordinal: int | None = None,
         execution_context: ExecutionContext | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        execution_context = execution_context or ExecutionContext.explicit_ai(
-            correlation_id=correlation_id,
-            allow_live_providers=True,
-        )
         self._validate_job_type(job_type)
         profile = profile_for_job(job_type)
         if not self._authorize(
@@ -260,7 +246,9 @@ class AIResearchJobService:
                     ),
                     "last_error": (
                         "AGENT_DISABLED"
-                        if execution_context.allow_ai and not enabled
+                        if execution_context is not None
+                        and execution_context.allow_ai
+                        and not enabled
                         else "AI_NOT_AUTHORIZED"
                     ),
                 },
@@ -420,12 +408,7 @@ class AIResearchJobService:
             job_type=job_type,
         )
         if not ai_required:
-            authorized = bool(
-                execution_context
-                and execution_context.allow_live_providers
-                and enabled
-            )
-            decision = "AI_NOT_REQUIRED"
+            authorized = decision == "AI_NOT_REQUIRED" and enabled
         else:
             authorized = (
                 decision == "AI_ALLOWED"
@@ -443,7 +426,7 @@ class AIResearchJobService:
                 "reason": (
                     "explicit_execution_context"
                     if authorized
-                    else "provider_only_or_disabled"
+                    else "missing_invalid_unauthorized_or_disabled_context"
                 ),
             },
         )

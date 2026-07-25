@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from app.core.config import Settings
 from app.models.common import Impact
@@ -144,7 +147,35 @@ def test_explicit_context_is_persisted_and_worker_acquisition_is_fail_closed(
         )
         is None
     )
-    assert repository.get(unauthorized["job_id"])["status"] == "PENDING"
+    rejected = repository.get(unauthorized["job_id"])
+    assert rejected["status"] == "REJECTED"
+    assert rejected["last_error"] == "AI_NOT_AUTHORIZED"
+    assert rejected["completed_at"] is not None
+    assert rejected["result_payload"]["diagnostic"] == {
+        "backend_invocation_attempted": False,
+        "category": "AI_NOT_AUTHORIZED",
+        "decision": "AI_SUPPRESSED",
+        "retryable": False,
+        "terminalized_at": rejected["completed_at"],
+    }
+    terminal_timestamp = rejected["completed_at"]
+    assert (
+        repository.acquire_next(
+            "worker",
+            require_execution_authorization=True,
+        )
+        is None
+    )
+    assert repository.get(unauthorized["job_id"])["completed_at"] == terminal_timestamp
+    assert table_count(settings, "ai_research_job_attempts") == 1
+    assert table_count(settings, "research_backend_invocations") == 0
+    assert table_count(settings, "market_context_snapshots") == 0
+    assert table_count(settings, "market_context_outbox") == 0
+    with sqlite3.connect(settings.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_research_job_attempts WHERE job_id=?",
+            (unauthorized["job_id"],),
+        ).fetchone()[0] == 0
 
 
 def test_no_data_without_claims_does_not_create_snapshot(tmp_path: Path) -> None:
@@ -224,6 +255,9 @@ def _seed_reconciliation_database(settings: Settings) -> None:
     runs = ResearchRuntimeRepository(settings)
     repository = service.repository
     for revision, snapshot_id in EXPECTED_SNAPSHOTS.items():
+        context = ExecutionContext.explicit_ai(
+            correlation_id=f"incident-{revision}",
+        )
         job, created = service.enqueue_explicit(
             job_type="MISSING_EVENT_RESEARCH",
             symbol="MNQ",
@@ -231,6 +265,7 @@ def _seed_reconciliation_database(settings: Settings) -> None:
             request_payload={"pending_fields": [f"field-{revision}"]},
             pending_fields=[f"field-{revision}"],
             force=True,
+            execution_context=context,
         )
         assert created
         run = runs.ensure_run(job, "MISSING_EVENT_RESEARCH", "test")
@@ -296,3 +331,34 @@ def test_reconciliation_is_read_only_guarded_and_idempotent(
     assert statuses == [("ACTIVE", 1), ("ORPHANED", 5)]
     assert first["tokens_or_telemetry_modified"] is False
     assert json.dumps(first["records"]).count("MISSING_EVENT_RESEARCH") == 5
+
+
+def test_reconciliation_apply_refuses_configured_listening_port(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    _seed_reconciliation_database(settings)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    backup = tmp_path / "market.backup.sqlite"
+    shutil.copy2(settings.database_path, backup)
+    before = settings.database_path.read_bytes()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    try:
+        port = int(listener.getsockname()[1])
+        with pytest.raises(
+            RuntimeError,
+            match="service_must_be_stopped_before_apply",
+        ):
+            reconcile(
+                settings.database_path,
+                apply=True,
+                backup=backup,
+                service_host="127.0.0.1",
+                service_port=port,
+            )
+    finally:
+        listener.close()
+    assert settings.database_path.read_bytes() == before

@@ -62,7 +62,7 @@ enforcer inside the offline process, then runs the corrected projection.
 
 | Measure | Reconstructed before | After |
 |---|---:|---:|
-| canonical consumer bytes | 179,344 | 30,998 |
+| canonical consumer bytes | 179,344 | 31,775 |
 | AI jobs | forensic 5 | 0 |
 | research runs | forensic 5 | 0 |
 | backend invocations | forensic 5 | 0 |
@@ -88,12 +88,24 @@ python -m scripts.replay_provider_force_regression_offline
 
 - Provider refresh routes construct an immutable provider-only execution
   context. `force` cannot change `allow_ai`.
-- The queue persists the context and rejects unknown job types. Scheduler,
-  recovery, lifecycle resolver, retry, worker acquisition, and runtime remain
-  fail-closed.
+- Only trusted API, configured scheduler, and configured recovery entrypoints
+  construct AI authority. Queue services, coordinators, due scanners, startup
+  catch-up, and scheduler evaluation receive it explicitly and never infer it
+  from `force` or an `ai_enqueue` callback.
+- Execution-context payloads require all four fields, strict booleans, a
+  non-empty correlation ID, and a whitelisted origin. Missing, incomplete,
+  `allow_ai=false`, or unknown-origin contexts emit `AI_SUPPRESSED` and create
+  no job, run, invocation, or token usage.
+- Worker acquisition terminalizes unauthorized legacy or malformed jobs as
+  idempotent `REJECTED` / `AI_NOT_AUTHORIZED`, with a terminal timestamp and
+  structured non-retryable diagnostic. They are not merely hidden from the
+  acquisition query and cannot create attempts, snapshots, or outbox events.
 - Explicitly authorized residual research remains idempotent and bounded.
-- Consumer compaction is deterministic and section-aware; raw contracts,
-  headers, tokens, and diagnostics are excluded.
+- Consumer sanitization is recursive and unconditional before section budgets:
+  forbidden raw structures, headers, authorization fields, API keys, tokens,
+  and bearer values are removed or redacted even in small under-budget
+  sections. Safe provider lineage, freshness, `as_of`, quality, and `NO_DATA`
+  reasons remain.
 - Projection/schema/size/source/temporal validation completes before
   `BEGIN IMMEDIATE`; snapshot, components, links, lifecycle, and outbox then
   commit or roll back together.
@@ -103,15 +115,15 @@ python -m scripts.replay_provider_force_regression_offline
 
 ## Validation results
 
-- complete suite: `1485 passed`;
-- focused authorization/consumer/snapshot/outbox/lifecycle/provider suites:
-  passed;
+- complete suite: `1532 passed`;
+- focused PR-review blocker suite: `52 passed`;
+- provider/consumer/scheduler/recovery/worker suites: passed;
 - migration matrix `1 -> 20` and schema-20 reopen: passed;
 - Ruff: passed;
 - `py_compile` and `compileall`: passed;
 - `git diff --check`: passed;
 - Windows PowerShell parser: all four repository `.ps1` scripts valid;
-- offline replay: 179,344 bytes before, 30,998 after, zero live calls.
+- offline replay: 179,344 bytes before, 31,775 after, zero live calls.
 
 ## Historical reconciliation
 
@@ -119,6 +131,8 @@ python -m scripts.replay_provider_force_regression_offline
 It recognizes exactly revisions 86–90 plus their `MISSING_EVENT_RESEARCH`
 jobs and `NO_DATA` runs. Apply requires an exclusive lock (closed operational
 database), a byte-identical backup, and an audit JSON path:
+Apply also probes the configured service host/port and aborts if a listener is
+present, before opening the database for writes.
 
 ```powershell
 python -m scripts.reconcile_unauthorized_no_data_snapshots `
@@ -128,14 +142,18 @@ python -m scripts.reconcile_unauthorized_no_data_snapshots `
   --database C:\path\market.sqlite `
   --apply `
   --backup C:\path\market.pre-reconcile.sqlite `
-  --audit-output C:\path\reconcile-audit.json
+  --audit-output C:\path\reconcile-audit.json `
+  --service-host 127.0.0.1 `
+  --service-port 8000
 ```
 
 Apply changes only the five snapshot `audit_status` values from `ACTIVE` to
 the existing semantic state `ORPHANED`. It deletes nothing and does not alter
 jobs, runs, token usage, or telemetry. Repeated apply is idempotent. The
 expected-state guard aborts on any identity, revision, status, job, or run
-mismatch.
+mismatch. `AI_MARKET_SERVICE_HOST` and `AI_MARKET_SERVICE_PORT` provide the CLI
+defaults; the explicit arguments should match the actual Uvicorn bind
+configuration.
 
 ## Future single live-smoke checklist
 

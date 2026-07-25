@@ -16,6 +16,7 @@ from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 from app.services.research_backend import (
     OpenAIResponsesResearchBackend,
@@ -105,6 +106,9 @@ def make_macro_run(
         correlation_id=identity,
         request_payload={"gap": {"topic": "macro_events"}},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     repository = OfflineEvidenceRepository(cfg, now=lambda: REFERENCE_NOW)
@@ -422,7 +426,14 @@ def test_parent_finalization_is_stable_and_aggregates_forensic_oracle(
         )
         conn.commit()
     coordinator = ParallelResearchCoordinator(cfg)
-    created = coordinator.create_parent(manifest, correlation_id="parent-oracle", force=True)
+    created = coordinator.create_parent(
+        manifest,
+        correlation_id="parent-oracle",
+        force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="parent-oracle",
+        ),
+    )
     monkeypatch.setattr(
         "app.services.parallel_research_coordinator._now",
         lambda: replay["parent"]["first_completed_at"],
@@ -679,6 +690,9 @@ def test_official_observation_policy_is_narrow_and_numeric_aware(
         correlation_id=f"official-{metric_id}-{value}",
         request_payload={"gap": {"topic": topic}},
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=f"official-{metric_id}-{value}",
+        ),
     )
     assert created
     repository = ResearchRuntimeRepository(cfg, now=lambda: REFERENCE_NOW)

@@ -20,6 +20,7 @@ from app.services.event_driven_lifecycle_service import (
     compute_datum_lifecycle,
     persist_lifecycle_in_transaction,
 )
+from app.services.execution_context import ExecutionContext
 from app.services.db_only_market_context_materializer import (
     DBOnlyMarketContextMaterializer,
 )
@@ -130,6 +131,9 @@ def test_disabled_service_and_repository_do_not_create_jobs(tmp_path: Path) -> N
         correlation_id="disabled-service",
         request_payload={"missing_fields": ["articles"]},
         specialized_topic="news",
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="disabled-service",
+        ),
     )
     assert created is False
     assert job["status"] == "REJECTED"
@@ -140,7 +144,11 @@ def test_disabled_service_and_repository_do_not_create_jobs(tmp_path: Path) -> N
         job_type="NEWS_RESEARCH",
         symbol="MNQ",
         correlation_id="disabled-repository",
-        request_payload={},
+        request_payload={
+            "execution_context": ExecutionContext.explicit_ai(
+                correlation_id="disabled-repository",
+            ).as_payload()
+        },
         policy_version="test",
         prompt_version="test",
         profile_id="NEWS_RESEARCH",
@@ -160,7 +168,11 @@ def test_worker_rejects_preexisting_disabled_job_before_backend(tmp_path: Path) 
         job_type="NEWS_RESEARCH",
         symbol="MNQ",
         correlation_id="queued-before-disable",
-        request_payload={},
+        request_payload={
+            "execution_context": ExecutionContext.explicit_ai(
+                correlation_id="queued-before-disable",
+            ).as_payload()
+        },
         policy_version="test",
         prompt_version="test",
         profile_id="NEWS_RESEARCH",
@@ -188,7 +200,12 @@ def test_worker_rejects_preexisting_disabled_job_before_backend(tmp_path: Path) 
 async def test_real_async_due_scan_wiring_enqueues_residual_ai_once(
     tmp_path: Path,
 ) -> None:
-    settings = cfg(tmp_path, lifecycle_due_scanner_enabled=True)
+    settings = cfg(
+        tmp_path,
+        enable_scheduler=True,
+        research_scheduler_enabled=True,
+        lifecycle_due_scanner_enabled=True,
+    )
     lifecycle = compute_datum_lifecycle(
         "macro_actual",
         "CPI:2026-07",

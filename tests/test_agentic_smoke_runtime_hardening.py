@@ -21,6 +21,7 @@ from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.ai_research_worker import AIResearchWorker
 from app.services.ai_research_capability_service import AIResearchCapabilityService
+from app.services.execution_context import ExecutionContext
 from app.services.codex_runtime_contract import (
     CodexCLIError,
     all_step_output_schemas,
@@ -57,6 +58,9 @@ def make_job_and_run(cfg: Settings) -> tuple[dict[str, Any], dict[str, Any]]:
         symbol="MNQ",
         correlation_id="hardening-test",
         request_payload={"database_context": {}},
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id="hardening-test",
+        ),
     )
     run = ResearchRuntimeRepository(cfg).ensure_run(
         job,

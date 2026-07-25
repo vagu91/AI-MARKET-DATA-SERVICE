@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import socket
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +37,21 @@ def _open(database: Path, *, apply: bool) -> sqlite3.Connection:
     connection.execute("PRAGMA busy_timeout=0")
     connection.execute("BEGIN EXCLUSIVE")
     return connection
+
+
+def _assert_service_not_listening(host: str, port: int) -> None:
+    if not 1 <= int(port) <= 65_535:
+        raise ValueError("service_port_out_of_range")
+    probe_host = {
+        "0.0.0.0": "127.0.0.1",
+        "::": "::1",
+    }.get(str(host).strip(), str(host).strip())
+    try:
+        with socket.create_connection((probe_host, int(port)), timeout=0.25):
+            pass
+    except OSError:
+        return
+    raise RuntimeError("service_must_be_stopped_before_apply")
 
 
 def _expected_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -83,6 +100,8 @@ def reconcile(
     *,
     apply: bool = False,
     backup: Path | None = None,
+    service_host: str = "127.0.0.1",
+    service_port: int = 8000,
 ) -> dict[str, Any]:
     database = database.resolve()
     if not database.is_file():
@@ -90,6 +109,7 @@ def reconcile(
     database_hash = _sha256(database)
     backup_hash = None
     if apply:
+        _assert_service_not_listening(service_host, service_port)
         sidecars = [
             Path(f"{database}{suffix}")
             for suffix in ("-wal", "-journal")
@@ -145,6 +165,11 @@ def reconcile(
         "backup": str(backup) if backup else None,
         "backup_sha256": backup_hash,
         "mode": "APPLY" if apply else "DRY_RUN",
+        "service_listener_guard": {
+            "host": service_host,
+            "port": service_port,
+            "listening": False,
+        },
         "executed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "expected_snapshot_count": len(EXPECTED_SNAPSHOTS),
         "matched_snapshot_count": len(before),
@@ -171,10 +196,27 @@ def main() -> int:
         help="Byte-identical closed-database backup; required with --apply.",
     )
     parser.add_argument("--audit-output", type=Path)
+    parser.add_argument(
+        "--service-host",
+        default=os.getenv("AI_MARKET_SERVICE_HOST", "127.0.0.1"),
+        help="Configured service bind host to probe before --apply.",
+    )
+    parser.add_argument(
+        "--service-port",
+        type=int,
+        default=int(os.getenv("AI_MARKET_SERVICE_PORT", "8000")),
+        help="Configured service port to probe before --apply.",
+    )
     args = parser.parse_args()
     if args.apply and (args.backup is None or args.audit_output is None):
         parser.error("--backup and --audit-output are required with --apply")
-    result = reconcile(args.database, apply=args.apply, backup=args.backup)
+    result = reconcile(
+        args.database,
+        apply=args.apply,
+        backup=args.backup,
+        service_host=args.service_host,
+        service_port=args.service_port,
+    )
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     if args.audit_output is not None:
         output = args.audit_output.resolve()

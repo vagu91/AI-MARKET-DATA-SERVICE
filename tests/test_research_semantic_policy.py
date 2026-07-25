@@ -14,6 +14,7 @@ from app.infrastructure.persistence.migrations import migrate_database
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_job_executor import build_agentic_research_prompt
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.codex_runtime_contract import agentic_research_output_schema
 from app.services.research_backend import ResearchBackendResult
 from app.services.research_runtime_repository import ResearchRuntimeRepository
@@ -54,6 +55,9 @@ def ensure_job(cfg: Settings, identity: str) -> dict[str, Any]:
             "database_context": {"data_as_of": "2026-07-23T12:00:00Z"},
         },
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     return job

@@ -18,6 +18,11 @@ from app.services.observability_contract_service import (
     DeterministicAnomalyDetector,
     TelemetryRepository,
 )
+from app.services.execution_context import (
+    ExecutionContext,
+    authorizes_ai,
+    authorizes_live_providers,
+)
 
 
 ACTIVE_JOB_STATUSES = {"PENDING", "RUNNING", "RETRY_SCHEDULED"}
@@ -349,7 +354,7 @@ class AIResearchJobRepository:
             abandoned = conn.execute(
                 """
                 SELECT job_id,attempts,max_attempts,last_retry_reason,
-                       job_type,profile_id,specialized_topic
+                       job_type,profile_id,specialized_topic,request_payload_json
                 FROM ai_research_jobs
                 WHERE status='RUNNING' AND lease_expires_at IS NOT NULL
                   AND lease_expires_at<=?
@@ -357,6 +362,14 @@ class AIResearchJobRepository:
                 (now,),
             ).fetchall()
             for row in abandoned:
+                if not self._row_execution_authorized(row):
+                    self._reject_job_in_transaction(
+                        conn,
+                        job_id=str(row["job_id"]),
+                        now=now,
+                        reason="AI_NOT_AUTHORIZED",
+                    )
+                    continue
                 if not self._row_agent_enabled(row):
                     conn.execute(
                         """
@@ -442,6 +455,9 @@ class AIResearchJobRepository:
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._reject_disabled_waiting_in_transaction(conn, now=now)
+            # Authorization is an invariant of acquisition, not an optional
+            # query preference. Keep the argument for API compatibility only.
+            self._reject_unauthorized_waiting_in_transaction(conn, now=now)
             type_clause = ""
             values: list[Any] = [now]
             if allowed_job_types is not None:
@@ -454,28 +470,14 @@ class AIResearchJobRepository:
                 " AND (job_type='RELEASE_ACTUAL_REFRESH' OR json_extract(request_payload_json,'$.authorized_live_smoke')=1)"
                 if authorized_smoke_only else ""
             )
-            authorization_clause = (
-                """
-                AND (
-                  (job_type='RELEASE_ACTUAL_REFRESH'
-                   AND json_extract(request_payload_json,'$.execution_context.allow_live_providers')=1)
-                  OR
-                  (job_type!='RELEASE_ACTUAL_REFRESH'
-                   AND json_extract(request_payload_json,'$.execution_context.allow_ai')=1)
-                )
-                """
-                if require_execution_authorization
-                else ""
-            )
             row = conn.execute(
                 f"""
                 SELECT * FROM ai_research_jobs
                 WHERE (status='PENDING'
                    OR (status='RETRY_SCHEDULED' AND (next_retry_at IS NULL OR next_retry_at<=?)))
                    AND source_audit_status='ACTIVE'
-                   {type_clause}
-                   {smoke_clause}
-                   {authorization_clause}
+                    {type_clause}
+                    {smoke_clause}
                 ORDER BY priority ASC,created_at ASC
                 LIMIT 1
                 """,
@@ -524,6 +526,46 @@ class AIResearchJobRepository:
             job_type=row["job_type"],
         )
 
+    @staticmethod
+    def _row_execution_authorized(row: Any) -> bool:
+        try:
+            payload = json.loads(str(row["request_payload_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+        context = ExecutionContext.from_payload(
+            payload.get("execution_context") if isinstance(payload, dict) else None
+        )
+        if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH":
+            return authorizes_ai(context) and authorizes_live_providers(context)
+        return authorizes_ai(context)
+
+    def _reject_unauthorized_waiting_in_transaction(
+        self,
+        conn: Any,
+        *,
+        now: str,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT job_id,job_type,request_payload_json
+            FROM ai_research_jobs
+            WHERE status IN ('PENDING','RETRY_SCHEDULED')
+              AND source_audit_status='ACTIVE'
+            """
+        ).fetchall()
+        rejected = 0
+        for row in rows:
+            if self._row_execution_authorized(row):
+                continue
+            self._reject_job_in_transaction(
+                conn,
+                job_id=str(row["job_id"]),
+                now=now,
+                reason="AI_NOT_AUTHORIZED",
+            )
+            rejected += 1
+        return rejected
+
     def _reject_disabled_waiting_in_transaction(
         self,
         conn: Any,
@@ -556,28 +598,62 @@ class AIResearchJobRepository:
         *,
         job_id: str,
         now: str,
+        reason: str = "AGENT_DISABLED",
     ) -> None:
+        diagnostic = {
+            "status": "REJECTED",
+            "error": reason,
+            "diagnostic": {
+                "category": reason,
+                "decision": "AI_SUPPRESSED" if reason == "AI_NOT_AUTHORIZED" else "AI_NOT_REQUIRED",
+                "retryable": False,
+                "backend_invocation_attempted": False,
+                "terminalized_at": now,
+            },
+        }
+        encoded = json.dumps(
+            diagnostic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         conn.execute(
             """
             UPDATE ai_research_jobs
             SET status='REJECTED',worker_id=NULL,lease_expires_at=NULL,
                 heartbeat_at=NULL,next_retry_at=NULL,completed_at=?,
-                last_error='AGENT_DISABLED',retry_class='NON_RETRYABLE',
-                last_retry_reason='AGENT_DISABLED',updated_at=?
+                last_error=?,retry_class='NON_RETRYABLE',
+                last_retry_reason=?,result_payload_json=?,
+                accepted_fields_json='[]',rejected_fields_json='[]',updated_at=?
             WHERE job_id=?
               AND status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
             """,
-            (now, now, job_id),
+            (now, reason, reason, encoded, now, job_id),
+        )
+        conn.execute(
+            """
+            UPDATE ai_research_job_attempts
+            SET status='REJECTED',completed_at=?,error=?,
+                error_category=?,retry_classification='NON_RETRYABLE'
+            WHERE job_id=? AND status='RUNNING'
+            """,
+            (now, reason, reason, job_id),
         )
         conn.execute(
             """
             UPDATE research_runs
             SET status='REJECTED',completed_at=?,
-                blocking_gaps_json='["AGENT_DISABLED"]',updated_at=?
+                result_json=?,blocking_gaps_json=?,updated_at=?
             WHERE job_id=?
               AND status IN ('PENDING','RUNNING','RETRY_SCHEDULED')
             """,
-            (now, now, job_id),
+            (
+                now,
+                encoded,
+                json.dumps([reason], separators=(",", ":")),
+                now,
+                job_id,
+            ),
         )
 
     def mark_pending_capability(self, status: str, *, excluded_job_types: list[str] | None = None) -> int:

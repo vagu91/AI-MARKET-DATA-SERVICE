@@ -15,6 +15,7 @@ from app.infrastructure.persistence.migrations import migrate_database
 from app.services.agentic_research_runtime import AgenticResearchRuntime
 from app.services.ai_research_job_executor import build_agentic_research_prompt
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.execution_context import ExecutionContext
 from app.services.research_backend import ResearchBackend, ResearchBackendResult
 from app.services.research_metrics_service import ResearchMetricsService
 from app.services.research_runtime_repository import ResearchRuntimeRepository
@@ -64,6 +65,9 @@ def ensure_run(
             "identity": identity,
         },
         force=True,
+        execution_context=ExecutionContext.explicit_ai(
+            correlation_id=identity,
+        ),
     )
     assert created
     repository = ResearchRuntimeRepository(

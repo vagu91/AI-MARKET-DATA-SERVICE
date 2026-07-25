@@ -20,6 +20,7 @@ from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.ai_research_worker import AIResearchWorker
 from app.services.db_only_market_context_materializer import DBOnlyMarketContextMaterializer
+from app.services.execution_context import ExecutionContext
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.market_fact_repository import MarketFactRepository, connect_market_db
 from app.services.source_policy_service import SourcePolicyService
@@ -39,6 +40,10 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
+
+
+def _context(correlation_id: str) -> ExecutionContext:
+    return ExecutionContext.explicit_ai(correlation_id=correlation_id)
 
 
 def _event(release: datetime, *, name: str = "Consumer Price Index") -> EconomicEvent:
@@ -119,6 +124,7 @@ def test_worker_persists_and_reads_back_all_accepted_missing_fields(tmp_path: Pa
             "temporal_state": {"release_at": release.isoformat()},
             "pending_fields": ["forecast", "consensus", "previous"],
         },
+        execution_context=_context("all-fields"),
     )
     assert created
 
@@ -223,14 +229,32 @@ def test_terminal_jobs_stay_idempotent_in_window_and_force_is_explicit(tmp_path:
         "job_type": "MISSING_EVENT_RESEARCH", "symbol": "MNQ", "event_key": "event:scope",
         "request_payload": {"pending_fields": ["forecast"]}, "pending_fields": ["forecast"],
     }
-    first, created = service.enqueue_explicit(correlation_id="first", **kwargs)
-    duplicate, duplicate_created = service.enqueue_explicit(correlation_id="duplicate", force=True, **kwargs)
+    first, created = service.enqueue_explicit(
+        correlation_id="first",
+        execution_context=_context("first"),
+        **kwargs,
+    )
+    duplicate, duplicate_created = service.enqueue_explicit(
+        correlation_id="duplicate",
+        force=True,
+        execution_context=_context("duplicate"),
+        **kwargs,
+    )
     assert created and not duplicate_created and duplicate["job_id"] == first["job_id"]
     repo.acquire_next("worker")
     repo.complete(first["job_id"], "worker", status="NO_DATA", result_payload={"status": "NO_DATA"})
-    second, second_created = service.enqueue_explicit(correlation_id="second", **kwargs)
+    second, second_created = service.enqueue_explicit(
+        correlation_id="second",
+        execution_context=_context("second"),
+        **kwargs,
+    )
     assert not second_created and second["job_id"] == first["job_id"]
-    forced, forced_created = service.enqueue_explicit(correlation_id="forced", force=True, **kwargs)
+    forced, forced_created = service.enqueue_explicit(
+        correlation_id="forced",
+        force=True,
+        execution_context=_context("forced"),
+        **kwargs,
+    )
     assert forced_created and forced["job_id"] != first["job_id"]
     assert len(repo.latest(limit=10, event_keys=["event:scope"])) == 2
 
@@ -242,11 +266,13 @@ def test_ai_status_is_scoped_to_snapshot_or_current_event_set(tmp_path: Path) ->
         job_type="MISSING_EVENT_RESEARCH", symbol="MNQ", correlation_id="one",
         event_key="event:one", request_payload={"pending_fields": ["forecast"]},
         pending_fields=["forecast"],
+        execution_context=_context("one"),
     )
     service.enqueue_explicit(
         job_type="MISSING_EVENT_RESEARCH", symbol="MNQ", correlation_id="two",
         event_key="event:two", request_payload={"pending_fields": ["previous"]},
         pending_fields=["previous"],
+        execution_context=_context("two"),
     )
     stored = MarketContextSnapshotRepository(cfg).save_next(
         symbol="MNQ", refresh_mode="auto", debug_payload=_debug_payload(),
@@ -310,7 +336,10 @@ def test_recovery_closes_abandoned_attempt_and_bounds_exhausted_job(tmp_path: Pa
     repo = AIResearchJobRepository(cfg, clock=lambda: now[0])
     job, _ = repo.enqueue(
         idempotency_key="lease", job_type="MISSING_EVENT_RESEARCH", symbol="MNQ",
-        correlation_id="lease", request_payload={}, policy_version="v1", prompt_version="v1",
+        correlation_id="lease",
+        request_payload={"execution_context": _context("lease").as_payload()},
+        policy_version="v1",
+        prompt_version="v1",
         max_attempts=1,
     )
     assert repo.acquire_next("worker")["status"] == "RUNNING"

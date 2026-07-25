@@ -28,7 +28,7 @@ from app.services.event_driven_lifecycle_service import (
 from app.services.research_agent_enablement import is_research_agent_enabled
 from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.observability_contract_service import TelemetryRepository
-from app.services.execution_context import ExecutionContext
+from app.services.execution_context import ExecutionContext, authorizes_ai
 
 
 class ResearchSchedulerService:
@@ -61,13 +61,17 @@ class ResearchSchedulerService:
         execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         """Lease due work, run resolvers first, and enqueue AI once for residuals."""
-        if execution_context is None and ai_enqueue is not None:
-            # Supplying an enqueue callback is the explicit scheduler authority
-            # boundary. Provider request paths never call this API.
-            execution_context = ExecutionContext.explicit_ai(
-                correlation_id=owner,
-                request_origin="research_scheduler",
-                allow_live_providers=True,
+        ai_authorized = self._scanner_ai_authorized(execution_context)
+        if not ai_authorized:
+            self.telemetry.emit(
+                "ai_authorization",
+                identifiers={"correlation_id": owner},
+                decision_summary="AI_SUPPRESSED",
+                stop_reason="AI_SUPPRESSED",
+                payload={
+                    "status": "AI_SUPPRESSED",
+                    "reason": "scheduler_disabled_or_execution_context_invalid",
+                },
             )
         if not self.settings.lifecycle_due_scanner_enabled and not force:
             return {
@@ -541,8 +545,7 @@ class ResearchSchedulerService:
         if (
             ai_eligible
             and ai_enqueue is not None
-            and execution_context is not None
-            and execution_context.allow_ai
+            and ai_authorized
         ):
             enqueue_result = ai_enqueue(ai_eligible)
             ai_invocations = 1
@@ -684,6 +687,7 @@ class ResearchSchedulerService:
         *,
         resolver: Callable[[dict[str, Any]], dict[str, Any]],
         ai_enqueue: Callable[[list[dict[str, Any]]], Any],
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         if not (
             self.settings.enable_scheduler
@@ -713,11 +717,7 @@ class ResearchSchedulerService:
             resolver=resolver,
             ai_enqueue=ai_enqueue,
             due_since=window_start,
-            execution_context=ExecutionContext.explicit_ai(
-                correlation_id="startup-lifecycle-catch-up",
-                request_origin="recovery",
-                allow_live_providers=True,
-            ),
+            execution_context=execution_context,
         )
         self.telemetry.emit(
             "startup_catch_up",
@@ -889,12 +889,41 @@ class ResearchSchedulerService:
                 jobs.append(job)
         return jobs
 
-    def evaluate(self, trigger_name: str, *, force: bool = False) -> dict[str, Any]:
-        execution_context = ExecutionContext.explicit_ai(
-            correlation_id=f"scheduler-{trigger_name}-{uuid.uuid4()}",
-            request_origin="research_scheduler",
-            allow_live_providers=True,
-        )
+    def evaluate(
+        self,
+        trigger_name: str,
+        *,
+        force: bool = False,
+        execution_context: ExecutionContext | None = None,
+    ) -> dict[str, Any]:
+        if not (
+            self.settings.enable_scheduler
+            and self.settings.research_scheduler_enabled
+            and authorizes_ai(execution_context)
+            and execution_context is not None
+            and execution_context.request_origin == "research_scheduler"
+        ):
+            correlation_id = (
+                execution_context.correlation_id
+                if execution_context is not None
+                else f"scheduler-{trigger_name}-suppressed"
+            )
+            self.telemetry.emit(
+                "ai_authorization",
+                identifiers={"correlation_id": correlation_id},
+                decision_summary="AI_SUPPRESSED",
+                stop_reason="AI_SUPPRESSED",
+                payload={
+                    "status": "AI_SUPPRESSED",
+                    "reason": "scheduler_disabled_or_execution_context_invalid",
+                },
+            )
+            return self._decision(
+                trigger_name,
+                "AI_SUPPRESSED",
+                "NOT_REQUIRED",
+                "AI_SUPPRESSED",
+            )
         snapshot = self.snapshots.latest("MNQ")
         payload = _fingerprint_payload(snapshot)
         fingerprint = hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
@@ -996,6 +1025,19 @@ class ResearchSchedulerService:
         return self.service.enqueue_temporal_refreshes(
             eligible, correlation_id=f"scheduler-{trigger_name}-{uuid.uuid4()}", now=now,
             execution_context=execution_context,
+        )
+
+    def _scanner_ai_authorized(
+        self,
+        execution_context: ExecutionContext | None,
+    ) -> bool:
+        return bool(
+            self.settings.enable_scheduler
+            and self.settings.research_scheduler_enabled
+            and self.settings.lifecycle_due_scanner_enabled
+            and authorizes_ai(execution_context)
+            and execution_context is not None
+            and execution_context.request_origin in {"research_scheduler", "recovery"}
         )
 
     def _same_completed_decision(self, trigger: str, fingerprint: str) -> bool:
