@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
 import asyncio
+import logging
+import uuid
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -11,6 +13,10 @@ from app.core.logging import configure_logging
 from app.infrastructure.storage_retention import cleanup_storage, maybe_run_startup_cleanup
 from app.infrastructure.persistence.database_maintenance import run_database_maintenance
 from app.services.execution_context import ExecutionContext
+
+
+logger = logging.getLogger(__name__)
+EVENT_CALENDAR_CATCHUP_ERROR_BACKOFF_MAX_SECONDS = 30
 
 
 async def run_lifecycle_due_scan(state):
@@ -32,16 +38,20 @@ async def run_lifecycle_due_scan(state):
     )
 
 
-async def run_startup_lifecycle_catchup(state):
+async def run_startup_lifecycle_catchup(
+    state,
+    *,
+    correlation_id: str = "startup-lifecycle-catch-up",
+):
     scheduler = state["research_scheduler"]
     execution_context = (
         ExecutionContext.provider_only(
-            correlation_id="startup-lifecycle-catch-up",
+            correlation_id=correlation_id,
             allow_live_providers=True,
         )
         if scheduler.settings.event_calendar_catchup_enabled
         else ExecutionContext.explicit_ai(
-            correlation_id="startup-lifecycle-catch-up",
+            correlation_id=correlation_id,
             request_origin="recovery",
             allow_live_providers=True,
         )
@@ -59,11 +69,70 @@ async def run_startup_lifecycle_catchup(state):
 
 async def run_event_calendar_catchup_loop(state):
     settings = state["settings"]
+    scheduler = state["research_scheduler"]
+    interval_seconds = max(
+        int(settings.lifecycle_due_scanner_interval_seconds),
+        1,
+    )
+    consecutive_failures = 0
     while settings.event_calendar_catchup_enabled:
-        await asyncio.sleep(
-            max(int(settings.lifecycle_due_scanner_interval_seconds), 1)
+        await asyncio.sleep(interval_seconds)
+        correlation_id = f"event-calendar-catch-up-{uuid.uuid4()}"
+        try:
+            result = await run_startup_lifecycle_catchup(
+                state,
+                correlation_id=correlation_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            consecutive_failures += 1
+            retry_delay_seconds = min(
+                2 ** min(consecutive_failures - 1, 5),
+                EVENT_CALENDAR_CATCHUP_ERROR_BACKOFF_MAX_SECONDS,
+            )
+            catch_up_status = "UNKNOWN"
+            try:
+                catch_up_status = (
+                    scheduler.record_event_calendar_catchup_error(
+                        correlation_id=correlation_id,
+                        error=exc,
+                        retry_delay_seconds=retry_delay_seconds,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "event calendar catch-up error telemetry failed; "
+                    "correlation_id=%s original_error_type=%s",
+                    correlation_id,
+                    type(exc).__name__,
+                )
+            logger.exception(
+                "event calendar catch-up tick failed; "
+                "correlation_id=%s error_type=%s catch_up_status=%s "
+                "retry_delay_seconds=%s",
+                correlation_id,
+                type(exc).__name__,
+                catch_up_status,
+                retry_delay_seconds,
+            )
+            await asyncio.sleep(retry_delay_seconds)
+            continue
+        consecutive_failures = 0
+        runtime_status = str(result.get("status") or "UNKNOWN")
+        checkpoint_status = str(
+            result.get("catch_up_completion_status")
+            or runtime_status
         )
-        await run_startup_lifecycle_catchup(state)
+        logger.info(
+            "event calendar catch-up tick finished; "
+            "correlation_id=%s status=%s checkpoint_status=%s",
+            correlation_id,
+            runtime_status,
+            checkpoint_status,
+        )
 
 
 def run_research_scheduler_evaluation(state, trigger_name: str):

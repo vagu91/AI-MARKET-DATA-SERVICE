@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
@@ -33,6 +34,9 @@ from app.services.research_agent_enablement import is_research_agent_enabled
 from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.observability_contract_service import TelemetryRepository
 from app.services.execution_context import ExecutionContext, authorizes_ai
+
+
+logger = logging.getLogger(__name__)
 
 
 class ResearchSchedulerService:
@@ -938,8 +942,16 @@ class ResearchSchedulerService:
             due_since=window_start,
             entity_types=event_entity_types,
         )
+        (
+            pending_backoff_before,
+            next_retry_at_before,
+        ) = self._event_calendar_catchup_backoff_state(
+            window_start=window_start,
+            entity_types=event_entity_types,
+        )
         if (
             backlog_before == 0
+            and pending_backoff_before == 0
             and checkpoint.get("completion_status") == "COMPLETED"
         ):
             return {
@@ -959,11 +971,79 @@ class ResearchSchedulerService:
                 "catch_up_cursor": checkpoint.get("cursor"),
                 "catch_up_backlog_before": 0,
                 "catch_up_backlog_after": 0,
+                "catch_up_pending_backoff": 0,
+                "catch_up_next_retry_at": None,
                 "catch_up_tick_count": int(
                     checkpoint.get("tick_count") or 0
                 ),
                 "catch_up_completion_status": "COMPLETED",
                 "catch_up_provider_only": True,
+                "telemetry_emitted": False,
+            }
+        if backlog_before == 0 and pending_backoff_before > 0:
+            transition_required = (
+                checkpoint.get("completion_status") != "WAITING_BACKOFF"
+                or int(checkpoint.get("pending_backoff") or 0)
+                != pending_backoff_before
+                or checkpoint.get("next_retry_at")
+                != next_retry_at_before
+            )
+            tick_count = int(checkpoint.get("tick_count") or 0)
+            checkpoint_written = False
+            telemetry_emitted = False
+            if transition_required:
+                tick_count += 1
+                checkpoint_payload = {
+                    "backlog_before": 0,
+                    "claimed": 0,
+                    "resolved": 0,
+                    "backoff": 0,
+                    "backlog_after": 0,
+                    "pending_backoff": pending_backoff_before,
+                    "next_retry_at": next_retry_at_before,
+                    "cursor": checkpoint.get("cursor"),
+                    "tick_count": tick_count,
+                    "completion_status": "WAITING_BACKOFF",
+                    "updated_at": now.astimezone(UTC).replace(
+                        microsecond=0
+                    ).isoformat(),
+                }
+                self._write_event_calendar_catchup_checkpoint(
+                    checkpoint_payload
+                )
+                self._emit_event_calendar_catchup_tick(
+                    checkpoint_payload,
+                    correlation_id=self._catchup_correlation_id(
+                        execution_context
+                    ),
+                )
+                checkpoint_written = True
+                telemetry_emitted = True
+            return {
+                **_empty_catchup_result(),
+                "status": "WAITING_BACKOFF",
+                "writes": 0,
+                "checkpoint_written": checkpoint_written,
+                "catch_up_window_start": window_start.isoformat(),
+                "catch_up_window_hours": int(
+                    self.settings.event_calendar_catchup_lookback_days
+                )
+                * 24,
+                "catch_up_backlog_before": 0,
+                "catch_up_backlog_after": 0,
+                "catch_up_pending_backoff": pending_backoff_before,
+                "catch_up_next_retry_at": next_retry_at_before,
+                "catch_up_batch_size": int(
+                    self.settings.event_calendar_catchup_batch_size
+                ),
+                "catch_up_max_per_tick": int(
+                    self.settings.event_calendar_catchup_max_per_tick
+                ),
+                "catch_up_cursor": checkpoint.get("cursor"),
+                "catch_up_tick_count": tick_count,
+                "catch_up_completion_status": "WAITING_BACKOFF",
+                "catch_up_provider_only": True,
+                "telemetry_emitted": telemetry_emitted,
             }
 
         aggregate = _empty_catchup_result()
@@ -1004,7 +1084,10 @@ class ResearchSchedulerService:
             if int(batch.get("claimed") or 0) == 0:
                 break
 
-        pending_backoff = self._event_calendar_catchup_backoff_count(
+        (
+            pending_backoff,
+            next_retry_at,
+        ) = self._event_calendar_catchup_backoff_state(
             window_start=window_start,
             entity_types=event_entity_types,
         )
@@ -1023,6 +1106,7 @@ class ResearchSchedulerService:
             "backoff": len(aggregate["backoff"]),
             "backlog_after": backlog_after,
             "pending_backoff": pending_backoff,
+            "next_retry_at": next_retry_at,
             "cursor": cursor,
             "tick_count": tick_count,
             "completion_status": completion_status,
@@ -1031,35 +1115,24 @@ class ResearchSchedulerService:
             ).isoformat(),
         }
         self._write_event_calendar_catchup_checkpoint(checkpoint_payload)
-        telemetry_reason = ";".join(
-            f"{key}:{checkpoint_payload[key]}"
-            for key in (
-                "backlog_before",
-                "claimed",
-                "resolved",
-                "backoff",
-                "backlog_after",
-                "cursor",
-                "tick_count",
-                "completion_status",
-            )
+        correlation_id = self._catchup_correlation_id(execution_context)
+        self._emit_event_calendar_catchup_tick(
+            checkpoint_payload,
+            correlation_id=correlation_id,
         )
-        self.telemetry.emit(
-            "startup_catch_up",
-            identifiers={"correlation_id": "event-calendar-catch-up"},
-            decision_summary=(
-                "persistent provider-only event calendar catch-up tick completed"
-            ),
-            stop_reason=completion_status,
-            payload={
-                "status": completion_status,
-                "reason": telemetry_reason,
-                **checkpoint_payload,
-            },
+        logger.info(
+            "event calendar catch-up checkpoint advanced; "
+            "correlation_id=%s status=%s backlog_after=%s "
+            "pending_backoff=%s next_retry_at=%s",
+            correlation_id,
+            completion_status,
+            backlog_after,
+            pending_backoff,
+            next_retry_at,
         )
         return {
             **aggregate,
-            "status": "COMPLETED",
+            "status": completion_status,
             "writes": len(aggregate["rematerialized_snapshot_ids"]),
             "checkpoint_written": True,
             "catch_up_window_start": window_start.isoformat(),
@@ -1070,13 +1143,92 @@ class ResearchSchedulerService:
             "catch_up_backlog_before": backlog_before,
             "catch_up_backlog_after": backlog_after,
             "catch_up_pending_backoff": pending_backoff,
+            "catch_up_next_retry_at": next_retry_at,
             "catch_up_batch_size": batch_size,
             "catch_up_max_per_tick": max_per_tick,
             "catch_up_cursor": cursor,
             "catch_up_tick_count": tick_count,
             "catch_up_completion_status": completion_status,
             "catch_up_provider_only": True,
+            "telemetry_emitted": True,
         }
+
+    def _catchup_correlation_id(
+        self,
+        execution_context: ExecutionContext | None,
+    ) -> str:
+        return str(
+            getattr(execution_context, "correlation_id", None)
+            or "event-calendar-catch-up"
+        )
+
+    def _emit_event_calendar_catchup_tick(
+        self,
+        checkpoint_payload: dict[str, Any],
+        *,
+        correlation_id: str,
+    ) -> None:
+        telemetry_reason = ";".join(
+            f"{key}:{checkpoint_payload.get(key)}"
+            for key in (
+                "backlog_before",
+                "claimed",
+                "resolved",
+                "backoff",
+                "backlog_after",
+                "pending_backoff",
+                "next_retry_at",
+                "cursor",
+                "tick_count",
+                "completion_status",
+            )
+        )
+        completion_status = str(
+            checkpoint_payload["completion_status"]
+        )
+        self.telemetry.emit(
+            "startup_catch_up",
+            identifiers={"correlation_id": correlation_id},
+            decision_summary=(
+                "persistent provider-only event calendar catch-up tick completed"
+            ),
+            stop_reason=completion_status,
+            payload={
+                "status": completion_status,
+                "reason": telemetry_reason,
+                **checkpoint_payload,
+            },
+        )
+
+    def record_event_calendar_catchup_error(
+        self,
+        *,
+        correlation_id: str,
+        error: Exception,
+        retry_delay_seconds: int,
+    ) -> str:
+        checkpoint = self._read_event_calendar_catchup_checkpoint()
+        catch_up_status = str(
+            checkpoint.get("completion_status") or "IN_PROGRESS"
+        )
+        error_type = type(error).__name__
+        self.telemetry.emit(
+            "startup_catch_up",
+            identifiers={"correlation_id": correlation_id},
+            decision_summary=(
+                "transient event calendar catch-up tick failed; retry scheduled"
+            ),
+            stop_reason="TRANSIENT_ERROR",
+            error=f"{error_type}: {error}",
+            payload={
+                "status": catch_up_status,
+                "reason": "transient_tick_error",
+                "catch_up_completion_status": catch_up_status,
+                "error_type": error_type,
+                "retry_delay_seconds": retry_delay_seconds,
+            },
+        )
+        return catch_up_status
 
     def _read_event_calendar_catchup_checkpoint(self) -> dict[str, Any]:
         with connect_sqlite(self.settings.database_path) as conn:
@@ -1121,7 +1273,7 @@ class ResearchSchedulerService:
                     str(payload["completion_status"]),
                     "provider_only_bounded_tick",
                     int(payload["completion_status"] == "WAITING_BACKOFF"),
-                    None,
+                    payload.get("next_retry_at"),
                     json.dumps(payload, sort_keys=True, separators=(",", ":")),
                     timestamp,
                     timestamp,
@@ -1129,17 +1281,19 @@ class ResearchSchedulerService:
             )
             conn.commit()
 
-    def _event_calendar_catchup_backoff_count(
+    def _event_calendar_catchup_backoff_state(
         self,
         *,
         window_start: datetime,
         entity_types: frozenset[str],
-    ) -> int:
+    ) -> tuple[int, str | None]:
         placeholders = ",".join("?" for _ in entity_types)
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
                 f"""
-                SELECT COUNT(*) FROM datum_lifecycle_items
+                SELECT COUNT(*) AS pending_count,
+                       MIN(next_retry_at) AS next_retry_at
+                FROM datum_lifecycle_items
                 WHERE work_status='BACKOFF'
                   AND entity_type IN ({placeholders})
                   AND COALESCE(event_at,updated_at)>=?
@@ -1151,7 +1305,12 @@ class ResearchSchedulerService:
                     ).isoformat(),
                 ),
             ).fetchone()
-        return int(row[0] if row else 0)
+        return (
+            int(row["pending_count"] if row else 0),
+            str(row["next_retry_at"])
+            if row is not None and row["next_retry_at"]
+            else None,
+        )
 
     def _rematerialize_provider_resolution(
         self,

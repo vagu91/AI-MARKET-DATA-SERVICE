@@ -98,6 +98,53 @@ lineage across snapshots, and never triggers by absence alone. An admitted,
 explicit cancellation or postponement tombstone upgrades it to
 `REMOVED_FROM_CALENDAR` and produces the corresponding semantic trigger.
 
+### 6. Catch-up loop resilience and state semantics follow-up
+
+Follow-up review scope: PR HEAD
+`4584641d9ca9a36ab2fac576578042b12e56c311`.
+
+Cause: an exception escaping one application-loop tick terminated the
+long-running task. Separately, `_event_calendar_catchup_tick` persisted the
+right completion checkpoint but always exposed `status=COMPLETED`. A tick
+before a deferred item's `next_retry_at` also rewrote the same
+`WAITING_BACKOFF` checkpoint and emitted duplicate telemetry.
+
+After:
+
+- ordinary tick exceptions are logged and emitted as redacted
+  `startup_catch_up` error telemetry with correlation ID, error type, current
+  catch-up state, and bounded retry delay;
+- retry delay grows exponentially from one second and is capped at 30 seconds;
+- a telemetry persistence failure is itself contained so the application loop
+  still advances to a later tick;
+- `asyncio.CancelledError` is explicitly re-raised both from the tick and error
+  reporting path so shutdown is never swallowed;
+- every loop tick still creates a provider-only execution context, and
+  `allow_ai_residual` remains false;
+- runtime/API `status`, checkpoint `completion_status`, tick telemetry
+  `status`, and logs now distinguish `IN_PROGRESS`, `WAITING_BACKOFF`, and
+  `COMPLETED`; a read-only subsequent tick exposes `ALREADY_COMPLETE` while
+  retaining the final `COMPLETED` checkpoint;
+- the checkpoint stores the earliest pending `next_retry_at` in the existing
+  schema-20 `provider_state` row;
+- while already `WAITING_BACKOFF` and before that time, the tick performs only
+  due/backoff state reads. It makes zero provider or resolver calls, creates
+  zero AI jobs/invocations, snapshots, or outbox rows, and does not rewrite the
+  checkpoint or duplicate telemetry. A write is allowed only for a real state
+  transition.
+
+Deterministic evidence:
+
+- transient tick failure followed by a successful second tick in the same
+  task, without restart;
+- `CancelledError` propagation with no error telemetry or AI work;
+- 45-item drain states `IN_PROGRESS -> COMPLETED -> ALREADY_COMPLETE` for
+  `40 + 5 + 0` claims;
+- deferred provider result transitions to `WAITING_BACKOFF`; an early repeated
+  tick is byte-for-byte checkpoint-idempotent with unchanged telemetry,
+  snapshot, and outbox counts;
+- `research_backend_invocations` and AI jobs remain zero in every case.
+
 ## Atomicity and zero-AI evidence
 
 Snapshot preflight, projected lifecycle rows, resolved lifecycle rows, and
@@ -115,10 +162,13 @@ records:
 
 ## Validation
 
-- Focused calendar/lifecycle/CME/Consumer suites: 95 passed.
-- Extended provider/actual/recovery/worker/telemetry/snapshot suites:
+- Original focused calendar/lifecycle/CME/Consumer suites: 95 passed.
+- Original extended provider/actual/recovery/worker/telemetry/snapshot suites:
   507 passed.
-- Full suite: 1,652 passed in 263.94 seconds.
+- Follow-up catch-up blocker tests: 14 passed.
+- Follow-up pertinent lifecycle/provider/actual/outbox/telemetry suites:
+  252 passed.
+- Follow-up full suite: 1,655 passed in 259.27 seconds.
 - Migration matrix schema 1 through 20: 20 passed.
 - Ruff: passed.
 - `py_compile`: passed.

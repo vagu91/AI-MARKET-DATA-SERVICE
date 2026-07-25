@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -370,10 +372,12 @@ def test_persistent_provider_only_ticks_drain_more_than_forty_without_restart(
     )
 
     assert first["claimed"] == 40
+    assert first["status"] == "IN_PROGRESS"
     assert first["catch_up_backlog_before"] == 45
     assert first["catch_up_backlog_after"] == 5
     assert first["catch_up_completion_status"] == "IN_PROGRESS"
     assert second["claimed"] == 5
+    assert second["status"] == "COMPLETED"
     assert second["catch_up_backlog_after"] == 0
     assert second["catch_up_completion_status"] == "COMPLETED"
     assert third["status"] == "ALREADY_COMPLETE"
@@ -382,6 +386,7 @@ def test_persistent_provider_only_ticks_drain_more_than_forty_without_restart(
     assert resolver_types == ["macro_actual"] * 45
     assert first["ai_invocations"] == second["ai_invocations"] == 0
     assert first["ai_jobs_created"] == second["ai_jobs_created"] == 0
+    assert third["ai_invocations"] == third["ai_jobs_created"] == 0
     with connect_sqlite(settings.database_path) as conn:
         checkpoint = conn.execute(
             """
@@ -394,6 +399,22 @@ def test_persistent_provider_only_ticks_drain_more_than_forty_without_restart(
         assert payload["backlog_after"] == 0
         assert payload["tick_count"] == 2
         assert payload["completion_status"] == "COMPLETED"
+        tick_telemetry = conn.execute(
+            """
+            SELECT stop_reason,payload_json
+            FROM service_telemetry_events
+            WHERE event_name='startup_catch_up'
+            ORDER BY rowid
+            """
+        ).fetchall()
+        assert [row["stop_reason"] for row in tick_telemetry] == [
+            "IN_PROGRESS",
+            "COMPLETED",
+        ]
+        assert [
+            json.loads(row["payload_json"])["payload"]["status"]
+            for row in tick_telemetry
+        ] == ["IN_PROGRESS", "COMPLETED"]
         assert conn.execute(
             "SELECT COUNT(*) FROM market_context_snapshots"
         ).fetchone()[0] == snapshot_count_after_completion
@@ -441,8 +462,6 @@ async def test_production_catchup_loop_runs_provider_only_ticks_without_restart(
         if sleeps > 2:
             raise asyncio.CancelledError
 
-    import asyncio
-
     monkeypatch.setattr(asyncio, "sleep", bounded_sleep)
     state = {
         "settings": settings,
@@ -455,6 +474,261 @@ async def test_production_catchup_loop_runs_provider_only_ticks_without_restart(
     assert len(contexts) == 2
     assert all(context.allow_ai is False for context in contexts)
     assert all(context.allow_live_providers is True for context in contexts)
+
+
+@pytest.mark.asyncio
+async def test_catchup_loop_recovers_after_transient_tick_without_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = cfg(
+        tmp_path,
+        lifecycle_due_scanner_interval_seconds=5,
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+    contexts: list[ExecutionContext] = []
+    tick_calls = 0
+
+    def transient_then_success(**kwargs: object) -> dict[str, object]:
+        nonlocal tick_calls
+        tick_calls += 1
+        contexts.append(kwargs["execution_context"])  # type: ignore[arg-type]
+        if tick_calls == 1:
+            raise RuntimeError("temporary provider fixture failure")
+        return {
+            "status": "COMPLETED",
+            "catch_up_completion_status": "COMPLETED",
+            "ai_invocations": 0,
+            "ai_jobs_created": 0,
+        }
+
+    monkeypatch.setattr(
+        scheduler,
+        "startup_catch_up",
+        transient_then_success,
+    )
+    sleep_delays: list[float] = []
+
+    async def bounded_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        if len(sleep_delays) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", bounded_sleep)
+    caplog.set_level(logging.INFO, logger="app.main")
+    state = {
+        "settings": settings,
+        "research_scheduler": scheduler,
+        "lifecycle_due_resolver": SimpleNamespace(
+            resolve=lambda _: pytest.fail(
+                "fixture scheduler must not invoke a provider"
+            )
+        ),
+    }
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_event_calendar_catchup_loop(state)
+
+    assert tick_calls == 2
+    assert sleep_delays == [5, 1, 5, 5]
+    assert all(context.allow_ai is False for context in contexts)
+    assert all(context.allow_live_providers is True for context in contexts)
+    with connect_sqlite(settings.database_path) as conn:
+        error_row = conn.execute(
+            """
+            SELECT correlation_id,stop_reason,payload_json
+            FROM service_telemetry_events
+            WHERE event_name='startup_catch_up'
+              AND stop_reason='TRANSIENT_ERROR'
+            """
+        ).fetchone()
+        assert error_row is not None
+        error_payload = json.loads(error_row["payload_json"])
+        assert str(error_row["correlation_id"]).startswith(
+            "event-calendar-catch-up-"
+        )
+        assert error_payload["payload"]["status"] == "IN_PROGRESS"
+        assert error_payload["payload"]["error_type"] == "RuntimeError"
+        assert error_payload["payload"]["retry_delay_seconds"] == 1
+        assert "RuntimeError" in str(error_payload["redacted_error"])
+        assert conn.execute(
+            "SELECT COUNT(*) FROM research_backend_invocations"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ai_research_jobs"
+        ).fetchone()[0] == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "error_type=RuntimeError catch_up_status=IN_PROGRESS" in message
+        and "correlation_id=event-calendar-catch-up-" in message
+        for message in messages
+    )
+    assert any("status=COMPLETED" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_catchup_loop_always_propagates_cancelled_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = cfg(
+        tmp_path,
+        lifecycle_due_scanner_interval_seconds=5,
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+    contexts: list[ExecutionContext] = []
+
+    def cancelled_tick(**kwargs: object) -> dict[str, object]:
+        contexts.append(kwargs["execution_context"])  # type: ignore[arg-type]
+        raise asyncio.CancelledError
+
+    async def immediate_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "startup_catch_up", cancelled_tick)
+    monkeypatch.setattr(asyncio, "sleep", immediate_sleep)
+    state = {
+        "settings": settings,
+        "research_scheduler": scheduler,
+        "lifecycle_due_resolver": SimpleNamespace(resolve=lambda _: {}),
+    }
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_event_calendar_catchup_loop(state)
+
+    assert len(contexts) == 1
+    assert contexts[0].allow_ai is False
+    with connect_sqlite(settings.database_path) as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM service_telemetry_events
+            WHERE event_name='startup_catch_up'
+            """
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM research_backend_invocations"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ai_research_jobs"
+        ).fetchone()[0] == 0
+
+
+def test_waiting_backoff_early_tick_is_fully_idempotent_and_provider_free(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    _seed_due_macro(
+        settings,
+        key="macro:deferred:idempotent",
+        release=NOW - timedelta(days=1),
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
+    resolver_calls = 0
+
+    def deferred(_: dict[str, object]) -> dict[str, object]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return {
+            "status": "DEFERRED",
+            "reason": "temporary_provider_fixture_failure",
+            "provider_request_attempted": True,
+            "provider_request_failed": True,
+            "ai_eligible": True,
+        }
+
+    context = ExecutionContext.provider_only(
+        correlation_id="waiting-backoff-fixture",
+        allow_live_providers=True,
+    )
+    first = scheduler.startup_catch_up(
+        resolver=deferred,
+        ai_enqueue=lambda _: pytest.fail("AI must remain unreachable"),
+        execution_context=context,
+    )
+    with connect_sqlite(settings.database_path) as conn:
+        checkpoint_before = conn.execute(
+            """
+            SELECT payload_json,updated_at,next_retry_at
+            FROM provider_state
+            WHERE state_key='event_calendar_lifecycle_catchup'
+            """
+        ).fetchone()
+        telemetry_before = conn.execute(
+            "SELECT COUNT(*) FROM service_telemetry_events"
+        ).fetchone()[0]
+        snapshots_before = conn.execute(
+            "SELECT COUNT(*) FROM market_context_snapshots"
+        ).fetchone()[0]
+        outbox_before = conn.execute(
+            "SELECT COUNT(*) FROM market_context_outbox"
+        ).fetchone()[0]
+    assert checkpoint_before is not None
+
+    second = scheduler.startup_catch_up(
+        resolver=lambda _: pytest.fail(
+            "resolver must not run before next_retry_at"
+        ),
+        ai_enqueue=lambda _: pytest.fail("AI must remain unreachable"),
+        execution_context=context,
+    )
+
+    assert resolver_calls == 1
+    assert first["status"] == "WAITING_BACKOFF"
+    assert first["catch_up_completion_status"] == "WAITING_BACKOFF"
+    assert first["catch_up_pending_backoff"] == 1
+    assert first["catch_up_next_retry_at"] is not None
+    assert first["ai_invocations"] == first["ai_jobs_created"] == 0
+    with connect_sqlite(settings.database_path) as conn:
+        waiting_telemetry = conn.execute(
+            """
+            SELECT stop_reason,payload_json
+            FROM service_telemetry_events
+            WHERE event_name='startup_catch_up'
+            """
+        ).fetchone()
+        assert waiting_telemetry is not None
+        assert waiting_telemetry["stop_reason"] == "WAITING_BACKOFF"
+        assert (
+            json.loads(waiting_telemetry["payload_json"])["payload"]["status"]
+            == "WAITING_BACKOFF"
+        )
+    assert second["status"] == "WAITING_BACKOFF"
+    assert second["catch_up_completion_status"] == "WAITING_BACKOFF"
+    assert second["claimed"] == 0
+    assert second["provider_calls"] == 0
+    assert second["resolver_evaluations"] == 0
+    assert second["actual_provider_requests"] == 0
+    assert second["ai_invocations"] == second["ai_jobs_created"] == 0
+    assert second["writes"] == 0
+    assert second["checkpoint_written"] is False
+    assert second["telemetry_emitted"] is False
+    assert second["catch_up_next_retry_at"] == first["catch_up_next_retry_at"]
+    with connect_sqlite(settings.database_path) as conn:
+        checkpoint_after = conn.execute(
+            """
+            SELECT payload_json,updated_at,next_retry_at
+            FROM provider_state
+            WHERE state_key='event_calendar_lifecycle_catchup'
+            """
+        ).fetchone()
+        assert checkpoint_after is not None
+        assert dict(checkpoint_after) == dict(checkpoint_before)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM service_telemetry_events"
+        ).fetchone()[0] == telemetry_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM market_context_snapshots"
+        ).fetchone()[0] == snapshots_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM market_context_outbox"
+        ).fetchone()[0] == outbox_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM research_backend_invocations"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ai_research_jobs"
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("offline_days", [7, 30, 365, 730])
@@ -488,6 +762,7 @@ def test_catchup_lookback_accepts_required_downtime_boundaries(
 
     assert result["claimed"] == 1
     assert claimed == [f"macro:downtime:{offline_days}"]
+    assert result["status"] == "WAITING_BACKOFF"
     assert result["ai_invocations"] == 0
     assert result["catch_up_completion_status"] == "WAITING_BACKOFF"
 
