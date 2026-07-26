@@ -481,7 +481,13 @@ def test_material_trigger_emits_one_idempotent_outbox_event(tmp_path: Path) -> N
             "created_at": NOW.isoformat(),
         }
         first = repository.emit_in_transaction(conn, **kwargs)
-        second = repository.emit_in_transaction(conn, **kwargs)
+        second = repository.emit_in_transaction(
+            conn,
+            **{
+                **kwargs,
+                "created_at": (NOW + timedelta(minutes=1)).isoformat(),
+            },
+        )
         conn.commit()
     assert first and second and first["event_id"] == second["event_id"]
     assert len(repository.list_events()) == 1

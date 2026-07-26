@@ -149,12 +149,18 @@ deduplicate across sources or truncate records while saving.
 
 ## ACK
 
-Send `status=PERSISTED`, the exact delivery id, target snapshot revision and the
-section revision inventory actually committed. Use the coordinator timestamp.
+Send `status=PERSISTED`, the exact delivery id, target snapshot revision and
+exactly the changed-section revision inventory named by that delivery. Use the
+coordinator timestamp, never a time before notification creation or more than
+five minutes in the future.
 Retry the identical ACK on timeout. Treat HTTP 409 as a contract conflict that
 requires diagnosis; do not manufacture another ACK payload.
 
 ACK does not mean analysis complete.
+
+Do not call the deprecated global outbox ACK endpoint or the deprecated
+`/market-context/mnq/consumer` projection. The former returns HTTP 410; the
+latter is not complete synchronization input.
 
 ## Snapshot pinning and Senior Analyst start
 

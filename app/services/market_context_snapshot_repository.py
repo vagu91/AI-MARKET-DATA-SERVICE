@@ -504,11 +504,11 @@ class MarketContextSnapshotRepository:
         """Compatibility helper for fixtures importing an already allocated immutable snapshot."""
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         debug_payload = self.source_policy.sanitize_operational_payload(
-            debug_payload,
+            redact_payload(debug_payload),
             allow_test_reserved=self.allow_test_reserved_sources,
         ) or {}
         consumer_payload = self.source_policy.sanitize_operational_payload(
-            consumer_payload,
+            redact_payload(consumer_payload),
             allow_test_reserved=self.allow_test_reserved_sources,
         ) or {}
         generated_at = str(debug_payload.get("generated_at_utc") or debug_payload.get("generated_at") or now)

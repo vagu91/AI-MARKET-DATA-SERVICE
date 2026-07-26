@@ -31,7 +31,8 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /events/upcoming?country=US&days=7`
 - `GET /events/active-windows?symbol=MNQ`
 - `GET /market-context/mnq`
-- `GET /market-context/mnq/consumer?refresh=false|auto|force`
+- `GET /market-context/mnq/consumer?refresh=false|auto|force` (deprecated
+  analysis projection; not a synchronization source)
 - `GET /market-context/mnq/debug?refresh=false|auto|force`
 - `GET /ai-research/jobs/latest?view=full|compact`
 - `GET /ai-research/jobs/{job_id}`
@@ -90,7 +91,8 @@ provider state, versioned context snapshots, source candidates with lineage,
 persistent AI jobs/attempts, observed research tool events, verified evidence
 and schema migrations. Migrations through schema 21 are additive and upgrade
 all supported prior versions without rebuilding canonical tables. Migration 21
-adds immutable per-section sync state, durable refresh work/waiters, ACK and
+adds immutable per-section sync state, durable refresh work/waiters,
+consumer-specific ACK/delivery targets, bounded retry/dead-letter state,
 consumer diagnostics, delivery attempts and versioned outbox metadata.
 
 The AI Trader producer protocol is documented in

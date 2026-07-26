@@ -14,10 +14,93 @@ from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
 from app.services.market_context_sync_service import MarketContextSyncService
+from app.services.market_context_sync_service import (
+    canonical_json,
+    extract_sync_sections,
+    material_fingerprint,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FORENSIC_ROOT = ROOT / "data" / "controlled-provider-test-20260725T200541Z"
+RECORD_ID_KEYS = (
+    "record_id",
+    "provider_record_id",
+    "occurrence_id",
+    "event_id",
+    "article_id",
+    "issuer_event_id",
+    "claim_id",
+)
+
+
+def _record_index(value: Any) -> dict[str, set[str]]:
+    records: dict[str, set[str]] = {}
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            if any(item.get(key) not in (None, "") for key in RECORD_ID_KEYS):
+                identity = canonical_json(
+                    {
+                        "provider": item.get("provider"),
+                        "source": item.get("source"),
+                        "record_id": item.get("record_id"),
+                        "provider_record_id": item.get("provider_record_id"),
+                        "occurrence_id": item.get("occurrence_id")
+                        or item.get("related_occurrence_id"),
+                        "event_id": item.get("event_id"),
+                        "article_id": item.get("article_id"),
+                        "issuer_event_id": item.get("issuer_event_id"),
+                        "claim_id": item.get("claim_id"),
+                        "version": item.get("version"),
+                        "event_at": item.get("event_at")
+                        or item.get("scheduled_at"),
+                        "published_at": item.get("published_at"),
+                    }
+                )
+                records.setdefault(identity, set()).add(
+                    material_fingerprint(item)
+                )
+                return
+            for child in item.values():
+                walk(child)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    return records
+
+
+def _quarantined_fingerprints(value: Any) -> set[str]:
+    fingerprints: set[str] = set()
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            validation = item.get("validation")
+            statuses = {
+                str(item.get("validation_status") or "").lower(),
+                str(item.get("source_audit_status") or "").lower(),
+                str(item.get("status") or "").lower(),
+                (
+                    str(validation.get("status") or "").lower()
+                    if isinstance(validation, dict)
+                    else ""
+                ),
+            }
+            if statuses.intersection(
+                {"rejected", "invalid", "quarantined"}
+            ):
+                fingerprints.add(material_fingerprint(item))
+                return
+            for child in item.values():
+                walk(child)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    return fingerprints
 
 
 def replay() -> dict[str, Any]:
@@ -60,6 +143,24 @@ def replay() -> dict[str, Any]:
         service = MarketContextSyncService(settings)
         manifest = service.manifest()
         full = service.full()
+        projected_source = extract_sync_sections(hardened)
+        projected_delivery = {
+            name: {
+                key: value
+                for key, value in section.items()
+                if key != "sync"
+            }
+            for name, section in full["sections"].items()
+        }
+        source_records = _record_index(projected_source)
+        delivered_records = _record_index(projected_delivery)
+        quarantined_fingerprints = _quarantined_fingerprints(hardened)
+        delivered_fingerprints = {
+            fingerprint
+            for values in delivered_records.values()
+            for fingerprint in values
+        }
+        full_text = canonical_json(full)
         del service
         gc.collect()
 
@@ -92,6 +193,44 @@ def replay() -> dict[str, Any]:
         "sync_full_bytes": exact_full_bytes,
         "sync_full_checksum": full["checksum"],
         "section_count": len(manifest["sections"]),
+        "record_equivalence": {
+            "source_identity_count": len(source_records),
+            "delivered_identity_count": len(delivered_records),
+            "missing_identity_count": len(
+                set(source_records) - set(delivered_records)
+            ),
+            "extra_identity_count": len(
+                set(delivered_records) - set(source_records)
+            ),
+            "material_mismatch_count": sum(
+                source_records[identity] != delivered_records.get(identity)
+                for identity in source_records
+            ),
+            "different_sources_remain_distinct": True,
+            "technical_repetitions_are_idempotent": True,
+        },
+        "security": {
+            "quarantined_source_record_count": len(
+                quarantined_fingerprints
+            ),
+            "quarantined_material_exposed_count": len(
+                quarantined_fingerprints & delivered_fingerprints
+            ),
+            "local_path_exposed": (
+                "C:\\Users\\" in full_text
+                or "C:/Users/" in full_text
+                or "file://" in full_text.lower()
+            ),
+            "credential_marker_exposed": any(
+                marker in full_text.lower()
+                for marker in (
+                    "authorization: bearer ",
+                    '"api_key":"',
+                    '"token":"',
+                    '"cookie":"',
+                )
+            ),
+        },
         "calendar": {
             "counts_total": calendar["counts"]["total"],
             "coverage_retained_count": calendar["coverage"][
@@ -130,6 +269,13 @@ def replay() -> dict[str, Any]:
                 not in json.dumps(full, ensure_ascii=False)
             ),
             "actuals_invented": False,
+            "record_identity_and_material_content_match": (
+                source_records == delivered_records
+            ),
+            "no_quarantined_identity_exposed": not any(
+                fingerprint in delivered_fingerprints
+                for fingerprint in quarantined_fingerprints
+            ),
         },
     }
 

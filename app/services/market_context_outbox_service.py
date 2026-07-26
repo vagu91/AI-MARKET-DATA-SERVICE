@@ -114,16 +114,53 @@ class MarketContextOutboxRepository:
             ]
         if not changed_sections:
             return None
+        trigger_envelopes = [
+            dict(item)
+            for item in (trigger_metadata or {}).get("triggers") or []
+            if isinstance(item, dict) and item.get("type")
+        ]
+        if not trigger_envelopes:
+            trigger_envelopes = [
+                {
+                    "type": str(item).upper(),
+                    "entity_id": trigger_entity,
+                    "occurred_at": created_at,
+                }
+                for item in (
+                    (trigger_metadata or {}).get("causes")
+                    or [trigger_type]
+                )
+                if item
+            ]
+        trigger_envelopes = sorted(
+            (
+                {
+                    "type": str(item["type"]).upper(),
+                    "entity_id": item.get("entity_id"),
+                    "occurred_at": item.get("occurred_at") or created_at,
+                }
+                for item in trigger_envelopes
+            ),
+            key=_json,
+        )
         payload_hash = materiality_fingerprint(
             section_metadata or current_payload
         )
         idempotency_seed = "|".join(
             (
                 "market_context.updated",
-                str(trigger_type),
-                str(trigger_entity or ""),
-                str(previous_snapshot_id or ""),
+                str(snapshot_id),
+                str(snapshot_revision),
                 payload_hash,
+                _json(
+                    [
+                        {
+                            "type": item["type"],
+                            "entity_id": item["entity_id"],
+                        }
+                        for item in trigger_envelopes
+                    ]
+                ),
             )
         )
         idempotency_key = hashlib.sha256(
@@ -196,15 +233,7 @@ class MarketContextOutboxRepository:
                     if base_revision is not None
                     else max(int(snapshot_revision) - 1, 0)
                 ),
-                _json(
-                    [
-                        {
-                            "type": str(trigger_type).upper(),
-                            "entity_id": trigger_entity,
-                            "occurred_at": created_at,
-                        }
-                    ]
-                ),
+                _json(trigger_envelopes),
                 "/market-context/mnq/sync/manifest",
                 (
                     "/market-context/mnq/sync/changes"

@@ -1287,13 +1287,17 @@ CREATE INDEX IF NOT EXISTS idx_market_context_sync_sections_revision
 CREATE TABLE IF NOT EXISTS market_context_sync_refresh_work (
   work_id TEXT PRIMARY KEY,
   symbol TEXT NOT NULL,
-  generation INTEGER NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation>0),
   refresh_reason TEXT NOT NULL,
   request_fingerprint TEXT NOT NULL,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL
+    CHECK(status IN (
+      'PENDING','RUNNING','WAITING_BACKOFF','COMPLETED'
+    )),
   sections_json TEXT NOT NULL,
   completed_sections_json TEXT NOT NULL DEFAULT '[]',
   residual_sections_json TEXT NOT NULL DEFAULT '[]',
+  trigger_reasons_json TEXT NOT NULL DEFAULT '[]',
   parent_work_id TEXT NULL,
   target_snapshot_revision INTEGER NULL,
   result_snapshot_id TEXT NULL,
@@ -1311,12 +1315,17 @@ CREATE TABLE IF NOT EXISTS market_context_sync_refresh_work (
 
 CREATE INDEX IF NOT EXISTS idx_market_context_sync_work_active
   ON market_context_sync_refresh_work(symbol,status,generation);
+CREATE INDEX IF NOT EXISTS idx_market_context_sync_work_fingerprint
+  ON market_context_sync_refresh_work(
+    symbol,request_fingerprint,status,generation
+  );
 
 CREATE TABLE IF NOT EXISTS market_context_sync_waiters (
   work_id TEXT NOT NULL,
-  consumer_id TEXT NOT NULL,
-  request_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL CHECK(length(consumer_id) BETWEEN 1 AND 128),
+  request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 128),
   requested_sections_json TEXT NOT NULL,
+  request_fingerprint TEXT NOT NULL,
   attached_at TEXT NOT NULL,
   PRIMARY KEY(work_id,consumer_id,request_id),
   UNIQUE(consumer_id,request_id),
@@ -1324,10 +1333,10 @@ CREATE TABLE IF NOT EXISTS market_context_sync_waiters (
 );
 
 CREATE TABLE IF NOT EXISTS market_context_delivery_acks (
-  consumer_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL CHECK(length(consumer_id) BETWEEN 1 AND 128),
   delivery_id TEXT NOT NULL,
   snapshot_revision INTEGER NOT NULL,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status='PERSISTED'),
   section_revisions_json TEXT NOT NULL,
   acknowledged_at TEXT NOT NULL,
   received_at TEXT NOT NULL,
@@ -1337,7 +1346,7 @@ CREATE TABLE IF NOT EXISTS market_context_delivery_acks (
 );
 
 CREATE TABLE IF NOT EXISTS market_context_consumer_state (
-  consumer_id TEXT PRIMARY KEY,
+  consumer_id TEXT PRIMARY KEY CHECK(length(consumer_id) BETWEEN 1 AND 128),
   last_delivery_created TEXT NULL,
   last_delivery_notified TEXT NULL,
   last_delivery_acknowledged TEXT NULL,
@@ -1354,15 +1363,40 @@ CREATE TABLE IF NOT EXISTS market_context_consumer_state (
 CREATE TABLE IF NOT EXISTS market_context_delivery_attempts (
   attempt_id TEXT PRIMARY KEY,
   delivery_id TEXT NOT NULL,
-  consumer_id TEXT NOT NULL,
-  attempt_number INTEGER NOT NULL,
-  status TEXT NOT NULL,
+  consumer_id TEXT NOT NULL CHECK(length(consumer_id) BETWEEN 1 AND 128),
+  attempt_number INTEGER NOT NULL CHECK(attempt_number>0),
+  status TEXT NOT NULL CHECK(status IN ('NOTIFIED','FAILED')),
   attempted_at TEXT NOT NULL,
   next_retry_at TEXT NULL,
   error_json TEXT NULL,
   UNIQUE(delivery_id,consumer_id,attempt_number),
   FOREIGN KEY(delivery_id) REFERENCES market_context_outbox(event_id)
 );
+
+CREATE TABLE IF NOT EXISTS market_context_delivery_targets (
+  delivery_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL CHECK(length(consumer_id) BETWEEN 1 AND 128),
+  status TEXT NOT NULL
+    CHECK(status IN (
+      'PENDING','NOTIFIED','ACKNOWLEDGED','DEAD_LETTER'
+    )),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0),
+  next_retry_at TEXT NULL,
+  last_error_json TEXT NOT NULL DEFAULT '{}',
+  superseded_by_delivery_id TEXT NULL,
+  acknowledged_at TEXT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(delivery_id,consumer_id),
+  FOREIGN KEY(delivery_id) REFERENCES market_context_outbox(event_id),
+  FOREIGN KEY(superseded_by_delivery_id)
+    REFERENCES market_context_outbox(event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_context_delivery_targets_due
+  ON market_context_delivery_targets(
+    consumer_id,status,next_retry_at,created_at
+  );
 
 ALTER TABLE market_context_outbox ADD COLUMN base_revision INTEGER NULL;
 ALTER TABLE market_context_outbox

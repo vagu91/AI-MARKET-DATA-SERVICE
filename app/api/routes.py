@@ -499,8 +499,9 @@ async def market_context_mnq_debug(
     )
 
 
-@router.get("/market-context/mnq/consumer")
+@router.get("/market-context/mnq/consumer", deprecated=True)
 async def market_context_mnq_consumer(
+    response: Response,
     refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
     macro_service: MacroService = Depends(get_macro_service),
     event_service: EventService = Depends(get_event_service),
@@ -509,6 +510,10 @@ async def market_context_mnq_consumer(
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
     deterministic_runtime=Depends(get_deterministic_provider_runtime),
 ) -> dict[str, object]:
+    response.headers["Deprecation"] = "true"
+    response.headers["Link"] = (
+        '</market-context/mnq/sync/full>; rel="successor-version"'
+    )
     return await market_context_mnq(
         refresh=refresh,
         view="consumer",
@@ -559,14 +564,9 @@ async def market_context_sync_sections(
     ),
 ) -> dict[str, object]:
     return _sync_call(
-        lambda: _market_context_sync(enrichment_orchestrator).sections(
-            consumer_id=str(payload.get("consumer_id") or ""),
-            target_snapshot_revision=int(
-                payload.get("target_snapshot_revision") or 0
-            ),
-            sections=payload.get("sections") or [],
-            include_lineage=bool(payload.get("include_lineage")),
-        )
+        lambda: _market_context_sync(
+            enrichment_orchestrator
+        ).sections_request(payload)
     )
 
 
@@ -706,22 +706,14 @@ async def acknowledge_market_context_outbox_event(
         get_enrichment_orchestrator
     ),
 ) -> dict[str, object]:
-    try:
-        event = MarketContextOutboxRepository(
-            enrichment_orchestrator.settings
-        ).acknowledge(
-            event_id,
-            consumer_id=str(payload.get("consumer_id") or ""),
-            idempotency_key=str(payload.get("idempotency_key") or ""),
-        )
-    except ValueError as exc:
-        detail = str(exc)
-        status_code = 404 if detail == "outbox_event_not_found" else 409
-        raise HTTPException(status_code=status_code, detail=detail) from exc
-    return {
-        "event": event,
-        "delivery_enabled": False,
-    }
+    del event_id, payload, enrichment_orchestrator
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "legacy_global_outbox_ack_deprecated:"
+            "use_/market-context/mnq/sync/ack"
+        ),
+    )
 
 
 def _materialize_market_context(

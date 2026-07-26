@@ -72,8 +72,13 @@ Command:
 Observed result:
 
 ```text
-sync full bytes              1,466,342
+sync full bytes                916,011
 section count                       17
+validated source identities         118
+delivered identities                118
+missing / extra / mismatched      0 / 0 / 0
+quarantined source fingerprints     207
+quarantined material exposed          0
 calendar candidate_count            30
 calendar retained_count             30
 calendar omitted_count               0
@@ -89,10 +94,13 @@ deliveries                            0
 operational DB writes                 0
 ```
 
-The full payload is about 31 times the old consumer artifact and is merely
-measured. All 30 calendar candidates are retained. The empty previous week is
-now explicitly `UNVERIFIED_EMPTY` under partial source coverage. The two missing
-actuals remain missing.
+The full payload is about 19.6 times the old consumer artifact and is merely
+measured. Its smaller size than the raw debug snapshot comes from withholding
+rejected/quarantined source material, not from truncating accepted data. Every
+validated record identity and material fingerprint matches the delivery. All 30
+calendar candidates are retained. The empty previous week is now explicitly
+`UNVERIFIED_EMPTY` under partial source coverage. The two missing actuals remain
+missing.
 
 ## General corrections
 
@@ -123,7 +131,7 @@ and explicitly authorized for a residual field.
 
 ## Verification
 
-- complete suite: 1,670 passed;
+- complete suite: 1,698 passed;
 - sync and migration matrix: passed;
 - Ruff, `py_compile`, `compileall` and `git diff --check`: passed;
 - Windows PowerShell 5.1 parser: four scripts, zero errors;

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from app.core.config import Settings
+from app.core.redaction import redact_payload
 from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.migrations import migrate_database
 from app.services.data_freshness_service import parse_datetime
@@ -38,8 +42,6 @@ SECTION_SET = frozenset(SECTION_NAMES)
 AVAILABLE_STATUSES = frozenset(
     {
         "AVAILABLE",
-        "PARTIAL",
-        "LAST_KNOWN_GOOD",
         "NO_DATA_EXPECTED",
         "NO_RELEVANT_DATA",
         "NO_RELEVANT_MARKETS",
@@ -48,7 +50,14 @@ AVAILABLE_STATUSES = frozenset(
 UNAVAILABLE_STATUSES = frozenset(
     {"NO_DATA", "UNAVAILABLE", "QUARANTINED", "BACKOFF", "DISABLED"}
 )
+DEGRADED_STATUSES = frozenset(
+    {"PARTIAL", "LAST_KNOWN_GOOD", "STALE", "EXPIRED", "DUE"}
+)
 ACTIVE_WORK_STATUSES = frozenset({"PENDING", "RUNNING", "WAITING_BACKOFF"})
+MAX_CONTROL_PAYLOAD_BYTES = 262_144
+MAX_IDENTIFIER_LENGTH = 128
+MAX_ACK_CLOCK_SKEW_SECONDS = 300
+MAX_DELIVERY_ATTEMPTS = 8
 MATERIAL_TRIGGER_REASONS = frozenset(
     {
         "MARKET_TRIGGER",
@@ -101,6 +110,33 @@ VOLATILE_KEYS = frozenset(
         "network_called",
         "cache_hit",
     }
+)
+TEMPORAL_KEYS = frozenset(
+    {
+        "acknowledged_at",
+        "as_of",
+        "checked_at",
+        "created_at",
+        "data_as_of",
+        "event_at",
+        "fresh_until",
+        "generated_at",
+        "generated_at_utc",
+        "next_refresh_at",
+        "observed_at",
+        "published_at",
+        "release_at",
+        "retrieved_at",
+        "scheduled_at",
+        "updated_at",
+        "valid_from",
+        "valid_until",
+    }
+)
+_WITHHELD = object()
+_LOCAL_PATH_RE = re.compile(
+    r"(?i)(?:\b[A-Z]:[\\/]|\\\\|file://|/(?:home|root|Users|tmp)/)"
+    r"[^\s\"'<>]*"
 )
 
 
@@ -157,13 +193,15 @@ def persist_sync_sections_in_transaction(
             reference=parse_datetime(created_at) or datetime.now(UTC),
         )
         record_count = record_count_for(payload)
+        encoded_payload = canonical_json(payload)
         conn.execute(
             """
-            INSERT OR REPLACE INTO market_context_sync_sections(
+            INSERT INTO market_context_sync_sections(
               symbol,snapshot_id,snapshot_revision,section_name,section_revision,
               fingerprint,record_count,data_as_of,freshness,valid_until,status,
               reason,payload_json,created_at
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(snapshot_id,section_name) DO NOTHING
             """,
             (
                 symbol.upper(),
@@ -178,10 +216,43 @@ def persist_sync_sections_in_transaction(
                 valid_until,
                 status,
                 reason,
-                canonical_json(payload),
+                encoded_payload,
                 created_at,
             ),
         )
+        persisted = conn.execute(
+            """
+            SELECT section_revision,fingerprint,record_count,data_as_of,
+                   freshness,valid_until,status,reason,payload_json
+            FROM market_context_sync_sections
+            WHERE snapshot_id=? AND section_name=?
+            """,
+            (snapshot_id, section_name),
+        ).fetchone()
+        expected_immutable = (
+            section_revision,
+            fingerprint,
+            record_count,
+            section_data_as_of,
+            freshness,
+            valid_until,
+            status,
+            reason,
+            encoded_payload,
+        )
+        actual_immutable = (
+            int(persisted["section_revision"]),
+            str(persisted["fingerprint"]),
+            int(persisted["record_count"]),
+            persisted["data_as_of"],
+            str(persisted["freshness"]),
+            persisted["valid_until"],
+            str(persisted["status"]),
+            persisted["reason"],
+            str(persisted["payload_json"]),
+        )
+        if actual_immutable != expected_immutable:
+            raise RuntimeError("sync_section_immutability_conflict")
         metadata[section_name] = {
             "section_revision": section_revision,
             "fingerprint": fingerprint,
@@ -205,6 +276,15 @@ def extract_sync_sections(full: dict[str, Any]) -> dict[str, Any]:
             full.get("economic_calendar_enrichment") or {}
         ),
         "event_windows": full.get("event_windows") or {},
+        "market_calendar": full.get("market_calendar") or {},
+        "events_today": full.get("events_today") or [],
+        "events_today_context": full.get("events_today_context") or {},
+        "next_24h_events": full.get("next_24h_events") or [],
+        "next_7d_critical_events": full.get("next_7d_critical_events") or [],
+        "recently_released_events": full.get("recently_released_events") or [],
+        "upcoming_high_impact_events": (
+            full.get("upcoming_high_impact_events") or []
+        ),
     }
     news_context = full.get("news_context") or {}
     nasdaq_context = full.get("nasdaq_context") or {}
@@ -236,6 +316,9 @@ def extract_sync_sections(full: dict[str, Any]) -> dict[str, Any]:
     risk = {
         "risk_context": full.get("risk_context") or {},
         "risk_sentiment": full.get("risk_sentiment") or {},
+        "sentiment": full.get("sentiment") or {},
+        "sentiment_context": full.get("sentiment_context") or {},
+        "social_sentiment": full.get("social_sentiment") or {},
     }
     vix = _extract_vix(full)
     geopolitical = {
@@ -250,7 +333,7 @@ def extract_sync_sections(full: dict[str, Any]) -> dict[str, Any]:
             if key in {"geopolitical_risk", "regulatory_risk"}
         },
     }
-    return {
+    raw_sections = {
         "macro": {
             "snapshot": full.get("macro_snapshot") or {},
             "provider_payload": full.get("macro") or {},
@@ -275,6 +358,129 @@ def extract_sync_sections(full: dict[str, Any]) -> dict[str, Any]:
         "earnings_intelligence": full.get("earnings_intelligence") or {},
         "geopolitical_regulatory_risk": geopolitical,
     }
+    return {
+        name: withhold_quarantined_payload(payload)
+        for name, payload in raw_sections.items()
+    }
+
+
+def withhold_quarantined_payload(value: Any) -> Any:
+    """Remove rejected records while disclosing only aggregate quarantine state."""
+
+    quarantined: dict[str, set[str]] = {
+        "fingerprints": set(),
+        "reasons": set(),
+    }
+    cleaned = _withhold_quarantined(
+        _redact_contract_local_paths(redact_payload(value)),
+        quarantined=quarantined,
+    )
+    if cleaned is _WITHHELD:
+        cleaned = {}
+    if not isinstance(cleaned, dict):
+        cleaned = {"records": cleaned}
+    if quarantined["fingerprints"]:
+        cleaned = dict(cleaned)
+        cleaned["producer_disclosures"] = {
+            "quarantine": {
+                "status": "WITHHELD",
+                "record_count": len(quarantined["fingerprints"]),
+                "reasons": sorted(quarantined["reasons"]),
+            }
+        }
+    return cleaned
+
+
+def _redact_contract_local_paths(value: Any) -> Any:
+    if isinstance(value, str):
+        return _LOCAL_PATH_RE.sub("<redacted-local-path>", value)
+    if isinstance(value, list):
+        return [_redact_contract_local_paths(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_contract_local_paths(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _redact_contract_local_paths(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _withhold_quarantined(
+    value: Any,
+    *,
+    quarantined: dict[str, set[str]],
+    parent_key: str | None = None,
+) -> Any:
+    if _quarantine_container(parent_key):
+        quarantined["fingerprints"].add(material_fingerprint(value))
+        quarantined["reasons"].update(_quarantine_reasons(value))
+        return _WITHHELD
+    if isinstance(value, dict):
+        if _node_is_quarantined(value):
+            quarantined["fingerprints"].add(material_fingerprint(value))
+            quarantined["reasons"].update(_quarantine_reasons(value))
+            return _WITHHELD
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            cleaned = _withhold_quarantined(
+                item,
+                quarantined=quarantined,
+                parent_key=str(key),
+            )
+            if cleaned is not _WITHHELD:
+                output[str(key)] = cleaned
+        return output
+    if isinstance(value, list):
+        output = []
+        for item in value:
+            cleaned = _withhold_quarantined(
+                item,
+                quarantined=quarantined,
+                parent_key=parent_key,
+            )
+            if cleaned is not _WITHHELD:
+                output.append(cleaned)
+        return output
+    return value
+
+
+def _node_is_quarantined(value: dict[str, Any]) -> bool:
+    validation = value.get("validation")
+    states = {
+        str(value.get("validation_status") or "").lower(),
+        str(value.get("source_audit_status") or "").lower(),
+        str(value.get("audit_status") or "").lower(),
+        (
+            str(validation.get("status") or "").lower()
+            if isinstance(validation, dict)
+            else ""
+        ),
+    }
+    if str(value.get("status") or "").upper() == "QUARANTINED":
+        states.add("quarantined")
+    return bool(states.intersection({"rejected", "invalid", "quarantined"}))
+
+
+def _quarantine_container(key: str | None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key or "").lower())
+    return normalized.startswith("quarantined") and normalized not in {
+        "quarantined_record_count",
+    }
+
+
+def _quarantine_reasons(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        return {"SOURCE_OR_VALIDATION_QUARANTINE"}
+    reasons: set[str] = set()
+    for key in ("reason", "reason_code", "rejection_reason"):
+        if value.get(key):
+            reasons.add(str(value[key])[:160])
+    for key in ("reasons", "rejection_reasons", "warnings"):
+        raw = value.get(key)
+        if isinstance(raw, list):
+            reasons.update(str(item)[:160] for item in raw if item)
+    return reasons or {"SOURCE_OR_VALIDATION_QUARANTINE"}
 
 
 class MarketContextSyncService:
@@ -288,6 +494,7 @@ class MarketContextSyncService:
         symbol: str = SYMBOL,
         snapshot_revision: int | None = None,
     ) -> dict[str, Any]:
+        validate_symbol(symbol)
         snapshot, rows = self._snapshot_and_sections(
             symbol=symbol,
             snapshot_revision=snapshot_revision,
@@ -314,6 +521,7 @@ class MarketContextSyncService:
         symbol: str = SYMBOL,
         snapshot_revision: int | None = None,
     ) -> dict[str, Any]:
+        validate_symbol(symbol)
         snapshot, rows = self._snapshot_and_sections(
             symbol=symbol,
             snapshot_revision=snapshot_revision,
@@ -354,9 +562,9 @@ class MarketContextSyncService:
         include_lineage: bool = False,
         symbol: str = SYMBOL,
     ) -> dict[str, Any]:
+        validate_symbol(symbol)
         normalized = validate_sections(sections)
-        if not str(consumer_id or "").strip():
-            raise SyncContractError("consumer_id_required", 422)
+        validate_identifier(consumer_id, field="consumer_id")
         try:
             snapshot, rows = self._snapshot_and_sections(
                 symbol=symbol,
@@ -393,34 +601,108 @@ class MarketContextSyncService:
         }
         return finalize_delivery(response)
 
+    def sections_request(
+        self,
+        payload: dict[str, Any],
+        *,
+        symbol: str = SYMBOL,
+    ) -> dict[str, Any]:
+        validate_control_payload(
+            payload,
+            allowed={
+                "consumer_id",
+                "target_snapshot_revision",
+                "sections",
+                "include_lineage",
+            },
+        )
+        include_lineage = payload.get("include_lineage", False)
+        if not isinstance(include_lineage, bool):
+            raise SyncContractError("include_lineage_must_be_boolean", 422)
+        return self.sections(
+            consumer_id=validate_identifier(
+                payload.get("consumer_id"),
+                field="consumer_id",
+            ),
+            target_snapshot_revision=parse_positive_int(
+                payload.get("target_snapshot_revision"),
+                field="target_snapshot_revision",
+            ),
+            sections=(
+                payload["sections"]
+                if "sections" in payload
+                else []
+            ),
+            include_lineage=include_lineage,
+            symbol=symbol,
+        )
+
     def plan(
         self,
         payload: dict[str, Any],
         *,
         symbol: str = SYMBOL,
     ) -> dict[str, Any]:
-        consumer_id = str(payload.get("consumer_id") or "").strip()
-        request_id = str(payload.get("request_id") or "").strip()
-        if not consumer_id:
-            raise SyncContractError("consumer_id_required", 422)
-        if not request_id:
-            raise SyncContractError("request_id_required", 422)
-        required = validate_sections(payload.get("required_sections") or SECTION_NAMES)
+        validate_control_payload(
+            payload,
+            allowed={
+                "consumer_id",
+                "request_id",
+                "analysis_profile",
+                "required_sections",
+                "known_snapshot_revision",
+                "known_sections",
+            },
+        )
+        validate_symbol(symbol)
+        validate_identifier(
+            payload.get("consumer_id"),
+            field="consumer_id",
+        )
+        validate_identifier(
+            payload.get("request_id"),
+            field="request_id",
+        )
+        required = validate_sections(
+            payload["required_sections"]
+            if "required_sections" in payload
+            else SECTION_NAMES
+        )
         manifest = self.manifest(symbol=symbol)
         target_revision = int(manifest["snapshot_revision"])
         known_revision = payload.get("known_snapshot_revision")
         known_sections = payload.get("known_sections")
-        if not isinstance(known_sections, dict):
-            known_sections = {}
+        if known_sections is not None and not isinstance(known_sections, dict):
+            raise SyncContractError("known_sections_must_be_object", 422)
+        known_sections = known_sections or {}
+        if known_revision is not None:
+            known_revision = parse_positive_int(
+                known_revision,
+                field="known_snapshot_revision",
+            )
+        for name, known in known_sections.items():
+            if name not in SECTION_SET:
+                raise SyncContractError(f"unknown_section:{name}", 422)
+            if not isinstance(known, (dict, int)) or isinstance(known, bool):
+                raise SyncContractError(
+                    f"known_section_inventory_invalid:{name}",
+                    422,
+                )
         unavailable = [
             {
                 "section": name,
-                "classification": "UNAVAILABLE_AT_PRODUCER",
+                "classification": producer_availability_classification(
+                    manifest["sections"][name]
+                ),
                 "status": manifest["sections"][name]["status"],
+                "freshness": manifest["sections"][name]["freshness"],
                 "reason": manifest["sections"][name].get("reason"),
             }
             for name in required
-            if manifest["sections"][name]["status"] in UNAVAILABLE_STATUSES
+            if producer_availability_classification(
+                manifest["sections"][name]
+            )
+            is not None
         ]
         if known_revision is None or not known_sections:
             return {
@@ -430,7 +712,10 @@ class MarketContextSyncService:
                 "required_sections": required,
                 "unavailable_at_producer": unavailable,
             }
-        if not self._revision_exists(symbol, int(known_revision)):
+        if known_revision > target_revision or not self._revision_exists(
+            symbol,
+            known_revision,
+        ):
             return {
                 "sync_mode": "FULL",
                 "target_snapshot_revision": target_revision,
@@ -442,7 +727,7 @@ class MarketContextSyncService:
         unchanged: list[str] = []
         for name in required:
             current = manifest["sections"][name]
-            if current["status"] in UNAVAILABLE_STATUSES:
+            if producer_availability_classification(current) is not None:
                 continue
             known = known_sections.get(name)
             if isinstance(known, int):
@@ -457,9 +742,22 @@ class MarketContextSyncService:
                     }
                 )
                 continue
-            if int(known.get("section_revision") or -1) != int(
-                current["section_revision"]
-            ):
+            try:
+                known_section_revision = parse_positive_int(
+                    known.get("section_revision"),
+                    field=f"known_sections.{name}.section_revision",
+                )
+            except SyncContractError:
+                fetch.append(
+                    {
+                        "section": name,
+                        "classification": "MISSING_AT_CONSUMER",
+                        "reason": "SECTION_INVENTORY_INVALID",
+                        "current_revision": current["section_revision"],
+                    }
+                )
+                continue
+            if known_section_revision != int(current["section_revision"]):
                 fetch.append(
                     {
                         "section": name,
@@ -470,9 +768,20 @@ class MarketContextSyncService:
                 )
                 continue
             known_fingerprint = known.get("fingerprint")
-            if known_fingerprint and str(known_fingerprint) != str(
-                current["fingerprint"]
+            if not isinstance(known_fingerprint, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}",
+                known_fingerprint,
             ):
+                fetch.append(
+                    {
+                        "section": name,
+                        "classification": "MISSING_AT_CONSUMER",
+                        "reason": "FINGERPRINT_MISSING_OR_INVALID",
+                        "current_revision": current["section_revision"],
+                    }
+                )
+                continue
+            if known_fingerprint.lower() != str(current["fingerprint"]).lower():
                 fetch.append(
                     {
                         "section": name,
@@ -505,6 +814,11 @@ class MarketContextSyncService:
         since_revision: int,
         symbol: str = SYMBOL,
     ) -> dict[str, Any]:
+        validate_symbol(symbol)
+        since_revision = parse_positive_int(
+            since_revision,
+            field="since_revision",
+        )
         target = self.manifest(symbol=symbol)
         target_revision = int(target["snapshot_revision"])
         if int(since_revision) == target_revision:
@@ -535,7 +849,11 @@ class MarketContextSyncService:
         for name in SECTION_NAMES:
             previous = base["sections"][name]
             current = target["sections"][name]
-            if previous["fingerprint"] == current["fingerprint"]:
+            if (
+                previous["fingerprint"] == current["fingerprint"]
+                and previous["section_revision"]
+                == current["section_revision"]
+            ):
                 continue
             changed.append(
                 {
@@ -560,23 +878,84 @@ class MarketContextSyncService:
         *,
         symbol: str = SYMBOL,
     ) -> tuple[int, dict[str, Any]]:
-        consumer_id = str(payload.get("consumer_id") or "").strip()
-        request_id = str(payload.get("request_id") or "").strip()
+        validate_control_payload(
+            payload,
+            allowed={
+                "consumer_id",
+                "request_id",
+                "reason",
+                "required_sections",
+                "known_snapshot_revision",
+                "known_sections",
+                "trigger",
+            },
+        )
+        validate_symbol(symbol)
+        consumer_id = validate_identifier(
+            payload.get("consumer_id"),
+            field="consumer_id",
+        )
+        request_id = validate_identifier(
+            payload.get("request_id"),
+            field="request_id",
+        )
         reason = str(payload.get("reason") or "CONTEXT_REQUIRED").strip().upper()
-        if not consumer_id:
-            raise SyncContractError("consumer_id_required", 422)
-        if not request_id:
-            raise SyncContractError("request_id_required", 422)
-        requested = validate_sections(payload.get("required_sections") or SECTION_NAMES)
+        requested = validate_sections(
+            payload["required_sections"]
+            if "required_sections" in payload
+            else SECTION_NAMES
+        )
+        known_revision = (
+            parse_positive_int(
+                payload["known_snapshot_revision"],
+                field="known_snapshot_revision",
+            )
+            if payload.get("known_snapshot_revision") is not None
+            else None
+        )
+        if payload.get("known_sections") is not None and not isinstance(
+            payload.get("known_sections"),
+            dict,
+        ):
+            raise SyncContractError("known_sections_must_be_object", 422)
+        idempotency_fingerprint = control_request_fingerprint(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "request_id"
+            }
+        )
         manifest = self.manifest(symbol=symbol)
-        if reason not in MATERIAL_TRIGGER_REASONS and all(
-            manifest["sections"][name]["status"] in AVAILABLE_STATUSES
-            and manifest["sections"][name]["freshness"] == "CURRENT"
-            for name in requested
+        if (
+            (
+                reason not in MATERIAL_TRIGGER_REASONS
+                or (
+                    known_revision is not None
+                    and known_revision < int(manifest["snapshot_revision"])
+                )
+            )
+            and all(
+                producer_availability_classification(
+                    manifest["sections"][name]
+                )
+                is None
+                for name in requested
+            )
         ):
             return 200, {
                 "status": "READY",
                 "snapshot_revision": manifest["snapshot_revision"],
+                "sync_plan_url": f"/market-context/{symbol.lower()}/sync/plan",
+            }
+        if known_revision is not None and (
+            known_revision > int(manifest["snapshot_revision"])
+            or not self._revision_exists(symbol, known_revision)
+        ):
+            return 200, {
+                "status": "RESYNC_REQUIRED",
+                "snapshot_revision": manifest["snapshot_revision"],
+                "requires_full_resync": True,
+                "reason": "REVISION_GAP",
                 "sync_plan_url": f"/market-context/{symbol.lower()}/sync/plan",
             }
         now = _iso(datetime.now(UTC))
@@ -584,15 +963,29 @@ class MarketContextSyncService:
             conn.execute("BEGIN IMMEDIATE")
             existing_waiter = conn.execute(
                 """
-                SELECT w.* FROM market_context_sync_waiters wait
+                SELECT w.*,wait.request_fingerprint AS waiter_request_fingerprint
+                FROM market_context_sync_waiters wait
                 JOIN market_context_sync_refresh_work w ON w.work_id=wait.work_id
                 WHERE wait.consumer_id=? AND wait.request_id=?
                 """,
                 (consumer_id, request_id),
             ).fetchone()
             if existing_waiter is not None:
+                if (
+                    str(existing_waiter["waiter_request_fingerprint"])
+                    != idempotency_fingerprint
+                ):
+                    conn.rollback()
+                    raise SyncContractError(
+                        "refresh_request_idempotency_conflict",
+                        409,
+                    )
                 conn.commit()
-                return 202, self._work_response(
+                return (
+                    200
+                    if str(existing_waiter["status"]) == "COMPLETED"
+                    else 202
+                ), self._work_response(
                     existing_waiter,
                     attached=True,
                     new_job_created=False,
@@ -608,55 +1001,23 @@ class MarketContextSyncService:
             requested_set = set(requested)
             for row in active:
                 current_sections = set(_loads(row["sections_json"], []))
-                if str(row["status"]) == "WAITING_BACKOFF" and requested_set <= current_sections:
-                    self._attach_waiter(
-                        conn,
-                        row["work_id"],
-                        consumer_id,
-                        request_id,
-                        requested,
-                        now,
-                    )
-                    conn.commit()
-                    return 202, self._work_response(
-                        row,
-                        attached=True,
-                        new_job_created=False,
-                    )
-                if requested_set <= current_sections:
-                    self._attach_waiter(
-                        conn,
-                        row["work_id"],
-                        consumer_id,
-                        request_id,
-                        requested,
-                        now,
-                    )
-                    conn.commit()
-                    return 202, self._work_response(
-                        row,
-                        attached=True,
-                        new_job_created=False,
-                    )
+                row_status = str(row["status"])
+                row_reasons = set(_loads(row["trigger_reasons_json"], []))
                 overlap = requested_set & current_sections
-                if overlap and str(row["status"]) == "PENDING":
+                if row_status == "WAITING_BACKOFF" and overlap:
                     union = sorted(requested_set | current_sections)
-                    fingerprint = refresh_fingerprint(
-                        symbol=symbol,
-                        reason=reason,
-                        sections=union,
-                    )
+                    reasons = sorted(row_reasons | {reason})
                     conn.execute(
                         """
                         UPDATE market_context_sync_refresh_work
                         SET sections_json=?,residual_sections_json=?,
-                            request_fingerprint=?,updated_at=?
+                            trigger_reasons_json=?,updated_at=?
                         WHERE work_id=?
                         """,
                         (
                             canonical_json(union),
-                            canonical_json(sorted(requested_set - current_sections)),
-                            fingerprint,
+                            canonical_json(union),
+                            canonical_json(reasons),
                             now,
                             row["work_id"],
                         ),
@@ -668,14 +1029,87 @@ class MarketContextSyncService:
                         request_id,
                         requested,
                         now,
+                        idempotency_fingerprint,
                     )
                     updated = conn.execute(
-                        "SELECT * FROM market_context_sync_refresh_work WHERE work_id=?",
+                        """
+                        SELECT * FROM market_context_sync_refresh_work
+                        WHERE work_id=?
+                        """,
                         (row["work_id"],),
                     ).fetchone()
                     conn.commit()
                     return 202, self._work_response(
                         updated,
+                        attached=True,
+                        new_job_created=False,
+                    )
+                if row_status == "PENDING":
+                    union = sorted(requested_set | current_sections)
+                    reasons = sorted(row_reasons | {reason})
+                    fingerprint = refresh_fingerprint(
+                        symbol=symbol,
+                        reason="|".join(reasons),
+                        sections=union,
+                    )
+                    conn.execute(
+                        """
+                        UPDATE market_context_sync_refresh_work
+                        SET sections_json=?,residual_sections_json=?,
+                            request_fingerprint=?,trigger_reasons_json=?,
+                            updated_at=?
+                        WHERE work_id=?
+                        """,
+                        (
+                            canonical_json(union),
+                            canonical_json(
+                                sorted(requested_set - current_sections)
+                            ),
+                            fingerprint,
+                            canonical_json(reasons),
+                            now,
+                            row["work_id"],
+                        ),
+                    )
+                    self._attach_waiter(
+                        conn,
+                        row["work_id"],
+                        consumer_id,
+                        request_id,
+                        requested,
+                        now,
+                        idempotency_fingerprint,
+                    )
+                    updated = conn.execute(
+                        """
+                        SELECT * FROM market_context_sync_refresh_work
+                        WHERE work_id=?
+                        """,
+                        (row["work_id"],),
+                    ).fetchone()
+                    conn.commit()
+                    return 202, self._work_response(
+                        updated,
+                        attached=True,
+                        new_job_created=False,
+                    )
+                if (
+                    row_status == "RUNNING"
+                    and requested_set <= current_sections
+                    and reason in row_reasons
+                ):
+                    self._attach_waiter(
+                        conn,
+                        row["work_id"],
+                        consumer_id,
+                        request_id,
+                        requested,
+                        now,
+                        idempotency_fingerprint,
+                    )
+                    conn.commit()
+                    return 202, self._work_response(
+                        row,
                         attached=True,
                         new_job_created=False,
                     )
@@ -716,8 +1150,9 @@ class MarketContextSyncService:
                 INSERT INTO market_context_sync_refresh_work(
                   work_id,symbol,generation,refresh_reason,request_fingerprint,
                   status,sections_json,completed_sections_json,
-                  residual_sections_json,parent_work_id,created_at,updated_at
-                ) VALUES (?,?,?,?,?,'PENDING',?,'[]',?,?,?,?)
+                  residual_sections_json,trigger_reasons_json,parent_work_id,
+                  created_at,updated_at
+                ) VALUES (?,?,?,?,?,'PENDING',?,'[]',?,?,?,?,?)
                 """,
                 (
                     work_id,
@@ -727,6 +1162,7 @@ class MarketContextSyncService:
                     request_fingerprint,
                     canonical_json(residual),
                     canonical_json(residual),
+                    canonical_json([reason]),
                     str(running["work_id"]) if running is not None else None,
                     now,
                     now,
@@ -739,6 +1175,7 @@ class MarketContextSyncService:
                 request_id,
                 requested,
                 now,
+                idempotency_fingerprint,
             )
             row = conn.execute(
                 "SELECT * FROM market_context_sync_refresh_work WHERE work_id=?",
@@ -759,27 +1196,17 @@ class MarketContextSyncService:
             ).fetchone()
             if row is None:
                 raise SyncContractError("refresh_work_not_found", 404)
-            waiters = conn.execute(
-                """
-                SELECT consumer_id,request_id,requested_sections_json,attached_at
-                FROM market_context_sync_waiters WHERE work_id=?
-                ORDER BY attached_at,consumer_id,request_id
-                """,
-                (work_id,),
-            ).fetchall()
+            waiter_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM market_context_sync_waiters
+                    WHERE work_id=?
+                    """,
+                    (work_id,),
+                ).fetchone()[0]
+            )
         output = self._work_row(row)
-        output["waiters"] = [
-            {
-                **dict(waiter),
-                "requested_sections": _loads(
-                    waiter["requested_sections_json"],
-                    [],
-                ),
-            }
-            for waiter in waiters
-        ]
-        for waiter in output["waiters"]:
-            waiter.pop("requested_sections_json", None)
+        output["waiter_count"] = waiter_count
         return output
 
     def claim_next_refresh_work(
@@ -1001,30 +1428,50 @@ class MarketContextSyncService:
         *,
         symbol: str = SYMBOL,
     ) -> dict[str, Any]:
-        consumer_id = str(payload.get("consumer_id") or "").strip()
-        delivery_id = str(payload.get("delivery_id") or "").strip()
+        validate_control_payload(
+            payload,
+            allowed={
+                "consumer_id",
+                "delivery_id",
+                "snapshot_revision",
+                "status",
+                "section_revisions",
+                "acknowledged_at",
+            },
+        )
+        validate_symbol(symbol)
+        consumer_id = validate_identifier(
+            payload.get("consumer_id"),
+            field="consumer_id",
+        )
+        delivery_id = validate_identifier(
+            payload.get("delivery_id"),
+            field="delivery_id",
+        )
         status = str(payload.get("status") or "").strip().upper()
         acknowledged_at = str(payload.get("acknowledged_at") or "").strip()
         section_revisions = payload.get("section_revisions")
-        if not consumer_id:
-            raise SyncContractError("consumer_id_required", 422)
-        if not delivery_id:
-            raise SyncContractError("delivery_id_required", 422)
         if status != "PERSISTED":
             raise SyncContractError("ack_status_must_be_persisted", 422)
-        if parse_datetime(acknowledged_at) is None:
+        acknowledged_datetime = parse_datetime(acknowledged_at)
+        if acknowledged_datetime is None:
             raise SyncContractError("acknowledged_at_invalid", 422)
-        if not isinstance(section_revisions, dict):
+        if not isinstance(section_revisions, dict) or not section_revisions:
             raise SyncContractError("section_revisions_required", 422)
-        revision = int(payload.get("snapshot_revision") or 0)
-        normalized_revisions = {
-            name: int(value)
-            for name, value in section_revisions.items()
-            if name in SECTION_SET
-        }
-        if len(normalized_revisions) != len(section_revisions):
-            raise SyncContractError("ack_unknown_section", 422)
-        received_at = _iso(datetime.now(UTC))
+        revision = parse_positive_int(
+            payload.get("snapshot_revision"),
+            field="snapshot_revision",
+        )
+        normalized_revisions: dict[str, int] = {}
+        for name, value in section_revisions.items():
+            if name not in SECTION_SET:
+                raise SyncContractError("ack_unknown_section", 422)
+            normalized_revisions[name] = parse_positive_int(
+                value,
+                field=f"section_revisions.{name}",
+            )
+        received_datetime = datetime.now(UTC)
+        received_at = _iso(received_datetime)
         fingerprint = hashlib.sha256(
             canonical_json(
                 {
@@ -1049,6 +1496,43 @@ class MarketContextSyncService:
             if int(delivery["snapshot_revision"]) != revision:
                 conn.rollback()
                 raise SyncContractError("ack_snapshot_revision_mismatch", 409)
+            created_datetime = parse_datetime(str(delivery["created_at"]))
+            if (
+                created_datetime is None
+                or _aware(acknowledged_datetime) < _aware(created_datetime)
+            ):
+                conn.rollback()
+                raise SyncContractError("ack_precedes_delivery", 409)
+            if _aware(acknowledged_datetime) > (
+                received_datetime
+                + timedelta(seconds=MAX_ACK_CLOCK_SKEW_SECONDS)
+            ):
+                conn.rollback()
+                raise SyncContractError("ack_timestamp_in_future", 422)
+            target = conn.execute(
+                """
+                SELECT * FROM market_context_delivery_targets
+                WHERE delivery_id=? AND consumer_id=?
+                """,
+                (delivery_id, consumer_id),
+            ).fetchone()
+            if target is None:
+                conn.rollback()
+                raise SyncContractError("ack_consumer_not_notified", 409)
+            if str(target["status"]) not in {
+                "NOTIFIED",
+                "DEAD_LETTER",
+                "ACKNOWLEDGED",
+            }:
+                conn.rollback()
+                raise SyncContractError("ack_precedes_delivery", 409)
+            changed_sections = {
+                str(name)
+                for name in _loads(delivery["changed_sections_json"], [])
+            }
+            if set(normalized_revisions) != changed_sections:
+                conn.rollback()
+                raise SyncContractError("ack_partial_persistence", 409)
             expected_rows = conn.execute(
                 """
                 SELECT section_name,section_revision
@@ -1082,6 +1566,9 @@ class MarketContextSyncService:
                     "idempotent_replay": True,
                     "delivery_id": delivery_id,
                     "snapshot_revision": revision,
+                    "superseded_delivery": bool(
+                        target["superseded_by_delivery_id"]
+                    ),
                 }
             conn.execute(
                 """
@@ -1104,26 +1591,57 @@ class MarketContextSyncService:
             )
             conn.execute(
                 """
-                UPDATE market_context_outbox
-                SET delivery_status='ACKNOWLEDGED',acknowledged_at=?,
-                    acknowledged_by=?
-                WHERE event_id=?
+                UPDATE market_context_delivery_targets
+                SET status='ACKNOWLEDGED',acknowledged_at=?,
+                    updated_at=?
+                WHERE delivery_id=? AND consumer_id=?
                 """,
-                (received_at, consumer_id, delivery_id),
+                (received_at, received_at, delivery_id, consumer_id),
             )
             pending = int(
                 conn.execute(
                     """
-                    SELECT COUNT(*) FROM market_context_outbox o
-                    WHERE o.delivery_status='PENDING'
-                      AND NOT EXISTS (
-                        SELECT 1 FROM market_context_delivery_acks a
-                        WHERE a.delivery_id=o.event_id AND a.consumer_id=?
-                      )
+                    SELECT COUNT(*) FROM market_context_delivery_targets
+                    WHERE consumer_id=? AND status IN ('PENDING','NOTIFIED')
+                      AND superseded_by_delivery_id IS NULL
                     """,
                     (consumer_id,),
                 ).fetchone()[0]
             )
+            current_state = conn.execute(
+                """
+                SELECT last_snapshot_revision_acknowledged,
+                       section_revisions_json
+                FROM market_context_consumer_state
+                WHERE consumer_id=?
+                """,
+                (consumer_id,),
+            ).fetchone()
+            superseded = bool(
+                current_state is not None
+                and current_state["last_snapshot_revision_acknowledged"]
+                is not None
+                and int(current_state["last_snapshot_revision_acknowledged"])
+                > revision
+            )
+            prior_inventory = (
+                _loads(current_state["section_revisions_json"], {})
+                if current_state is not None
+                else {}
+            )
+            merged_inventory = {
+                str(name): int(value)
+                for name, value in prior_inventory.items()
+                if name in SECTION_SET
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+            }
+            for name, value in normalized_revisions.items():
+                merged_inventory[name] = max(
+                    int(merged_inventory.get(name, 0)),
+                    value,
+                )
             conn.execute(
                 """
                 INSERT INTO market_context_consumer_state(
@@ -1133,10 +1651,33 @@ class MarketContextSyncService:
                   gap_detected,resync_required,updated_at
                 ) VALUES (?,?,?,?,?,?,?,0,0,0,?)
                 ON CONFLICT(consumer_id) DO UPDATE SET
-                  last_delivery_acknowledged=excluded.last_delivery_acknowledged,
-                  last_snapshot_revision_acknowledged=
-                    excluded.last_snapshot_revision_acknowledged,
-                  section_revisions_json=excluded.section_revisions_json,
+                  last_delivery_acknowledged=CASE
+                    WHEN market_context_consumer_state.
+                      last_snapshot_revision_acknowledged IS NULL
+                      OR excluded.last_snapshot_revision_acknowledged>=
+                        market_context_consumer_state.
+                          last_snapshot_revision_acknowledged
+                    THEN excluded.last_delivery_acknowledged
+                    ELSE market_context_consumer_state.
+                      last_delivery_acknowledged
+                  END,
+                  last_snapshot_revision_acknowledged=MAX(
+                    COALESCE(
+                      market_context_consumer_state.
+                        last_snapshot_revision_acknowledged,
+                      0
+                    ),
+                    excluded.last_snapshot_revision_acknowledged
+                  ),
+                  section_revisions_json=CASE
+                    WHEN market_context_consumer_state.
+                      last_snapshot_revision_acknowledged IS NULL
+                      OR excluded.last_snapshot_revision_acknowledged>=
+                        market_context_consumer_state.
+                          last_snapshot_revision_acknowledged
+                    THEN excluded.section_revisions_json
+                    ELSE market_context_consumer_state.section_revisions_json
+                  END,
                   pending_delivery_count=excluded.pending_delivery_count,
                   gap_detected=0,resync_required=0,updated_at=excluded.updated_at
                 """,
@@ -1146,7 +1687,7 @@ class MarketContextSyncService:
                     delivery_id,
                     delivery_id,
                     revision,
-                    canonical_json(normalized_revisions),
+                    canonical_json(merged_inventory),
                     pending,
                     received_at,
                 ),
@@ -1157,12 +1698,11 @@ class MarketContextSyncService:
             "idempotent_replay": False,
             "delivery_id": delivery_id,
             "snapshot_revision": revision,
+            "superseded_delivery": superseded,
         }
 
     def consumer_state(self, consumer_id: str) -> dict[str, Any]:
-        consumer_id = str(consumer_id or "").strip()
-        if not consumer_id:
-            raise SyncContractError("consumer_id_required", 422)
+        consumer_id = validate_identifier(consumer_id, field="consumer_id")
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
                 "SELECT * FROM market_context_consumer_state WHERE consumer_id=?",
@@ -1170,15 +1710,18 @@ class MarketContextSyncService:
             ).fetchone()
             pending_rows = conn.execute(
                 """
-                SELECT event_id,snapshot_revision,attempt_count,next_attempt_at,
-                       created_at
-                FROM market_context_outbox o
-                WHERE o.delivery_status='PENDING'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM market_context_delivery_acks a
-                    WHERE a.delivery_id=o.event_id AND a.consumer_id=?
-                  )
-                ORDER BY created_at,event_id
+                SELECT target.delivery_id AS event_id,
+                       outbox.snapshot_revision,target.attempt_count,
+                       target.next_retry_at AS next_attempt_at,
+                       target.status,target.superseded_by_delivery_id,
+                       target.created_at
+                FROM market_context_delivery_targets target
+                JOIN market_context_outbox outbox
+                  ON outbox.event_id=target.delivery_id
+                WHERE target.consumer_id=?
+                  AND target.status IN ('PENDING','NOTIFIED')
+                  AND target.superseded_by_delivery_id IS NULL
+                ORDER BY target.created_at,target.delivery_id
                 """,
                 (consumer_id,),
             ).fetchall()
@@ -1226,8 +1769,10 @@ class MarketContextSyncService:
         next_retry_at: str | None = None,
         error: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        consumer_id = validate_identifier(consumer_id, field="consumer_id")
+        delivery_id = validate_identifier(delivery_id, field="delivery_id")
         normalized_status = str(status or "").strip().upper()
-        if normalized_status not in {"NOTIFIED", "FAILED", "ACKNOWLEDGED"}:
+        if normalized_status not in {"NOTIFIED", "FAILED"}:
             raise SyncContractError("delivery_attempt_status_invalid", 422)
         if next_retry_at and parse_datetime(next_retry_at) is None:
             raise SyncContractError("next_retry_at_invalid", 422)
@@ -1241,15 +1786,45 @@ class MarketContextSyncService:
             if delivery is None:
                 conn.rollback()
                 raise SyncContractError("delivery_not_found", 404)
-            attempt_number = int(
-                conn.execute(
-                    """
-                    SELECT COALESCE(MAX(attempt_number),0)+1
-                    FROM market_context_delivery_attempts
-                    WHERE delivery_id=? AND consumer_id=?
-                    """,
-                    (delivery_id, consumer_id),
-                ).fetchone()[0]
+            existing_target = conn.execute(
+                """
+                SELECT * FROM market_context_delivery_targets
+                WHERE delivery_id=? AND consumer_id=?
+                """,
+                (delivery_id, consumer_id),
+            ).fetchone()
+            if (
+                existing_target is not None
+                and str(existing_target["status"]) == "ACKNOWLEDGED"
+            ):
+                conn.rollback()
+                raise SyncContractError(
+                    "delivery_already_acknowledged",
+                    409,
+                )
+            attempt_number = (
+                int(existing_target["attempt_count"]) + 1
+                if existing_target is not None
+                else 1
+            )
+            if normalized_status == "FAILED" and next_retry_at is None:
+                next_retry_at = _iso(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=min(
+                            30 * (2 ** min(attempt_number - 1, 5)),
+                            900,
+                        )
+                    )
+                )
+            target_status = (
+                "NOTIFIED"
+                if normalized_status == "NOTIFIED"
+                else (
+                    "DEAD_LETTER"
+                    if attempt_number >= MAX_DELIVERY_ATTEMPTS
+                    else "PENDING"
+                )
             )
             attempt_id = (
                 "delivery-attempt-"
@@ -1274,7 +1849,50 @@ class MarketContextSyncService:
                     normalized_status,
                     attempted_at,
                     next_retry_at,
-                    canonical_json(error or {}),
+                    canonical_json(redact_payload(error or {})),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO market_context_delivery_targets(
+                  delivery_id,consumer_id,status,attempt_count,next_retry_at,
+                  last_error_json,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(delivery_id,consumer_id) DO UPDATE SET
+                  status=excluded.status,
+                  attempt_count=excluded.attempt_count,
+                  next_retry_at=excluded.next_retry_at,
+                  last_error_json=excluded.last_error_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    delivery_id,
+                    consumer_id,
+                    target_status,
+                    attempt_number,
+                    next_retry_at if target_status == "PENDING" else None,
+                    canonical_json(redact_payload(error or {})),
+                    attempted_at,
+                    attempted_at,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE market_context_delivery_targets
+                SET superseded_by_delivery_id=?,updated_at=?
+                WHERE consumer_id=? AND delivery_id<>?
+                  AND status IN ('PENDING','NOTIFIED')
+                  AND delivery_id IN (
+                    SELECT older.event_id FROM market_context_outbox older
+                    WHERE older.snapshot_revision<?
+                  )
+                """,
+                (
+                    delivery_id,
+                    attempted_at,
+                    consumer_id,
+                    delivery_id,
+                    int(delivery["snapshot_revision"]),
                 ),
             )
             conn.execute(
@@ -1283,7 +1901,21 @@ class MarketContextSyncService:
                 SET attempt_count=attempt_count+1,next_attempt_at=?
                 WHERE event_id=?
                 """,
-                (next_retry_at, delivery_id),
+                (
+                    next_retry_at if target_status == "PENDING" else None,
+                    delivery_id,
+                ),
+            )
+            pending_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM market_context_delivery_targets
+                    WHERE consumer_id=?
+                      AND status IN ('PENDING','NOTIFIED')
+                      AND superseded_by_delivery_id IS NULL
+                    """,
+                    (consumer_id,),
+                ).fetchone()[0]
             )
             conn.execute(
                 """
@@ -1291,14 +1923,14 @@ class MarketContextSyncService:
                   consumer_id,last_delivery_created,last_delivery_notified,
                   section_revisions_json,pending_delivery_count,retry_count,
                   last_error_json,gap_detected,resync_required,updated_at
-                ) VALUES (?,?,?,'{}',1,?,?,0,0,?)
+                ) VALUES (?,?,?,'{}',?,?,?,0,0,?)
                 ON CONFLICT(consumer_id) DO UPDATE SET
                   last_delivery_created=excluded.last_delivery_created,
                   last_delivery_notified=CASE
                     WHEN ?='NOTIFIED' THEN excluded.last_delivery_notified
                     ELSE market_context_consumer_state.last_delivery_notified
                   END,
-                  pending_delivery_count=1,
+                  pending_delivery_count=excluded.pending_delivery_count,
                   retry_count=market_context_consumer_state.retry_count+?,
                   last_error_json=excluded.last_error_json,
                   updated_at=excluded.updated_at
@@ -1307,8 +1939,9 @@ class MarketContextSyncService:
                     consumer_id,
                     delivery_id,
                     delivery_id if normalized_status == "NOTIFIED" else None,
+                    pending_count,
                     int(normalized_status == "FAILED"),
-                    canonical_json(error or {}),
+                    canonical_json(redact_payload(error or {})),
                     attempted_at,
                     normalized_status,
                     int(normalized_status == "FAILED"),
@@ -1320,8 +1953,11 @@ class MarketContextSyncService:
             "delivery_id": delivery_id,
             "consumer_id": consumer_id,
             "attempt_number": attempt_number,
-            "status": normalized_status,
-            "next_retry_at": next_retry_at,
+            "status": target_status,
+            "attempt_status": normalized_status,
+            "next_retry_at": (
+                next_retry_at if target_status == "PENDING" else None
+            ),
         }
 
     def _snapshot_and_sections(
@@ -1331,6 +1967,7 @@ class MarketContextSyncService:
         snapshot_revision: int | None,
     ) -> tuple[Any, list[Any]]:
         with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if snapshot_revision is None:
                 snapshot = conn.execute(
                     """
@@ -1456,18 +2093,21 @@ class MarketContextSyncService:
         request_id: str,
         requested: list[str],
         attached_at: str,
+        request_fingerprint: str,
     ) -> None:
         conn.execute(
             """
             INSERT INTO market_context_sync_waiters(
-              work_id,consumer_id,request_id,requested_sections_json,attached_at
-            ) VALUES (?,?,?,?,?)
+              work_id,consumer_id,request_id,requested_sections_json,
+              request_fingerprint,attached_at
+            ) VALUES (?,?,?,?,?,?)
             """,
             (
                 work_id,
                 consumer_id,
                 request_id,
                 canonical_json(requested),
+                request_fingerprint,
                 attached_at,
             ),
         )
@@ -1481,6 +2121,20 @@ class MarketContextSyncService:
         new_job_created: bool,
     ) -> dict[str, Any]:
         status = str(row["status"])
+        if status == "COMPLETED":
+            return {
+                "status": "COMPLETED",
+                "work_id": str(row["work_id"]),
+                "target_generation": int(row["generation"]),
+                "snapshot_id": row["result_snapshot_id"],
+                "snapshot_revision": row["target_snapshot_revision"],
+                "attached_to_existing_work": attached,
+                "new_job_created": False,
+                "sync_plan_url": "/market-context/mnq/sync/plan",
+                "status_url": (
+                    f"/market-context/mnq/sync/requests/{row['work_id']}"
+                ),
+            }
         if status == "WAITING_BACKOFF":
             return {
                 "status": status,
@@ -1506,14 +2160,28 @@ class MarketContextSyncService:
 
     @staticmethod
     def _work_row(row: Any) -> dict[str, Any]:
-        output = dict(row)
-        for source, target, default in (
-            ("sections_json", "sections", []),
-            ("completed_sections_json", "completed_sections", []),
-            ("residual_sections_json", "residual_sections", []),
-            ("error_json", "error", None),
-        ):
-            output[target] = _loads(output.pop(source), default)
+        output = {
+            "work_id": str(row["work_id"]),
+            "symbol": str(row["symbol"]),
+            "generation": int(row["generation"]),
+            "refresh_reason": str(row["refresh_reason"]),
+            "refresh_reasons": _loads(row["trigger_reasons_json"], []),
+            "status": str(row["status"]),
+            "sections": _loads(row["sections_json"], []),
+            "completed_sections": _loads(
+                row["completed_sections_json"],
+                [],
+            ),
+            "residual_sections": _loads(row["residual_sections_json"], []),
+            "parent_work_id": row["parent_work_id"],
+            "target_snapshot_revision": row["target_snapshot_revision"],
+            "result_snapshot_id": row["result_snapshot_id"],
+            "next_retry_at": row["next_retry_at"],
+            "error": _public_work_error(_loads(row["error_json"], None)),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+        }
         output["status_url"] = (
             f"/market-context/mnq/sync/requests/{output['work_id']}"
         )
@@ -1539,29 +2207,189 @@ def validate_sections(sections: Iterable[str]) -> list[str]:
     return normalized
 
 
+def validate_symbol(symbol: Any) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if normalized != SYMBOL:
+        raise SyncContractError("symbol_not_supported", 422)
+    return normalized
+
+
+def validate_identifier(value: Any, *, field: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise SyncContractError(f"{field}_required", 422)
+    if len(normalized) > MAX_IDENTIFIER_LENGTH or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:@/-]*",
+        normalized,
+    ):
+        raise SyncContractError(f"{field}_invalid", 422)
+    return normalized
+
+
+def parse_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise SyncContractError(f"{field}_invalid", 422)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SyncContractError(f"{field}_invalid", 422) from exc
+    if parsed < 1 or str(value).strip() != str(parsed):
+        raise SyncContractError(f"{field}_invalid", 422)
+    return parsed
+
+
+def validate_control_payload(
+    payload: Any,
+    *,
+    allowed: set[str],
+) -> None:
+    if not isinstance(payload, dict):
+        raise SyncContractError("request_body_must_be_object", 422)
+    encoded = canonical_json(payload).encode("utf-8")
+    if len(encoded) > MAX_CONTROL_PAYLOAD_BYTES:
+        raise SyncContractError("control_payload_too_large", 413)
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise SyncContractError(
+            "unknown_request_fields:" + ",".join(unknown),
+            422,
+        )
+
+
+def control_request_fingerprint(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        canonical_json(_material_value(payload)).encode("utf-8")
+    ).hexdigest()
+
+
 def material_fingerprint(value: Any) -> str:
     return hashlib.sha256(
         canonical_json(_material_value(value)).encode("utf-8")
     ).hexdigest()
 
 
-def _material_value(value: Any) -> Any:
+def _material_value(value: Any, *, field_name: str | None = None) -> Any:
     if isinstance(value, dict):
         return {
-            str(key): _material_value(item)
+            str(key): _material_value(item, field_name=str(key).lower())
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
             if str(key).lower() not in VOLATILE_KEYS
         }
     if isinstance(value, list):
-        normalized = [_material_value(item) for item in value]
+        normalized = [
+            _material_value(item, field_name=field_name)
+            for item in value
+        ]
         if all(
             isinstance(item, dict)
             and any(item.get(key) not in (None, "") for key in ORDER_INSENSITIVE_ID_KEYS)
             for item in normalized
         ):
-            return sorted(normalized, key=canonical_json)
+            ordered = sorted(normalized, key=canonical_json)
+            deduplicated: list[Any] = []
+            seen: set[str] = set()
+            for item in ordered:
+                technical_identity = canonical_json(
+                    {
+                        "provider": item.get("provider"),
+                        "source": item.get("source"),
+                        "identifier": next(
+                            (
+                                [key, item[key]]
+                                for key in ORDER_INSENSITIVE_ID_KEYS
+                                if item.get(key) not in (None, "")
+                            ),
+                            None,
+                        ),
+                        "occurrence_id": item.get("occurrence_id")
+                        or item.get("related_occurrence_id"),
+                        "version": item.get("version"),
+                        "technical_fingerprint": item.get("technical_fingerprint")
+                        or item.get("fingerprint")
+                        or canonical_json(item),
+                    }
+                )
+                if technical_identity not in seen:
+                    seen.add(technical_identity)
+                    deduplicated.append(item)
+            return deduplicated
         return normalized
+    if isinstance(value, datetime):
+        return {"__datetime_utc__": _iso(_aware(value))}
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        return {"__number__": _canonical_number(value)}
+    if isinstance(value, str) and field_name in TEMPORAL_KEYS:
+        parsed = parse_datetime(value)
+        if parsed is not None:
+            return {"__datetime_utc__": _iso(_aware(parsed))}
     return value
+
+
+def _canonical_number(value: int | float | Decimal) -> str:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non_finite_number_not_supported")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid_numeric_value") from exc
+    if not number.is_finite():
+        raise ValueError("non_finite_number_not_supported")
+    normalized = number.normalize()
+    if normalized == 0:
+        return "0"
+    return format(normalized, "f")
+
+
+def producer_availability_classification(
+    metadata: dict[str, Any],
+) -> str | None:
+    status = str(metadata.get("status") or "UNAVAILABLE").upper()
+    freshness = str(metadata.get("freshness") or "UNKNOWN").upper()
+    if status == "QUARANTINED" or freshness == "QUARANTINED":
+        return "QUARANTINED_AT_PRODUCER"
+    if status == "PARTIAL":
+        return "PARTIAL_AT_PRODUCER"
+    if status in UNAVAILABLE_STATUSES:
+        return "UNAVAILABLE_AT_PRODUCER"
+    if status in DEGRADED_STATUSES or freshness in DEGRADED_STATUSES:
+        return "STALE_AT_PRODUCER"
+    return None
+
+
+def _quarantine_disclosure(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"record_count": 0, "reasons": []}
+    disclosures = payload.get("producer_disclosures")
+    quarantine = (
+        disclosures.get("quarantine")
+        if isinstance(disclosures, dict)
+        and isinstance(disclosures.get("quarantine"), dict)
+        else {}
+    )
+    return {
+        "record_count": int(quarantine.get("record_count") or 0),
+        "reasons": list(quarantine.get("reasons") or []),
+    }
+
+
+def _without_disclosures(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != "producer_disclosures"
+    }
+
+
+def _public_work_error(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: redact_payload(value[key])
+        for key in ("code", "error_type", "attempt")
+        if value.get(key) is not None
+    }
 
 
 def record_count_for(value: Any) -> int:
@@ -1589,6 +2417,11 @@ def record_count_for(value: Any) -> int:
                             "occurrence_id": item.get("occurrence_id")
                             or item.get("related_occurrence_id"),
                             "version": item.get("version"),
+                            "technical_fingerprint": (
+                                item.get("technical_fingerprint")
+                                or item.get("fingerprint")
+                                or material_fingerprint(item)
+                            ),
                         }
                     )
                 )
@@ -1613,7 +2446,11 @@ def record_count_for(value: Any) -> int:
 
 
 def section_status(payload: Any) -> tuple[str, str | None]:
-    if not _has_material_data(payload):
+    quarantine = _quarantine_disclosure(payload)
+    material_payload = _without_disclosures(payload)
+    if not _has_material_data(material_payload):
+        if quarantine["record_count"]:
+            return "QUARANTINED", "VALIDATED_DATA_WITHHELD"
         return "NO_DATA", "NO_VALIDATED_DATA"
     statuses = {
         str(value).upper()
@@ -1636,10 +2473,36 @@ def section_status(payload: Any) -> tuple[str, str | None]:
         return "QUARANTINED", "NO_ACCEPTED_SOURCE"
     if "QUARANTINED" in statuses:
         return "QUARANTINED", "SOURCE_OR_VALIDATION_QUARANTINE"
+    source_coverage = {
+        str(value).upper()
+        for value in _find_key_values(payload, "source_coverage_status")
+        if value not in (None, "")
+    }
+    lifecycle = {
+        str(value).upper()
+        for value in _find_key_values(payload, "lifecycle_status")
+        + _find_key_values(payload, "freshness_state")
+        if value not in (None, "")
+    }
+    if quarantine["record_count"]:
+        return "PARTIAL", "CONTAINS_WITHHELD_QUARANTINED_RECORDS"
     if validations.intersection({"rejected", "invalid", "quarantined"}):
         return "PARTIAL", "CONTAINS_QUARANTINED_RECORDS"
-    for status in ("BACKOFF", "UNAVAILABLE", "NO_DATA", "PARTIAL", "AVAILABLE"):
-        if status in statuses:
+    if source_coverage.intersection({"PARTIAL", "UNVERIFIED_EMPTY"}):
+        return "PARTIAL", "SOURCE_COVERAGE_INCOMPLETE"
+    if lifecycle.intersection({"AWAITING_ACTUAL", "DUE", "EXPIRED"}):
+        return "PARTIAL", "LIFECYCLE_DATA_INCOMPLETE"
+    recognized = statuses.intersection(
+        {"BACKOFF", "UNAVAILABLE", "NO_DATA", "PARTIAL", "AVAILABLE"}
+    )
+    available = "AVAILABLE" in recognized
+    unavailable = recognized.intersection({"BACKOFF", "UNAVAILABLE", "NO_DATA"})
+    if "PARTIAL" in recognized or (available and unavailable):
+        return "PARTIAL", _find_reason(payload) or "MIXED_COMPONENT_STATUS"
+    if available:
+        return "AVAILABLE", _find_reason(payload)
+    for status in ("BACKOFF", "UNAVAILABLE", "NO_DATA"):
+        if status in recognized:
             return status, _find_reason(payload)
     return "AVAILABLE", None
 
@@ -1715,25 +2578,38 @@ def market_session_from_sections(rows: list[Any]) -> dict[str, Any]:
 
 
 def delivery_readiness(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    statuses = {
-        name: str((value.get("sync") or {}).get("status") or "UNAVAILABLE")
+    metadata = {
+        name: dict(value.get("sync") or {})
         for name, value in sections.items()
     }
-    unavailable = [
-        name for name, status in statuses.items() if status in UNAVAILABLE_STATUSES
+    statuses = {
+        name: str(value.get("status") or "UNAVAILABLE")
+        for name, value in metadata.items()
+    }
+    classifications = {
+        name: producer_availability_classification(value)
+        for name, value in metadata.items()
+    }
+    available = [
+        name for name, classification in classifications.items()
+        if classification is None
     ]
-    available = [name for name in statuses if name not in unavailable]
+    degraded = [
+        name for name, classification in classifications.items()
+        if classification is not None
+    ]
     ratio = round(len(available) / max(len(statuses), 1), 4)
     return {
-        "status": "READY" if not unavailable else "PARTIAL",
+        "status": "READY" if not degraded else "PARTIAL",
         "calculated_from_delivered_payload": True,
         "available_section_count": len(available),
-        "unavailable_section_count": len(unavailable),
+        "unavailable_section_count": len(degraded),
         "section_count": len(statuses),
         "coverage_ratio": ratio,
         "sections_available": available,
-        "sections_unavailable": unavailable,
+        "sections_unavailable": degraded,
         "section_status": statuses,
+        "producer_classification": classifications,
     }
 
 
@@ -1832,6 +2708,7 @@ def canonical_json(value: Any) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
         default=str,
     )
 

@@ -123,9 +123,11 @@ Deterministic results:
 - `NONE`: all requested available sections match.
 
 `MISSING_AT_CONSUMER` means the producer has a usable section that AI Trader
-does not have. `UNAVAILABLE_AT_PRODUCER` means the producer itself has no valid
-section; the response includes the real status and reason. The latter is not a
-request to fetch an empty replacement.
+does not have. Producer truth is classified exactly as
+`UNAVAILABLE_AT_PRODUCER`, `STALE_AT_PRODUCER`,
+`PARTIAL_AT_PRODUCER` or `QUARANTINED_AT_PRODUCER`; the response includes the
+real status, freshness and reason. None of these classifications is a request
+to fetch an empty replacement.
 
 ## Full snapshot
 
@@ -138,6 +140,12 @@ per-section fingerprints, `context_fingerprint`, exact UTF-8
 `payload_size_bytes`, and a global SHA-256 checksum. Readiness is recalculated
 from the sections actually delivered. Empty sections remain present with
 status and reason.
+
+Rejected, invalid and quarantined source records are not returned as usable
+records. Their content is withheld and only an aggregate
+`producer_disclosures.quarantine` count and reason-code list is exposed.
+Secrets, credentialed URLs and local filesystem paths are redacted before
+section persistence.
 
 `checksum_scope=CANONICAL_DELIVERY_WITHOUT_MEASUREMENT_FIELDS` means the
 checksum is computed from canonical JSON after omitting only `checksum` and
@@ -258,7 +266,9 @@ snapshot:
 
 The notification never contains the full context. Retry records delivery
 attempts; it does not resend a full snapshot. The same outbox idempotency key
-does not create duplicate deliveries.
+does not create duplicate deliveries. Attempts use bounded exponential backoff;
+attempt eight transitions that consumer target to `DEAD_LETTER` instead of
+silently deleting it. Multiple material causes remain in the `triggers` array.
 
 Notification inspection is available at:
 
@@ -289,14 +299,32 @@ ACK request:
 }
 ```
 
-The producer validates delivery existence, snapshot revision and every supplied
-section revision. Identical replay is idempotent; conflicting replay is HTTP
-409. ACK, consumer inventory summary and outbox delivery state survive restart.
+The producer accepts an ACK only for the consumer-specific target that was
+actually notified. It validates delivery existence, snapshot revision, clock
+ordering and the exact changed-section set: partial `PERSISTED` claims and
+impossible section revisions are HTTP 409. Identical replay is idempotent;
+conflicting replay is HTTP 409. A late ACK for a superseded delivery is retained
+without regressing the consumer's latest acknowledged snapshot or section
+inventory. ACK and consumer-specific delivery state survive restart.
 `PERSISTED` means only that AI Trader declares an atomic local save. It does not
 mean Senior Analyst has run, approved or interpreted the data.
 
 Without ACK, the delivery remains pending and eligible for notification retry.
 The producer must not infer consumer possession from notification send alone.
+
+The former global endpoint
+`POST /market-context/outbox/events/{event_id}/ack` is explicitly deprecated
+and returns HTTP 410. It cannot close delivery state for all consumers. New and
+future consumers must use `/market-context/mnq/sync/ack`.
+
+## Legacy consumer transition
+
+`GET /market-context/mnq/consumer` remains temporarily available as the
+analysis-oriented schema-2.1 projection and emits `Deprecation: true` plus a
+successor link. It is not a synchronization or persistence source and the
+future AI Trader must not use it. Its remaining record arrays are not silently
+top-N truncated, but only the sync endpoints guarantee the complete immutable
+producer projection, per-section revisions and checksums.
 
 ## Calendar and recovery
 

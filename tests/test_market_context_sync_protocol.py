@@ -25,6 +25,7 @@ from app.services.market_context_sync_service import (
     MarketContextSyncService,
     SyncContractError,
     canonical_json,
+    extract_sync_sections,
     material_fingerprint,
 )
 from app.services.market_context_sync_refresh_worker import (
@@ -376,7 +377,7 @@ def test_refresh_single_flight_concurrency_overlap_and_persistent_fanout(
     assert overlap["attached_to_existing_work"] is True
     status = service.work_status(overlap["work_id"])
     assert set(status["sections"]) == {"news", "vix", "market_internals"}
-    assert len(status["waiters"]) == 11
+    assert status["waiter_count"] == 11
     with connect_sqlite(settings.database_path) as conn:
         assert (
             conn.execute(
@@ -590,7 +591,7 @@ def test_running_generation_is_immutable_and_expired_lease_recovers(
         owner="worker-after-restart"
     )
     assert recovered["work_id"] == next_generation["work_id"]
-    assert recovered["lease_owner"] == "worker-after-restart"
+    assert recovered["status"] == "RUNNING"
 
 
 def test_changes_notification_and_idempotent_ack_survive_restart(tmp_path: Path) -> None:
@@ -661,8 +662,7 @@ def test_changes_notification_and_idempotent_ack_survive_restart(tmp_path: Path)
     assert failed_attempt["attempt_number"] == 1
     assert notified_attempt["attempt_number"] == 2
     section_revisions = {
-        name: details["section_revision"]
-        for name, details in manifest["sections"].items()
+        "news": manifest["sections"]["news"]["section_revision"],
     }
     ack_payload = {
         "consumer_id": "ai-trader",
@@ -798,6 +798,13 @@ def test_versioned_sync_http_contract(tmp_path: Path) -> None:
                 "sections": ["arbitrary_sql"],
             },
         )
+        legacy_global_ack = client.post(
+            "/market-context/outbox/events/legacy-delivery/ack",
+            json={
+                "consumer_id": "ai-trader",
+                "idempotency_key": "legacy-key",
+            },
+        )
 
     assert manifest.status_code == 200
     assert manifest.json()["contract"] == "ai_trader_market_context_sync"
@@ -809,3 +816,688 @@ def test_versioned_sync_http_contract(tmp_path: Path) -> None:
     assert refresh.status_code == 202
     assert work.json()["status"] == "PENDING"
     assert rejected.status_code == 422
+    assert legacy_global_ack.status_code == 410
+
+
+@pytest.mark.parametrize(
+    ("mutation", "same"),
+    [
+        ({"retrieved_at": "2030-01-01T00:00:00Z"}, True),
+        ({"telemetry": {"duration_ms": 999}}, True),
+        ({"actual": 1.0}, True),
+        ({"event_at": "2026-07-25T16:06:20-04:00"}, True),
+        ({"actual": 2}, False),
+        ({"actual": None}, False),
+        ({"actual": 0}, False),
+        ({"valid_until": "2026-08-03T20:06:20Z"}, False),
+        ({"lifecycle_status": "INVALIDATED"}, False),
+        ({"validation_status": "rejected"}, False),
+    ],
+)
+def test_material_fingerprint_canonicalization_and_materiality(
+    mutation: dict[str, Any],
+    same: bool,
+) -> None:
+    baseline = {
+        **record("stable-record", 1),
+        "actual": 1,
+        "event_at": "2026-07-25T20:06:20Z",
+    }
+    candidate = {**baseline, **mutation}
+    assert (
+        material_fingerprint(candidate) == material_fingerprint(baseline)
+    ) is same
+
+
+def test_material_fingerprint_is_order_and_restart_stable() -> None:
+    first = record("first", {"actual": 1})
+    second = {
+        **record("second", {"actual": 2}),
+        "source": "Federal Reserve",
+        "provider": "FRED",
+    }
+    payload = {"records": [first, second], "status": "AVAILABLE"}
+    reordered = {
+        "status": "AVAILABLE",
+        "records": [
+            {key: second[key] for key in reversed(second)},
+            {key: first[key] for key in reversed(first)},
+        ],
+    }
+    assert material_fingerprint(payload) == material_fingerprint(reordered)
+
+
+def test_sync_projection_preserves_added_roots_and_withholds_quarantine() -> None:
+    valid_event = {
+        **record("next-seven-day", 7),
+        "occurrence_id": "occurrence-next-seven-day",
+    }
+    rejected_record = {
+        **record("rejected-record", "must-not-escape"),
+        "validation_status": "rejected",
+        "rejection_reasons": ["SOURCE_DOMAIN_NOT_ALLOWLISTED"],
+        "source_url": "https://example.test/?api_key=super-secret-value",
+    }
+    payload = debug_payload()
+    payload.update(
+        {
+            "next_7d_critical_events": [valid_event],
+            "upcoming_high_impact_events": [valid_event],
+            "sentiment_context": {
+                "status": "AVAILABLE",
+                "items": [record("sentiment-1", "risk-off")],
+            },
+            "news_context": {
+                "status": "AVAILABLE",
+                "articles": [
+                    record("accepted-news", "ok"),
+                    rejected_record,
+                ],
+                "diagnostic_file": (
+                    r"C:\Users\analyst\private\trace.json"
+                ),
+            },
+        }
+    )
+    sections = extract_sync_sections(payload)
+    encoded = canonical_json(sections)
+
+    assert sections["event_calendar"]["next_7d_critical_events"] == [
+        valid_event
+    ]
+    assert sections["event_calendar"]["upcoming_high_impact_events"] == [
+        valid_event
+    ]
+    assert sections["risk"]["sentiment_context"]["items"][0][
+        "record_id"
+    ] == "sentiment-1"
+    assert "rejected-record" not in encoded
+    assert "super-secret-value" not in encoded
+    assert r"C:\Users" not in encoded
+    assert "<redacted-local-path>" in encoded
+    disclosure = sections["news"]["producer_disclosures"]["quarantine"]
+    assert disclosure["status"] == "WITHHELD"
+    assert disclosure["record_count"] == 1
+    assert disclosure["reasons"] == ["SOURCE_DOMAIN_NOT_ALLOWLISTED"]
+
+
+def test_readiness_and_plan_classify_degraded_producer_truth(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    payload = debug_payload()
+    payload["market_internals"] = {
+        "status": "AVAILABLE",
+        "source_coverage_status": "UNVERIFIED_EMPTY",
+        "items": [],
+    }
+    payload["options_positioning"] = {
+        "status": "QUARANTINED",
+        "validation": {"status": "rejected"},
+        "items": [record("rejected-option", 1)],
+    }
+    save_snapshot(settings, revision=1, payload=payload)
+    service = MarketContextSyncService(settings)
+    manifest = service.manifest()
+    full = service.full()
+    plan = service.plan(
+        {
+            "consumer_id": "ai-trader",
+            "request_id": "degraded-plan",
+            "required_sections": [
+                "market_internals",
+                "options_positioning",
+            ],
+        }
+    )
+    classifications = {
+        item["section"]: item["classification"]
+        for item in plan["unavailable_at_producer"]
+    }
+
+    assert manifest["sections"]["market_internals"]["status"] == "PARTIAL"
+    assert manifest["sections"]["options_positioning"]["status"] == (
+        "QUARANTINED"
+    )
+    assert classifications == {
+        "market_internals": "PARTIAL_AT_PRODUCER",
+        "options_positioning": "QUARANTINED_AT_PRODUCER",
+    }
+    assert full["readiness"]["status"] == "PARTIAL"
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (
+            {
+                "consumer_id": "consumer",
+                "request_id": "empty",
+                "required_sections": [],
+            },
+            "sections_required",
+        ),
+        (
+            {
+                "consumer_id": "consumer",
+                "request_id": "unknown",
+                "required_sections": ["sqlite_master"],
+            },
+            "unknown_sections",
+        ),
+        (
+            {
+                "consumer_id": "consumer",
+                "request_id": "malformed",
+                "required_sections": ["news"],
+                "known_sections": [],
+            },
+            "known_sections_must_be_object",
+        ),
+        (
+            {
+                "consumer_id": "consumer",
+                "request_id": "extra",
+                "required_sections": ["news"],
+                "force": True,
+            },
+            "unknown_request_fields",
+        ),
+    ],
+)
+def test_plan_rejects_adversarial_inventory(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    error: str,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+    with pytest.raises(SyncContractError, match=error):
+        MarketContextSyncService(settings).plan(payload)
+
+
+def test_plan_rejects_oversized_control_body(tmp_path: Path) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+    with pytest.raises(SyncContractError, match="control_payload_too_large"):
+        MarketContextSyncService(settings).plan(
+            {
+                "consumer_id": "consumer",
+                "request_id": "oversized",
+                "analysis_profile": "x" * 270_000,
+                "required_sections": ["news"],
+            }
+        )
+
+
+def test_five_megabyte_unicode_payload_is_exact_and_deterministic(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    body = ("Mercati—東京—🚀" * 256) + "\n"
+    rows = [
+        record(f"large-{index}", {"ordinal": index, "body": body})
+        for index in range(1_500)
+    ]
+    save_snapshot(settings, revision=1, payload=debug_payload(news=rows))
+    first_service = MarketContextSyncService(settings)
+    full = first_service.full()
+    selective = first_service.sections(
+        consumer_id="ai-trader",
+        target_snapshot_revision=1,
+        sections=["news"],
+        include_lineage=True,
+    )
+    restarted = MarketContextSyncService(settings).full()
+    delivered = selective["sections"]["news"]["context"]["articles"]
+
+    assert full["payload_size_bytes"] > 5_000_000
+    assert delivered == rows
+    assert full["checksum"] == restarted["checksum"]
+    assert full["payload_size_bytes"] == len(
+        canonical_json(full).encode("utf-8")
+    )
+
+
+def test_changes_preserve_a_to_b_to_a_revision_history(tmp_path: Path) -> None:
+    settings = cfg(tmp_path)
+    value_a = [record("news-a", "A")]
+    value_b = [record("news-b", "B")]
+    save_snapshot(settings, revision=1, payload=debug_payload(news=value_a))
+    save_snapshot(settings, revision=2, payload=debug_payload(news=value_b))
+    save_snapshot(settings, revision=3, payload=debug_payload(news=value_a))
+    service = MarketContextSyncService(settings)
+
+    one = service.manifest(snapshot_revision=1)["sections"]["news"]
+    three = service.manifest(snapshot_revision=3)["sections"]["news"]
+    changes = service.changes(since_revision=1)
+
+    assert one["fingerprint"] == three["fingerprint"]
+    assert three["section_revision"] > one["section_revision"]
+    assert {item["section"] for item in changes["changed_sections"]} == {
+        "news"
+    }
+
+
+def test_full_remains_pinned_when_new_revision_commits_mid_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(
+        settings,
+        revision=1,
+        payload=debug_payload(news=[record("old", "old")]),
+    )
+    service = MarketContextSyncService(settings)
+    original_manifest = service.manifest
+    published = False
+
+    def interleaved_manifest(*args, **kwargs):
+        nonlocal published
+        if not published:
+            published = True
+            save_snapshot(
+                settings,
+                revision=2,
+                payload=debug_payload(news=[record("new", "new")]),
+            )
+        return original_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(service, "manifest", interleaved_manifest)
+    response = service.full()
+    article = response["sections"]["news"]["context"]["articles"][0]
+
+    assert response["snapshot_revision"] == 1
+    assert response["manifest"]["snapshot_revision"] == 1
+    assert article["record_id"] == "old"
+    assert MarketContextSyncService(settings).manifest()[
+        "snapshot_revision"
+    ] == 2
+
+
+def test_snapshot_section_outbox_transaction_rolls_back_atomically(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    repository = MarketContextSnapshotRepository(settings)
+    repository.save_next(
+        symbol="MNQ",
+        refresh_mode="seed",
+        debug_payload=debug_payload(),
+        ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+    with connect_sqlite(settings.database_path) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER fail_outbox_insert
+            BEFORE INSERT ON market_context_outbox
+            BEGIN
+              SELECT RAISE(ABORT,'deterministic_outbox_fault');
+            END
+            """
+        )
+        conn.commit()
+
+    with pytest.raises(Exception, match="deterministic_outbox_fault"):
+        repository.save_next(
+            symbol="MNQ",
+            refresh_mode="fault-injection",
+            debug_payload=debug_payload(
+                news=[record("material-change", "changed")]
+            ),
+            ai_enrichment={"status": "NOT_REQUIRED"},
+            trigger_type="breaking_news",
+        )
+    with connect_sqlite(settings.database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM market_context_snapshots"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM market_context_outbox"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM market_context_sync_sections
+            WHERE snapshot_revision=2
+            """
+        ).fetchone()[0] == 0
+
+
+def test_single_flight_across_service_instances_and_lease_claims(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+
+    def request(index: int) -> str:
+        _, result = MarketContextSyncService(settings).request_refresh(
+            {
+                "consumer_id": f"consumer-{index}",
+                "request_id": f"same-content-{index}",
+                "reason": "MARKET_TRIGGER",
+                "required_sections": ["news", "vix"],
+            }
+        )
+        return str(result["work_id"])
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        work_ids = list(executor.map(request, range(10)))
+    assert len(set(work_ids)) == 1
+
+    def claim(index: int):
+        return MarketContextSyncService(settings).claim_next_refresh_work(
+            owner=f"process-{index}"
+        )
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        claims = list(executor.map(claim, range(10)))
+    assert sum(item is not None for item in claims) == 1
+
+
+def test_refresh_idempotency_conflict_and_completed_replay(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+    service = MarketContextSyncService(settings)
+    request = {
+        "consumer_id": "consumer",
+        "request_id": "stable-request",
+        "reason": "MARKET_TRIGGER",
+        "required_sections": ["news"],
+    }
+    _, queued = service.request_refresh(request)
+    with pytest.raises(
+        SyncContractError,
+        match="refresh_request_idempotency_conflict",
+    ):
+        service.request_refresh(
+            {**request, "required_sections": ["news", "vix"]}
+        )
+    claimed = service.claim_next_refresh_work(owner="worker")
+    save_snapshot(
+        settings,
+        revision=2,
+        payload=debug_payload(news=[record("new", "new")]),
+    )
+    service.complete_refresh_work(
+        str(claimed["work_id"]),
+        owner="worker",
+        snapshot_id="mcs-sync-2",
+    )
+    status_code, replayed = service.request_refresh(request)
+    assert status_code == 200
+    assert replayed["status"] == "COMPLETED"
+    assert replayed["work_id"] == queued["work_id"]
+
+
+def _insert_delivery(
+    settings: Settings,
+    *,
+    delivery_id: str,
+    revision: int,
+    sections: list[str],
+    created_at: str,
+) -> None:
+    with connect_sqlite(settings.database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO market_context_outbox(
+              event_id,event_type,trigger_type,snapshot_id,snapshot_revision,
+              changed_sections_json,material_changes_json,created_at,
+              delivery_status,attempt_count,idempotency_key,payload_hash,
+              base_revision,triggers_json
+            ) VALUES (?,?,?,?,?,?,?,?,'PENDING',0,?,?,?,'[]')
+            """,
+            (
+                delivery_id,
+                "market_context.updated",
+                "breaking_news",
+                f"mcs-sync-{revision}",
+                revision,
+                canonical_json(sections),
+                "[]",
+                created_at,
+                f"idempotency-{delivery_id}",
+                f"hash-{delivery_id}",
+                max(revision - 1, 0),
+            ),
+        )
+        conn.commit()
+
+
+def test_ack_rejects_wrong_consumer_partial_and_bad_clock(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+    service = MarketContextSyncService(settings)
+    created = datetime.now(UTC).replace(microsecond=0)
+    _insert_delivery(
+        settings,
+        delivery_id="ack-adversarial",
+        revision=1,
+        sections=["news", "vix"],
+        created_at=created.isoformat(),
+    )
+    service.record_delivery_attempt(
+        delivery_id="ack-adversarial",
+        consumer_id="notified-consumer",
+        status="NOTIFIED",
+    )
+    manifest = service.manifest()
+    valid = {
+        "consumer_id": "notified-consumer",
+        "delivery_id": "ack-adversarial",
+        "snapshot_revision": 1,
+        "status": "PERSISTED",
+        "section_revisions": {
+            name: manifest["sections"][name]["section_revision"]
+            for name in ("news", "vix")
+        },
+        "acknowledged_at": created.isoformat(),
+    }
+    with pytest.raises(SyncContractError, match="ack_consumer_not_notified"):
+        service.acknowledge({**valid, "consumer_id": "wrong-consumer"})
+    with pytest.raises(SyncContractError, match="ack_partial_persistence"):
+        service.acknowledge(
+            {**valid, "section_revisions": {"news": 1}}
+        )
+    with pytest.raises(SyncContractError, match="ack_precedes_delivery"):
+        service.acknowledge(
+            {
+                **valid,
+                "acknowledged_at": (
+                    created - timedelta(seconds=1)
+                ).isoformat(),
+            }
+        )
+    with pytest.raises(SyncContractError, match="ack_timestamp_in_future"):
+        service.acknowledge(
+            {
+                **valid,
+                "acknowledged_at": (
+                    datetime.now(UTC) + timedelta(minutes=10)
+                ).isoformat(),
+            }
+        )
+
+
+def test_ack_is_concurrent_idempotent_and_transactional(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+    service = MarketContextSyncService(settings)
+    created = datetime.now(UTC).replace(microsecond=0)
+    _insert_delivery(
+        settings,
+        delivery_id="ack-concurrent",
+        revision=1,
+        sections=["news"],
+        created_at=created.isoformat(),
+    )
+    service.record_delivery_attempt(
+        delivery_id="ack-concurrent",
+        consumer_id="consumer",
+        status="NOTIFIED",
+    )
+    payload = {
+        "consumer_id": "consumer",
+        "delivery_id": "ack-concurrent",
+        "snapshot_revision": 1,
+        "status": "PERSISTED",
+        "section_revisions": {
+            "news": service.manifest()["sections"]["news"][
+                "section_revision"
+            ]
+        },
+        "acknowledged_at": created.isoformat(),
+    }
+    with connect_sqlite(settings.database_path) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER fail_ack_insert
+            BEFORE INSERT ON market_context_delivery_acks
+            BEGIN
+              SELECT RAISE(ABORT,'deterministic_ack_fault');
+            END
+            """
+        )
+        conn.commit()
+    with pytest.raises(Exception, match="deterministic_ack_fault"):
+        service.acknowledge(payload)
+    with connect_sqlite(settings.database_path) as conn:
+        target = conn.execute(
+            """
+            SELECT status FROM market_context_delivery_targets
+            WHERE delivery_id='ack-concurrent' AND consumer_id='consumer'
+            """
+        ).fetchone()
+        assert target["status"] == "NOTIFIED"
+        conn.execute("DROP TRIGGER fail_ack_insert")
+        conn.commit()
+
+    def acknowledge_once(_: int) -> dict[str, Any]:
+        return MarketContextSyncService(settings).acknowledge(payload)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        responses = list(executor.map(acknowledge_once, range(8)))
+    assert sum(not item["idempotent_replay"] for item in responses) == 1
+    assert sum(item["idempotent_replay"] for item in responses) == 7
+
+
+def test_delivery_retry_reaches_dead_letter_without_false_pending(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(settings, revision=1, payload=debug_payload())
+    service = MarketContextSyncService(settings)
+    _insert_delivery(
+        settings,
+        delivery_id="dead-letter",
+        revision=1,
+        sections=["news"],
+        created_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+    )
+    attempts = [
+        service.record_delivery_attempt(
+            delivery_id="dead-letter",
+            consumer_id="consumer",
+            status="FAILED",
+            error={
+                "code": "temporary",
+                "token": "should-be-redacted",
+            },
+        )
+        for _ in range(8)
+    ]
+    assert [item["attempt_number"] for item in attempts] == list(range(1, 9))
+    assert attempts[-1]["status"] == "DEAD_LETTER"
+    assert service.consumer_state("consumer")["pending_delivery_count"] == 0
+    with connect_sqlite(settings.database_path) as conn:
+        target = conn.execute(
+            """
+            SELECT status,last_error_json
+            FROM market_context_delivery_targets
+            WHERE delivery_id='dead-letter' AND consumer_id='consumer'
+            """
+        ).fetchone()
+    assert target["status"] == "DEAD_LETTER"
+    assert "should-be-redacted" not in target["last_error_json"]
+
+
+def test_late_superseded_ack_does_not_regress_consumer_inventory(
+    tmp_path: Path,
+) -> None:
+    settings = cfg(tmp_path)
+    save_snapshot(
+        settings,
+        revision=1,
+        payload=debug_payload(news=[record("news-old", "old")]),
+    )
+    save_snapshot(
+        settings,
+        revision=2,
+        payload=debug_payload(news=[record("news-new", "new")]),
+    )
+    service = MarketContextSyncService(settings)
+    created = datetime.now(UTC).replace(microsecond=0)
+    _insert_delivery(
+        settings,
+        delivery_id="delivery-old",
+        revision=1,
+        sections=["news"],
+        created_at=created.isoformat(),
+    )
+    _insert_delivery(
+        settings,
+        delivery_id="delivery-new",
+        revision=2,
+        sections=["news"],
+        created_at=created.isoformat(),
+    )
+    service.record_delivery_attempt(
+        delivery_id="delivery-old",
+        consumer_id="consumer",
+        status="NOTIFIED",
+    )
+    service.record_delivery_attempt(
+        delivery_id="delivery-new",
+        consumer_id="consumer",
+        status="NOTIFIED",
+    )
+    old_revision = service.manifest(snapshot_revision=1)["sections"][
+        "news"
+    ]["section_revision"]
+    new_revision = service.manifest(snapshot_revision=2)["sections"][
+        "news"
+    ]["section_revision"]
+    newer = service.acknowledge(
+        {
+            "consumer_id": "consumer",
+            "delivery_id": "delivery-new",
+            "snapshot_revision": 2,
+            "status": "PERSISTED",
+            "section_revisions": {"news": new_revision},
+            "acknowledged_at": created.isoformat(),
+        }
+    )
+    older = service.acknowledge(
+        {
+            "consumer_id": "consumer",
+            "delivery_id": "delivery-old",
+            "snapshot_revision": 1,
+            "status": "PERSISTED",
+            "section_revisions": {"news": old_revision},
+            "acknowledged_at": created.isoformat(),
+        }
+    )
+    state = service.consumer_state("consumer")
+
+    assert newer["superseded_delivery"] is False
+    assert older["superseded_delivery"] is True
+    assert state["last_snapshot_revision_acknowledged"] == 2
+    assert state["section_revisions"]["news"] == new_revision
+    assert state["pending_delivery_count"] == 0
