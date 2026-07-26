@@ -117,6 +117,7 @@ def _legacy_count_only_nasdaq(value: dict[str, Any]) -> bool:
 def _compact_quality(data_quality: dict[str, Any]) -> dict[str, Any]:
     overall = data_quality.get("overall_data_quality") or {}
     return {
+        **data_quality,
         "completeness_score": overall.get("completeness_score"),
         "freshness_score": overall.get("freshness_score"),
         "reliability_score": overall.get("reliability_score"),
@@ -130,14 +131,16 @@ def _compact_quality(data_quality: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_events(calendar: dict[str, Any]) -> dict[str, Any]:
     return {
-        "critical_macro_events": [_compact_event_item(item) for item in (calendar.get("critical_macro_events") or [])[:12]],
-        "fed_communications": [_compact_event_item(item) for item in (calendar.get("fed_communications") or [])[:8]],
-        "other_economic_events": [_compact_event_item(item) for item in (calendar.get("other_economic_events") or [])[:12]],
+        **calendar,
+        "critical_macro_events": [_compact_event_item(item) for item in (calendar.get("critical_macro_events") or [])],
+        "fed_communications": [_compact_event_item(item) for item in (calendar.get("fed_communications") or [])],
+        "other_economic_events": [_compact_event_item(item) for item in (calendar.get("other_economic_events") or [])],
     }
 
 
 def _compact_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
     output = {
+        **nasdaq,
         "qqq_holdings": nasdaq.get("qqq_holdings") or {},
         "sector_exposure": nasdaq.get("sector_exposure") or {},
         "mega_cap_snapshot": _compact_snapshot(nasdaq.get("mega_cap_snapshot") or {}),
@@ -151,14 +154,14 @@ def _compact_nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
     if isinstance(output["qqq_holdings"], dict) and output["qqq_holdings"].get("top_holdings"):
         output["qqq_holdings"] = {
             **output["qqq_holdings"],
-            "holdings": (output["qqq_holdings"].get("holdings") or [])[:15],
-            "top_holdings": output["qqq_holdings"]["top_holdings"][:15],
+            "holdings": output["qqq_holdings"].get("holdings") or [],
+            "top_holdings": output["qqq_holdings"]["top_holdings"],
         }
     return output
 
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    return {**snapshot, "stocks": (snapshot.get("stocks") or [])[:20]}
+    return {**snapshot, "stocks": snapshot.get("stocks") or []}
 
 
 def _compact_breadth(breadth: dict[str, Any]) -> dict[str, Any]:
@@ -214,8 +217,9 @@ def _compact_options(options: dict[str, Any]) -> dict[str, Any]:
     by_strike = matrix.get("by_strike") or []
     snapshot = options.get("snapshot") or {}
     spot = _float(snapshot.get("underlying_price") or snapshot.get("last_price"))
-    concentrations = sorted(by_strike, key=lambda item: float(item.get("total_open_interest") or item.get("open_interest") or 0), reverse=True)[:10]
+    concentrations = sorted(by_strike, key=lambda item: float(item.get("total_open_interest") or item.get("open_interest") or 0), reverse=True)
     return {
+        **options,
         "status": options.get("status"),
         "underlying": snapshot.get("underlying") or "QQQ",
         "source_timestamp": snapshot.get("retrieved_at") or options.get("retrieved_at"),
@@ -231,6 +235,7 @@ def _compact_options(options: dict[str, Any]) -> dict[str, Any]:
         "observed_put_call_volume_ratio": observed.get("put_call_volume_ratio"),
         "observed_scope": "partial_provider_snapshot",
         "top_combined_oi_concentrations": [_option_concentration(item, spot) for item in concentrations],
+        "open_interest_matrix": matrix,
         "warnings": options.get("warnings") or [],
     }
 
@@ -250,6 +255,7 @@ def _option_concentration(item: dict[str, Any], spot: float | None) -> dict[str,
 
 def _compact_nasdaq_100(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
+        **snapshot,
         "status": snapshot.get("status"),
         "retrieved_at": snapshot.get("retrieved_at"),
         "constituents_count": len(snapshot.get("constituents") or []),
@@ -270,6 +276,9 @@ def _compact_sentiment_context(sentiment: dict[str, Any]) -> dict[str, Any]:
             failure_type = "ssl_error"
         short_reason = _short_reason(combined, fallback=prediction.get("warning") or prediction.get("error"))
         output["prediction_markets"] = {
+            **prediction,
+            "errors": _compact_messages(errors),
+            "warnings": _compact_messages(warnings),
             "status": prediction.get("status"),
             "failure_type": failure_type,
             "attempt_count": int(prediction.get("attempt_count") or (prediction.get("diagnostics") or {}).get("attempt_count") or len((prediction.get("diagnostics") or {}).get("attempts") or []) or 0),
@@ -301,8 +310,9 @@ def _short_reason(messages: list[str], *, fallback: Any = None) -> str | None:
 
 def _compact_market_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
     return {
+        **schedule,
         "nasdaq_cash_session": schedule.get("nasdaq_cash_session") or {},
-        "holidays": (schedule.get("holidays") or [])[:10],
+        "holidays": schedule.get("holidays") or [],
         "holiday_source": schedule.get("holiday_source") or {},
     }
 

@@ -481,7 +481,13 @@ def test_material_trigger_emits_one_idempotent_outbox_event(tmp_path: Path) -> N
             "created_at": NOW.isoformat(),
         }
         first = repository.emit_in_transaction(conn, **kwargs)
-        second = repository.emit_in_transaction(conn, **kwargs)
+        second = repository.emit_in_transaction(
+            conn,
+            **{
+                **kwargs,
+                "created_at": (NOW + timedelta(minutes=1)).isoformat(),
+            },
+        )
         conn.commit()
     assert first and second and first["event_id"] == second["event_id"]
     assert len(repository.list_events()) == 1
@@ -664,7 +670,7 @@ def test_valid_unicode_is_not_corrupted() -> None:
     assert normalize_text(value) == value
 
 
-def test_migration_20_is_idempotent_and_preserves_rows(tmp_path: Path) -> None:
+def test_migration_21_is_idempotent_and_preserves_rows(tmp_path: Path) -> None:
     settings = cfg(tmp_path)
     first = migrate_database(settings.database_path)
     with connect_sqlite(settings.database_path) as conn:
@@ -682,7 +688,7 @@ def test_migration_20_is_idempotent_and_preserves_rows(tmp_path: Path) -> None:
     second = migrate_database(settings.database_path)
     with connect_sqlite(settings.database_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM anomaly_incidents").fetchone()[0]
-    assert first["schema_version"] == second["schema_version"] == 20
+    assert first["schema_version"] == second["schema_version"] == 21
     assert count == 1
 
 

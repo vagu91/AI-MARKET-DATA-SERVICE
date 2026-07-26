@@ -31,7 +31,8 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /events/upcoming?country=US&days=7`
 - `GET /events/active-windows?symbol=MNQ`
 - `GET /market-context/mnq`
-- `GET /market-context/mnq/consumer?refresh=false|auto|force`
+- `GET /market-context/mnq/consumer?refresh=false|auto|force` (deprecated
+  analysis projection; not a synchronization source)
 - `GET /market-context/mnq/debug?refresh=false|auto|force`
 - `GET /ai-research/jobs/latest?view=full|compact`
 - `GET /ai-research/jobs/{job_id}`
@@ -67,6 +68,14 @@ API docs: <http://127.0.0.1:8000/docs>
 - `GET /providers/sentiment/macromicro-aaii?refresh=false|auto|force`
 - `GET /providers/polymarket/markets?refresh=false|auto|force`
 - `GET /diagnostics/data-quality`
+- `GET /market-context/mnq/sync/manifest`
+- `GET /market-context/mnq/sync/full`
+- `POST /market-context/mnq/sync/plan`
+- `POST /market-context/mnq/sync/sections`
+- `GET /market-context/mnq/sync/changes?since_revision=N`
+- `POST /market-context/mnq/sync/refresh`
+- `GET /market-context/mnq/sync/requests/{work_id}`
+- `POST /market-context/mnq/sync/ack`
 
 ## Persistent Data Store
 
@@ -76,7 +85,20 @@ The central persistent SQLite DB defaults to `./data/market_data_service.sqlite`
 AI_MARKET_DATABASE_PATH=./data/market_data_service.sqlite
 ```
 
-The DB stores reusable facts, official event history, deduplicated news, provider observations, enrichment run metrics, provider cache entries, provider state, versioned context snapshots, source candidates with lineage, persistent AI jobs/attempts, observed research tool events, verified evidence and schema migrations. Schemas 7-14 are additive and upgrade existing supported databases without rebuilding tables. Migration 14 adds research event/release, issuer and post-event lifecycle lineage.
+The DB stores reusable facts, official event history, source-preserving news
+records, provider observations, enrichment run metrics, provider cache entries,
+provider state, versioned context snapshots, source candidates with lineage,
+persistent AI jobs/attempts, observed research tool events, verified evidence
+and schema migrations. Migrations through schema 21 are additive and upgrade
+all supported prior versions without rebuilding canonical tables. Migration 21
+adds immutable per-section sync state, durable refresh work/waiters,
+consumer-specific ACK/delivery targets, bounded retry/dead-letter state,
+consumer diagnostics, delivery attempts and versioned outbox metadata.
+
+The AI Trader producer protocol is documented in
+[`docs/market-context-sync-contract.md`](docs/market-context-sync-contract.md);
+the future consumer implementation handoff is in
+[`docs/ai-trader-market-context-sync-handoff.md`](docs/ai-trader-market-context-sync-handoff.md).
 
 `GET /ai-research/jobs/latest` returns a JSON array ordered newest-first by
 `created_at`, then by insertion order when timestamps match. Its compatible default

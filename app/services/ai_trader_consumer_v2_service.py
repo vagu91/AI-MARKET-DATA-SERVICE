@@ -49,7 +49,7 @@ INCLUDED_SECTIONS = [
     "deterministic_domains",
     "agentic_domains",
     "quality",
-    "compaction",
+    "payload_measurement",
 ]
 EXCLUDED_DEBUG_SECTIONS = [
     "provider_diagnostics",
@@ -232,46 +232,21 @@ def build_ai_trader_consumer_v2(
         "research": research,
         "warnings": _warnings(hardened),
     }
-    _enforce_payload_limit(consumer)
+    _sanitize_payload_without_reduction(consumer)
     size = _payload_size(consumer)
+    consumer["payload_measurement"] = {
+        "serialization": "utf8_json_compact_separators",
+        "size_bytes": size,
+        "size_limit_applied": False,
+        "records_removed_for_size": 0,
+    }
+    consumer["payload_measurement"]["size_bytes"] = _payload_size(consumer)
     logger.info("consumer_payload_materialized", extra={"payload_size_bytes": size})
-    logger.info(
-        "consumer_payload_size_validated",
-        extra={"payload_size_bytes": size, "under_90kb": size < 90_000},
-    )
+    logger.info("consumer_payload_size_measured", extra={"payload_size_bytes": size})
     logger.info("consumer_contract_validated", extra={"contract": CONTRACT_NAME, "schema_version": SCHEMA_VERSION})
     return consumer
 
 
-SECTION_BYTE_BUDGETS = {
-    "readiness": 2_500,
-    "snapshot_summary": 1_500,
-    "macro": 6_500,
-    "event_risk": 9_000,
-    "event_calendar_window": 18_000,
-    "rates": 4_500,
-    "risk": 5_500,
-    "positioning": 2_500,
-    "nasdaq": 9_000,
-    "earnings": 4_000,
-    "news": 4_000,
-    "sentiment": 2_500,
-    "market_schedule": 6_000,
-    "macro_actuals": 2_000,
-    "rates_context": 2_000,
-    "options_positioning": 2_500,
-    "market_internals": 2_000,
-    "cross_asset_context": 2_000,
-    "earnings_intelligence": 2_000,
-    "current_company_news": 2_000,
-    "deterministic_domains": 3_500,
-    "agentic_domains": 3_500,
-    "quality": 3_000,
-    "lifecycle": 2_500,
-    "ai_enrichment": 1_500,
-    "research": 3_000,
-    "warnings": 1_500,
-}
 _CONSUMER_FORBIDDEN_KEYS = frozenset(
     {
         "chains",
@@ -290,93 +265,30 @@ _CONSUMER_FORBIDDEN_KEYS = frozenset(
         "token",
     }
 )
-_SUMMARY_KEYS = (
-    "status",
-    "data_coverage_status",
-    "as_of",
-    "data_as_of",
-    "freshness",
-    "fresh_until",
-    "valid_until",
-    "provider",
-    "source",
-    "lineage",
-    "underlying",
-    "target_context",
-    "proxy_used",
-    "expirations_considered",
-    "put_call_ratio",
-    "put_call_volume_ratio",
-    "put_call_open_interest_ratio",
-    "open_interest_aggregate",
-    "volume_aggregate",
-    "dominant_strikes",
-    "top_strikes",
-    "implied_volatility",
-    "reason",
-    "no_data_reason",
-    "warnings",
-    "coverage",
-    "quality",
-)
 _BEARER_TOKEN_RE = re.compile(
     r"(?i)\bbearer\s+[A-Za-z0-9_\-./+=]{4,}"
 )
 
 
-def _enforce_payload_limit(consumer: dict[str, Any], limit: int = 90_000) -> None:
-    """Apply stable semantic section budgets before validating canonical bytes."""
-    originals = {
-        key: value
-        for key, value in consumer.items()
-    }
+def _sanitize_payload_without_reduction(consumer: dict[str, Any]) -> None:
+    """Redact technical secrets without dropping, deduplicating or truncating data."""
+
     sanitized = _sanitize_consumer_value(consumer)
     if not isinstance(sanitized, dict):
         raise ValueError("consumer_payload_must_be_object")
     consumer.clear()
     consumer.update(sanitized)
-    section_metrics: dict[str, dict[str, Any]] = {}
-    for key, budget in SECTION_BYTE_BUDGETS.items():
-        if key not in consumer:
-            continue
-        original = originals.get(key)
-        before_bytes = _value_size(original)
-        before_items = _recursive_item_count(original)
-        sanitized_section = consumer[key]
-        sanitized_bytes = _value_size(sanitized_section)
-        compacted = (
-            _fit_section(sanitized_section, budget=budget)
-            if sanitized_bytes > budget
-            else sanitized_section
-        )
-        consumer[key] = compacted
-        after_bytes = _value_size(compacted)
-        after_items = _recursive_item_count(compacted)
-        section_metrics[key] = {
-            "budget_bytes": budget,
-            "before_bytes": before_bytes,
-            "sanitized_bytes": sanitized_bytes,
-            "after_bytes": after_bytes,
-            "items_before": before_items,
-            "items_after": after_items,
-            "items_removed_or_deduplicated": max(before_items - after_items, 0),
-            "reason": (
-                "section_budget_semantic_compaction"
-                if sanitized_bytes > budget
-                else "sanitized_within_section_budget"
-            ),
-        }
-    consumer["compaction"] = {
-        "serialization": "utf8_json_compact_separators",
-        "limit_bytes": limit,
-        "total_size_bytes": 0,
-        "sections": section_metrics,
-    }
-    for _ in range(3):
-        consumer["compaction"]["total_size_bytes"] = _payload_size(consumer)
     _validate_consumer_security(consumer)
-    if _payload_size(consumer) >= limit:
-        raise ValueError("consumer_payload_exceeds_90kb")
+
+
+def _enforce_payload_limit(
+    consumer: dict[str, Any],
+    limit: int | None = None,
+) -> None:
+    """Compatibility alias: sanitize only; ``limit`` is intentionally ignored."""
+
+    del limit
+    _sanitize_payload_without_reduction(consumer)
 
 
 def _sanitize_consumer_value(value: Any) -> Any:
@@ -389,21 +301,7 @@ def _sanitize_consumer_value(value: Any) -> Any:
             output[normalized_key] = _sanitize_consumer_value(item)
         return output
     if isinstance(value, list):
-        output: list[Any] = []
-        seen: set[str] = set()
-        for item in value:
-            sanitized = _sanitize_consumer_value(item)
-            canonical = json.dumps(
-                sanitized,
-                sort_keys=True,
-                default=str,
-                separators=(",", ":"),
-            )
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            output.append(sanitized)
-        return output
+        return [_sanitize_consumer_value(item) for item in value]
     if isinstance(value, str):
         redacted = redact_sensitive(value)
         return _BEARER_TOKEN_RE.sub("Bearer <redacted>", redacted)
@@ -423,105 +321,6 @@ def _validate_consumer_security(value: Any) -> None:
         return
     if isinstance(value, str) and _BEARER_TOKEN_RE.search(value):
         raise ValueError("consumer_secret_pattern_detected")
-
-
-def _fit_section(value: Any, *, budget: int) -> Any:
-    for keep in (16, 8, 4, 2):
-        compacted = _semantic_compact(value, list_limit=keep)
-        if _value_size(compacted) <= budget:
-            return compacted
-    summarized = _semantic_summary(value)
-    if _value_size(summarized) <= budget:
-        return summarized
-    return _bound_strings(summarized, limit=160)
-
-
-def _semantic_compact(value: Any, *, list_limit: int) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _semantic_compact(item, list_limit=list_limit)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if str(key).lower() not in _CONSUMER_FORBIDDEN_KEYS
-            and item not in (None, {}, [])
-        }
-    if isinstance(value, list):
-        deduplicated: dict[str, Any] = {}
-        for item in value:
-            compacted = _semantic_compact(item, list_limit=list_limit)
-            deduplicated.setdefault(
-                json.dumps(compacted, sort_keys=True, default=str, separators=(",", ":")),
-                compacted,
-            )
-        ordered = sorted(
-            deduplicated.values(),
-            key=_semantic_rank,
-            reverse=True,
-        )
-        return ordered[:list_limit]
-    if isinstance(value, str):
-        return value if len(value) <= 512 else f"{value[:509]}..."
-    return value
-
-
-def _semantic_summary(value: Any) -> Any:
-    if isinstance(value, dict):
-        output = {
-            key: _semantic_compact(value[key], list_limit=2)
-            for key in _SUMMARY_KEYS
-            if key in value and value[key] not in (None, {}, [])
-        }
-        output["compacted_item_count"] = _recursive_item_count(value)
-        return output
-    if isinstance(value, list):
-        return {
-            "items": _semantic_compact(value, list_limit=2),
-            "compacted_item_count": len(value),
-        }
-    return value
-
-
-def _semantic_rank(value: Any) -> tuple[float, str, str]:
-    if not isinstance(value, dict):
-        canonical = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
-        return 0.0, "", canonical
-    scores = []
-    for key in (
-        "relevance",
-        "mnq_relevance_score",
-        "market_impact_score",
-        "importance",
-        "weight_pct",
-        "open_interest",
-        "volume",
-    ):
-        try:
-            scores.append(float(value.get(key) or 0))
-        except (TypeError, ValueError):
-            continue
-    score = max(scores, default=0.0)
-    timestamp = str(
-        value.get("as_of")
-        or value.get("published_at")
-        or value.get("release_at")
-        or value.get("date")
-        or ""
-    )
-    canonical = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
-    return score, timestamp, canonical
-
-
-def _recursive_item_count(value: Any) -> int:
-    if isinstance(value, list):
-        return len(value) + sum(_recursive_item_count(item) for item in value)
-    if isinstance(value, dict):
-        return sum(_recursive_item_count(item) for item in value.values())
-    return 0
-
-
-def _value_size(value: Any) -> int:
-    return len(
-        json.dumps(value, default=str, separators=(",", ":")).encode("utf-8")
-    )
 
 
 def _ai_enrichment(value: dict[str, Any]) -> dict[str, Any]:
@@ -563,7 +362,7 @@ def _deterministic_section(value: dict[str, Any]) -> dict[str, Any]:
         if key not in forbidden
     }
     if isinstance(output.get("items"), list):
-        output["items"] = output["items"][:20]
+        output["items"] = output["items"]
     output.setdefault("status", "AVAILABLE")
     output.setdefault(
         "data_coverage_status",
@@ -696,10 +495,10 @@ def _research(value: dict[str, Any]) -> dict[str, Any]:
         "non_blocking_gaps": list(value.get("non_blocking_gaps") or []),
         "claim_count": int(value.get("claim_count") or 0),
         "evidence_count": int(value.get("evidence_count") or 0),
-        "key_verified_drivers": list(value.get("key_verified_drivers") or [])[:8],
-        "critical_evidence_references": list(value.get("critical_evidence_references") or [])[:8],
-        "source_domains": list(value.get("source_domains") or [])[:12],
-        "warnings": list(value.get("warnings") or [])[:12],
+        "key_verified_drivers": list(value.get("key_verified_drivers") or []),
+        "critical_evidence_references": list(value.get("critical_evidence_references") or []),
+        "source_domains": list(value.get("source_domains") or []),
+        "warnings": list(value.get("warnings") or []),
         "policy_no_data_topics": list(
             value.get("policy_no_data_topics") or []
         ),
@@ -886,40 +685,40 @@ def _event_risk(full: dict[str, Any]) -> dict[str, Any]:
         "actual_lifecycle": ((full.get("metadata") or {}).get("data_lifecycle") or {}).get("macro_actual") or {},
         "events_today": _events_today(full.get("events_today_context") or {}),
         "event_risk_window_status": windows.get("event_risk_window_status"),
-        "active_windows": [_event(item) for item in active[:6]],
-        "upcoming_high_impact_windows": [_event(item) for item in upcoming[:6]],
-        "upcoming_high_impact_events_unscheduled": [_unscheduled_event(item) for item in unscheduled[:6]],
+        "active_windows": [_event(item) for item in active],
+        "upcoming_high_impact_windows": [_event(item) for item in upcoming],
+        "upcoming_high_impact_events_unscheduled": [_unscheduled_event(item) for item in unscheduled],
         "next_critical_event": _event(scheduled_critical[0]) if scheduled_critical else None,
         "next_fomc": _event(
             next((item for item in upcoming_events if "FOMC" in _event_text(item)), {})
         ) or None,
-        "upcoming_events": [_event(item) for item in upcoming_events[:20]],
+        "upcoming_events": [_event(item) for item in upcoming_events],
         "awaiting_actual_events": [
-            _event(item) for item in awaiting_actual_events[:20]
+            _event(item) for item in awaiting_actual_events
         ],
         "recently_released_events": [
-            _event(item) for item in recently_released_events[:20]
+            _event(item) for item in recently_released_events
         ],
-        "historical_events": [_event(item) for item in historical_events[:20]],
+        "historical_events": [_event(item) for item in historical_events],
         "critical_events": [
             _event(item)
             for item in projected
             if item.get("canonical_event_key") in critical_keys
-        ][:6],
+        ],
         "xtb_us_macro_calendar": {
             "status": xtb.get("status"),
             "provider_status": xtb.get("status"),
             "retrieved_at": xtb.get("retrieved_at"),
             "valid_until": xtb.get("valid_until"),
             "source": xtb.get("source"),
-            "events": [_xtb_event(item) for item in (xtb.get("events") or xtb.get("items") or [])[:12]],
+            "events": [_xtb_event(item) for item in (xtb.get("events") or xtb.get("items") or [])],
         },
         "warnings": windows.get("warnings") or [],
     }
 
 
 def _rates(rates: dict[str, Any]) -> dict[str, Any]:
-    meetings = [_meeting(item) for item in (rates.get("meetings") or [])[:4]]
+    meetings = [_meeting(item) for item in (rates.get("meetings") or [])]
     return {
         "lifecycle": rates.get("lifecycle") or {},
         "status": rates.get("status"),
@@ -970,7 +769,7 @@ def _risk(risk: dict[str, Any]) -> dict[str, Any]:
             "structure": curve.get("structure"),
             "m1_m2_spread_points": curve.get("m1_m2_spread_points"),
             "m1_m2_spread_pct": curve.get("m1_m2_spread_pct"),
-            "contracts": [_contract(item) for item in contracts[:3]],
+            "contracts": [_contract(item) for item in contracts],
             "source": curve.get("source"),
             "freshness": curve.get("freshness"),
         },
@@ -1010,7 +809,7 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
                 else "NOT_AVAILABLE"
             ),
             "top_20_holdings": (
-                [_holding(item) for item in (qqq.get("holdings") or [])[:20]]
+                [_holding(item) for item in (qqq.get("holdings") or [])]
                 if str(qqq.get("status") or "").upper()
                 == "LAST_KNOWN_GOOD"
                 else []
@@ -1041,13 +840,13 @@ def _nasdaq(nasdaq: dict[str, Any]) -> dict[str, Any]:
     return {
         "lifecycle": qqq.get("lifecycle") or {},
         "status": nasdaq.get("status") or qqq.get("status"),
-        "top_20_holdings": [_holding(item) for item in holdings[:20]],
+        "top_20_holdings": [_holding(item) for item in holdings],
         "holdings_count": qqq.get("holdings_count"),
         "concentration": nasdaq.get("concentration") or {},
         "sector_exposure": _compact_sector(nasdaq.get("sector_exposure") or {}),
         "mega_cap_contributors": {
-            "top_positive": (breadth.get("top_positive_contributors") or [])[:8],
-            "top_negative": (breadth.get("top_negative_contributors") or [])[:8],
+            "top_positive": (breadth.get("top_positive_contributors") or []),
+            "top_negative": (breadth.get("top_negative_contributors") or []),
             "net_contribution": breadth.get("weighted_net_contribution"),
         },
         "semiconductor_context": nasdaq.get("semiconductor_context") or {},
@@ -1118,9 +917,9 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
         ]
     )
     today = datetime.now(NEW_YORK).date()
-    projected = [_earnings_event(item, today=today) for item in events[:50]]
-    upcoming = [item for item in projected if item.get("temporal_status") == "PRE_RELEASE"][:20]
-    released = [item for item in projected if item.get("temporal_status") != "PRE_RELEASE"][:20]
+    projected = [_earnings_event(item, today=today) for item in events]
+    upcoming = [item for item in projected if item.get("temporal_status") == "PRE_RELEASE"]
+    released = [item for item in projected if item.get("temporal_status") != "PRE_RELEASE"]
     return {
         "lifecycle": earnings.get("lifecycle") or {},
         "status": earnings.get("status") or (
@@ -1141,7 +940,7 @@ def _earnings(full: dict[str, Any]) -> dict[str, Any]:
 def _news(news: dict[str, Any], digest: dict[str, Any], schedule: dict[str, Any]) -> dict[str, Any]:
     current_drivers: list[dict[str, Any]] = []
     previous_session_drivers: list[dict[str, Any]] = []
-    for raw in (digest.get("drivers") or [])[:12]:
+    for raw in (digest.get("drivers") or []):
         driver = _news_driver(
             raw,
             context_date=str(news.get("context_date") or schedule.get("context_date") or ""),
@@ -1167,10 +966,10 @@ def _news(news: dict[str, Any], digest: dict[str, Any], schedule: dict[str, Any]
         "candidate_article_count": news.get("candidate_article_count"),
         "accepted_article_count": news.get("accepted_article_count"),
         "rejected_article_count": news.get("rejected_article_count"),
-        "articles": [_article(item) for item in (news.get("articles") or news.get("latest") or [])[:8]],
-        "clusters": [_cluster(item) for item in (news.get("clusters") or [])[:8]],
-        "current_drivers": current_drivers[:8],
-        "previous_session_drivers": previous_session_drivers[:8],
+        "articles": [_article(item) for item in (news.get("articles") or news.get("latest") or [])],
+        "clusters": [_cluster(item) for item in (news.get("clusters") or [])],
+        "current_drivers": current_drivers,
+        "previous_session_drivers": previous_session_drivers,
         "quality": news.get("quality") or {},
         "reason": news.get("reason"),
         "warnings": news.get("warnings") or digest.get("warnings") or [],
@@ -1311,7 +1110,7 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
         ),
         "metrics": [
             _event_metric(metric)
-            for metric in (enrichment.get("metrics") or [])[:6]
+            for metric in (enrichment.get("metrics") or [])
         ],
     }
     temporal = (enrichment.get("summary") or {}).get("temporal_domain") or temporal_event_state(item)
@@ -1328,7 +1127,7 @@ def _event(item: dict[str, Any]) -> dict[str, Any]:
 def _meeting(item: dict[str, Any]) -> dict[str, Any]:
     return {
         **_select(item, "meeting_id", "meeting_date", "meeting_time_utc", "expected_target_midpoint", "expected_change_bps", "cut_probability", "hold_probability", "hike_probability", "most_likely_target_range", "most_likely_probability", "probability_semantics", "is_single_meeting_action_probability", "source", "freshness"),
-        "outcomes": [_select(row, "target_lower_bound", "target_upper_bound", "target_midpoint", "change_bps", "probability", "classification") for row in (item.get("outcomes") or [])[:8]],
+        "outcomes": [_select(row, "target_lower_bound", "target_upper_bound", "target_midpoint", "change_bps", "probability", "classification") for row in (item.get("outcomes") or [])],
     }
 
 
@@ -1339,7 +1138,7 @@ def _holding(item: dict[str, Any]) -> dict[str, Any]:
 def _compact_sector(exposure: dict[str, Any]) -> dict[str, Any]:
     return {
         **_select(exposure, "status", "coverage_scope", "sector_weight_coverage_pct", "unknown_weight_pct", "source", "weight_method"),
-        "sectors": (exposure.get("sectors") or [])[:12],
+        "sectors": (exposure.get("sectors") or []),
     }
 
 
@@ -1464,7 +1263,7 @@ def _cluster(item: dict[str, Any]) -> dict[str, Any]:
 def _events_today(context: dict[str, Any]) -> dict[str, Any]:
     return {
         **_select(context, "status", "date", "market_session_status", "calendar_query_completed", "event_count", "blocking", "errors"),
-        "events": [_event(item) for item in (context.get("events") or [])[:12]],
+        "events": [_event(item) for item in (context.get("events") or [])],
     }
 
 
@@ -1505,7 +1304,7 @@ def _compact_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
     if prediction.get("status") == "SSL_ERROR" or any("SSL" in item.upper() for item in warnings):
         output["warnings"] = ["ssl_certificate_verification_failed"]
     else:
-        output["warnings"] = [item[:180] for item in warnings[:5]]
+        output["warnings"] = warnings
     output["blocking"] = False
     return output
 
@@ -1730,17 +1529,4 @@ def _drop_nulls(value: Any) -> Any:
             for item in value
             if (cleaned := _drop_nulls(item)) not in (None, {}, [])
         ]
-    return value
-
-
-def _bound_strings(value: Any, *, limit: int) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _bound_strings(item, limit=limit)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_bound_strings(item, limit=limit) for item in value]
-    if isinstance(value, str) and len(value) > limit:
-        return value[:limit]
     return value

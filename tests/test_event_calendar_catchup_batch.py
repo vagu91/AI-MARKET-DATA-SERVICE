@@ -540,6 +540,6 @@ def test_schema_1_through_20_migration_matrix_remains_idempotent(
     first = migrate_database(database)
     second = migrate_database(database)
 
-    assert first["schema_version"] == 20
-    assert second["schema_version"] == 20
+    assert first["schema_version"] == 21
+    assert second["schema_version"] == 21
     assert second["applied"] == []

@@ -507,6 +507,11 @@ def _operational_value_present(category: str, value: Any) -> bool:
     if category == "news":
         return bool(value.get("articles") or value.get("latest"))
     if category == "cot":
+        nested_cot = value.get("cot")
+        if isinstance(nested_cot, dict):
+            nested_cot = nested_cot.get("nasdaq_100") or nested_cot
+            if isinstance(nested_cot, dict) and nested_cot:
+                value = nested_cot
         groups = [
             value.get("asset_managers"),
             value.get("leveraged_funds"),
@@ -520,7 +525,7 @@ def _operational_value_present(category: str, value: Any) -> bool:
                     isinstance(group, dict)
                     and any(
                         group.get(field) not in (None, "")
-                        for field in ("long", "short", "spreading", "net")
+                        for field in ("long", "short", "spread", "spreading", "net")
                     )
                     for group in groups
                 )

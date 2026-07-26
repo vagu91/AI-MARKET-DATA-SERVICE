@@ -389,7 +389,7 @@ def test_17_disabled_domains_are_compact_and_listed(tmp_path: Path) -> None:
         }
 
 
-def test_18_consumer_is_bounded_by_real_utf8_bytes(tmp_path: Path) -> None:
+def test_18_consumer_measures_real_utf8_bytes_without_reduction(tmp_path: Path) -> None:
     full = consumer_input([])
     full["quality"] = {"verbose": "é" * 120_000}
     full["news_context"] = {
@@ -411,7 +411,10 @@ def test_18_consumer_is_bounded_by_real_utf8_bytes(tmp_path: Path) -> None:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    assert len(encoded) <= 90 * 1024
+    assert len(encoded) > 500_000
+    assert len(consumer["news"]["articles"]) == 40
+    assert consumer["payload_measurement"]["size_limit_applied"] is False
+    assert consumer["payload_measurement"]["records_removed_for_size"] == 0
 
 
 def test_19_empty_domain_payload_is_not_data_present(tmp_path: Path) -> None:

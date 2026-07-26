@@ -107,7 +107,7 @@ async def test_hacker_news_social_sentiment_provider_mock(tmp_path: Path) -> Non
     assert result["social_market_sentiment"]["discussion_volume"] == 2
 
 
-def test_consumer_contract_is_compact_and_excludes_debug_blocks() -> None:
+def test_deprecated_consumer_contract_preserves_material_source_arrays() -> None:
     full = {
         "symbol": "MNQ",
         "generated_at_utc": "2099-01-01T00:00:00Z",
@@ -122,7 +122,7 @@ def test_consumer_contract_is_compact_and_excludes_debug_blocks() -> None:
     encoded = json.dumps(consumer)
     assert consumer["contract"] == "ai_trader_market_context"
     assert "raw_provider_attempts" not in encoded
-    assert "by_strike" not in encoded
+    assert "by_strike" in encoded
     assert len(encoded.encode("utf-8")) < 400_000
 
 

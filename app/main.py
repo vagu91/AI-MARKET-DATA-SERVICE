@@ -148,6 +148,12 @@ def run_research_scheduler_evaluation(state, trigger_name: str):
     )
 
 
+def run_market_context_sync_refresh(state):
+    return state["market_context_sync_refresh_worker"].run_once(
+        owner="apscheduler-market-context-sync-refresh",
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -240,6 +246,15 @@ async def lifespan(app: FastAPI):
             "interval",
             hours=max(settings.storage_cleanup_interval_hours, 1),
             id="database_retention_cleanup",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            run_market_context_sync_refresh,
+            "interval",
+            args=[state],
+            seconds=max(settings.lifecycle_due_scanner_interval_seconds, 1),
+            id="market_context_sync_refresh",
             max_instances=1,
             coalesce=True,
         )

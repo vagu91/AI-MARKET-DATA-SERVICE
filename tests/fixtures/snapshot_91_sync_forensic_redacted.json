@@ -1,0 +1,43 @@
+{
+  "fixture_contract": "market_context_snapshot_91_forensic_redacted",
+  "schema_version": "1.0",
+  "source_snapshot": {
+    "snapshot_id": "mcs-0dccc313-75a5-44c6-aeba-9c3ab37d99e4",
+    "snapshot_revision": 91,
+    "generated_at": "2026-07-25T20:06:20.574141+00:00"
+  },
+  "original_artifacts": {
+    "debug_payload_bytes": 1593830,
+    "consumer_payload_bytes": 46841,
+    "consumer_sha256": "78F2487B99D88DDB9690EFB09F26F89A3D88A6095BDFF560AB3D54DAAB8430D1"
+  },
+  "calendar": {
+    "timezone": "America/New_York",
+    "window_start": "2026-07-13T00:00:00-04:00",
+    "window_end": "2026-08-02T23:59:59-04:00",
+    "candidate_count": 30,
+    "retained_count": 20,
+    "omitted_for_size_count": 10,
+    "previous_week_count": 0,
+    "current_week_count": 2,
+    "next_week_count": 18,
+    "awaiting_actual_count": 2,
+    "finding": "previous week was empty without affirmative source coverage"
+  },
+  "findings": [
+    "consumer projection removed material macro, Nasdaq, news, rates and lifecycle content",
+    "consumer projection used section byte budgets and a 90000 byte ceiling",
+    "calendar retained 20 of 30 candidates and omitted 10 for size",
+    "readiness described the pre-compaction payload",
+    "COT contained positions while lifecycle data_present was false",
+    "market schedule was AVAILABLE while its top-level validation was rejected",
+    "Nasdaq cash and MNQ futures session truth were not independently authoritative",
+    "two 2026-07-24 occurrences remained AWAITING_ACTUAL; no actual is inferred"
+  ],
+  "redaction": {
+    "credentials_included": false,
+    "authorization_headers_included": false,
+    "cookies_included": false,
+    "sensitive_query_parameters_included": false
+  }
+}

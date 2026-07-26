@@ -136,7 +136,7 @@ class _MetadataParser(HTMLParser):
     @property
     def article_text(self) -> str | None:
         text = re.sub(r"\s+", " ", " ".join(self._article_text)).strip()
-        return text[:2000] if len(text) >= 80 else None
+        return text if len(text) >= 80 else None
 
 
 def extract_page_metadata(html_text: str, *, page_url: str) -> dict[str, Any]:
@@ -457,19 +457,24 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     return article
 
 
-def build_news_context(news_items: list[dict[str, Any]], *, limit: int = 12, now: datetime | None = None) -> dict[str, Any]:
+def build_news_context(
+    news_items: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    del limit
     now = now or datetime.now(UTC)
     normalized = [normalize_news_article(_raw_article(item), now=now) for item in news_items]
     accepted = [item for item in normalized if item["accepted"]]
     excluded = [_compact_exclusion(item) for item in normalized if not item["accepted"]]
     representatives, duplicates = _deduplicate_articles(accepted)
-    excluded.extend(_compact_exclusion(item) for item in duplicates)
     clusters = _build_clusters(representatives)
     cluster_by_article = {article_id: cluster["cluster_id"] for cluster in clusters for article_id in cluster["article_ids"]}
     for item in representatives:
         item["cluster_id"] = cluster_by_article.get(item["article_id"])
     representatives.sort(key=lambda item: (item.get("relevance_score") or 0, item.get("published_at") or ""), reverse=True)
-    latest = representatives[:limit]
+    latest = representatives
     by_topic = _group_items(latest, "topics")
     by_symbol = _group_items(latest, "symbols")
     official = [item for item in latest if item.get("is_official_source")]
@@ -486,8 +491,8 @@ def build_news_context(news_items: list[dict[str, Any]], *, limit: int = 12, now
         "by_symbol": by_symbol,
         "official_sources": official,
         "market_sources": market,
-        "excluded": excluded[:100],
-        "duplicates": [_compact_duplicate(item) for item in duplicates[:100]],
+        "excluded": excluded,
+        "duplicates": [_compact_duplicate(item) for item in duplicates],
         "clusters": clusters,
         "diagnostics": diagnostics,
         "quality": quality,
@@ -691,19 +696,35 @@ def _exclusion_reason(article: dict[str, Any], *, now: datetime) -> str | None:
 
 
 def _deduplicate_articles(articles: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collapse only exact retry acquisitions of the same technical record."""
+
     groups: dict[str, list[dict[str, Any]]] = {}
-    aliases: dict[str, str] = {}
     for article in articles:
-        canonical_key = _stable_hash(f"url:{article.get('canonical_url')}") if article.get("canonical_url") else None
-        publisher_key = _stable_hash(
-            f"publisher_title:{str(article.get('original_publisher') or article.get('source') or 'unknown').lower()}:{_normalized_title(article.get('title'))}"
+        technical_identity = {
+            "provider": article.get("provider") or article.get("source"),
+            "provider_record_id": (
+                article.get("provider_record_id")
+                or article.get("article_id")
+            ),
+            "occurrence": article.get("occurrence_id"),
+            "version": article.get("version") or 1,
+            "canonical_url": article.get("canonical_url"),
+            "source_url": article.get("source_url"),
+            "aggregator_url": article.get("aggregator_url"),
+            "published_at": article.get("published_at"),
+            "title": article.get("title"),
+            "summary": article.get("summary"),
+        }
+        group_id = _stable_hash(
+            "technical_retry:"
+            + json.dumps(
+                technical_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
         )
-        known = next((aliases[key] for key in (canonical_key, publisher_key) if key and key in aliases), None)
-        group_id = known or canonical_key or publisher_key
         groups.setdefault(group_id, []).append(article)
-        aliases[publisher_key] = group_id
-        if canonical_key:
-            aliases[canonical_key] = group_id
         article["duplicate_group_id"] = group_id
         article["syndication_group"] = group_id
     representatives: list[dict[str, Any]] = []
@@ -716,10 +737,13 @@ def _deduplicate_articles(articles: list[dict[str, Any]]) -> tuple[list[dict[str
         for duplicate in items[1:]:
             duplicate["is_duplicate"] = True
             duplicate["duplicate_of"] = representative["article_id"]
-            duplicate["exclusion_reason"] = "duplicate"
+            duplicate["exclusion_reason"] = "idempotent_retry"
             duplicate["accepted"] = False
             duplicates.append(duplicate)
-            logger.info("news_article_deduplicated", extra=_log_fields(duplicate))
+            logger.info(
+                "news_article_idempotent_retry_deduplicated",
+                extra=_log_fields(duplicate),
+            )
     return representatives, duplicates
 
 
@@ -762,7 +786,11 @@ def _build_clusters(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "article_ids": [item["article_id"] for item in items],
             "representative_articles": [
                 {"article_id": item["article_id"], "title": item.get("title"), "source": item.get("source"), "source_url": item.get("canonical_url") or item.get("source_url")}
-                for item in sorted(items, key=lambda row: float(row.get("reliability") or 0), reverse=True)[:3]
+                for item in sorted(
+                    items,
+                    key=lambda row: float(row.get("reliability") or 0),
+                    reverse=True,
+                )
             ],
             "published_at_latest": max((item.get("published_at") for item in items if item.get("published_at")), default=None),
         }
@@ -1002,7 +1030,7 @@ def _clean_summary(value: Any) -> str | None:
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     if not text or len(text) < 20:
         return None
-    return text[:2000]
+    return text
 
 
 def _summary_quality(summary: str | None) -> float:

@@ -18,6 +18,9 @@ JSON_SECRET_RE = re.compile(
     r'(?i)("(?:api[_-]?key|token|secret|authorization|cookie)"\s*:\s*")([^"]+)(")'
 )
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+URL_CREDENTIAL_RE = re.compile(
+    r"(?i)\b(https?://)[^/@\s:]+:[^/@\s]+@"
+)
 SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[_-]?key|apikey|token|secret|authorization|cookie)\s*[:=]\s*"
     r"(?:bearer\s+)?([A-Za-z0-9_\-./+=]{8,})"
@@ -40,6 +43,7 @@ SENSITIVE_KEYS = {
 
 def redact_sensitive(value: str) -> str:
     redacted = SENSITIVE_QUERY_RE.sub(lambda match: f"{match.group(1)}=<redacted>", value)
+    redacted = URL_CREDENTIAL_RE.sub(r"\1<redacted>@", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}=<redacted>",
         redacted,

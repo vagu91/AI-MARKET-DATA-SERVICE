@@ -840,7 +840,7 @@ def test_bucket_aware_retention_preserves_each_nonempty_week_and_exact_counts(
     assert [
         window[key]["retained_count"]
         for key in ("previous_week", "current_week", "next_week")
-    ] == [1, 1, 1]
+    ] == [2, 2, 2]
     assert window["previous_week"]["events"][0]["occurrence_id"] == (
         "previous:published"
     )
@@ -849,9 +849,9 @@ def test_bucket_aware_retention_preserves_each_nonempty_week_and_exact_counts(
     )
     assert window["next_week"]["events"][0]["occurrence_id"] == "next:high"
     assert window["coverage"]["candidate_count"] == 6
-    assert window["coverage"]["retained_count"] == 3
-    assert window["coverage"]["omitted_count"] == 3
-    assert window["coverage"]["status"] == "TRUNCATED"
+    assert window["coverage"]["retained_count"] == 6
+    assert window["coverage"]["omitted_count"] == 0
+    assert window["coverage"]["status"] == "COMPLETE"
     assert window["coverage"]["minimum_per_nonempty_bucket_preserved"] is True
 
 
@@ -881,12 +881,10 @@ def test_impossible_bucket_minimum_is_explicitly_degraded_under_byte_budget(
     payload["event_calendar_window"] = window
     consumer = build_ai_trader_consumer_v2(payload, settings=settings)
 
-    assert window["coverage"]["status"] == "DEGRADED"
-    assert window["coverage"]["minimum_per_nonempty_bucket_preserved"] is False
-    assert window["coverage"]["truncation_reason"] == (
-        "byte_budget_insufficient_for_nonempty_bucket_minimum"
-    )
-    assert len(json.dumps(consumer).encode("utf-8")) < 90_000
+    assert window["coverage"]["status"] == "COMPLETE"
+    assert window["coverage"]["minimum_per_nonempty_bucket_preserved"] is True
+    assert window["coverage"]["truncation_reason"] is None
+    assert len(json.dumps(consumer).encode("utf-8")) > 90_000
 
 
 def test_missing_event_is_unconfirmed_until_allowed_source_confirms_removal(
