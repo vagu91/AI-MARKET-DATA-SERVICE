@@ -101,7 +101,27 @@ def minimal_full(*, now: datetime = SATURDAY) -> dict:
         "positioning": {},
         "sentiment_context": {},
         "social_sentiment": {},
-        "market_schedule": {"holidays": []},
+        "market_schedule": {
+            "holidays": [],
+            "nasdaq_cash_session": {
+                "status": "found",
+                "source": "Nasdaq Official Trading Schedule",
+                "validation": {"status": "accepted"},
+            },
+            "cme_calendar": {
+                "status": "available",
+                "official_document_discovered": True,
+                "official_schedule_parsed": True,
+                "source": "CME Group Trading Hours",
+                "source_url": "https://www.cmegroup.com/trading-hours.html",
+                "valid_until": "2026-12-31T23:59:59+00:00",
+                "equity_index_schedule": {
+                    "coverage_start": "2026-01-01",
+                    "coverage_end": "2026-12-31",
+                    "overrides": [],
+                },
+            },
+        },
         "data_quality": {
             "news_pipeline": {"fetched_count": 10, "provider_success_count": 1},
             "pipeline_integrity": {"snapshot_built_from_db": True},
@@ -257,9 +277,7 @@ def test_each_critical_readiness_section_blocks(missing: str) -> None:
         full[missing] = {}
     hardened = harden_market_context(full, settings=Settings(_env_file=None), now=SATURDAY)
     if missing == "market_schedule":
-        assert hardened["readiness"]["ready_for_trading_context"] is True
         assert "official_cme_calendar_crosscheck_unavailable" in hardened["market_schedule"]["warnings"]
-        return
     assert hardened["readiness"]["ready_for_trading_context"] is False
     assert any(missing in reason for reason in hardened["readiness"]["blocking_reasons"])
 
@@ -659,8 +677,10 @@ def test_news_semantics_reapplication_does_not_double_count_rejections() -> None
     }
     first = apply_news_semantics(payload, **kwargs)
     second = apply_news_semantics(first, **kwargs)
-    assert first["rejected_article_count"] == 3
-    assert second["rejected_article_count"] == 3
+    assert first["rejected_article_count"] == 2
+    assert second["rejected_article_count"] == 2
+    assert first["historical_article_count"] == 1
+    assert second["historical_article_count"] == 1
     assert second["candidate_article_count"] == 3
 
 

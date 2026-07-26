@@ -965,8 +965,33 @@ def _news(news: dict[str, Any], digest: dict[str, Any], schedule: dict[str, Any]
         "provider_failure_count": news.get("provider_failure_count"),
         "candidate_article_count": news.get("candidate_article_count"),
         "accepted_article_count": news.get("accepted_article_count"),
+        "delivered_raw_article_count": news.get(
+            "delivered_raw_article_count"
+        ),
         "rejected_article_count": news.get("rejected_article_count"),
         "articles": [_article(item) for item in (news.get("articles") or news.get("latest") or [])],
+        "historical_articles": [
+            _article(item)
+            for item in (news.get("historical_articles") or [])
+        ],
+        "historical_article_count": news.get(
+            "historical_article_count",
+            len(news.get("historical_articles") or []),
+        ),
+        "historical_context_available": bool(
+            news.get("historical_articles")
+        ),
+        "historical_coverage_status": news.get(
+            "historical_coverage_status"
+        ),
+        "directly_relevant": [
+            _article(item)
+            for item in (news.get("directly_relevant") or [])
+        ],
+        "supporting": [
+            _article(item)
+            for item in (news.get("supporting") or [])
+        ],
         "clusters": [_cluster(item) for item in (news.get("clusters") or [])],
         "current_drivers": current_drivers,
         "previous_session_drivers": previous_session_drivers,
@@ -1011,6 +1036,19 @@ def _schedule(schedule: dict[str, Any]) -> dict[str, Any]:
         "next_holiday": schedule.get("next_holiday"),
         "next_early_close": schedule.get("next_early_close"),
         "source": schedule.get("source"),
+        "validation": schedule.get("validation") or {},
+        "session_state_verified": schedule.get("session_state_verified"),
+        "nasdaq_cash_session_verified": schedule.get(
+            "nasdaq_cash_session_verified"
+        ),
+        "mnq_futures_session_verified": schedule.get(
+            "mnq_futures_session_verified"
+        ),
+        "last_verified_cme_calendar_used": schedule.get(
+            "last_verified_cme_calendar_used"
+        ),
+        "retry_policy": schedule.get("retry_policy") or {},
+        "next_retry_at": schedule.get("next_retry_at"),
         "warnings": schedule.get("warnings") or [],
     }
 
@@ -1253,7 +1291,66 @@ def _alphabet_aggregate(holdings: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _article(item: dict[str, Any]) -> dict[str, Any]:
-    return _select(item, "article_id", "title", "summary", "source", "source_tier", "source_classification", "canonical_url", "published_at", "published_at_source", "published_at_verified", "timestamp_inferred", "timestamp_confidence", "symbols", "topics", "mnq_relevance_score", "market_impact_score", "source_quality_score", "recency_score", "final_acceptance_score", "reliability", "confidence", "cluster_id")
+    return _drop_empty(
+        {
+            **_select(
+                item,
+                "article_id",
+                "news_key",
+                "provider_record_id",
+                "title",
+                "summary",
+                "content",
+                "content_snippet",
+                "source",
+                "provider",
+                "source_tier",
+                "source_classification",
+                "source_url",
+                "canonical_url",
+                "aggregator_url",
+                "published_at",
+                "published_at_source",
+                "published_at_verified",
+                "retrieved_at",
+                "timestamp_inferred",
+                "timestamp_confidence",
+                "symbols",
+                "topic",
+                "topics",
+                "mnq_relevance_score",
+                "market_impact_score",
+                "source_quality_score",
+                "recency_score",
+                "final_acceptance_score",
+                "reliability",
+                "confidence",
+                "cluster_id",
+                "event_fingerprint",
+                "duplicate_group_id",
+                "syndication_group",
+                "validation",
+                "freshness",
+                "valid_until",
+                "field_lineage",
+                "lineage",
+                "lifecycle",
+                "warnings",
+            ),
+            "headline": item.get("headline") or item.get("title"),
+            "cluster_links": list(
+                dict.fromkeys(
+                    value
+                    for value in (
+                        item.get("cluster_id"),
+                        item.get("event_fingerprint"),
+                        item.get("syndication_group"),
+                    )
+                    if value
+                )
+            ),
+        }
+    )
 
 
 def _cluster(item: dict[str, Any]) -> dict[str, Any]:
@@ -1294,6 +1391,9 @@ def _session(session: dict[str, Any]) -> dict[str, Any]:
         "source",
         "source_classification",
         "calendar_crosscheck_status",
+        "last_known_good_used",
+        "valid_until",
+        "retrieved_at",
         "freshness",
     )
 

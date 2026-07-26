@@ -102,6 +102,16 @@ def snapshot_payload(
             "scheduled_regulatory_events": regulatory or [],
             "scheduled_geopolitical_events": geopolitical or [],
             "removal_confirmations": removals or [],
+            "source_coverage": {
+                "by_bucket": {
+                    bucket: {"status": "VERIFIED_COMPLETE"}
+                    for bucket in (
+                        "PREVIOUS_WEEK",
+                        "CURRENT_WEEK",
+                        "NEXT_WEEK",
+                    )
+                }
+            },
         },
         "macro_snapshot": {},
         "market_schedule": {},

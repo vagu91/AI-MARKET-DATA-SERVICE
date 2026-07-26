@@ -66,6 +66,16 @@ def full(*events: dict[str, object]) -> dict[str, object]:
             "critical_macro_events": list(events),
             "fed_communications": [],
             "other_economic_events": [],
+            "source_coverage": {
+                "by_bucket": {
+                    bucket: {"status": "VERIFIED_COMPLETE"}
+                    for bucket in (
+                        "PREVIOUS_WEEK",
+                        "CURRENT_WEEK",
+                        "NEXT_WEEK",
+                    )
+                }
+            },
         }
     }
 
@@ -289,7 +299,8 @@ def test_deterministic_ordering_deduplication_limits_and_coverage(
     assert ids == ["high", "medium", "dup", "later"]
     assert window["coverage"]["status"] == "COMPLETE"
     assert window["coverage"]["overflow_count"] == 0
-    assert window["telemetry"]["duplicate_occurrence_count"] == 1
+    assert window["telemetry"]["duplicate_occurrence_count"] == 0
+    assert window["coverage"]["delivered_valid_source_record_count"] == 5
 
 
 def test_unscheduled_news_is_never_projected_as_future_event(
@@ -604,8 +615,11 @@ def test_saturday_sessions_are_both_closed_with_explicit_reasons() -> None:
 
     assert schedule["nasdaq_cash_session"]["is_open"] is False
     assert schedule["nasdaq_cash_session"]["closed_reason"] == "WEEKEND"
-    assert schedule["mnq_futures_session"]["is_open"] is False
-    assert schedule["mnq_futures_session"]["closed_reason"] == "WEEKEND"
+    assert schedule["mnq_futures_session"]["is_open"] is None
+    assert (
+        schedule["mnq_futures_session"]["closed_reason"]
+        == "UNVERIFIED_SCHEDULE"
+    )
 
 
 def test_nasdaq_holiday_is_named_and_macro_calendar_remains_independent() -> None:
@@ -626,7 +640,7 @@ def test_nasdaq_holiday_is_named_and_macro_calendar_remains_independent() -> Non
     assert cash["status"] == "holiday"
     assert cash["closed_reason"] == "HOLIDAY"
     assert cash["holiday_name"] == "Independence Day observed"
-    assert schedule["status"] == "UNAVAILABLE"
+    assert schedule["status"] == "UNVERIFIED"
     assert schedule["session_state_verified"] is False
 
 
@@ -658,8 +672,11 @@ def test_cash_closed_while_futures_open_on_sunday_evening() -> None:
     )
 
     assert schedule["nasdaq_cash_session"]["is_open"] is False
-    assert schedule["mnq_futures_session"]["is_open"] is True
-    assert schedule["mnq_futures_session"]["closed_reason"] is None
+    assert schedule["mnq_futures_session"]["is_open"] is None
+    assert (
+        schedule["mnq_futures_session"]["closed_reason"]
+        == "UNVERIFIED_SCHEDULE"
+    )
 
 
 def test_futures_maintenance_break_is_distinct_from_cash_close() -> None:
@@ -670,8 +687,9 @@ def test_futures_maintenance_break_is_distinct_from_cash_close() -> None:
 
     futures = schedule["mnq_futures_session"]
     assert futures["status"] == "maintenance_break"
-    assert futures["is_open"] is False
-    assert futures["closed_reason"] == "MAINTENANCE_BREAK"
+    assert futures["calculated_status"] == "maintenance_break"
+    assert futures["is_open"] is None
+    assert futures["closed_reason"] == "UNVERIFIED_SCHEDULE"
     assert futures["maintenance_break"]["start"] == "17:00:00"
     assert futures["next_open_at"] == futures["next_open"]
 

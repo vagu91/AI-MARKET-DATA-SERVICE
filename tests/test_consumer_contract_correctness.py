@@ -71,7 +71,27 @@ def base_full() -> dict:
         "positioning": {"status": "available"},
         "sentiment_context": {},
         "social_sentiment": {},
-        "market_schedule": {"holidays": []},
+        "market_schedule": {
+            "holidays": [],
+            "nasdaq_cash_session": {
+                "status": "found",
+                "source": "Nasdaq Official Trading Schedule",
+                "validation": {"status": "accepted"},
+            },
+            "cme_calendar": {
+                "status": "available",
+                "official_document_discovered": True,
+                "official_schedule_parsed": True,
+                "source": "CME Group Trading Hours",
+                "source_url": "https://www.cmegroup.com/trading-hours.html",
+                "valid_until": "2026-12-31T23:59:59+00:00",
+                "equity_index_schedule": {
+                    "coverage_start": "2026-01-01",
+                    "coverage_end": "2026-12-31",
+                    "overrides": [],
+                },
+            },
+        },
         "data_quality": {"section_quality": {"macro_snapshot": {"completeness_score": 0.95}}, "news_pipeline": {}},
         "metadata": {"multi_source_runtime": {"refresh_mode": "false", "provider_calls": 0, "cache_used": True}},
     }

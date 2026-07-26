@@ -110,10 +110,11 @@ def test_readiness_false_when_blocking_reasons_present() -> None:
     )
 
     assert consumer["readiness"]["ready"] is False
-    assert consumer["readiness"]["critical_errors"] == 1
+    assert consumer["readiness"]["critical_errors"] == 2
     assert consumer["readiness"]["critical_error_details"] == []
     assert consumer["readiness"]["critical_error_count"] == 0
     assert "macro_snapshot_missing" in consumer["readiness"]["blocking_reasons"]
+    assert "market_schedule_missing" in consumer["readiness"]["blocking_reasons"]
     assert consumer["data_quality"]["missing_critical_fields"] == ["DGS10"]
 
 

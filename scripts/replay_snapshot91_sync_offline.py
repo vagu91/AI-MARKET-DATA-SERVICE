@@ -1,295 +1,375 @@
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
 import json
-import tempfile
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.core.config import Settings
-from app.services.market_context_hardening_service import harden_market_context
-from app.services.market_context_snapshot_repository import (
-    MarketContextSnapshotRepository,
+from app.services.event_calendar_window_service import (
+    build_event_calendar_window,
 )
-from app.services.market_context_sync_service import MarketContextSyncService
 from app.services.market_context_sync_service import (
     canonical_json,
-    extract_sync_sections,
+    delivery_readiness,
+    finalize_delivery,
     material_fingerprint,
+    reconcile_delivered_section,
+    record_count_for,
+    section_freshness,
+    section_status,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FORENSIC_ROOT = ROOT / "data" / "controlled-provider-test-20260725T200541Z"
-RECORD_ID_KEYS = (
-    "record_id",
-    "provider_record_id",
-    "occurrence_id",
-    "event_id",
-    "article_id",
-    "issuer_event_id",
-    "claim_id",
+FORENSIC_ROOT = (
+    ROOT
+    / "data"
+    / "market-context-sync-live-validation-20260726T083217Z"
+)
+FULL_EXACT = FORENSIC_ROOT / "ai-trader-full-sync-exact.json"
+VALIDATION_SUMMARY = FORENSIC_ROOT / "validation-summary.json"
+EXPECTED_FULL_SHA256 = (
+    "6521F9B03004DB1D7B52398FABCF46306C26AE604D263580A7475B8DBFE3407F"
+)
+EXPECTED_SUMMARY_SHA256 = (
+    "3F130BF7DA0448FA283E2A185EB041ED28CA26A1A5E4F6E8ABC61BCF95D39605"
 )
 
 
-def _record_index(value: Any) -> dict[str, set[str]]:
-    records: dict[str, set[str]] = {}
-
-    def walk(item: Any) -> None:
-        if isinstance(item, dict):
-            if any(item.get(key) not in (None, "") for key in RECORD_ID_KEYS):
-                identity = canonical_json(
-                    {
-                        "provider": item.get("provider"),
-                        "source": item.get("source"),
-                        "record_id": item.get("record_id"),
-                        "provider_record_id": item.get("provider_record_id"),
-                        "occurrence_id": item.get("occurrence_id")
-                        or item.get("related_occurrence_id"),
-                        "event_id": item.get("event_id"),
-                        "article_id": item.get("article_id"),
-                        "issuer_event_id": item.get("issuer_event_id"),
-                        "claim_id": item.get("claim_id"),
-                        "version": item.get("version"),
-                        "event_at": item.get("event_at")
-                        or item.get("scheduled_at"),
-                        "published_at": item.get("published_at"),
-                    }
-                )
-                records.setdefault(identity, set()).add(
-                    material_fingerprint(item)
-                )
-                return
-            for child in item.values():
-                walk(child)
-        elif isinstance(item, list):
-            for child in item:
-                walk(child)
-
-    walk(value)
-    return records
-
-
-def _quarantined_fingerprints(value: Any) -> set[str]:
-    fingerprints: set[str] = set()
-
-    def walk(item: Any) -> None:
-        if isinstance(item, dict):
-            validation = item.get("validation")
-            statuses = {
-                str(item.get("validation_status") or "").lower(),
-                str(item.get("source_audit_status") or "").lower(),
-                str(item.get("status") or "").lower(),
-                (
-                    str(validation.get("status") or "").lower()
-                    if isinstance(validation, dict)
-                    else ""
-                ),
-            }
-            if statuses.intersection(
-                {"rejected", "invalid", "quarantined"}
-            ):
-                fingerprints.add(material_fingerprint(item))
-                return
-            for child in item.values():
-                walk(child)
-        elif isinstance(item, list):
-            for child in item:
-                walk(child)
-
-    walk(value)
-    return fingerprints
-
-
 def replay() -> dict[str, Any]:
-    debug_path = FORENSIC_ROOT / "market-context-debug-readback.json"
-    consumer_path = FORENSIC_ROOT / "ai-trader-consumer-2.1-exact.json"
-    debug = json.loads(debug_path.read_text(encoding="utf-8"))
-    consumer = json.loads(consumer_path.read_text(encoding="utf-8"))
-    original_consumer_bytes = len(
-        consumer_path.read_bytes()
+    original_bytes = FULL_EXACT.read_bytes()
+    summary_bytes = VALIDATION_SUMMARY.read_bytes()
+    original = json.loads(original_bytes)
+    event_section = deepcopy(original["sections"]["event_calendar"])
+    original_window = event_section.get("window") or {}
+    source_full = _calendar_source_payload(original, event_section)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        source_policy_path=ROOT / "config" / "source_policy.json",
+        model_pricing_path=ROOT / "config" / "model_pricing.json",
     )
-    original_consumer_hash = hashlib.sha256(
-        consumer_path.read_bytes()
-    ).hexdigest().upper()
+    generated_at = datetime.fromisoformat(
+        str(original["generated_at"]).replace("Z", "+00:00")
+    )
+    replayed_window = build_event_calendar_window(
+        source_full,
+        settings=settings,
+        now=generated_at,
+    )
+    event_section["window"] = replayed_window
 
-    with tempfile.TemporaryDirectory(prefix="snapshot91-sync-replay-") as tmp:
-        root = Path(tmp)
-        settings = Settings(
-            _env_file=None,
-            database_path=root / "replay.sqlite",
-            source_policy_path=ROOT / "config" / "source_policy.json",
-            model_pricing_path=ROOT / "config" / "model_pricing.json",
-            ai_job_workspace_root=root / "jobs",
-            codex_workspace_dir=root / "codex",
-            environment="test",
-        )
-        hardened = harden_market_context(
-            debug,
-            settings=settings,
-            force_recalculate=True,
-        )
-        MarketContextSnapshotRepository(settings).save(
-            snapshot_id=str(debug["snapshot_id"]),
-            revision=int(debug["snapshot_revision"]),
-            symbol="MNQ",
-            refresh_mode="offline-forensic-replay",
-            debug_payload=hardened,
-            consumer_payload=consumer,
-            ai_status="NOT_REQUIRED",
-        )
-        service = MarketContextSyncService(settings)
-        manifest = service.manifest()
-        full = service.full()
-        projected_source = extract_sync_sections(hardened)
-        projected_delivery = {
-            name: {
+    replayed = deepcopy(original)
+    replayed["sections"]["event_calendar"] = _refresh_section(
+        event_section,
+        original=original["sections"]["event_calendar"],
+        generated_at=generated_at,
+    )
+    replayed["sections"]["news"] = _refresh_section(
+        reconcile_delivered_section(
+            "news",
+            {
                 key: value
-                for key, value in section.items()
+                for key, value in original["sections"]["news"].items()
                 if key != "sync"
+            },
+        ),
+        original=original["sections"]["news"],
+        generated_at=generated_at,
+    )
+    replayed["readiness"] = delivery_readiness(replayed["sections"])
+    replayed["context_fingerprint"] = material_fingerprint(
+        {
+            name: {
+                "section_revision": section["sync"].get(
+                    "section_revision"
+                ),
+                "fingerprint": section["sync"]["fingerprint"],
             }
-            for name, section in full["sections"].items()
+            for name, section in replayed["sections"].items()
         }
-        source_records = _record_index(projected_source)
-        delivered_records = _record_index(projected_delivery)
-        quarantined_fingerprints = _quarantined_fingerprints(hardened)
-        delivered_fingerprints = {
-            fingerprint
-            for values in delivered_records.values()
-            for fingerprint in values
-        }
-        full_text = canonical_json(full)
-        del service
-        gc.collect()
+    )
+    replayed.pop("checksum", None)
+    replayed["payload_size_bytes"] = 0
+    finalize_delivery(replayed)
 
-    calendar = hardened["event_calendar_window"]
-    buckets = ("previous_week", "current_week", "next_week")
-    bucket_event_count = sum(
-        int(calendar[name]["event_count"]) for name in buckets
+    old_ids = _window_ids(original_window)
+    new_ids = _window_ids(replayed_window)
+    quarantine_ids = {
+        str(item.get("occurrence_id"))
+        for item in (
+            (replayed_window.get("audit") or {}).get(
+                "quarantined_occurrences"
+            )
+            or []
+        )
+        if item.get("occurrence_id")
+    }
+    formerly_omitted = sorted(new_ids - old_ids)
+    actual_missing = sorted(
+        {
+            str(item["occurrence_id"])
+            for item in _window_events(replayed_window)
+            if item.get("is_past")
+            and item.get("release_status")
+            in {"AWAITING_ACTUAL", "UNAVAILABLE"}
+        }
     )
-    bucket_list_count = sum(
-        len(calendar[name]["events"]) for name in buckets
+    news = replayed["sections"]["news"]
+    news_context = news.get("context") or {}
+    schedule_sync = (
+        replayed["sections"]["market_schedule"].get("sync") or {}
     )
-    exact_full_bytes = len(
-        json.dumps(
-            full,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+    coverage = replayed_window["coverage"]
+    equation_rhs = (
+        int(coverage["delivered_valid_source_record_count"])
+        + int(coverage["quarantined_occurrence_count"])
+        + int(coverage["exact_duplicate_count"])
     )
+    replayed_bytes = canonical_json(replayed).encode("utf-8")
     return {
-        "mode": "OFFLINE_FORENSIC_REPLAY",
-        "provider_calls": 0,
-        "ai_calls": 0,
-        "deliveries": 0,
-        "operational_database_writes": 0,
-        "snapshot_id": manifest["snapshot_id"],
-        "snapshot_revision": manifest["snapshot_revision"],
-        "original_consumer_bytes": original_consumer_bytes,
-        "original_consumer_sha256": original_consumer_hash,
-        "sync_full_bytes": exact_full_bytes,
-        "sync_full_checksum": full["checksum"],
-        "section_count": len(manifest["sections"]),
-        "record_equivalence": {
-            "source_identity_count": len(source_records),
-            "delivered_identity_count": len(delivered_records),
-            "missing_identity_count": len(
-                set(source_records) - set(delivered_records)
+        "mode": "OFFLINE_SNAPSHOT_91_CONTENT_CLOSURE_REPLAY",
+        "snapshot_id": original["snapshot_id"],
+        "snapshot_revision": original["snapshot_revision"],
+        "input_integrity": {
+            "full_exact_sha256": hashlib.sha256(
+                original_bytes
+            ).hexdigest().upper(),
+            "full_exact_hash_verified": (
+                hashlib.sha256(original_bytes).hexdigest().upper()
+                == EXPECTED_FULL_SHA256
             ),
-            "extra_identity_count": len(
-                set(delivered_records) - set(source_records)
+            "validation_summary_sha256": hashlib.sha256(
+                summary_bytes
+            ).hexdigest().upper(),
+            "validation_summary_hash_verified": (
+                hashlib.sha256(summary_bytes).hexdigest().upper()
+                == EXPECTED_SUMMARY_SHA256
             ),
-            "material_mismatch_count": sum(
-                source_records[identity] != delivered_records.get(identity)
-                for identity in source_records
-            ),
-            "different_sources_remain_distinct": True,
-            "technical_repetitions_are_idempotent": True,
-        },
-        "security": {
-            "quarantined_source_record_count": len(
-                quarantined_fingerprints
-            ),
-            "quarantined_material_exposed_count": len(
-                quarantined_fingerprints & delivered_fingerprints
-            ),
-            "local_path_exposed": (
-                "C:\\Users\\" in full_text
-                or "C:/Users/" in full_text
-                or "file://" in full_text.lower()
-            ),
-            "credential_marker_exposed": any(
-                marker in full_text.lower()
-                for marker in (
-                    "authorization: bearer ",
-                    '"api_key":"',
-                    '"token":"',
-                    '"cookie":"',
-                )
-            ),
+            "original_full_sync_bytes": len(original_bytes),
         },
         "calendar": {
-            "counts_total": calendar["counts"]["total"],
-            "coverage_retained_count": calendar["coverage"][
-                "retained_count"
+            "source_candidate_count": coverage[
+                "source_candidate_count"
             ],
-            "bucket_event_count": bucket_event_count,
-            "bucket_list_count": bucket_list_count,
-            "candidate_count": calendar["coverage"]["candidate_count"],
-            "omitted_count": calendar["coverage"]["omitted_count"],
-            "previous_week_count": calendar["previous_week"][
-                "event_count"
+            "validated_occurrence_count": coverage[
+                "validated_occurrence_count"
             ],
-            "source_coverage_status": calendar["coverage"][
-                "source_coverage_status"
+            "delivered_occurrence_count": coverage[
+                "delivered_occurrence_count"
             ],
-            "missing_source_coverage_buckets": calendar["coverage"][
-                "missing_source_coverage_buckets"
+            "delivered_valid_source_record_count": coverage[
+                "delivered_valid_source_record_count"
             ],
-            "awaiting_actual_count": calendar["telemetry"][
-                "missing_actuals"
+            "quarantined_occurrence_count": coverage[
+                "quarantined_occurrence_count"
             ],
+            "invalid_temporal_count": coverage[
+                "invalid_temporal_count"
+            ],
+            "exact_duplicate_count": coverage[
+                "exact_duplicate_count"
+            ],
+            "omitted_for_size_count": coverage[
+                "omitted_for_size_count"
+            ],
+            "omitted_for_count_count": coverage[
+                "omitted_for_count_count"
+            ],
+            "unexplained_loss": coverage["unexplained_loss"],
+            "formerly_omitted_ids": formerly_omitted,
+            "quarantined_ids": sorted(quarantine_ids),
+            "bucket_coverage": coverage["by_bucket"],
+            "actual_missing_ids": actual_missing,
+        },
+        "news": {
+            "delivered_current_raw_count": len(
+                news_context.get("articles") or []
+            ),
+            "delivered_historical_raw_count": len(
+                news_context.get("historical_articles") or []
+            ),
+            "declared_historical_article_count": int(
+                news_context.get("historical_article_count") or 0
+            ),
+            "historical_context_available": bool(
+                news_context.get("historical_context_available")
+            ),
+            "coverage_status": news_context.get(
+                "historical_coverage_status"
+            ),
+            "quarantine_disclosure": (
+                (news.get("producer_disclosures") or {}).get("quarantine")
+                or {}
+            ),
+        },
+        "market_schedule": {
+            "status": schedule_sync.get("status"),
+            "freshness": schedule_sync.get("freshness"),
+            "reason": schedule_sync.get("reason"),
+        },
+        "replayed_full_sync": {
+            "exact_size_bytes": len(replayed_bytes),
+            "reported_size_bytes": replayed["payload_size_bytes"],
+            "checksum": replayed["checksum"],
+            "readiness": replayed["readiness"]["status"],
+        },
+        "side_effects": {
+            "provider_calls": 0,
+            "ai_job_count": 0,
+            "ai_run_count": 0,
+            "ai_backend_invocations": 0,
+            "operational_database_writes": 0,
         },
         "invariants": {
-            "calendar_counts_match": len(
-                {
-                    calendar["counts"]["total"],
-                    calendar["coverage"]["retained_count"],
-                    bucket_event_count,
-                    bucket_list_count,
-                }
-            )
-            == 1,
-            "no_size_limit": True,
-            "no_compacted_item_count": (
-                "compacted_item_count"
-                not in json.dumps(full, ensure_ascii=False)
+            "candidate_equation_holds": (
+                int(coverage["source_candidate_count"])
+                == equation_rhs
             ),
-            "actuals_invented": False,
-            "record_identity_and_material_content_match": (
-                source_records == delivered_records
+            "candidate_equation": {
+                "candidate": int(coverage["source_candidate_count"]),
+                "delivered_valid": int(
+                    coverage["delivered_valid_source_record_count"]
+                ),
+                "quarantined_invalid": int(
+                    coverage["quarantined_occurrence_count"]
+                ),
+                "exact_duplicate_technical": int(
+                    coverage["exact_duplicate_count"]
+                ),
+                "right_hand_side": equation_rhs,
+            },
+            "omitted_for_size_is_zero": (
+                coverage["omitted_for_size_count"] == 0
             ),
-            "no_quarantined_identity_exposed": not any(
-                fingerprint in delivered_fingerprints
-                for fingerprint in quarantined_fingerprints
+            "omitted_for_count_is_zero": (
+                coverage["omitted_for_count_count"] == 0
+            ),
+            "unexplained_loss_is_zero": (
+                coverage["unexplained_loss"] == 0
+            ),
+            "news_historical_state_matches_content": (
+                int(news_context.get("historical_article_count") or 0)
+                == len(news_context.get("historical_articles") or [])
+                and bool(
+                    news_context.get("historical_context_available")
+                )
+                == bool(news_context.get("historical_articles"))
+            ),
+            "payload_size_exact": (
+                len(replayed_bytes) == replayed["payload_size_bytes"]
             ),
         },
     }
 
 
+def _calendar_source_payload(
+    original: dict[str, Any],
+    event_section: dict[str, Any],
+) -> dict[str, Any]:
+    calendar = deepcopy(event_section.get("calendar") or {})
+    calendar["source_coverage"] = {
+        "by_bucket": {
+            "PREVIOUS_WEEK": {"status": "UNVERIFIED_EMPTY"},
+            "CURRENT_WEEK": {"status": "PARTIAL"},
+            "NEXT_WEEK": {"status": "PARTIAL"},
+        }
+    }
+    return {
+        "generated_at_utc": original["generated_at"],
+        "event_calendar": calendar,
+        "economic_calendar_enrichment": event_section.get(
+            "economic_calendar_enrichment"
+        )
+        or {},
+        "events_today": event_section.get("events_today") or [],
+        "next_24h_events": event_section.get("next_24h_events") or [],
+        "next_7d_critical_events": event_section.get(
+            "next_7d_critical_events"
+        )
+        or [],
+        "recently_released_events": event_section.get(
+            "recently_released_events"
+        )
+        or [],
+        "upcoming_high_impact_events": event_section.get(
+            "upcoming_high_impact_events"
+        )
+        or [],
+    }
+
+
+def _refresh_section(
+    payload: dict[str, Any],
+    *,
+    original: dict[str, Any],
+    generated_at: datetime,
+) -> dict[str, Any]:
+    output = {
+        key: value for key, value in payload.items() if key != "sync"
+    }
+    sync = dict(original.get("sync") or {})
+    status, reason = section_status(output)
+    sync.update(
+        {
+            "fingerprint": material_fingerprint(output),
+            "record_count": record_count_for(output),
+            "freshness": section_freshness(
+                status=status,
+                valid_until=sync.get("valid_until"),
+                payload=output,
+                reference=generated_at,
+            ),
+            "status": status,
+            "reason": reason,
+        }
+    )
+    output["sync"] = sync
+    return output
+
+
+def _window_events(window: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for bucket in ("previous_week", "current_week", "next_week")
+        for item in (window.get(bucket) or {}).get("events") or []
+        if isinstance(item, dict)
+    ]
+
+
+def _window_ids(window: dict[str, Any]) -> set[str]:
+    return {
+        str(item["occurrence_id"])
+        for item in _window_events(window)
+        if item.get("occurrence_id")
+    }
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path)
+    parser = argparse.ArgumentParser(
+        description="Replay snapshot 91 content closure without live I/O."
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional report path; stdout is always emitted.",
+    )
     args = parser.parse_args()
     result = replay()
-    rendered = json.dumps(result, indent=2, ensure_ascii=False)
+    text = json.dumps(
+        result,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
     if args.output:
-        args.output.write_text(rendered + "\n", encoding="utf-8")
-    print(rendered)
-    return 0
+        args.output.write_text(text + "\n", encoding="utf-8")
+    print(text)
+    return 0 if all(result["invariants"].values()) else 1
 
 
 if __name__ == "__main__":

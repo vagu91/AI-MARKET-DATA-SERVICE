@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
@@ -30,6 +33,10 @@ from app.services.event_calendar_window_service import (
     classify_event_change,
     coalesce_event_changes,
 )
+from app.services.event_occurrence_lifecycle_service import (
+    classify_occurrence_lifecycle,
+)
+from app.services.temporal_validation_service import TemporalPolicy
 from app.services.research_agent_enablement import is_research_agent_enabled
 from app.services.research_gap_manifest import TOPIC_PROFILES
 from app.services.observability_contract_service import TelemetryRepository
@@ -784,6 +791,7 @@ class ResearchSchedulerService:
         *,
         resolver: Callable[[dict[str, Any]], dict[str, Any]],
         ai_enqueue: Callable[[list[dict[str, Any]]], Any],
+        schedule_acquire: Callable[..., Any] | None = None,
         execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         event_calendar_catchup = bool(
@@ -812,6 +820,7 @@ class ResearchSchedulerService:
             return self._event_calendar_catchup_tick(
                 resolver=resolver,
                 ai_enqueue=ai_enqueue,
+                schedule_acquire=schedule_acquire,
                 execution_context=execution_context,
             )
         now = self.clock()
@@ -917,9 +926,14 @@ class ResearchSchedulerService:
         *,
         resolver: Callable[[dict[str, Any]], dict[str, Any]],
         ai_enqueue: Callable[[list[dict[str, Any]]], Any],
+        schedule_acquire: Callable[..., Any] | None,
         execution_context: ExecutionContext | None,
     ) -> dict[str, Any]:
         now = self.clock()
+        schedule_coverage = self._seed_canonical_schedule_gaps(
+            schedule_acquire=schedule_acquire,
+            now=now,
+        )
         window_start = now - timedelta(
             days=int(self.settings.event_calendar_catchup_lookback_days)
         )
@@ -978,6 +992,7 @@ class ResearchSchedulerService:
                 ),
                 "catch_up_completion_status": "COMPLETED",
                 "catch_up_provider_only": True,
+                "source_coverage": schedule_coverage,
                 "telemetry_emitted": False,
             }
         if backlog_before == 0 and pending_backoff_before > 0:
@@ -1004,6 +1019,7 @@ class ResearchSchedulerService:
                     "cursor": checkpoint.get("cursor"),
                     "tick_count": tick_count,
                     "completion_status": "WAITING_BACKOFF",
+                    "source_coverage": schedule_coverage,
                     "updated_at": now.astimezone(UTC).replace(
                         microsecond=0
                     ).isoformat(),
@@ -1043,6 +1059,7 @@ class ResearchSchedulerService:
                 "catch_up_tick_count": tick_count,
                 "catch_up_completion_status": "WAITING_BACKOFF",
                 "catch_up_provider_only": True,
+                "source_coverage": schedule_coverage,
                 "telemetry_emitted": telemetry_emitted,
             }
 
@@ -1110,6 +1127,7 @@ class ResearchSchedulerService:
             "cursor": cursor,
             "tick_count": tick_count,
             "completion_status": completion_status,
+            "source_coverage": schedule_coverage,
             "updated_at": now.astimezone(UTC).replace(
                 microsecond=0
             ).isoformat(),
@@ -1150,8 +1168,396 @@ class ResearchSchedulerService:
             "catch_up_tick_count": tick_count,
             "catch_up_completion_status": completion_status,
             "catch_up_provider_only": True,
+            "source_coverage": schedule_coverage,
             "telemetry_emitted": True,
         }
+
+    def _seed_canonical_schedule_gaps(
+        self,
+        *,
+        schedule_acquire: Callable[..., Any] | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if schedule_acquire is None:
+            return self._seed_canonical_schedule_gaps_unleased(
+                schedule_acquire=None,
+                now=now,
+            )
+        lease_owner = f"schedule-catchup-{uuid.uuid4()}"
+        lease = self._acquire_schedule_seed_lease(
+            owner=lease_owner,
+            now=now,
+        )
+        if not lease["acquired"]:
+            return {
+                "status": str(lease["status"]),
+                "reason": str(lease["reason"]),
+                "provider_calls": 0,
+                "persisted_gap_count": 0,
+                "unchanged_occurrence_count": 0,
+                "quarantined_occurrence_count": 0,
+                "next_retry_at": lease.get("next_retry_at"),
+            }
+        try:
+            result = self._seed_canonical_schedule_gaps_unleased(
+                schedule_acquire=schedule_acquire,
+                now=now,
+            )
+        except BaseException:
+            self._complete_schedule_seed_lease(
+                owner=lease_owner,
+                now=now,
+                status="PROVIDER_UNAVAILABLE",
+                next_retry_at=(
+                    now + timedelta(minutes=5)
+                ).astimezone(UTC).isoformat(),
+            )
+            raise
+        self._complete_schedule_seed_lease(
+            owner=lease_owner,
+            now=now,
+            status=str(result["status"]),
+            next_retry_at=result.get("next_retry_at"),
+        )
+        return result
+
+    def _seed_canonical_schedule_gaps_unleased(
+        self,
+        *,
+        schedule_acquire: Callable[..., Any] | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        timezone = ZoneInfo(
+            str(
+                self.settings.event_calendar_timezone
+                or "America/New_York"
+            )
+        )
+        local_now = now.astimezone(timezone)
+        current_start = local_now.date() - timedelta(
+            days=local_now.weekday()
+        )
+        previous_start = current_start - timedelta(days=7)
+        window_start = datetime.combine(
+            previous_start,
+            datetime.min.time(),
+            timezone,
+        ).astimezone(UTC)
+        coverage = {
+            "window_start": window_start.isoformat(),
+            "window_end": now.astimezone(UTC).isoformat(),
+            "provider_calls": 0,
+            "persisted_gap_count": 0,
+            "unchanged_occurrence_count": 0,
+            "quarantined_occurrence_count": 0,
+            "by_bucket": {
+                "PREVIOUS_WEEK": {
+                    "status": "UNVERIFIED_EMPTY",
+                    "candidate_count": 0,
+                },
+                "CURRENT_WEEK": {
+                    "status": "UNVERIFIED_EMPTY",
+                    "candidate_count": 0,
+                },
+            },
+        }
+        if schedule_acquire is None:
+            coverage["status"] = "UNVERIFIED_EMPTY"
+            coverage["reason"] = "schedule_acquirer_not_configured"
+            return coverage
+        coverage["provider_calls"] = 1
+        try:
+            output = schedule_acquire(
+                country="US",
+                start=window_start,
+                end=now.astimezone(UTC),
+                enrich=False,
+            )
+            if inspect.isawaitable(output):
+                output = asyncio.run(output)
+        except Exception as exc:
+            coverage["status"] = "PROVIDER_UNAVAILABLE"
+            coverage["reason"] = type(exc).__name__
+            coverage["next_retry_at"] = (
+                now + timedelta(minutes=5)
+            ).astimezone(UTC).isoformat()
+            for bucket in coverage["by_bucket"].values():
+                bucket["status"] = "PROVIDER_UNAVAILABLE"
+            return coverage
+
+        provider_owner = getattr(schedule_acquire, "__self__", None)
+        provider_results = list(
+            getattr(provider_owner, "last_provider_results", []) or []
+        )
+        provider_successes = sum(
+            1
+            for result in provider_results
+            if not list(getattr(result, "errors", []) or [])
+        )
+        coverage["provider_result_count"] = len(provider_results)
+        coverage["provider_success_count"] = provider_successes
+        if provider_results and provider_successes == 0:
+            coverage["status"] = "PROVIDER_UNAVAILABLE"
+            coverage["reason"] = "all_schedule_providers_failed"
+            coverage["next_retry_at"] = (
+                now + timedelta(minutes=5)
+            ).astimezone(UTC).isoformat()
+            for bucket in coverage["by_bucket"].values():
+                bucket["status"] = "PROVIDER_UNAVAILABLE"
+            return coverage
+
+        rows = [
+            (
+                item.model_dump(mode="json")
+                if hasattr(item, "model_dump")
+                else dict(item)
+            )
+            for item in (output or [])
+            if hasattr(item, "model_dump") or isinstance(item, dict)
+        ]
+        temporal_policy = TemporalPolicy(clock=lambda: now)
+        existing_keys = {
+            (str(item["entity_type"]), str(item["entity_key"]))
+            for item in self.lifecycle.list_items()
+        }
+        persisted = 0
+        unchanged = 0
+        quarantined = 0
+        for payload in rows:
+            release = parse_datetime(
+                payload.get("release_at")
+                or payload.get("time_utc")
+                or payload.get("date")
+            )
+            if release is None:
+                quarantined += 1
+                continue
+            release_local = release.astimezone(timezone)
+            bucket_name = (
+                "PREVIOUS_WEEK"
+                if previous_start
+                <= release_local.date()
+                < current_start
+                else "CURRENT_WEEK"
+                if current_start
+                <= release_local.date()
+                <= local_now.date()
+                else None
+            )
+            if bucket_name is None:
+                continue
+            coverage["by_bucket"][bucket_name]["candidate_count"] += 1
+            decision = temporal_policy.evaluate(
+                payload,
+                domain="macro_calendar",
+            )
+            if not decision.accepted:
+                quarantined += 1
+                coverage["by_bucket"][bucket_name]["status"] = "QUARANTINED"
+                continue
+            occurrence_key = canonical_event_key(payload)
+            classification = classify_occurrence_lifecycle(
+                {
+                    **payload,
+                    "canonical_event_key": occurrence_key,
+                    "release_at": release.isoformat(),
+                }
+            )
+            entity_type = classification.entity_type
+            lifecycle = compute_datum_lifecycle(
+                entity_type,
+                occurrence_key,
+                payload,
+                settings=self.settings,
+                now=now,
+                fields_attempted=list(classification.outcome_fields),
+                triggering_event=entity_type,
+                refresh_reason="provider_first_canonical_schedule_catchup",
+            )
+            existed = (entity_type, occurrence_key) in existing_keys
+            actual_present = payload.get("actual") not in (None, "")
+            self.lifecycle.upsert(
+                lifecycle,
+                payload=payload,
+                work_status=(
+                    "COMPLETED"
+                    if actual_present or not classification.operational
+                    else "READY"
+                ),
+            )
+            if not existed:
+                persisted += 1
+                existing_keys.add((entity_type, occurrence_key))
+            else:
+                unchanged += 1
+        for details in coverage["by_bucket"].values():
+            if details["status"] == "QUARANTINED":
+                continue
+            details["status"] = "VERIFIED_COMPLETE"
+        coverage.update(
+            {
+                "status": (
+                    "QUARANTINED"
+                    if quarantined
+                    else "VERIFIED_COMPLETE"
+                ),
+                "persisted_gap_count": persisted,
+                "unchanged_occurrence_count": unchanged,
+                "quarantined_occurrence_count": quarantined,
+            }
+        )
+        return coverage
+
+    def _acquire_schedule_seed_lease(
+        self,
+        *,
+        owner: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        now_utc = now.astimezone(UTC)
+        lease_until = now_utc + timedelta(minutes=5)
+        state_key = "provider_first_schedule_catchup"
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT payload_json,next_retry_at
+                FROM provider_state
+                WHERE state_key=?
+                """,
+                (state_key,),
+            ).fetchone()
+            payload: dict[str, Any] = {}
+            if row is not None:
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+                retry_at = parse_datetime(row["next_retry_at"])
+                if retry_at is not None and retry_at > now_utc:
+                    conn.commit()
+                    return {
+                        "acquired": False,
+                        "status": "PROVIDER_UNAVAILABLE",
+                        "reason": "persistent_provider_backoff",
+                        "next_retry_at": retry_at.isoformat(),
+                    }
+                active_until = parse_datetime(payload.get("lease_until"))
+                if (
+                    payload.get("lease_owner")
+                    and active_until is not None
+                    and active_until > now_utc
+                ):
+                    conn.commit()
+                    return {
+                        "acquired": False,
+                        "status": "PARTIAL",
+                        "reason": "schedule_catchup_single_flight_active",
+                        "next_retry_at": active_until.isoformat(),
+                    }
+            timestamp = now_utc.replace(microsecond=0).isoformat()
+            lease_payload = {
+                **payload,
+                "lease_owner": owner,
+                "lease_until": lease_until.isoformat(),
+                "last_started_at": timestamp,
+            }
+            conn.execute(
+                """
+                INSERT INTO provider_state(
+                  state_key,provider_name,state_type,status,reason,retryable,
+                  next_retry_at,payload_json,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                  status=excluded.status,
+                  reason=excluded.reason,
+                  retryable=excluded.retryable,
+                  next_retry_at=NULL,
+                  payload_json=excluded.payload_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    state_key,
+                    "event_service",
+                    "persistent_schedule_catchup_lease",
+                    "LEASED",
+                    "provider_first_canonical_schedule_catchup",
+                    1,
+                    None,
+                    json.dumps(
+                        lease_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.commit()
+        return {
+            "acquired": True,
+            "status": "LEASED",
+            "reason": "schedule_catchup_lease_acquired",
+        }
+
+    def _complete_schedule_seed_lease(
+        self,
+        *,
+        owner: str,
+        now: datetime,
+        status: str,
+        next_retry_at: str | None,
+    ) -> None:
+        timestamp = now.astimezone(UTC).replace(
+            microsecond=0
+        ).isoformat()
+        with connect_sqlite(self.settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT payload_json FROM provider_state
+                WHERE state_key='provider_first_schedule_catchup'
+                """
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if payload.get("lease_owner") != owner:
+                conn.commit()
+                return
+            payload.update(
+                {
+                    "lease_owner": None,
+                    "lease_until": None,
+                    "last_completed_at": timestamp,
+                    "last_status": status,
+                }
+            )
+            conn.execute(
+                """
+                UPDATE provider_state
+                SET status=?,reason=?,retryable=?,next_retry_at=?,
+                    payload_json=?,updated_at=?
+                WHERE state_key='provider_first_schedule_catchup'
+                """,
+                (
+                    status,
+                    "provider_first_canonical_schedule_catchup",
+                    int(next_retry_at is not None),
+                    next_retry_at,
+                    json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    timestamp,
+                ),
+            )
+            conn.commit()
 
     def _catchup_correlation_id(
         self,

@@ -66,6 +66,9 @@ class EconomicEvent(BaseModel):
     previous: Any | None = None
     source: str
     source_url: str
+    source_timezone: str | None = None
+    retrieved_at: datetime | None = None
+    validation: dict[str, Any] = Field(default_factory=dict)
     reliability: float = Field(ge=0.0, le=1.0)
     incomplete_time: bool = False
     event_risk_level: Impact = Impact.LOW

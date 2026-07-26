@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
@@ -13,6 +15,33 @@ from app.services.data_freshness_service import parse_datetime
 
 QUARANTINED_STATUS = "QUARANTINED"
 EVENT_HORIZON_REASON = "EVENT_BEYOND_CONFIGURED_HORIZON"
+RELEASE_ON_IMPLAUSIBLE_WEEKEND = "RELEASE_ON_IMPLAUSIBLE_WEEKEND"
+REFERENCE_PERIOD_AFTER_RELEASE_DATE = "REFERENCE_PERIOD_AFTER_RELEASE_DATE"
+PERIOD_RELEASE_DATE_INCONSISTENT = "PERIOD_RELEASE_DATE_INCONSISTENT"
+SCHEDULE_DATE_UNVERIFIED = "SCHEDULE_DATE_UNVERIFIED"
+SOURCE_OCCURRENCE_AMBIGUOUS = "SOURCE_OCCURRENCE_AMBIGUOUS"
+
+_OFFICIAL_MACRO_SOURCES = ("BLS", "BEA", "CENSUS")
+_MONTHS = {
+    name.lower(): index
+    for index, name in enumerate(
+        (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        start=1,
+    )
+}
 
 
 @dataclass(frozen=True)
@@ -66,6 +95,14 @@ class TemporalPolicy:
         event_field, event_value = self._event_timestamp(item)
         event_at = parse_datetime(event_value)
         if event_field and event_at is not None:
+            semantic = self._semantic_event_decision(
+                item,
+                event_field=event_field,
+                event_at=_aware(event_at),
+                domain=domain,
+            )
+            if semantic is not None:
+                return semantic
             horizon_days = (
                 self.earnings_max_future_days
                 if domain == "earnings"
@@ -80,10 +117,148 @@ class TemporalPolicy:
                 )
         return TemporalDecision(True)
 
+    def _semantic_event_decision(
+        self,
+        item: dict[str, Any],
+        *,
+        event_field: str,
+        event_at: datetime,
+        domain: str,
+    ) -> TemporalDecision | None:
+        if domain != "macro_calendar":
+            return None
+        event_value = event_at.isoformat()
+        timezone_name = item.get("source_timezone") or item.get("timezone")
+        if timezone_name:
+            try:
+                ZoneInfo(str(timezone_name))
+            except ZoneInfoNotFoundError:
+                return TemporalDecision(
+                    False,
+                    SCHEDULE_DATE_UNVERIFIED,
+                    event_field,
+                    event_value,
+                )
+        precision = str(
+            item.get("scheduled_time_precision")
+            or item.get("time_precision")
+            or ""
+        ).upper()
+        if precision in {"UNKNOWN", "INVALID"}:
+            return TemporalDecision(
+                False,
+                SCHEDULE_DATE_UNVERIFIED,
+                event_field,
+                event_value,
+            )
+        validation = item.get("schedule_validation") or item.get(
+            "temporal_validation"
+        ) or item.get("validation")
+        validation_status = str(
+            validation.get("status")
+            if isinstance(validation, dict)
+            else item.get("schedule_validation_status")
+            or item.get("temporal_validation_status")
+            or ""
+        ).upper()
+        if (
+            validation_status in {"REJECTED", "INVALID", "QUARANTINED"}
+            and _is_schedule_validation(item, validation)
+        ):
+            return TemporalDecision(
+                False,
+                SCHEDULE_DATE_UNVERIFIED,
+                event_field,
+                event_value,
+            )
+        verification = str(
+            item.get("schedule_verification_status")
+            or item.get("calendar_verification_status")
+            or ""
+        ).upper()
+        if verification in {"UNVERIFIED", "UNKNOWN", "FAILED", "TIMEOUT"}:
+            return TemporalDecision(
+                False,
+                SCHEDULE_DATE_UNVERIFIED,
+                event_field,
+                event_value,
+            )
+        if item.get("source_occurrence_ambiguous") is True:
+            return TemporalDecision(
+                False,
+                SOURCE_OCCURRENCE_AMBIGUOUS,
+                event_field,
+                event_value,
+            )
+
+        source = str(
+            item.get("provider")
+            or item.get("source")
+            or ""
+        ).upper()
+        official_macro = any(token in source for token in _OFFICIAL_MACRO_SOURCES)
+        source_event_at = _source_local_time(item, event_at)
+        validation_checks = (
+            validation.get("checks")
+            if isinstance(validation, dict)
+            else []
+        ) or []
+        weekday_is_authoritative = (
+            "CALENDAR" in source
+            or "SCHEDULE" in source
+            or "weekday" in validation_checks
+            or item.get("weekday_verified") is True
+        )
+        if (
+            official_macro
+            and source_event_at.weekday() >= 5
+            and weekday_is_authoritative
+            and not _weekend_release_expected(item)
+        ):
+            return TemporalDecision(
+                False,
+                RELEASE_ON_IMPLAUSIBLE_WEEKEND,
+                event_field,
+                event_value,
+            )
+
+        period = _reference_period(item)
+        if period is None:
+            return None
+        period_start, _period_end, frequency = period
+        release_date = source_event_at.date()
+        if (
+            frequency in {"monthly", "quarterly"}
+            and period_start > release_date
+        ):
+            return TemporalDecision(
+                False,
+                REFERENCE_PERIOD_AFTER_RELEASE_DATE,
+                event_field,
+                event_value,
+            )
+        maximum_lag_days = {
+            "monthly": 550,
+            "quarterly": 1100,
+            "annual": 2200,
+        }.get(frequency)
+        if (
+            maximum_lag_days is not None
+            and release_date - period_start > timedelta(days=maximum_lag_days)
+        ):
+            return TemporalDecision(
+                False,
+                PERIOD_RELEASE_DATE_INCONSISTENT,
+                event_field,
+                event_value,
+            )
+        return None
+
     @staticmethod
     def _event_timestamp(item: dict[str, Any]) -> tuple[str | None, str | None]:
         for field in (
             "release_at",
+            "scheduled_at",
             "decision_at",
             "event_start_at",
             "event_at",
@@ -94,6 +269,169 @@ class TemporalPolicy:
             if parse_datetime(value) is not None:
                 return field, str(value)
         return None, None
+
+
+def _weekend_release_expected(item: dict[str, Any]) -> bool:
+    if item.get("weekend_release_expected") is True:
+        return True
+    semantics = str(
+        item.get("schedule_semantics")
+        or item.get("event_kind")
+        or item.get("event_type")
+        or item.get("category")
+        or ""
+    ).upper()
+    return any(
+        token in semantics
+        for token in (
+            "WEEKEND_EXPECTED",
+            "GEOPOLITICAL",
+            "ELECTION",
+            "SCHEDULED_SPEECH",
+        )
+    )
+
+
+def _is_schedule_validation(
+    item: dict[str, Any],
+    validation: Any,
+) -> bool:
+    if item.get("schedule_validation") or item.get("temporal_validation"):
+        return True
+    if item.get("schedule_validation_status") or item.get(
+        "temporal_validation_status"
+    ):
+        return True
+    if not isinstance(validation, dict):
+        return False
+    validation_domain = str(
+        validation.get("domain")
+        or validation.get("validation_domain")
+        or ""
+    ).upper()
+    if validation_domain in {
+        "CALENDAR",
+        "MACRO_CALENDAR",
+        "SCHEDULE",
+        "TEMPORAL",
+    }:
+        return True
+    reason_codes = {
+        str(value).upper()
+        for value in (
+            validation.get("reason_code"),
+            *(validation.get("reasons") or []),
+        )
+        if value
+    }
+    return bool(
+        reason_codes
+        & {
+            RELEASE_ON_IMPLAUSIBLE_WEEKEND,
+            REFERENCE_PERIOD_AFTER_RELEASE_DATE,
+            PERIOD_RELEASE_DATE_INCONSISTENT,
+            SCHEDULE_DATE_UNVERIFIED,
+            SOURCE_OCCURRENCE_AMBIGUOUS,
+        }
+    )
+
+
+def _source_local_time(
+    item: dict[str, Any],
+    event_at: datetime,
+) -> datetime:
+    timezone_name = str(
+        item.get("source_timezone")
+        or item.get("timezone")
+        or "America/New_York"
+    )
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo("America/New_York")
+    return event_at.astimezone(timezone)
+
+
+def _reference_period(
+    item: dict[str, Any],
+) -> tuple[date, date, str] | None:
+    raw = str(
+        item.get("reference_period")
+        or item.get("period")
+        or _period_from_title(item)
+        or ""
+    ).strip()
+    if not raw:
+        return None
+    month = re.search(
+        r"\b(" + "|".join(_MONTHS) + r")\s+(\d{4})\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if month:
+        year = int(month.group(2))
+        month_number = _MONTHS[month.group(1).lower()]
+        start = date(year, month_number, 1)
+        next_month = (
+            date(year + 1, 1, 1)
+            if month_number == 12
+            else date(year, month_number + 1, 1)
+        )
+        return start, next_month - timedelta(days=1), "monthly"
+    iso_month = re.fullmatch(r"(\d{4})-(\d{2})", raw)
+    if iso_month:
+        year = int(iso_month.group(1))
+        month_number = int(iso_month.group(2))
+        if not 1 <= month_number <= 12:
+            return None
+        start = date(year, month_number, 1)
+        next_month = (
+            date(year + 1, 1, 1)
+            if month_number == 12
+            else date(year, month_number + 1, 1)
+        )
+        return start, next_month - timedelta(days=1), "monthly"
+    quarter = re.search(
+        r"\b(?:Q([1-4])|(?:First|Second|Third|Fourth)\s+Quarter)\s+(\d{4})\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if quarter:
+        quarter_number = (
+            int(quarter.group(1))
+            if quarter.group(1)
+            else {
+                "first": 1,
+                "second": 2,
+                "third": 3,
+                "fourth": 4,
+            }[quarter.group(0).split()[0].lower()]
+        )
+        year = int(quarter.group(2))
+        start_month = 1 + (quarter_number - 1) * 3
+        start = date(year, start_month, 1)
+        next_quarter = (
+            date(year + 1, 1, 1)
+            if quarter_number == 4
+            else date(year, start_month + 3, 1)
+        )
+        return start, next_quarter - timedelta(days=1), "quarterly"
+    annual = re.search(r"\bAnnual\s+(\d{4})\b", raw, re.IGNORECASE)
+    if annual:
+        year = int(annual.group(1))
+        return date(year, 1, 1), date(year, 12, 31), "annual"
+    return None
+
+
+def _period_from_title(item: dict[str, Any]) -> str | None:
+    title = str(
+        item.get("name")
+        or item.get("event_name")
+        or item.get("title")
+        or ""
+    )
+    match = re.search(r"\(([^()]*(?:\d{4}|Annual)[^()]*)\)\s*$", title)
+    return match.group(1) if match else None
 
 
 class TemporalValidationService:

@@ -48,7 +48,16 @@ AVAILABLE_STATUSES = frozenset(
     }
 )
 UNAVAILABLE_STATUSES = frozenset(
-    {"NO_DATA", "UNAVAILABLE", "QUARANTINED", "BACKOFF", "DISABLED"}
+    {
+        "NO_DATA",
+        "UNAVAILABLE",
+        "UNVERIFIED",
+        "UNVERIFIED_EMPTY",
+        "PROVIDER_UNAVAILABLE",
+        "QUARANTINED",
+        "BACKOFF",
+        "DISABLED",
+    }
 )
 DEGRADED_STATUSES = frozenset(
     {"PARTIAL", "LAST_KNOWN_GOOD", "STALE", "EXPIRED", "DUE"}
@@ -79,6 +88,7 @@ ORDER_INSENSITIVE_ID_KEYS = (
     "provider_record_id",
     "occurrence_id",
     "event_id",
+    "article_id",
     "news_key",
     "claim_id",
     "symbol",
@@ -359,7 +369,10 @@ def extract_sync_sections(full: dict[str, Any]) -> dict[str, Any]:
         "geopolitical_regulatory_risk": geopolitical,
     }
     return {
-        name: withhold_quarantined_payload(payload)
+        name: reconcile_delivered_section(
+            name,
+            withhold_quarantined_payload(payload),
+        )
         for name, payload in raw_sections.items()
     }
 
@@ -386,9 +399,131 @@ def withhold_quarantined_payload(value: Any) -> Any:
                 "status": "WITHHELD",
                 "record_count": len(quarantined["fingerprints"]),
                 "reasons": sorted(quarantined["reasons"]),
+                "record_fingerprints": sorted(
+                    quarantined["fingerprints"]
+                ),
             }
         }
     return cleaned
+
+
+def reconcile_delivered_section(
+    section_name: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Make delivered counts/statuses agree with post-quarantine content."""
+
+    if section_name != "news":
+        return payload
+    output = dict(payload)
+    context = (
+        dict(output.get("context") or {})
+        if isinstance(output.get("context"), dict)
+        else {}
+    )
+    current = _unique_records(
+        [
+            *list(context.get("articles") or []),
+            *list(context.get("latest") or []),
+        ],
+        identity_keys=("article_id", "news_key", "canonical_url", "source_url"),
+    )
+    historical = _unique_records(
+        list(context.get("historical_articles") or []),
+        identity_keys=("article_id", "news_key", "canonical_url", "source_url"),
+    )
+    current_ids = {
+        _record_identity(item) for item in current
+    }
+    historical = [
+        item
+        for item in historical
+        if _record_identity(item) not in current_ids
+    ]
+    delivered = [*current, *historical]
+    delivered_ids = {_record_identity(item) for item in delivered}
+    context["articles"] = current
+    context["latest"] = current
+    context["historical_articles"] = historical
+    context["directly_relevant"] = [
+        item
+        for item in context.get("directly_relevant") or []
+        if _record_identity(item) in delivered_ids
+    ]
+    context["supporting"] = [
+        item
+        for item in context.get("supporting") or []
+        if _record_identity(item) in delivered_ids
+    ]
+    context["accepted_article_count"] = len(current)
+    context["delivered_raw_article_count"] = len(delivered)
+    context["historical_article_count"] = len(historical)
+    context["historical_context_available"] = bool(historical)
+    diagnostics = dict(context.get("diagnostics") or {})
+    diagnostics["content_filter_accepted_count"] = int(
+        diagnostics.get("accepted_count") or 0
+    )
+    diagnostics["accepted_count"] = len(delivered)
+    context["diagnostics"] = diagnostics
+    quarantine = (
+        (output.get("producer_disclosures") or {}).get("quarantine")
+        if isinstance(output.get("producer_disclosures"), dict)
+        else {}
+    ) or {}
+    if quarantine.get("record_count"):
+        context["status"] = "PARTIAL" if delivered else "QUARANTINED"
+        context["reason"] = "SOURCE_VALIDATION_WITHHELD_RECORDS"
+    elif not delivered and context.get("search_completed") is not True:
+        context["status"] = "PROVIDER_UNAVAILABLE"
+    elif not delivered and str(
+        context.get("historical_coverage_status") or ""
+    ).upper() == "UNVERIFIED_EMPTY":
+        context["status"] = "PARTIAL"
+        context["reason"] = "HISTORICAL_COVERAGE_UNVERIFIED"
+    output["context"] = context
+    return output
+
+
+def _unique_records(
+    rows: list[Any],
+    *,
+    identity_keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    del identity_keys
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        identity = _record_identity(raw)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        output.append(raw)
+    return output
+
+
+def _record_identity(item: dict[str, Any]) -> str:
+    stable_id = item.get("article_id") or item.get("news_key")
+    if stable_id not in (None, ""):
+        return material_fingerprint(
+            {
+                "provider": item.get("provider"),
+                "source": item.get("source"),
+                "stable_id": stable_id,
+            }
+        )
+    return material_fingerprint(
+        {
+            "provider": item.get("provider"),
+            "source": item.get("source"),
+            "source_url": item.get("source_url"),
+            "canonical_url": item.get("canonical_url"),
+            "published_at": item.get("published_at"),
+            "headline": item.get("headline") or item.get("title"),
+            "material": item,
+        }
+    )
 
 
 def _redact_contract_local_paths(value: Any) -> Any:
@@ -2476,6 +2611,8 @@ def section_status(payload: Any) -> tuple[str, str | None]:
     source_coverage = {
         str(value).upper()
         for value in _find_key_values(payload, "source_coverage_status")
+        + _find_key_values(payload, "historical_coverage_status")
+        + _find_key_values(payload, "coverage_status")
         if value not in (None, "")
     }
     lifecycle = {
@@ -2488,20 +2625,43 @@ def section_status(payload: Any) -> tuple[str, str | None]:
         return "PARTIAL", "CONTAINS_WITHHELD_QUARANTINED_RECORDS"
     if validations.intersection({"rejected", "invalid", "quarantined"}):
         return "PARTIAL", "CONTAINS_QUARANTINED_RECORDS"
-    if source_coverage.intersection({"PARTIAL", "UNVERIFIED_EMPTY"}):
+    if source_coverage.intersection(
+        {
+            "PARTIAL",
+            "UNVERIFIED_EMPTY",
+            "PROVIDER_UNAVAILABLE",
+            "QUARANTINED",
+        }
+    ):
         return "PARTIAL", "SOURCE_COVERAGE_INCOMPLETE"
     if lifecycle.intersection({"AWAITING_ACTUAL", "DUE", "EXPIRED"}):
         return "PARTIAL", "LIFECYCLE_DATA_INCOMPLETE"
     recognized = statuses.intersection(
-        {"BACKOFF", "UNAVAILABLE", "NO_DATA", "PARTIAL", "AVAILABLE"}
+        {
+            "BACKOFF",
+            "UNAVAILABLE",
+            "UNVERIFIED",
+            "UNVERIFIED_EMPTY",
+            "PROVIDER_UNAVAILABLE",
+            "NO_DATA",
+            "PARTIAL",
+            "AVAILABLE",
+        }
     )
     available = "AVAILABLE" in recognized
-    unavailable = recognized.intersection({"BACKOFF", "UNAVAILABLE", "NO_DATA"})
+    unavailable = recognized.intersection(UNAVAILABLE_STATUSES)
     if "PARTIAL" in recognized or (available and unavailable):
         return "PARTIAL", _find_reason(payload) or "MIXED_COMPONENT_STATUS"
     if available:
         return "AVAILABLE", _find_reason(payload)
-    for status in ("BACKOFF", "UNAVAILABLE", "NO_DATA"):
+    for status in (
+        "BACKOFF",
+        "PROVIDER_UNAVAILABLE",
+        "UNVERIFIED",
+        "UNVERIFIED_EMPTY",
+        "UNAVAILABLE",
+        "NO_DATA",
+    ):
         if status in recognized:
             return status, _find_reason(payload)
     return "AVAILABLE", None
@@ -2516,7 +2676,15 @@ def section_freshness(
 ) -> str:
     if status == "QUARANTINED":
         return "QUARANTINED"
-    if status in {"NO_DATA", "UNAVAILABLE", "BACKOFF", "DISABLED"}:
+    if status in {
+        "NO_DATA",
+        "UNAVAILABLE",
+        "UNVERIFIED",
+        "UNVERIFIED_EMPTY",
+        "PROVIDER_UNAVAILABLE",
+        "BACKOFF",
+        "DISABLED",
+    }:
         return status
     explicit = next(
         (

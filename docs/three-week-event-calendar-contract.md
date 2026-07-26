@@ -58,12 +58,23 @@ regulatory, geopolitical, and unknown scheduled occurrences.
 
 ## Persistence and catch-up
 
-Schema 20 is sufficient. `economic_events_history` remains the historical
+Schema 21 is sufficient; this closure adds no migration.
+`economic_events_history` remains the historical
 occurrence store, while `datum_lifecycle_items` provides the persistent
 checkpoint, due time, retry/backoff, lease, heartbeat, and payload. Snapshot
 materialization atomically seeds visible scheduled occurrences into the
 lifecycle table. A future occurrence is idle until its exact release; a past
 occurrence without an actual is `AWAITING_ACTUAL` and due.
+
+At startup and on every provider-only catch-up tick, the service first computes
+the canonical previous/current-week interval and asks the deterministic
+calendar service for that exact interval. Validated schedule gaps are persisted,
+including `schedule_only` occurrences; existing rows are unchanged. The
+acquisition itself uses a five-minute persistent single-flight lease in
+`provider_state`. All-provider failure records `PROVIDER_UNAVAILABLE` and a
+persistent retry time. A second tick inside that backoff performs no provider
+call. Successful empty results are `VERIFIED_COMPLETE` only when at least one
+configured provider completed without errors.
 
 Event catch-up is separately opt-in and disabled by default. It:
 
@@ -128,23 +139,65 @@ missing or unparseable, static Globex rules remain explicitly unverified; on a
 holiday-sensitive weekday MNQ becomes `UNKNOWN` with
 `UNVERIFIED_HOLIDAY_SCHEDULE` instead of being invented as open.
 
-## Consumer limit and offline verification
+## Lossless consumer projection and source coverage
 
-The Consumer 2.1 projection keeps compact source/domain lineage and deterministic
-ordering by scheduled time, descending impact, then occurrence ID. Configurable
-impact and count limits produce explicit coverage and overflow metrics.
-Retention is bucket-aware: every nonempty week first receives a minimum quota,
-then HIGH-impact and bucket-specific priorities are applied (published/revised
-previous-week actuals, current-day/awaiting-actual occurrences, and next-week
-HIGH events). Each bucket exposes `candidate_count`, `retained_count`, and
-`omitted_count`. Any omission prevents `COMPLETE`; if even one item per nonempty
-bucket cannot fit, coverage is `DEGRADED` with
-`byte_budget_insufficient_for_nonempty_bucket_minimum`. The complete consumer
-remains below 90,000 UTF-8 bytes.
+The canonical projection is lossless and deterministically ordered by scheduled
+time, descending impact, then occurrence ID. Configuration fields retained for
+backward compatibility do not cap this projection. There is no event-count
+limit, byte budget, top-N, impact-floor reduction, overflow removal, mandatory
+summary, or destructive compaction. The builder reads the complete calendar
+lists plus the pre-consumer `events_today`, `next_24h_events`,
+`next_7d_critical_events`, `recently_released_events`, and
+`upcoming_high_impact_events` views; the legacy projected window is never its
+only source.
 
-`scripts/replay_three_week_event_calendar_offline.py` verifies the three buckets,
-session split, deterministic replay, byte size, and zero provider, AI, browser,
-delivery, and trading calls.
+Coverage exposes, globally and per bucket:
+
+- `source_candidate_count`;
+- `validated_occurrence_count`;
+- `delivered_occurrence_count`;
+- `delivered_valid_source_record_count`;
+- `quarantined_occurrence_count`;
+- `invalid_temporal_count`;
+- `exact_duplicate_count`;
+- `omitted_for_size_count=0`;
+- `omitted_for_count_count=0`;
+- `unexplained_loss=0`;
+- `source_coverage_status`.
+
+Permitted source coverage states are `VERIFIED_COMPLETE`, `PARTIAL`,
+`UNVERIFIED_EMPTY`, `PROVIDER_UNAVAILABLE`, and `QUARANTINED`. An empty bucket
+without affirmative provider evidence is `UNVERIFIED_EMPTY`; non-empty data
+alone does not prove complete acquisition.
+
+Occurrence identity never uses array position or normalized-title similarity.
+Different timestamps remain different occurrences. Multiple source records for
+one occurrence remain in `source_evidence` with provider IDs, URLs, retrieval
+time, timezone, validation and field lineage. Only a content-identical record
+with the same deterministic occurrence/source identity is a technical
+duplicate.
+
+`scripts/replay_snapshot91_sync_offline.py` reconstructs the snapshot-91 window
+from the complete pre-consumer lists, refreshes the sync section in memory, and
+verifies the candidate equation, exact payload size, historical-news
+consistency, and zero provider, AI, or operational-database side effects.
+
+## Temporal admission
+
+Operational macro-calendar admission validates the timestamp, weekday,
+reference period, timezone, precision, source validation and occurrence
+ambiguity. Invalid rows remain under `audit.quarantined_occurrences` with a
+specific code and are excluded from delivered events. Current codes include
+`RELEASE_ON_IMPLAUSIBLE_WEEKEND`,
+`REFERENCE_PERIOD_AFTER_RELEASE_DATE`,
+`PERIOD_RELEASE_DATE_INCONSISTENT`, `SCHEDULE_DATE_UNVERIFIED`, and
+`SOURCE_OCCURRENCE_AMBIGUOUS`. A weekend occurrence is admitted only when its
+semantics explicitly permit a weekend release.
+
+The BLS production parser consumes the official list view, whose rows contain a
+full date, time and reference period. It requires the full date to match the
+requested year/month, preventing the leading/trailing adjacent-month cells of
+the month grid from being remapped to day 1 or 2 of the wrong month.
 
 ## Forensic blocker closure
 
@@ -163,7 +216,7 @@ automatic provider-only ticks, CME daily provenance is explicit, retention
 preserves week coverage when feasible, and removed IDs retain auditable
 confirmation state.
 
-Residual limits are intentional and fail closed:
+Residual fail-closed behavior:
 
 - a CME document without the supported structured equity-index payload is
   discovered but not parsed or session-verified;
@@ -172,4 +225,4 @@ Residual limits are intentional and fail closed:
 - an absent event without an admitted explicit tombstone remains indefinitely
   unconfirmed rather than being guessed as cancelled;
 - catch-up makes progress only while the service process is running, but schema
-  20 state survives restarts and resumes without manual cursor reconstruction.
+  21 state survives restarts and resumes without manual cursor reconstruction.

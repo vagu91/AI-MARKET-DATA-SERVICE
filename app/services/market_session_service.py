@@ -63,7 +63,10 @@ def build_session_aware_schedule(
             ),
         }
     )
-    cme_calendar = existing.get("cme_calendar") or {}
+    cme_calendar, cme_last_known_good_used = _select_cme_calendar(
+        existing,
+        reference=now,
+    )
     structured_cme = (
         cme_calendar.get("equity_index_schedule")
         if isinstance(cme_calendar.get("equity_index_schedule"), dict)
@@ -107,6 +110,9 @@ def build_session_aware_schedule(
                 "source_is_primary_originator": True,
                 "source_is_official_redistributor": False,
                 "is_official_source": True,
+                "last_known_good_used": cme_last_known_good_used,
+                "valid_until": cme_calendar.get("valid_until"),
+                "retrieved_at": cme_calendar.get("retrieved_at"),
             }
         )
     else:
@@ -167,7 +173,7 @@ def build_session_aware_schedule(
             if official_cash and futures["session_state_verified"]
             else "PARTIAL"
             if official_cash or futures["session_state_verified"]
-            else "UNAVAILABLE"
+            else "UNVERIFIED"
         ),
         "context_date": local.date().isoformat(),
         "market_session_status": cash["status"],
@@ -215,7 +221,7 @@ def build_session_aware_schedule(
             if official_cash and futures["session_state_verified"]
             else "mixed verified and deterministic session rules"
             if official_cash or futures["session_state_verified"]
-            else "deterministic unverified fallback"
+            else "unverified schedule; deterministic state withheld"
         ),
         "validation": {
             "status": (
@@ -223,7 +229,7 @@ def build_session_aware_schedule(
                 if official_cash and futures["session_state_verified"]
                 else "partial"
                 if official_cash or futures["session_state_verified"]
-                else "unavailable"
+                else "unverified"
             ),
             "reason_code": (
                 None
@@ -234,6 +240,17 @@ def build_session_aware_schedule(
         "warnings": _schedule_warnings(
             existing,
             official_cme=bool(futures["session_state_verified"]),
+        ),
+        "last_verified_cme_calendar_used": cme_last_known_good_used,
+        "retry_policy": existing.get("retry_policy")
+        or {
+            "persistent": True,
+            "strategy": "exponential_backoff",
+        },
+        "next_retry_at": (
+            (existing.get("cme_calendar") or {}).get("next_retry_at")
+            if isinstance(existing.get("cme_calendar"), dict)
+            else None
         ),
     }
 
@@ -360,7 +377,16 @@ def _futures_session(
     elif holiday_sensitive and status == "open":
         status = "unknown"
         closed_reason = "UNVERIFIED_HOLIDAY_SCHEDULE"
-    is_open: bool | None = status == "open" if status != "unknown" else None
+    calculated_status = status
+    if not schedule_verified:
+        is_open: bool | None = None
+        closed_reason = (
+            "UNVERIFIED_HOLIDAY_SCHEDULE"
+            if calculated_status == "unknown"
+            else "UNVERIFIED_SCHEDULE"
+        )
+    else:
+        is_open = status == "open" if status != "unknown" else None
     if closed_reason is None and is_open is False:
         closed_reason = (
             "MAINTENANCE_BREAK"
@@ -375,7 +401,13 @@ def _futures_session(
         )
     next_open = (
         _next_futures_open(local, status)
-        if status not in {"unknown", "holiday", "holiday_closed", "late_open"}
+        if status
+        not in {
+            "unknown",
+            "holiday",
+            "holiday_closed",
+            "late_open",
+        }
         else None
     )
     next_close = (
@@ -385,6 +417,7 @@ def _futures_session(
     )
     return {
         "status": status,
+        "calculated_status": calculated_status,
         "is_open": is_open,
         "closed_reason": closed_reason,
         "holiday_name": holiday_name,
@@ -475,6 +508,73 @@ def _override_time(item: dict[str, Any], key: str) -> time | None:
 def _schedule_source(schedule: dict[str, Any]) -> str:
     source = (schedule.get("holiday_source") or {}).get("source")
     return str(source or "versioned session rules")
+
+
+def _select_cme_calendar(
+    schedule: dict[str, Any],
+    *,
+    reference: datetime,
+) -> tuple[dict[str, Any], bool]:
+    current = (
+        dict(schedule.get("cme_calendar") or {})
+        if isinstance(schedule.get("cme_calendar"), dict)
+        else {}
+    )
+    if _verified_cme_candidate(current):
+        return current, False
+    candidates = [
+        current.get("last_known_good"),
+        schedule.get("last_verified_cme_calendar"),
+        schedule.get("cme_calendar_last_known_good"),
+    ]
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        candidate = dict(raw)
+        expiry = _datetime(candidate.get("valid_until"))
+        if (
+            _verified_cme_candidate(candidate)
+            and expiry is not None
+            and expiry >= reference.astimezone(UTC)
+        ):
+            return candidate, True
+    return current, False
+
+
+def _verified_cme_candidate(candidate: dict[str, Any]) -> bool:
+    validation = candidate.get("validation")
+    validation_status = str(
+        validation.get("status")
+        if isinstance(validation, dict)
+        else candidate.get("validation_status")
+        or ""
+    ).lower()
+    if validation_status in {"rejected", "invalid", "quarantined"}:
+        return False
+    lineage = (
+        f"{candidate.get('source') or ''} "
+        f"{candidate.get('source_url') or ''}"
+    ).lower()
+    if lineage and "cme" not in lineage:
+        return False
+    return bool(
+        candidate.get("official_schedule_parsed")
+        and isinstance(candidate.get("equity_index_schedule"), dict)
+    )
+
+
+def _datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (
+        parsed.replace(tzinfo=UTC)
+        if parsed.tzinfo is None
+        else parsed.astimezone(UTC)
+    )
 
 
 def _schedule_warnings(schedule: dict[str, Any], *, official_cme: bool = False) -> list[str]:
