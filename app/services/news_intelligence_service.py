@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from app.services.data_freshness_service import parse_datetime
 from app.services.data_integrity_service import clean_text, news_content_status
+from app.services.source_policy_service import SourcePolicyService
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,7 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
     display_source = original or source or domain or "Unknown"
     is_official = classification == "official_source"
     is_primary = classification in {"official_source", "primary_market_source"}
-    return {
+    classified = {
         "source": display_source,
         "original_publisher": display_source,
         "source_classification": classification,
@@ -243,6 +244,57 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         "source_is_official_redistributor": False,
         "source_reliability_base": SOURCE_BASE_RELIABILITY[classification],
     }
+    policy_candidate = {**article, **classified}
+    decision = SourcePolicyService().validate(
+        policy_candidate,
+        field_semantics="news",
+    )
+    reserved_fixture_source = any(
+        reason
+        in {
+            "SOURCE_HOST_RESERVED",
+            "SOURCE_HOST_LOCALHOST",
+            "SOURCE_HOST_NON_PUBLIC_IP",
+        }
+        for reason in decision.reasons
+    )
+    distributor = (
+        "Yahoo Finance"
+        if aggregator_url and domain == "finance.yahoo.com"
+        else domain
+        if aggregator_url
+        else article.get("distribution_source")
+    )
+    classified.update(
+        {
+            "publisher": display_source,
+            "distribution_source": distributor,
+            "distribution_url": aggregator_url,
+            "source_policy_version": decision.policy_version,
+            "source_policy_reliability": decision.reliability,
+            "confirmation": {
+                "confirmed": False,
+                "independent_source_count": 1,
+            },
+            "confirmed_by_multiple_sources": False,
+            "confirmation_status": "SINGLE_SOURCE",
+            "validation": {
+                "status": (
+                    "accepted"
+                    if decision.accepted
+                    else "unverified"
+                    if reserved_fixture_source
+                    else "rejected"
+                ),
+                "reason_code": (
+                    None if decision.accepted else ",".join(decision.reasons)
+                ),
+                "policy_version": decision.policy_version,
+                "domain": decision.domain,
+            },
+        }
+    )
+    return classified
 
 
 def extract_entities(article: dict[str, Any]) -> dict[str, Any]:

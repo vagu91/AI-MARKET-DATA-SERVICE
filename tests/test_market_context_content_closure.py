@@ -500,7 +500,7 @@ def test_cme_timeout_fails_closed_and_valid_lkg_is_used() -> None:
         now=now,
     )
 
-    assert unavailable["status"] == "UNVERIFIED"
+    assert unavailable["status"] == "PARTIAL"
     assert unavailable["mnq_futures_session"]["is_open"] is None
     assert (
         unavailable["mnq_futures_session"]["closed_reason"]

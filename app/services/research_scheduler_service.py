@@ -142,7 +142,9 @@ class ResearchSchedulerService:
         ai_decisions: list[dict[str, str]] = []
         deferred: list[str] = []
         backoff: list[str] = []
+        exhausted_no_data: list[str] = []
         item_outcomes: list[dict[str, str | None]] = []
+        provider_only_finalized: set[str] = set()
         effective_triggers: list[dict[str, str]] = []
         provider_resolution_batch: list[
             tuple[
@@ -568,6 +570,81 @@ class ResearchSchedulerService:
                     },
                 )
                 continue
+            if (
+                provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
+                and not allow_ai_residual
+            ):
+                exhausted = bool(
+                    provider_result.get("retry_deadline_exhausted")
+                    or provider_status == "EXHAUSTED"
+                )
+                no_data_payload = {
+                    **(
+                        item.get("payload")
+                        if isinstance(item.get("payload"), dict)
+                        else {}
+                    ),
+                    "actual": (
+                        (item.get("payload") or {}).get("actual")
+                        if isinstance(item.get("payload"), dict)
+                        else None
+                    ),
+                    "release_status": (
+                        (item.get("payload") or {}).get("release_status")
+                        if isinstance(item.get("payload"), dict)
+                        else None
+                    )
+                    or "AWAITING_ACTUAL",
+                    "reason": str(
+                        provider_result.get("reason")
+                        or "provider_returned_no_data"
+                    ),
+                    "fields_attempted": list(
+                        item.get("fields_attempted") or []
+                    ),
+                }
+                no_data_lifecycle = compute_datum_lifecycle(
+                    str(item.get("entity_type") or "unknown"),
+                    str(item.get("entity_key") or ""),
+                    no_data_payload,
+                    settings=self.settings,
+                    now=now,
+                    attempt_count=int(item.get("attempt_count") or 0) + 1,
+                    no_data=not exhausted,
+                    fields_attempted=list(
+                        item.get("fields_attempted") or []
+                    ),
+                    session_state=item.get("session_state"),
+                    triggering_event=effective_trigger_type,
+                    retry_class="NO_DATA",
+                    refresh_reason=str(
+                        provider_result.get("reason")
+                        or "provider_returned_no_data"
+                    ),
+                )
+                work_status = "NO_DATA" if exhausted else "BACKOFF"
+                self.lifecycle.upsert(
+                    no_data_lifecycle,
+                    payload=no_data_payload,
+                    work_status=work_status,
+                )
+                residual.append(unresolved)
+                if exhausted:
+                    exhausted_no_data.append(item_id)
+                    outcome = "EXHAUSTED_NO_DATA"
+                else:
+                    backoff.append(item_id)
+                    deferred.append(item_id)
+                    outcome = "WAITING_BACKOFF"
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": outcome,
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                provider_only_finalized.add(item_id)
+                continue
             residual.append(unresolved)
             ai_decisions.append(
                 {
@@ -665,7 +742,10 @@ class ResearchSchedulerService:
                     )
         for item in residual:
             item_id = str(item["item_id"])
-            if item_id in queued_item_ids:
+            if (
+                item_id in queued_item_ids
+                or item_id in provider_only_finalized
+            ):
                 continue
             agent_status = next(
                 (
@@ -732,8 +812,25 @@ class ResearchSchedulerService:
                     ),
                 }
             )
+        outcome_statuses = {
+            str(item.get("status") or "") for item in item_outcomes
+        }
+        scan_status = (
+            "PARTIAL"
+            if len(outcome_statuses) > 1
+            and outcome_statuses.difference({"RESOLVED"})
+            else "WAITING_BACKOFF"
+            if outcome_statuses.intersection({"BACKOFF", "WAITING_BACKOFF"})
+            else "EXHAUSTED_NO_DATA"
+            if outcome_statuses == {"EXHAUSTED_NO_DATA"}
+            else "COMPLETED_WITH_GAPS"
+            if outcome_statuses.intersection(
+                {"NO_DATA", "DISABLED", "IDLE", "EXHAUSTED_NO_DATA"}
+            )
+            else "COMPLETED"
+        )
         return {
-            "status": "COMPLETED",
+            "status": scan_status,
             "claimed": len(claimed),
             "provider_calls": actual_provider_requests,
             "resolver_evaluations": resolver_evaluations,
@@ -745,6 +842,7 @@ class ResearchSchedulerService:
             "rematerialized_snapshot_ids": rematerialized,
             "deferred": deferred,
             "backoff": backoff,
+            "exhausted_no_data": exhausted_no_data,
             "residual_count": len(residual),
             "ai_eligible_count": len(ai_eligible),
             "ai_decisions": ai_decisions,
@@ -1080,7 +1178,7 @@ class ResearchSchedulerService:
             batch = self.scan_due_items(
                 owner="event-calendar-catch-up",
                 resolver=resolver,
-                ai_enqueue=ai_enqueue,
+                ai_enqueue=None,
                 due_since=window_start,
                 execution_context=execution_context,
                 force=True,
@@ -1113,6 +1211,8 @@ class ResearchSchedulerService:
             if backlog_after > 0
             else "WAITING_BACKOFF"
             if pending_backoff > 0
+            else "COMPLETED_WITH_GAPS"
+            if aggregate["exhausted_no_data"]
             else "COMPLETED"
         )
         tick_count = int(checkpoint.get("tick_count") or 0) + 1
@@ -1151,7 +1251,20 @@ class ResearchSchedulerService:
         return {
             **aggregate,
             "status": completion_status,
-            "writes": len(aggregate["rematerialized_snapshot_ids"]),
+            "writes": (
+                len(aggregate["rematerialized_snapshot_ids"])
+                + int(
+                    bool(schedule_coverage.get("rematerialized_snapshot_id"))
+                )
+            ),
+            "rematerialized_snapshot_ids": [
+                *(
+                    [str(schedule_coverage["rematerialized_snapshot_id"])]
+                    if schedule_coverage.get("rematerialized_snapshot_id")
+                    else []
+                ),
+                *aggregate["rematerialized_snapshot_ids"],
+            ],
             "checkpoint_written": True,
             "catch_up_window_start": window_start.isoformat(),
             "catch_up_window_hours": int(
@@ -1285,7 +1398,10 @@ class ResearchSchedulerService:
                 bucket["status"] = "PROVIDER_UNAVAILABLE"
             return coverage
 
-        provider_owner = getattr(schedule_acquire, "__self__", None)
+        provider_owner = (
+            getattr(schedule_acquire, "__self__", None)
+            or schedule_acquire
+        )
         provider_results = list(
             getattr(provider_owner, "last_provider_results", []) or []
         )
@@ -1323,6 +1439,11 @@ class ResearchSchedulerService:
         persisted = 0
         unchanged = 0
         quarantined = 0
+        discovered_occurrence_ids: list[str] = []
+        discovered_rows: list[dict[str, Any]] = []
+        discovered_lifecycles: list[
+            tuple[DatumLifecycle, dict[str, Any], str]
+        ] = []
         for payload in rows:
             release = parse_datetime(
                 payload.get("release_at")
@@ -1356,18 +1477,22 @@ class ResearchSchedulerService:
                 coverage["by_bucket"][bucket_name]["status"] = "QUARANTINED"
                 continue
             occurrence_key = canonical_event_key(payload)
+            canonical_payload = {
+                **payload,
+                "canonical_event_key": occurrence_key,
+                "occurrence_id": (
+                    payload.get("occurrence_id") or occurrence_key
+                ),
+                "release_at": release.isoformat(),
+            }
             classification = classify_occurrence_lifecycle(
-                {
-                    **payload,
-                    "canonical_event_key": occurrence_key,
-                    "release_at": release.isoformat(),
-                }
+                canonical_payload
             )
             entity_type = classification.entity_type
             lifecycle = compute_datum_lifecycle(
                 entity_type,
                 occurrence_key,
-                payload,
+                canonical_payload,
                 settings=self.settings,
                 now=now,
                 fields_attempted=list(classification.outcome_fields),
@@ -1375,19 +1500,20 @@ class ResearchSchedulerService:
                 refresh_reason="provider_first_canonical_schedule_catchup",
             )
             existed = (entity_type, occurrence_key) in existing_keys
-            actual_present = payload.get("actual") not in (None, "")
-            self.lifecycle.upsert(
-                lifecycle,
-                payload=payload,
-                work_status=(
-                    "COMPLETED"
-                    if actual_present or not classification.operational
-                    else "READY"
-                ),
+            actual_present = canonical_payload.get("actual") not in (None, "")
+            work_status = (
+                "COMPLETED"
+                if actual_present or not classification.operational
+                else "READY"
             )
+            discovered_occurrence_ids.append(occurrence_key)
+            discovered_rows.append(canonical_payload)
             if not existed:
                 persisted += 1
                 existing_keys.add((entity_type, occurrence_key))
+                discovered_lifecycles.append(
+                    (lifecycle, canonical_payload, work_status)
+                )
             else:
                 unchanged += 1
         for details in coverage["by_bucket"].values():
@@ -1404,9 +1530,152 @@ class ResearchSchedulerService:
                 "persisted_gap_count": persisted,
                 "unchanged_occurrence_count": unchanged,
                 "quarantined_occurrence_count": quarantined,
+                "discovered_occurrence_ids": sorted(
+                    set(discovered_occurrence_ids)
+                ),
             }
         )
+        rematerialized = self._rematerialize_schedule_discovery(
+            rows=discovered_rows,
+            lifecycles=discovered_lifecycles,
+            source_coverage=coverage,
+            now=now,
+        )
+        coverage["rematerialized_snapshot_id"] = (
+            rematerialized.get("snapshot_id")
+            if rematerialized is not None
+            else None
+        )
         return coverage
+
+    def _rematerialize_schedule_discovery(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        lifecycles: list[
+            tuple[DatumLifecycle, dict[str, Any], str]
+        ],
+        source_coverage: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Atomically commit discovered schedule rows and their lifecycle state."""
+
+        if not rows:
+            return None
+        components = self.snapshots.latest_components("MNQ")
+        previous = self.snapshots.latest("MNQ")
+        if not components or previous is None:
+            for lifecycle, payload, work_status in lifecycles:
+                self.lifecycle.upsert(
+                    lifecycle,
+                    payload=payload,
+                    work_status=work_status,
+                )
+            return None
+        debug = dict(components)
+        calendar = dict(debug.get("event_calendar") or {})
+        section_names = (
+            "critical_macro_events",
+            "fed_communications",
+            "other_economic_events",
+        )
+        existing: dict[str, dict[str, Any]] = {}
+        section_by_key: dict[str, str] = {}
+        calendar_changed = False
+        for section_name in section_names:
+            for item in calendar.get(section_name) or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(
+                    item.get("canonical_event_key")
+                    or item.get("occurrence_id")
+                    or canonical_event_key(item)
+                )
+                existing[key] = item
+                section_by_key[key] = section_name
+        for item in rows:
+            key = str(
+                item.get("canonical_event_key")
+                or item.get("occurrence_id")
+                or canonical_event_key(item)
+            )
+            merged = {**existing.get(key, {}), **item}
+            if existing.get(key) != merged:
+                calendar_changed = True
+            existing[key] = merged
+            if key not in section_by_key:
+                category = str(
+                    item.get("category")
+                    or item.get("event_type")
+                    or ""
+                ).upper()
+                section_by_key[key] = (
+                    "fed_communications"
+                    if "FOMC" in category or "FED" in category
+                    else "critical_macro_events"
+                    if str(item.get("impact") or "").upper() == "HIGH"
+                    else "other_economic_events"
+                )
+                calendar_changed = True
+        if not calendar_changed and not lifecycles:
+            return None
+        for section_name in section_names:
+            calendar[section_name] = sorted(
+                [
+                    item
+                    for key, item in existing.items()
+                    if section_by_key.get(key) == section_name
+                ],
+                key=lambda item: (
+                    str(
+                        item.get("release_at")
+                        or item.get("time_utc")
+                        or item.get("date")
+                        or ""
+                    ),
+                    str(
+                        item.get("canonical_event_key")
+                        or item.get("occurrence_id")
+                        or ""
+                    ),
+                ),
+            )
+        previous_coverage = (
+            dict(calendar.get("source_coverage") or {})
+            if isinstance(calendar.get("source_coverage"), dict)
+            else {}
+        )
+        previous_by_bucket = (
+            dict(previous_coverage.get("by_bucket") or {})
+            if isinstance(previous_coverage.get("by_bucket"), dict)
+            else {}
+        )
+        discovered_by_bucket = (
+            dict(source_coverage.get("by_bucket") or {})
+            if isinstance(source_coverage.get("by_bucket"), dict)
+            else {}
+        )
+        calendar["source_coverage"] = {
+            **previous_coverage,
+            **source_coverage,
+            "by_bucket": {
+                **previous_by_bucket,
+                **discovered_by_bucket,
+            },
+        }
+        debug["event_calendar"] = calendar
+        debug["generated_at_utc"] = (
+            now.astimezone(UTC).replace(microsecond=0).isoformat()
+        )
+        return self.snapshots.save_next(
+            symbol="MNQ",
+            refresh_mode="event_calendar_schedule_discovery",
+            debug_payload=debug,
+            ai_enrichment={"status": "NOT_REQUIRED"},
+            trigger_type=None,
+            correlation_id="event-calendar-schedule-discovery",
+            resolved_items=lifecycles,
+        )
 
     def _acquire_schedule_seed_lease(
         self,
@@ -2266,6 +2535,7 @@ def _empty_catchup_result() -> dict[str, Any]:
         "rematerialized_snapshot_ids": [],
         "deferred": [],
         "backoff": [],
+        "exhausted_no_data": [],
         "item_outcomes": [],
         "effective_triggers": [],
         "residual_count": 0,
@@ -2306,6 +2576,7 @@ def _accumulate_catchup_result(
         "rematerialized_snapshot_ids",
         "deferred",
         "backoff",
+        "exhausted_no_data",
         "item_outcomes",
         "effective_triggers",
         "ai_decisions",

@@ -166,6 +166,10 @@ def build_session_aware_schedule(
                 "is_official_source": True,
             }
         )
+    deterministic_base_verified = bool(
+        cash.get("verification_scope") == "BASE_WEEKLY_RULE"
+        or futures.get("verification_scope") == "BASE_WEEKLY_RULE"
+    )
     return {
         **existing,
         "status": (
@@ -173,6 +177,8 @@ def build_session_aware_schedule(
             if official_cash and futures["session_state_verified"]
             else "PARTIAL"
             if official_cash or futures["session_state_verified"]
+            else "PARTIAL"
+            if deterministic_base_verified
             else "UNVERIFIED"
         ),
         "context_date": local.date().isoformat(),
@@ -221,6 +227,8 @@ def build_session_aware_schedule(
             if official_cash and futures["session_state_verified"]
             else "mixed verified and deterministic session rules"
             if official_cash or futures["session_state_verified"]
+            else "deterministic base session rule; holiday override unverified"
+            if deterministic_base_verified
             else "unverified schedule; deterministic state withheld"
         ),
         "validation": {
@@ -229,6 +237,8 @@ def build_session_aware_schedule(
                 if official_cash and futures["session_state_verified"]
                 else "partial"
                 if official_cash or futures["session_state_verified"]
+                else "partial"
+                if deterministic_base_verified
                 else "unverified"
             ),
             "reason_code": (
@@ -318,6 +328,18 @@ def _cash_session(
         ).astimezone(UTC).isoformat(),
         "source": "exchange calendar with deterministic session rules",
         "freshness": "LIVE" if status == "open" else "CURRENT_SESSION",
+        "verification_scope": (
+            "BASE_WEEKLY_RULE"
+            if status == "weekend"
+            else "OFFICIAL_HOLIDAY_OVERRIDE"
+            if day_key in closed_dates or day_key in early_closes
+            else "REGULAR_SESSION_RULE"
+        ),
+        "holiday_override_status": (
+            "VERIFIED"
+            if day_key in closed_dates or day_key in early_closes
+            else "UNVERIFIED"
+        ),
     }
 
 
@@ -379,12 +401,20 @@ def _futures_session(
         closed_reason = "UNVERIFIED_HOLIDAY_SCHEDULE"
     calculated_status = status
     if not schedule_verified:
-        is_open: bool | None = None
-        closed_reason = (
-            "UNVERIFIED_HOLIDAY_SCHEDULE"
-            if calculated_status == "unknown"
-            else "UNVERIFIED_SCHEDULE"
-        )
+        if calculated_status in {"weekend", "maintenance_break"}:
+            is_open = False
+            closed_reason = (
+                "WEEKEND"
+                if calculated_status == "weekend"
+                else "MAINTENANCE_BREAK"
+            )
+        else:
+            is_open = None
+            closed_reason = (
+                "UNVERIFIED_HOLIDAY_SCHEDULE"
+                if calculated_status == "unknown"
+                else "UNVERIFIED_SCHEDULE"
+            )
     else:
         is_open = status == "open" if status != "unknown" else None
     if closed_reason is None and is_open is False:
@@ -446,6 +476,16 @@ def _futures_session(
         "data_origin_is_official": False,
         "is_official_source": False,
         "freshness": "LIVE" if status == "open" else "CURRENT_SESSION",
+        "verification_scope": (
+            "OFFICIAL_HOLIDAY_OVERRIDE"
+            if schedule_verified
+            else "BASE_WEEKLY_RULE"
+            if calculated_status in {"weekend", "maintenance_break"}
+            else "BASE_WEEKLY_RULE_WITH_UNVERIFIED_OVERRIDE"
+        ),
+        "holiday_override_status": (
+            "VERIFIED" if schedule_verified else "UNVERIFIED"
+        ),
     }
 
 

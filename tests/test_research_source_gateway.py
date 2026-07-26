@@ -350,7 +350,7 @@ def test_real_no_data_when_fetched_content_does_not_support_anchor(
     assert result["metrics"]["sources"]["verified"] == 0
 
 
-def test_tier_one_needs_one_confirmation_but_news_needs_two(
+def test_tier_one_and_current_news_accept_one_trusted_source(
     tmp_path: Path,
 ) -> None:
     cfg = settings(tmp_path)
@@ -437,12 +437,16 @@ def test_tier_one_needs_one_confirmation_but_news_needs_two(
     source_gateway.acquire(run2["run_id"], requests[1])
     one_news = source_gateway.verify_claims(run2["run_id"], [claims[1]])[0]
     one_news["evidence"] = one_news["evidence"][:1]
-    rejected = repository.persist_claims(
+    accepted = repository.persist_claims(
         repository.get_run(run2["run_id"]) or run2,
         [one_news],
     )
-    assert rejected["status"] == "NO_DATA"
-    assert "insufficient_independent_evidence" in rejected["rejected_claims"][0]["warnings"]
+    assert accepted["status"] == "PARTIAL"
+    assert accepted["accepted_count"] == 1
+    assert accepted["rejected_claims"] == []
+    assert "insufficient_independent_evidence" not in (
+        accepted["accepted_claims"][0].get("warnings") or []
+    )
     fred = SourcePolicyService(POLICY).validate(
         {
             "source_url": "https://fred.stlouisfed.org/series/UNRATE",

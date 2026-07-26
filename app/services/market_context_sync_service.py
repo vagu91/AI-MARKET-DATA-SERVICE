@@ -191,14 +191,48 @@ def persist_sync_sections_in_transaction(
             section_revision = int(maximum or 0) + 1
             changed.append(section_name)
         status, reason = section_status(payload)
-        valid_until = _find_temporal_value(payload, ("valid_until", "fresh_until"))
+        raw_valid_until = _find_temporal_value(
+            payload,
+            ("valid_until", "fresh_until"),
+        )
         section_data_as_of = _find_temporal_value(
             payload,
-            ("data_as_of", "as_of", "published_at", "event_at"),
+            (
+                "data_as_of",
+                "as_of",
+                "published_at",
+                "event_at",
+                "observed_at",
+                "retrieved_at",
+            ),
         ) or data_as_of
+        temporal_floor = _find_temporal_value(
+            payload,
+            (
+                "data_as_of",
+                "as_of",
+                "published_at",
+                "event_at",
+                "observed_at",
+                "retrieved_at",
+            ),
+        )
+        raw_expiry = parse_datetime(raw_valid_until)
+        floor_value = parse_datetime(temporal_floor)
+        temporal_invariant_corrected = bool(
+            floor_value is not None
+            and (raw_expiry is None or raw_expiry < floor_value)
+        )
+        valid_until = (
+            floor_value.isoformat()
+            if temporal_invariant_corrected and floor_value is not None
+            else raw_valid_until
+        )
         freshness = section_freshness(
             status=status,
-            valid_until=valid_until,
+            valid_until=(
+                None if temporal_invariant_corrected else valid_until
+            ),
             payload=payload,
             reference=parse_datetime(created_at) or datetime.now(UTC),
         )
@@ -272,6 +306,10 @@ def persist_sync_sections_in_transaction(
             "valid_until": valid_until,
             "status": status,
             "reason": reason,
+            "temporal_invariant_corrected": (
+                temporal_invariant_corrected
+            ),
+            "inherited_valid_until": raw_valid_until,
         }
     return metadata, changed
 
@@ -455,7 +493,8 @@ def reconcile_delivered_section(
         for item in context.get("supporting") or []
         if _record_identity(item) in delivered_ids
     ]
-    context["accepted_article_count"] = len(current)
+    context["accepted_article_count"] = len(delivered)
+    context["current_article_count"] = len(current)
     context["delivered_raw_article_count"] = len(delivered)
     context["historical_article_count"] = len(historical)
     context["historical_context_available"] = bool(historical)
@@ -464,6 +503,18 @@ def reconcile_delivered_section(
         diagnostics.get("accepted_count") or 0
     )
     diagnostics["accepted_count"] = len(delivered)
+    candidate_count = max(
+        int(context.get("candidate_article_count") or 0),
+        int(diagnostics.get("raw_article_count") or 0),
+        len(delivered),
+    )
+    diagnostics["raw_article_count"] = candidate_count
+    diagnostics["excluded_count"] = max(
+        int(diagnostics.get("excluded_count") or 0),
+        candidate_count - len(delivered),
+    )
+    context["candidate_article_count"] = candidate_count
+    context["rejected_article_count"] = diagnostics["excluded_count"]
     context["diagnostics"] = diagnostics
     quarantine = (
         (output.get("producer_disclosures") or {}).get("quarantine")
@@ -480,6 +531,66 @@ def reconcile_delivered_section(
     ).upper() == "UNVERIFIED_EMPTY":
         context["status"] = "PARTIAL"
         context["reason"] = "HISTORICAL_COVERAGE_UNVERIFIED"
+    elif delivered:
+        context["status"] = "AVAILABLE"
+        context.pop("reason", None)
+    context["usable_for_analysis"] = bool(delivered)
+    delivered_article_ids = {
+        str(item.get("article_id"))
+        for item in delivered
+        if item.get("article_id")
+    }
+    context["clusters"] = [
+        {
+            **cluster,
+            "article_ids": [
+                article_id
+                for article_id in cluster.get("article_ids") or []
+                if str(article_id) in delivered_article_ids
+            ],
+            "representative_articles": [
+                item
+                for item in cluster.get("representative_articles") or []
+                if str(item.get("article_id")) in delivered_article_ids
+            ],
+        }
+        for cluster in context.get("clusters") or []
+        if isinstance(cluster, dict)
+        and any(
+            str(article_id) in delivered_article_ids
+            for article_id in cluster.get("article_ids") or []
+        )
+    ]
+    output["latest"] = current
+    digest = (
+        dict(output.get("digest") or {})
+        if isinstance(output.get("digest"), dict)
+        else {}
+    )
+    digest.update(
+        {
+            "status": (
+                "AVAILABLE"
+                if delivered and not quarantine.get("record_count")
+                else "PARTIAL"
+                if delivered
+                else "QUARANTINED"
+                if quarantine.get("record_count")
+                else "NO_DATA_AVAILABLE"
+            ),
+            "candidate_article_count": candidate_count,
+            "accepted_article_count": len(delivered),
+            "delivered_article_count": len(delivered),
+            "historical_article_count": len(historical),
+            "excluded_article_count": max(
+                int(digest.get("excluded_article_count") or 0),
+                candidate_count - len(delivered),
+            ),
+            "cluster_count": len(context["clusters"]),
+        }
+    )
+    output["digest"] = digest
+    context["digest"] = dict(digest)
     output["context"] = context
     return output
 

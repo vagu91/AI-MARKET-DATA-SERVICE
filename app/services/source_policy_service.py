@@ -73,6 +73,12 @@ class SourcePolicyService:
                 raise ValueError(f"invalid source policy rule: {rule!r}")
             if int(rule["tier"]) not in range(1, 6):
                 raise ValueError("source tier must be between 1 and 5")
+            if rule.get("distribution_only") is True:
+                allowed_publishers = rule.get("allowed_publishers")
+                if not isinstance(allowed_publishers, list) or not allowed_publishers:
+                    raise ValueError(
+                        "distribution-only source rule requires allowed_publishers"
+                    )
         return payload
 
     def domain(self, url: str | None) -> str:
@@ -253,6 +259,19 @@ class SourcePolicyService:
             return self._decision(False, domain, 5, "UNKNOWN", 0.0, "unknown_source")
         semantics = field_semantics.lower()
         reasons: list[str] = []
+        if rule.get("distribution_only") is True:
+            allowed_publishers = {
+                str(item).strip().casefold()
+                for item in rule.get("allowed_publishers") or []
+                if str(item).strip()
+            }
+            original_publisher = str(
+                candidate.get("original_publisher")
+                or candidate.get("publisher")
+                or ""
+            ).strip()
+            if original_publisher.casefold() not in allowed_publishers:
+                reasons.append("distribution_source_original_publisher_not_allowed")
         if semantics in {"actual", "official_actual"} and not bool(rule["official_actual"]):
             reasons.append("actual_requires_official_source")
         if semantics in {"actual", "official_actual"} and int(rule["tier"]) != 1:

@@ -39,6 +39,13 @@ status
 reason
 ```
 
+For every delivered section, effective `valid_until` is monotonic with the
+materialized records: it cannot precede the maximum `data_as_of`,
+`observed_at`, or `retrieved_at`. An inherited older expiry is clamped to that
+floor and does not override a current freshness state carried by newer
+delivered records. Section freshness is calculated after quarantine
+withholding, from the records actually delivered.
+
 Material fingerprints exclude telemetry and volatile acquisition fields.
 Record-like lists are canonicalized independently of order. A telemetry-only
 change preserves both fingerprint and section revision. A material addition,
@@ -88,6 +95,14 @@ The response identifies the current immutable snapshot, independently reports
 Nasdaq cash and MNQ/Globex session state, and exposes all section metadata.
 `QUARANTINED`, `UNAVAILABLE`, `NO_DATA`, `PARTIAL` and `BACKOFF` are producer
 truth; they are never converted into consumer-missing state.
+
+A normal weekend or maintenance closure remains reportable when the official
+holiday-override source times out. Cash and MNQ remain separate and expose
+`is_open=false`, the deterministic closure reason,
+`verification_scope=BASE_WEEKLY_RULE`, and
+`holiday_override_status=UNVERIFIED`. An unverified override never creates a
+holiday or early-close claim, and the manifest therefore avoids `UNKNOWN` for
+an unambiguous base-weekly closure.
 
 ## Synchronization plan
 
@@ -146,6 +161,24 @@ records. Their content is withheld and only an aggregate
 `producer_disclosures.quarantine` count and reason-code list is exposed.
 Secrets, credentialed URLs and local filesystem paths are redacted before
 section persistence.
+
+Market-news admission uses versioned `source-policy-v5`, independently from
+official macro/actual policy. Trusted editorial publishers may be delivered
+from one source with explicit reliability and
+`confirmation.confirmed=false`. `investors.com` is an admitted editorial
+publisher. `finance.yahoo.com` is distribution-only: it is admitted only when
+the preserved original publisher is in its narrow publisher rule (currently
+Reuters), and Yahoo-only or unknown-origin content remains quarantined.
+Original publisher, distribution source/URL, canonical/source URL, timestamps,
+available original summary/content, validation and cluster lineage remain in
+the raw article.
+
+After withholding, `accepted_article_count`,
+`delivered_raw_article_count`, `historical_article_count`, rejected count,
+digest status, context status and `usable_for_analysis` are recomputed from the
+same delivered set. A digest cannot be `AVAILABLE` when zero articles are
+delivered. Clusters are supplemental views and never replace admitted raw
+records.
 
 `checksum_scope=CANONICAL_DELIVERY_WITHOUT_MEASUREMENT_FIELDS` means the
 checksum is computed from canonical JSON after omitting only `checksum` and
@@ -223,6 +256,11 @@ Completion must commit one coherent snapshot, its section rows and at most one
 coalesced outbox event in the same transaction. A rollback creates no visible
 notification. Material work arriving during generation N is never inserted
 retroactively into N and must remain queued for N+1.
+
+Provider-first schedule discovery uses the same transaction boundary: canonical
+calendar components, snapshot, section revisions, lifecycle rows and any
+outbox row become visible together. Full and selective sync therefore read the
+same revision and fingerprint immediately after a material catch-up discovery.
 
 ## Trigger policy
 

@@ -172,7 +172,7 @@ def test_redacted_live_replay_accepts_official_events_and_is_partial(
         ).fetchone()[0] == 4
 
 
-def test_current_news_keeps_two_domain_requirement_and_real_insufficiency(
+def test_current_news_accepts_trusted_single_source_without_false_confirmation(
     tmp_path: Path,
 ) -> None:
     cfg = settings(tmp_path)
@@ -235,10 +235,12 @@ def test_current_news_keeps_two_domain_requirement_and_real_insufficiency(
     ]
     verified = source_gateway.verify_claims(run["run_id"], claims)
     result = repository.persist_claims(repository.get_run(run["run_id"]) or run, verified)
-    assert result["accepted_count"] == 1
-    rejected = result["rejected_claims"][0]
-    assert rejected["field_semantics"] == "current_news"
-    assert rejected["warnings"] == ["insufficient_independent_evidence"]
+    assert result["accepted_count"] == 2
+    assert result["rejected_claims"] == []
+    accepted = {
+        item["claim_ref"]: item for item in result["accepted_claims"]
+    }
+    assert accepted["single-source-news"]["field_semantics"] == "current_news"
 
 
 def test_official_issuer_subdomain_is_allowed_with_dns_boundary(
@@ -425,7 +427,7 @@ def test_schema_policy_prompt_and_migration_expose_new_semantics(
     cfg = settings(tmp_path)
     policy = SourcePolicyService(POLICY)
     assert policy.required_confirmations("official_calendar_event") == 1
-    assert policy.required_confirmations("current_news") == 2
+    assert policy.required_confirmations("current_news") == 1
     assert policy.semantic_policy("current_market_context")["ttl_minutes"] == 60
     result = migrate_database(cfg.database_path)
     assert result["schema_version"] == 21

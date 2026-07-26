@@ -18,7 +18,10 @@ from app.services.market_fact_repository import (
     now_iso,
 )
 from app.services.news_intelligence_service import normalize_news_article
-from app.services.source_policy_service import SourcePolicyService
+from app.services.source_policy_service import (
+    SourcePolicyService,
+    SourceUrlValidation,
+)
 
 
 class MarketNewsRepository:
@@ -50,6 +53,22 @@ class MarketNewsRepository:
             source_url,
             allow_test_reserved=self.settings.environment.lower() == "test",
         )
+        reserved_fixture_source = (
+            self.settings.environment.lower() == "test"
+            and source_validation.accepted
+            and not policy.accepted
+            and bool(policy.reasons)
+            and set(policy.reasons).issubset(
+                {
+                    "SOURCE_HOST_RESERVED",
+                    "SOURCE_HOST_LOCALHOST",
+                    "SOURCE_HOST_NON_PUBLIC_IP",
+                }
+            )
+        )
+        source_admitted = source_validation.accepted and (
+            policy.accepted or reserved_fixture_source
+        )
         topics = list(article.get("topics") or [])
         payload = {
             "news_key": article.get("news_key") or self.keys.news_key(title=str(article.get("title") or ""), source_url=source_url),
@@ -80,11 +99,28 @@ class MarketNewsRepository:
             "source_tier": article.get("source_tier") or policy.tier,
             "source_classification": article.get("source_classification") or policy.classification,
             "source_audit_status": (
-                "ACTIVE" if source_validation.accepted else "QUARANTINED"
+                "ACTIVE"
+                if source_admitted
+                else "QUARANTINED"
             ),
-            "source_invalid_reason": source_validation.reason_code,
+            "source_invalid_reason": (
+                source_validation.reason_code
+                or (",".join(policy.reasons) if not policy.accepted else None)
+            ),
         }
-        if not source_validation.accepted:
+        article["validation"] = {
+            "status": (
+                "accepted"
+                if source_validation.accepted and policy.accepted
+                else "unverified"
+                if reserved_fixture_source
+                else "rejected"
+            ),
+            "reason_code": payload["source_invalid_reason"],
+            "policy_version": policy.policy_version,
+        }
+        payload["raw_payload_json"] = encode(article)
+        if not source_admitted:
             payload["reliability"] = 0.0
             payload["confidence"] = 0.0
             payload["is_official"] = 0
@@ -123,12 +159,21 @@ class MarketNewsRepository:
                 """,
                 [payload[column] for column in columns],
             )
-            if not source_validation.accepted:
+            if not source_admitted:
                 _record_source_quarantine(
                     conn,
                     entity_table="market_news",
                     entity_key=str(payload["news_key"]),
-                    invalid=source_validation,
+                    invalid=(
+                        source_validation
+                        if not source_validation.accepted
+                        else SourceUrlValidation(
+                            accepted=False,
+                            url=source_url,
+                            domain=policy.domain,
+                            reason_code=payload["source_invalid_reason"],
+                        )
+                    ),
                     previous_status="ACTIVE",
                     lineage={"canonical_url": payload["canonical_url"]},
                 )

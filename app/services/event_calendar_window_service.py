@@ -205,6 +205,15 @@ def build_event_calendar_window(
         and item["is_past"]
         for item in retained
     )
+    actual_missing_ids = sorted(
+        {
+            str(item["occurrence_id"])
+            for item in retained
+            if item["release_status"] in {"AWAITING_ACTUAL", "UNAVAILABLE"}
+            and item["is_past"]
+            and item.get("actual") in (None, "")
+        }
+    )
     revised_count = sum(
         item["release_status"] == "REVISED" for item in retained
     )
@@ -307,6 +316,7 @@ def build_event_calendar_window(
             "by_status": status_counts,
             "total": len(retained),
         },
+        "actual_missing_ids": actual_missing_ids,
         "coverage": {
             "status": coverage_status,
             "source_candidate_count": source_candidate_count,
@@ -399,6 +409,23 @@ def build_event_calendar_window(
         for item in existing_comparison.get("removals") or []
         if isinstance(item, dict)
     ]
+    result["coverage"]["cross_stage_reconciliation"] = (
+        _cross_stage_reconciliation(
+            full,
+            delivered_ids={
+                str(item.get("occurrence_id")) for item in retained
+            },
+            quarantined_ids={
+                str(item.get("occurrence_id"))
+                for item in quarantined_occurrences
+                if item.get("occurrence_id")
+            },
+            exact_duplicate_ids={
+                str(item) for item in exact_duplicate_occurrences
+            },
+            comparison=existing_comparison,
+        )
+    )
     logger.info(
         "event_calendar_window_materialized",
         extra={
@@ -479,6 +506,79 @@ def _bucket_source_coverage(
     if quarantined_count:
         return "QUARANTINED"
     return "PARTIAL" if candidate_count else "UNVERIFIED_EMPTY"
+
+
+def _cross_stage_reconciliation(
+    full: dict[str, Any],
+    *,
+    delivered_ids: set[str],
+    quarantined_ids: set[str],
+    exact_duplicate_ids: set[str],
+    comparison: dict[str, Any],
+) -> dict[str, Any]:
+    calendar = (
+        full.get("event_calendar")
+        if isinstance(full.get("event_calendar"), dict)
+        else {}
+    )
+    coverage = (
+        calendar.get("source_coverage")
+        if isinstance(calendar.get("source_coverage"), dict)
+        else {}
+    )
+    discovered_ids = {
+        str(item)
+        for item in coverage.get("discovered_occurrence_ids") or []
+        if item
+    }
+    confirmed_removal_ids = {
+        str(item.get("occurrence_id"))
+        for item in comparison.get("removals") or []
+        if isinstance(item, dict)
+        and item.get("occurrence_id")
+        and item.get("status") == "REMOVED_FROM_CALENDAR"
+    }
+    delivered_stage = discovered_ids & delivered_ids
+    quarantined_stage = (
+        discovered_ids & quarantined_ids
+    ) - delivered_stage
+    removal_stage = (
+        discovered_ids & confirmed_removal_ids
+    ) - delivered_stage - quarantined_stage
+    duplicate_stage = (
+        discovered_ids & exact_duplicate_ids
+    ) - delivered_stage - quarantined_stage - removal_stage
+    accounted_ids = (
+        delivered_stage
+        | quarantined_stage
+        | duplicate_stage
+        | removal_stage
+    )
+    unexplained_ids = sorted(discovered_ids - accounted_ids)
+    return {
+        "discovered_occurrence_count": len(discovered_ids),
+        "delivered_occurrence_count": len(delivered_stage),
+        "quarantined_occurrence_count": len(quarantined_stage),
+        "exact_duplicate_count": len(duplicate_stage),
+        "technical_retry_duplicate_count": len(exact_duplicate_ids),
+        "confirmed_removal_count": len(removal_stage),
+        "unconfirmed_removals_retained": sorted(
+            {
+                str(item.get("occurrence_id"))
+                for item in comparison.get("removals") or []
+                if isinstance(item, dict)
+                and item.get("status") == "UNCONFIRMED_REMOVAL"
+                and str(item.get("occurrence_id")) in delivered_ids
+            }
+        ),
+        "unexplained_loss": len(unexplained_ids),
+        "unexplained_occurrence_ids": unexplained_ids,
+        "equation": (
+            "discovered = delivered + quarantined + "
+            "exact_duplicates + confirmed_removals + unexplained_loss"
+        ),
+        "status": "RECONCILED" if not unexplained_ids else "GAP",
+    }
 
 
 def classify_event_change(
@@ -600,6 +700,46 @@ def _scheduled_rows(
         for raw in calendar.get(section) or []:
             if isinstance(raw, dict) and _is_scheduled_occurrence(raw):
                 yield raw, section_hints.get(section)
+
+    previous_comparison = (
+        (
+            (
+                full.get("event_calendar_window")
+                if isinstance(full.get("event_calendar_window"), dict)
+                else {}
+            ).get("audit")
+            or {}
+        ).get("comparison")
+        or {}
+    )
+    for removal in previous_comparison.get("removals") or []:
+        if (
+            not isinstance(removal, dict)
+            or removal.get("status") != "UNCONFIRMED_REMOVAL"
+            or not isinstance(removal.get("previous_occurrence"), dict)
+        ):
+            continue
+        previous_occurrence = dict(removal["previous_occurrence"])
+        yield (
+            {
+                **previous_occurrence,
+                "removal_status": "UNCONFIRMED_REMOVAL",
+                "comparison_lineage": removal.get("comparison_lineage") or {},
+                "release_status": (
+                    previous_occurrence.get("release_status")
+                    or (
+                        "AWAITING_ACTUAL"
+                        if previous_occurrence.get("is_past")
+                        and previous_occurrence.get("actual") in (None, "")
+                        else "SCHEDULED"
+                    )
+                ),
+            },
+            (
+                str(previous_occurrence.get("event_type") or "")
+                or None
+            ),
+        )
 
     # Complete pre-consumer lists may contain persisted occurrences absent
     # from a legacy event_calendar projection. They supplement, but never
@@ -866,6 +1006,12 @@ def _canonical_occurrence(
         ),
         "valid_until": valid_until,
         "next_refresh_at": next_refresh_at,
+        "removal_status": _nullable(item.get("removal_status")),
+        "comparison_lineage": (
+            item.get("comparison_lineage")
+            if isinstance(item.get("comparison_lineage"), dict)
+            else {}
+        ),
         "trigger_class": _occurrence_trigger_class(item, release_status),
         "lineage": _full_lineage(item),
         "source_evidence": [_source_evidence(item)],
@@ -1116,6 +1262,8 @@ def _full_lineage(item: dict[str, Any]) -> dict[str, Any]:
         "validation": item.get("validation") or enrichment.get("validation"),
         "retrieved_at": item.get("retrieved_at")
         or enrichment.get("retrieved_at"),
+        "removal_status": item.get("removal_status"),
+        "comparison_lineage": item.get("comparison_lineage") or {},
     }
 
 
