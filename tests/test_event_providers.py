@@ -10,16 +10,19 @@ from app.providers.fed_calendar import FederalReserveCalendarProvider
 
 
 def settings(tmp_path: Path) -> Settings:
-    return Settings(database_path=tmp_path / "cache.sqlite3")
+    return Settings(
+        _env_file=None,
+        database_path=tmp_path / "cache.sqlite3",
+    )
 
 
 def test_bls_upcoming_parser_uses_fixture_content_not_silent_mock(tmp_path) -> None:
     html = """
-    <h1>July 2026</h1>
-    <p>14</p>
-    <p>Consumer Price Index</p>
-    <p>June 2026</p>
-    <p>08:30 AM</p>
+    <table>
+      <tr><th>Date</th><th>Time</th><th>Release</th></tr>
+      <tr><td>Tuesday, July 14, 2026</td><td>08:30 AM</td>
+          <td>Consumer Price Index for June 2026</td></tr>
+    </table>
     """
     provider = BlsReleaseCalendarProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 

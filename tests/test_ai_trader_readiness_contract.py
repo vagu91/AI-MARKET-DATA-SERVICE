@@ -197,8 +197,8 @@ def test_snapshot_summary_is_present_and_data_only() -> None:
     summary = build_ai_trader_market_context(full)["snapshot_summary"]
 
     assert summary["symbol"] == "MNQ"
-    assert summary["ready"] is True
-    assert summary["critical_errors"] == 0
+    assert summary["ready"] is False
+    assert summary["critical_errors"] == 1
     assert summary["critical_error_details"] == []
     assert summary["critical_error_count"] == 0
     assert summary["critical_event_count"] == 1

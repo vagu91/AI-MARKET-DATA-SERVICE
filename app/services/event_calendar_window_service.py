@@ -16,6 +16,7 @@ from app.services.event_occurrence_lifecycle_service import (
 )
 from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key
+from app.services.temporal_validation_service import TemporalPolicy
 
 
 logger = logging.getLogger(__name__)
@@ -75,9 +76,17 @@ def build_event_calendar_window(
     window_end = bucket_bounds["NEXT_WEEK"][1]
 
     temporal_anomalies: list[dict[str, Any]] = []
-    duplicate_occurrences: list[str] = []
+    quarantined_occurrences: list[dict[str, Any]] = []
+    exact_duplicate_occurrences: list[str] = []
+    technical_records: set[str] = set()
+    source_record_count = 0
+    validated_source_record_count = 0
+    validated_source_records_by_bucket = {
+        bucket_name: 0 for bucket_name in WEEK_BUCKETS
+    }
     selected: dict[str, dict[str, Any]] = {}
     outside_window_count = 0
+    temporal_policy = TemporalPolicy(clock=lambda: now_utc)
     for raw, event_type_hint in _scheduled_rows(full):
         occurrence, anomaly = _canonical_occurrence(
             raw,
@@ -94,11 +103,40 @@ def build_event_calendar_window(
             outside_window_count += 1
             continue
         occurrence_id = str(occurrence["occurrence_id"])
+        technical_key = _technical_occurrence_key(occurrence)
+        if technical_key in technical_records:
+            exact_duplicate_occurrences.append(occurrence_id)
+            continue
+        technical_records.add(technical_key)
+        source_record_count += 1
+        decision = temporal_policy.evaluate(
+            {**raw, **occurrence},
+            domain="macro_calendar",
+        )
+        if not decision.accepted:
+            quarantined_occurrences.append(
+                {
+                    "occurrence_id": occurrence_id,
+                    "event_id": occurrence.get("event_id"),
+                    "week_bucket": occurrence.get("week_bucket"),
+                    "scheduled_at": occurrence.get("scheduled_at"),
+                    "title": occurrence.get("title"),
+                    "reason_code": decision.reason_code,
+                    "timestamp_field": decision.timestamp_field,
+                    "source": occurrence.get("source"),
+                    "source_url": occurrence.get("source_url"),
+                    "lineage": occurrence.get("lineage") or {},
+                }
+            )
+            continue
+        validated_source_record_count += 1
+        validated_source_records_by_bucket[
+            str(occurrence["week_bucket"])
+        ] += 1
         current = selected.get(occurrence_id)
         if current is None:
             selected[occurrence_id] = occurrence
             continue
-        duplicate_occurrences.append(occurrence_id)
         selected[occurrence_id] = _merge_occurrences(current, occurrence)
 
     impact_floor = "UNKNOWN"
@@ -107,7 +145,8 @@ def build_event_calendar_window(
     retained = candidates
     retained_event_bytes = _compact_events_size(retained)
     retained_ids = {str(item["occurrence_id"]) for item in retained}
-    overflow_count = max(len(candidates) - len(retained), 0)
+    omitted_for_size_count = 0
+    omitted_for_count_count = 0
 
     buckets: dict[str, dict[str, Any]] = {}
     status_counts = {status: 0 for status in sorted(RELEASE_STATUSES)}
@@ -116,6 +155,24 @@ def build_event_calendar_window(
         bucket_candidates = [
             item for item in candidates if item["week_bucket"] == bucket_name
         ]
+        bucket_quarantined = [
+            item
+            for item in quarantined_occurrences
+            if item.get("week_bucket") == bucket_name
+        ]
+        bucket_exact_duplicates = sum(
+            1
+            for occurrence_id in exact_duplicate_occurrences
+            if (
+                occurrence_id in selected
+                and selected[occurrence_id].get("week_bucket") == bucket_name
+            )
+            or any(
+                item.get("occurrence_id") == occurrence_id
+                and item.get("week_bucket") == bucket_name
+                for item in bucket_quarantined
+            )
+        )
         events = [
             item
             for item in retained
@@ -129,9 +186,13 @@ def build_event_calendar_window(
             "start": start.isoformat(),
             "end": end.isoformat(),
             "event_count": len(events),
-            "candidate_count": len(bucket_candidates),
+            "candidate_count": (
+                len(bucket_candidates)
+                + len(bucket_quarantined)
+                + bucket_exact_duplicates
+            ),
             "retained_count": len(events),
-            "omitted_count": max(len(bucket_candidates) - len(events), 0),
+            "omitted_count": 0,
             "events": events,
         }
 
@@ -147,16 +208,64 @@ def build_event_calendar_window(
     revised_count = sum(
         item["release_status"] == "REVISED" for item in retained
     )
-    coverage_status = "COMPLETE"
+    quarantined_by_bucket = {
+        bucket_name: sum(
+            item.get("week_bucket") == bucket_name
+            for item in quarantined_occurrences
+        )
+        for bucket_name in WEEK_BUCKETS
+    }
+    exact_duplicates_by_bucket = {
+        bucket_name: sum(
+            1
+            for occurrence_id in exact_duplicate_occurrences
+            if (
+                occurrence_id in selected
+                and selected[occurrence_id].get("week_bucket") == bucket_name
+            )
+            or any(
+                item.get("occurrence_id") == occurrence_id
+                and item.get("week_bucket") == bucket_name
+                for item in quarantined_occurrences
+            )
+        )
+        for bucket_name in WEEK_BUCKETS
+    }
     bucket_coverage = {
         bucket_name: {
+            "source_candidate_count": buckets[bucket_name][
+                "candidate_count"
+            ],
+            "validated_occurrence_count": len(
+                [
+                    item
+                    for item in candidates
+                    if item["week_bucket"] == bucket_name
+                ]
+            ),
+            "delivered_occurrence_count": buckets[bucket_name][
+                "event_count"
+            ],
+            "delivered_valid_source_record_count": (
+                validated_source_records_by_bucket[bucket_name]
+            ),
+            "quarantined_occurrence_count": quarantined_by_bucket[
+                bucket_name
+            ],
+            "invalid_temporal_count": quarantined_by_bucket[bucket_name],
+            "exact_duplicate_count": exact_duplicates_by_bucket[
+                bucket_name
+            ],
+            "omitted_for_size_count": 0,
+            "omitted_for_count_count": 0,
             "candidate_count": buckets[bucket_name]["candidate_count"],
-            "retained_count": buckets[bucket_name]["retained_count"],
-            "omitted_count": buckets[bucket_name]["omitted_count"],
-            "source_coverage_status": (
-                "COVERED"
-                if buckets[bucket_name]["candidate_count"]
-                else "UNVERIFIED_EMPTY"
+            "retained_count": buckets[bucket_name]["event_count"],
+            "omitted_count": 0,
+            "source_coverage_status": _bucket_source_coverage(
+                full,
+                bucket_name=bucket_name,
+                candidate_count=buckets[bucket_name]["candidate_count"],
+                quarantined_count=quarantined_by_bucket[bucket_name],
             ),
         }
         for bucket_name in WEEK_BUCKETS
@@ -164,8 +273,27 @@ def build_event_calendar_window(
     missing_source_coverage_buckets = [
         bucket_name
         for bucket_name, details in bucket_coverage.items()
-        if details["source_coverage_status"] == "UNVERIFIED_EMPTY"
+        if details["source_coverage_status"] != "VERIFIED_COMPLETE"
     ]
+    coverage_status = (
+        "COMPLETE"
+        if not missing_source_coverage_buckets
+        and not quarantined_occurrences
+        else "PARTIAL"
+    )
+    source_candidate_count = (
+        source_record_count + len(exact_duplicate_occurrences)
+    )
+    delivered_occurrence_count = len(retained)
+    quarantined_occurrence_count = len(quarantined_occurrences)
+    exact_duplicate_count = len(exact_duplicate_occurrences)
+    unexplained_loss = max(
+        source_candidate_count
+        - validated_source_record_count
+        - quarantined_occurrence_count
+        - exact_duplicate_count,
+        0,
+    )
     result = {
         "timezone": timezone_name,
         "generated_at": now_utc.replace(microsecond=0).isoformat(),
@@ -181,13 +309,26 @@ def build_event_calendar_window(
         },
         "coverage": {
             "status": coverage_status,
-            "candidate_count": len(candidates),
-            "retained_count": len(retained),
-            "omitted_count": overflow_count,
-            "overflow_count": overflow_count,
+            "source_candidate_count": source_candidate_count,
+            "source_record_count": source_record_count,
+            "validated_occurrence_count": len(candidates),
+            "delivered_occurrence_count": delivered_occurrence_count,
+            "delivered_valid_source_record_count": (
+                validated_source_record_count
+            ),
+            "quarantined_occurrence_count": quarantined_occurrence_count,
+            "invalid_temporal_count": quarantined_occurrence_count,
+            "exact_duplicate_count": exact_duplicate_count,
+            "omitted_for_size_count": omitted_for_size_count,
+            "omitted_for_count_count": omitted_for_count_count,
+            "unexplained_loss": unexplained_loss,
+            "candidate_count": source_candidate_count,
+            "retained_count": delivered_occurrence_count,
+            "omitted_count": 0,
+            "overflow_count": 0,
             "by_bucket": bucket_coverage,
             "source_coverage_status": (
-                "COMPLETE"
+                "VERIFIED_COMPLETE"
                 if not missing_source_coverage_buckets
                 else "PARTIAL"
             ),
@@ -195,7 +336,9 @@ def build_event_calendar_window(
                 missing_source_coverage_buckets
             ),
             "minimum_per_nonempty_bucket_preserved": all(
-                not details["candidate_count"] or details["retained_count"] >= 1
+                not details["source_candidate_count"]
+                or details["delivered_occurrence_count"] >= 1
+                or details["quarantined_occurrence_count"] >= 1
                 for details in bucket_coverage.values()
             ),
             "truncation_reason": None,
@@ -210,12 +353,20 @@ def build_event_calendar_window(
             "missing_actuals": missing_actual_count,
             "revisions": revised_count,
             "temporal_anomaly_count": len(temporal_anomalies),
-            "duplicate_occurrence_count": len(set(duplicate_occurrences)),
-            "overflow_count": overflow_count,
+            "duplicate_occurrence_count": exact_duplicate_count,
+            "exact_duplicate_count": exact_duplicate_count,
+            "quarantined_occurrence_count": quarantined_occurrence_count,
+            "invalid_temporal_count": quarantined_occurrence_count,
+            "omitted_for_size_count": 0,
+            "omitted_for_count_count": 0,
+            "overflow_count": 0,
         },
         "audit": {
             "temporal_anomalies": temporal_anomalies,
-            "duplicate_occurrence_ids": sorted(set(duplicate_occurrences)),
+            "quarantined_occurrences": quarantined_occurrences,
+            "duplicate_occurrence_ids": sorted(
+                set(exact_duplicate_occurrences)
+            ),
             "ordering": "scheduled_at,impact_desc,occurrence_id",
             "date_only_policy": "preserve_date_without_inventing_release_time",
             "unscheduled_news_policy": "excluded_from_scheduled_calendar_window",
@@ -258,8 +409,9 @@ def build_event_calendar_window(
             "missing_actual_count": missing_actual_count,
             "revision_count": revised_count,
             "temporal_anomaly_count": len(temporal_anomalies),
-            "duplicate_occurrence_count": len(set(duplicate_occurrences)),
-            "overflow_count": overflow_count,
+            "duplicate_occurrence_count": exact_duplicate_count,
+            "quarantined_occurrence_count": quarantined_occurrence_count,
+            "overflow_count": 0,
         },
     )
     return result
@@ -269,6 +421,64 @@ def compact_event_calendar_window(window: dict[str, Any]) -> dict[str, Any]:
     """Compatibility projection that preserves the complete calendar."""
 
     return json.loads(json.dumps(window, ensure_ascii=False, default=str))
+
+
+def _bucket_source_coverage(
+    full: dict[str, Any],
+    *,
+    bucket_name: str,
+    candidate_count: int,
+    quarantined_count: int,
+) -> str:
+    calendar = (
+        full.get("event_calendar")
+        if isinstance(full.get("event_calendar"), dict)
+        else {}
+    )
+    coverage = (
+        calendar.get("source_coverage")
+        or calendar.get("coverage")
+        or full.get("event_calendar_source_coverage")
+        or {}
+    )
+    by_bucket = (
+        coverage.get("by_bucket")
+        if isinstance(coverage, dict)
+        and isinstance(coverage.get("by_bucket"), dict)
+        else coverage
+        if isinstance(coverage, dict)
+        else {}
+    )
+    raw = by_bucket.get(bucket_name) or by_bucket.get(bucket_name.lower())
+    if isinstance(raw, dict):
+        raw = (
+            raw.get("status")
+            or raw.get("coverage_status")
+            or raw.get("source_coverage_status")
+        )
+    status = str(raw or "").upper()
+    aliases = {
+        "COMPLETE": "VERIFIED_COMPLETE",
+        "COVERED": "VERIFIED_COMPLETE",
+        "VERIFIED": "VERIFIED_COMPLETE",
+        "EMPTY_VERIFIED": "VERIFIED_COMPLETE",
+        "UNAVAILABLE": "PROVIDER_UNAVAILABLE",
+        "TIMEOUT": "PROVIDER_UNAVAILABLE",
+    }
+    status = aliases.get(status, status)
+    if status in {
+        "VERIFIED_COMPLETE",
+        "PARTIAL",
+        "UNVERIFIED_EMPTY",
+        "PROVIDER_UNAVAILABLE",
+        "QUARANTINED",
+    }:
+        if quarantined_count and status == "VERIFIED_COMPLETE":
+            return "QUARANTINED"
+        return status
+    if quarantined_count:
+        return "QUARANTINED"
+    return "PARTIAL" if candidate_count else "UNVERIFIED_EMPTY"
 
 
 def classify_event_change(
@@ -390,6 +600,20 @@ def _scheduled_rows(
         for raw in calendar.get(section) or []:
             if isinstance(raw, dict) and _is_scheduled_occurrence(raw):
                 yield raw, section_hints.get(section)
+
+    # Complete pre-consumer lists may contain persisted occurrences absent
+    # from a legacy event_calendar projection. They supplement, but never
+    # replace, the canonical calendar source above.
+    for section, hint in (
+        ("next_24h_events", None),
+        ("next_7d_critical_events", None),
+        ("recently_released_events", None),
+        ("upcoming_high_impact_events", None),
+        ("events_today", None),
+    ):
+        for raw in full.get(section) or []:
+            if isinstance(raw, dict) and _is_scheduled_occurrence(raw):
+                yield raw, hint
 
     earnings = (
         (full.get("nasdaq_context") or {}).get("earnings")
@@ -593,6 +817,13 @@ def _canonical_occurrence(
         ),
         "country": _nullable(item.get("country") or item.get("country_code")),
         "currency": _nullable(item.get("currency")),
+        "provider": _nullable(item.get("provider") or source),
+        "provider_event_id": _nullable(item.get("provider_event_id")),
+        "source_event_id": _nullable(item.get("source_event_id")),
+        "reference_period": _nullable(
+            item.get("reference_period") or item.get("period")
+        ),
+        "frequency": _nullable(item.get("frequency")),
         "impact": _impact(item),
         "scheduled_at": (
             scheduled.astimezone(timezone).replace(microsecond=0).isoformat()
@@ -637,6 +868,7 @@ def _canonical_occurrence(
         "next_refresh_at": next_refresh_at,
         "trigger_class": _occurrence_trigger_class(item, release_status),
         "lineage": _full_lineage(item),
+        "source_evidence": [_source_evidence(item)],
     }
     lifecycle_classification = classify_occurrence_lifecycle(
         {
@@ -887,6 +1119,76 @@ def _full_lineage(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _source_evidence(item: dict[str, Any]) -> dict[str, Any]:
+    enrichment = (
+        item.get("enrichment")
+        if isinstance(item.get("enrichment"), dict)
+        else {}
+    )
+    evidence = {
+        "provider": item.get("provider") or item.get("source"),
+        "source": item.get("source") or item.get("provider"),
+        "source_url": item.get("source_url")
+        or item.get("canonical_url")
+        or enrichment.get("source_url"),
+        "provider_event_id": item.get("provider_event_id"),
+        "source_event_id": item.get("source_event_id"),
+        "retrieved_at": item.get("retrieved_at")
+        or item.get("retrieved_at_utc")
+        or enrichment.get("retrieved_at"),
+        "timezone": item.get("source_timezone") or item.get("timezone"),
+        "validation": item.get("validation")
+        or enrichment.get("validation")
+        or {},
+        "field_lineage": item.get("field_lineage")
+        or enrichment.get("field_lineage")
+        or {},
+    }
+    evidence["evidence_id"] = hashlib.sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return evidence
+
+
+def _technical_occurrence_key(item: dict[str, Any]) -> str:
+    source_evidence = list(item.get("source_evidence") or [])
+    evidence = source_evidence[0] if source_evidence else {}
+    identity = {
+        "occurrence_id": item.get("occurrence_id"),
+        "provider": evidence.get("provider") or item.get("provider"),
+        "provider_event_id": evidence.get("provider_event_id")
+        or item.get("provider_event_id"),
+        "source_event_id": evidence.get("source_event_id")
+        or item.get("source_event_id"),
+        "source_url": evidence.get("source_url") or item.get("source_url"),
+        "scheduled_at": item.get("scheduled_at"),
+        "reference_period": item.get("reference_period"),
+        "title": item.get("title"),
+        "actual": item.get("actual"),
+        "forecast": item.get("forecast"),
+        "previous": item.get("previous"),
+        "release_status": item.get("release_status"),
+        "revision": item.get("revision"),
+        "validation": evidence.get("validation"),
+        "field_lineage": evidence.get("field_lineage"),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _compact_occurrence(item: dict[str, Any]) -> dict[str, Any]:
     return {
         key: item.get(key)
@@ -897,6 +1199,11 @@ def _compact_occurrence(item: dict[str, Any]) -> dict[str, Any]:
             "title",
             "country",
             "currency",
+            "provider",
+            "provider_event_id",
+            "source_event_id",
+            "reference_period",
+            "frequency",
             "impact",
             "scheduled_at",
             "scheduled_at_utc",
@@ -922,6 +1229,7 @@ def _compact_occurrence(item: dict[str, Any]) -> dict[str, Any]:
             "trigger_class",
             "lifecycle_entity_type",
             "outcome_contract",
+            "source_evidence",
         )
     }
 
@@ -942,119 +1250,6 @@ def _compact_events_size(items: list[dict[str, Any]]) -> int:
             default=str,
         ).encode("utf-8")
     )
-
-
-def _retain_bucket_aware(
-    items: list[dict[str, Any]],
-    *,
-    limit: int,
-) -> list[dict[str, Any]]:
-    if len(items) <= limit:
-        return list(items)
-    selected: list[dict[str, Any]] = []
-    selected_ids: set[str] = set()
-    for bucket_name in WEEK_BUCKETS:
-        bucket = [
-            item for item in items if item.get("week_bucket") == bucket_name
-        ]
-        if not bucket or len(selected) >= limit:
-            continue
-        winner = min(bucket, key=_bucket_quota_priority)
-        selected.append(winner)
-        selected_ids.add(str(winner.get("occurrence_id") or ""))
-    for item in sorted(items, key=_retention_priority):
-        identity = str(item.get("occurrence_id") or "")
-        if identity in selected_ids:
-            continue
-        if len(selected) >= limit:
-            break
-        selected.append(item)
-        selected_ids.add(identity)
-    return sorted(selected, key=_event_sort_key)
-
-
-def _retention_priority(item: dict[str, Any]) -> tuple[int, int, int, str, str]:
-    bucket = str(item.get("week_bucket") or "")
-    status = str(item.get("release_status") or "")
-    actual_priority = (
-        0
-        if bucket == "PREVIOUS_WEEK"
-        and (
-            item.get("actual") not in (None, "")
-            or status in {"PUBLISHED", "REVISED"}
-        )
-        else 1
-    )
-    current_priority = (
-        0
-        if bucket == "CURRENT_WEEK"
-        and (bool(item.get("is_today")) or status == "AWAITING_ACTUAL")
-        else 1
-    )
-    next_priority = (
-        0
-        if bucket == "NEXT_WEEK"
-        and str(item.get("impact") or "").upper() == "HIGH"
-        else 1
-    )
-    semantic_priority = min(actual_priority, current_priority, next_priority)
-    impact = -_IMPACT_ORDER.get(str(item.get("impact") or "UNKNOWN"), 0)
-    return (
-        impact,
-        semantic_priority,
-        WEEK_BUCKETS.index(bucket) if bucket in WEEK_BUCKETS else 99,
-        str(item.get("scheduled_at") or "9999-12-31"),
-        str(item.get("occurrence_id") or ""),
-    )
-
-
-def _bucket_quota_priority(
-    item: dict[str, Any],
-) -> tuple[int, int, str, str]:
-    bucket = str(item.get("week_bucket") or "")
-    status = str(item.get("release_status") or "")
-    if bucket == "PREVIOUS_WEEK":
-        semantic = int(
-            not (
-                item.get("actual") not in (None, "")
-                or status in {"PUBLISHED", "REVISED"}
-            )
-        )
-    elif bucket == "CURRENT_WEEK":
-        semantic = int(
-            not (
-                bool(item.get("is_today"))
-                or status == "AWAITING_ACTUAL"
-            )
-        )
-    elif bucket == "NEXT_WEEK":
-        semantic = int(
-            str(item.get("impact") or "").upper() != "HIGH"
-        )
-    else:
-        semantic = 1
-    return (
-        semantic,
-        -_IMPACT_ORDER.get(str(item.get("impact") or "UNKNOWN"), 0),
-        str(item.get("scheduled_at") or "9999-12-31"),
-        str(item.get("occurrence_id") or ""),
-    )
-
-
-def _drop_lowest_retention_priority(
-    retained: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if not retained:
-        return []
-    worst = max(retained, key=_retention_priority)
-    removed = False
-    output: list[dict[str, Any]] = []
-    for item in retained:
-        if not removed and item is worst:
-            removed = True
-            continue
-        output.append(item)
-    return output
 
 
 def _removal_confirmations(
@@ -1121,6 +1316,17 @@ def _merge_occurrences(
     if output.get("actual") is None and candidate.get("actual") is not None:
         output["actual"] = candidate["actual"]
         output["release_status"] = candidate["release_status"]
+    evidence = {
+        str(item.get("evidence_id")): item
+        for item in [
+            *list(primary.get("source_evidence") or []),
+            *list(candidate.get("source_evidence") or []),
+        ]
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    output["source_evidence"] = [
+        evidence[key] for key in sorted(evidence)
+    ]
     return output
 
 

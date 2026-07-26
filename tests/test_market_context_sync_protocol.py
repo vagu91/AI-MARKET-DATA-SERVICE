@@ -730,7 +730,13 @@ def test_calendar_retains_every_event_and_counts_match(tmp_path: Path) -> None:
         window[name]["event_count"]
         for name in ("previous_week", "current_week", "next_week")
     )
-    assert window["coverage"]["status"] == "COMPLETE"
+    assert window["coverage"]["status"] == "PARTIAL"
+    assert (
+        window["coverage"]["by_bucket"]["PREVIOUS_WEEK"][
+            "source_coverage_status"
+        ]
+        == "UNVERIFIED_EMPTY"
+    )
     assert window["coverage"]["omitted_count"] == 0
     assert window["counts"]["total"] == window["coverage"]["retained_count"]
     assert window["counts"]["total"] == bucket_counts == bucket_events

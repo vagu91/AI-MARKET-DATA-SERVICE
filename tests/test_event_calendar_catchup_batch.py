@@ -420,9 +420,9 @@ def test_new_high_impact_future_event_creates_one_schedule_outbox(
     tmp_path: Path,
 ) -> None:
     settings = cfg(tmp_path, event_calendar_catchup_enabled=False)
-    baseline = occurrence("event:baseline", NOW + timedelta(days=1))
+    baseline = occurrence("event:baseline", NOW + timedelta(days=3))
     seed_baseline(settings, [baseline])
-    added = occurrence("event:new-high", NOW + timedelta(days=2))
+    added = occurrence("event:new-high", NOW + timedelta(days=4))
 
     saved = MarketContextSnapshotRepository(settings).save_next(
         symbol="MNQ",
@@ -454,7 +454,7 @@ def test_new_high_impact_future_event_creates_one_schedule_outbox(
     ]
     assert saved["consumer_payload"]["event_calendar_window"]["coverage"][
         "status"
-    ] == "COMPLETE"
+    ] == "PARTIAL"
 
 
 @pytest.mark.parametrize(
@@ -463,7 +463,7 @@ def test_new_high_impact_future_event_creates_one_schedule_outbox(
         ({"release_status": "CANCELLED"}, "event_cancelled"),
         ({"release_status": "POSTPONED"}, "event_postponed"),
         (
-            {"release_at": (NOW + timedelta(days=2, hours=1)).isoformat()},
+            {"release_at": (NOW + timedelta(days=3, hours=1)).isoformat()},
             "event_time_changed",
         ),
     ],
@@ -474,7 +474,7 @@ def test_schedule_state_changes_are_detected_end_to_end(
     expected_trigger: str,
 ) -> None:
     settings = cfg(tmp_path, event_calendar_catchup_enabled=False)
-    baseline = occurrence("event:changed", NOW + timedelta(days=2))
+    baseline = occurrence("event:changed", NOW + timedelta(days=3))
     seed_baseline(settings, [baseline])
     updated = {**baseline, **mutation}
 

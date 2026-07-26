@@ -63,6 +63,12 @@ async def run_startup_lifecycle_catchup(
             items,
             execution_context=execution_context,
         ),
+        schedule_acquire=(
+            state["event_service"].list_events
+            if scheduler.settings.event_calendar_catchup_enabled
+            and state.get("event_service") is not None
+            else None
+        ),
         execution_context=execution_context,
     )
 

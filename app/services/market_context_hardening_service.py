@@ -84,11 +84,18 @@ def harden_market_context(
         output.get("event_calendar") or {},
         now=now,
     )
-    output["event_calendar_window"] = build_event_calendar_window(
-        output,
-        settings=settings,
-        now=now,
-    )
+    existing_window = output.get("event_calendar_window")
+    if (
+        not _has_calendar_source_rows(output)
+        and _lossless_existing_window(existing_window)
+    ):
+        output["event_calendar_window"] = dict(existing_window)
+    else:
+        output["event_calendar_window"] = build_event_calendar_window(
+            output,
+            settings=settings,
+            now=now,
+        )
     output["events_today"] = [
         _annotate_event(item, now=now)
         for item in output.get("events_today") or []
@@ -198,19 +205,28 @@ def apply_news_semantics(
     coverage = _news_lookback(settings, session_status)
     cutoff = now - timedelta(hours=coverage)
     context_date = str(market_schedule.get("context_date") or now.astimezone(NEW_YORK).date().isoformat())
+    context_day = _date(context_date) or now.astimezone(NEW_YORK).date()
+    current_week_start = context_day - timedelta(days=context_day.weekday())
+    historical_start = current_week_start - timedelta(days=7)
     current_articles: list[dict[str, Any]] = []
     historical_articles: list[dict[str, Any]] = []
     filtered_out = 0
     for article in articles:
         published = parse_datetime(article.get("published_at"))
-        if published is None or _aware(published) < cutoff:
+        if published is None:
             filtered_out += 1
             continue
-        if _aware(published).astimezone(NEW_YORK).date().isoformat() != context_date:
+        published_local_date = _aware(published).astimezone(NEW_YORK).date()
+        if published_local_date == context_day:
+            if _aware(published) < cutoff:
+                filtered_out += 1
+                continue
+            current_articles.append(article)
+            continue
+        if historical_start <= published_local_date < context_day:
             historical_articles.append(article)
-            filtered_out += 1
             continue
-        current_articles.append(article)
+        filtered_out += 1
     articles = current_articles
     accepted_count = len(articles)
     rejected_count = min(candidate_count, pipeline_rejected_count + filtered_out)
@@ -260,6 +276,9 @@ def apply_news_semantics(
             "provider_failure_count": provider_failure_count,
             "candidate_article_count": candidate_count,
             "accepted_article_count": accepted_count,
+            "delivered_raw_article_count": (
+                len(articles) + len(historical_articles)
+            ),
             "rejected_article_count": rejected_count,
             "reason": reason,
             "articles": articles,
@@ -267,6 +286,11 @@ def apply_news_semantics(
             "historical_articles": historical_articles,
             "historical_article_count": len(historical_articles),
             "historical_context_available": bool(historical_articles),
+            "historical_coverage_status": _historical_news_coverage_status(
+                output,
+                historical_articles=historical_articles,
+                provider_failure_count=provider_failure_count,
+            ),
             "confidence": float((output.get("digest") or {}).get("confidence") or output.get("confidence") or 0.0),
             "last_known_good_used": bool(output.get("last_known_good_used") and articles),
             "last_known_good_age_hours": lkg_age,
@@ -276,11 +300,25 @@ def apply_news_semantics(
         }
     )
     accepted_ids = {item.get("article_id") for item in articles}
-    if accepted_ids:
+    historical_ids = {
+        item.get("article_id") for item in historical_articles
+    }
+    delivered_ids = accepted_ids | historical_ids
+    output["directly_relevant"] = [
+        item
+        for item in output.get("directly_relevant") or []
+        if item.get("article_id") in delivered_ids
+    ]
+    output["supporting"] = [
+        item
+        for item in output.get("supporting") or []
+        if item.get("article_id") in delivered_ids
+    ]
+    if delivered_ids:
         output["clusters"] = [
             cluster
             for cluster in output.get("clusters") or []
-            if accepted_ids.intersection(cluster.get("article_ids") or [])
+            if delivered_ids.intersection(cluster.get("article_ids") or [])
         ]
     elif not articles:
         output["clusters"] = []
@@ -293,6 +331,47 @@ def apply_news_semantics(
     elif status == "PIPELINE_ERROR":
         logger.error("news_pipeline_error", extra={"errors": explicit_errors[:3]})
     return output
+
+
+def _historical_news_coverage_status(
+    context: dict[str, Any],
+    *,
+    historical_articles: list[dict[str, Any]],
+    provider_failure_count: int,
+) -> str:
+    explicit = str(
+        context.get("historical_coverage_status")
+        or context.get("historical_source_coverage_status")
+        or ""
+    ).upper()
+    aliases = {
+        "COMPLETE": "VERIFIED_COMPLETE",
+        "COVERED": "VERIFIED_COMPLETE",
+        "TIMEOUT": "PROVIDER_UNAVAILABLE",
+        "UNAVAILABLE": "PROVIDER_UNAVAILABLE",
+    }
+    explicit = aliases.get(explicit, explicit)
+    if explicit in {
+        "VERIFIED_COMPLETE",
+        "PARTIAL",
+        "UNVERIFIED_EMPTY",
+        "PROVIDER_UNAVAILABLE",
+        "QUARANTINED",
+    }:
+        return explicit
+    if provider_failure_count:
+        return "PROVIDER_UNAVAILABLE"
+    if historical_articles:
+        return (
+            "VERIFIED_COMPLETE"
+            if context.get("historical_search_completed") is True
+            else "PARTIAL"
+        )
+    return (
+        "VERIFIED_COMPLETE"
+        if context.get("historical_search_completed") is True
+        else "UNVERIFIED_EMPTY"
+    )
 
 
 def events_today_context(
@@ -361,7 +440,9 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
     section_status = {
         "macro_snapshot": _section_status(_macro_available(full.get("macro_snapshot") or {})),
         "event_risk": _event_section_status(events_today),
-        "market_schedule": _section_status(bool(full.get("market_schedule"))),
+        "market_schedule": _market_schedule_readiness_status(
+            full.get("market_schedule") or {}
+        ),
         "risk_context": _section_status(_risk_available(full.get("risk_context") or {})),
         "nasdaq_context": _section_status(_nasdaq_available(full.get("nasdaq_context") or {})),
         "news_context": "NO_DATA_EXPECTED" if news_status == "MARKET_CLOSED_NO_FRESH_NEWS" else news_status,
@@ -378,9 +459,9 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
     missing_optional: list[str] = []
 
     for key in ("macro_snapshot", "event_risk", "market_schedule", "risk_context", "nasdaq_context"):
-        if section_status[key] in {"NOT_AVAILABLE", "PIPELINE_ERROR"}:
+        if section_status[key] != "AVAILABLE":
             blocking.append(f"{key}_missing")
-            if section_status[key] == "PIPELINE_ERROR":
+            if section_status[key] in {"PIPELINE_ERROR", "QUARANTINED"}:
                 critical_errors.append(f"{key}_pipeline_error")
 
     if is_market_closed(session_status):
@@ -667,6 +748,58 @@ def _temporal_projection_changed(
         str(item.get("temporal_status") or item.get("status") or "").upper()
         != str(temporal_event_state(item, now=now)["temporal_status"]).upper()
         for item in rows
+    )
+
+
+def _has_calendar_source_rows(full: dict[str, Any]) -> bool:
+    calendar = (
+        full.get("event_calendar")
+        if isinstance(full.get("event_calendar"), dict)
+        else {}
+    )
+    return any(
+        calendar.get(section)
+        for section in (
+            "critical_macro_events",
+            "fed_communications",
+            "other_economic_events",
+            "scheduled_regulatory_events",
+            "scheduled_geopolitical_events",
+        )
+    ) or any(
+        full.get(section)
+        for section in (
+            "events_today",
+            "next_24h_events",
+            "next_7d_critical_events",
+            "recently_released_events",
+            "upcoming_high_impact_events",
+        )
+    )
+
+
+def _lossless_existing_window(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    coverage = (
+        value.get("coverage")
+        if isinstance(value.get("coverage"), dict)
+        else {}
+    )
+    return bool(
+        coverage
+        and coverage.get("size_limit_applied") is False
+        and int(coverage.get("omitted_for_size_count") or 0) == 0
+        and int(coverage.get("omitted_for_count_count") or 0) == 0
+        and int(coverage.get("omitted_count") or 0) == 0
+        and all(
+            isinstance((value.get(bucket) or {}).get("events"), list)
+            for bucket in (
+                "previous_week",
+                "current_week",
+                "next_week",
+            )
+        )
     )
 
 
@@ -1283,6 +1416,26 @@ def _section_status(available: bool) -> str:
     return "AVAILABLE" if available else "NOT_AVAILABLE"
 
 
+def _market_schedule_readiness_status(schedule: dict[str, Any]) -> str:
+    status = str(schedule.get("status") or "").upper()
+    validation = str(
+        (schedule.get("validation") or {}).get("status") or ""
+    ).upper()
+    if status == "AVAILABLE" and validation in {"", "ACCEPTED"}:
+        return "AVAILABLE"
+    if status == "PARTIAL" or validation == "PARTIAL":
+        return "PARTIAL"
+    if status in {
+        "QUARANTINED",
+        "UNVERIFIED",
+        "UNVERIFIED_EMPTY",
+        "PROVIDER_UNAVAILABLE",
+        "STALE",
+    }:
+        return status
+    return "NOT_AVAILABLE"
+
+
 def _optional_status(block: dict[str, Any]) -> str:
     status = str(block.get("status") or "").upper()
     if status in {"FOUND", "AVAILABLE", "COMPLETE"}:
@@ -1411,12 +1564,34 @@ def _deduplicate_articles(articles: list[Any]) -> list[dict[str, Any]]:
     for raw in articles:
         if not isinstance(raw, dict):
             continue
-        key = str(
-            raw.get("article_id")
-            or raw.get("news_key")
-            or raw.get("canonical_url")
-            or raw.get("source_url")
-            or f"{raw.get('title')}:{raw.get('published_at')}"
+        stable_id = raw.get("article_id") or raw.get("news_key")
+        key = (
+            json.dumps(
+                {
+                    "provider": raw.get("provider"),
+                    "source": raw.get("source"),
+                    "stable_id": stable_id,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            if stable_id not in (None, "")
+            else json.dumps(
+                {
+                    "provider": raw.get("provider"),
+                    "source": raw.get("source"),
+                    "source_url": raw.get("source_url"),
+                    "canonical_url": raw.get("canonical_url"),
+                    "published_at": raw.get("published_at"),
+                    "headline": raw.get("headline") or raw.get("title"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
         )
         if key in seen:
             continue
