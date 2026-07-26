@@ -104,16 +104,14 @@ def replay() -> dict[str, Any]:
         source_policy_path=ROOT / "config" / "source_policy.json",
         ai_job_workspace_root=Path(tempfile.gettempdir()) / "provider-force-jobs",
     )
-    original_enforcer = consumer_service._enforce_payload_limit
-    consumer_service._enforce_payload_limit = lambda value, limit=90_000: None
-    try:
-        before = consumer_service.build_ai_trader_consumer_v2(
-            debug,
-            settings=settings,
-        )
-    finally:
-        consumer_service._enforce_payload_limit = original_enforcer
-    after = consumer_service.build_ai_trader_consumer_v2(debug, settings=settings)
+    before = consumer_service.build_ai_trader_consumer_v2(
+        debug,
+        settings=settings,
+    )
+    after = consumer_service.build_ai_trader_consumer_v2(
+        debug,
+        settings=settings,
+    )
     repeated = consumer_service.build_ai_trader_consumer_v2(debug, settings=settings)
     context = ExecutionContext.provider_only(
         correlation_id="offline-provider-force-replay",
@@ -156,15 +154,28 @@ def replay() -> dict[str, Any]:
         },
         "after_size_bytes": consumer_service._payload_size(after),
         "after_section_sizes": {
-            key: value["after_bytes"]
-            for key, value in after["compaction"]["sections"].items()
+            key: len(
+                json.dumps(
+                    value,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+            for key, value in after.items()
         },
+        "size_limit_applied": after["payload_measurement"][
+            "size_limit_applied"
+        ],
+        "records_removed_for_size": after["payload_measurement"][
+            "records_removed_for_size"
+        ],
         "provider_only_ai_jobs": len(jobs),
         "database_counts": counts,
         "snapshot_id": stored["snapshot_id"],
         "weekend_preserved": after["market_session_status"] == "weekend",
         "deterministic_output": after == repeated,
         "raw_contracts_absent": "raw_contracts" not in encoded,
+        "compacted_item_count_absent": "compacted_item_count" not in encoded,
         "secrets_absent": all(
             marker not in encoded.lower()
             for marker in ("authorization", "api_key", "bearer ", "account_id")

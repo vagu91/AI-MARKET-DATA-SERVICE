@@ -496,13 +496,13 @@ def test_consumer_with_fmp_earnings_and_xtb_calendar_stays_under_90kb() -> None:
     assert len(json.dumps(consumer, separators=(",", ":"), default=str).encode()) < 90_000
 
 
-def test_consumer_v2_limits_holdings_to_twenty() -> None:
+def test_consumer_v2_preserves_all_holdings() -> None:
     full = minimal_full()
     full["nasdaq_context"]["qqq_holdings"]["holdings"] = [
         {"symbol": f"S{i}", "weight": 1.0} for i in range(103)
     ]
     consumer = build_ai_trader_consumer_v2(full, settings=Settings(_env_file=None))
-    assert len(consumer["nasdaq"]["top_20_holdings"]) == 20
+    assert len(consumer["nasdaq"]["top_20_holdings"]) == 103
     assert "holdings" not in consumer["nasdaq"]
 
 

@@ -286,9 +286,9 @@ def test_deterministic_ordering_deduplication_limits_and_coverage(
     )
 
     ids = [item["occurrence_id"] for item in all_events(window)]
-    assert ids == ["high", "medium", "later"]
-    assert window["coverage"]["status"] == "TRUNCATED"
-    assert window["coverage"]["overflow_count"] == 1
+    assert ids == ["high", "medium", "dup", "later"]
+    assert window["coverage"]["status"] == "COMPLETE"
+    assert window["coverage"]["overflow_count"] == 0
     assert window["telemetry"]["duplicate_occurrence_count"] == 1
 
 
@@ -395,7 +395,7 @@ def test_consumer_21_projection_is_compact_complete_and_under_90kb(
         "coverage",
     }
     assert window["current_week"]["events"][0]["forecast"] == "2.7"
-    assert "lineage" not in window["current_week"]["events"][0]
+    assert window["current_week"]["events"][0]["lineage"]
     assert (
         len(
             json.dumps(
@@ -449,13 +449,10 @@ def test_large_calendar_reports_true_overflow_without_hidden_compaction(
 
     assert visible == window["coverage"]["retained_count"]
     assert window["coverage"]["candidate_count"] == 100
-    assert window["coverage"]["overflow_count"] == 100 - visible
-    assert window["coverage"]["status"] == "TRUNCATED"
-    assert (
-        window["coverage"]["consumer_event_bytes"]
-        <= window["coverage"]["consumer_event_bytes_limit"]
-    )
-    assert len(json.dumps(consumer).encode("utf-8")) < 90_000
+    assert window["coverage"]["overflow_count"] == 0
+    assert window["coverage"]["status"] == "COMPLETE"
+    assert window["coverage"]["size_limit_applied"] is False
+    assert visible == 100
 
 
 def test_compact_projection_preserves_nulls_and_drops_debug_audit(
@@ -471,8 +468,8 @@ def test_compact_projection_preserves_nulls_and_drops_debug_audit(
     item = consumer["next_week"]["events"][0]
     assert item["actual"] is None
     assert item["forecast"] is None
-    assert "lineage" not in item
-    assert "audit" not in consumer
+    assert item["lineage"]
+    assert "audit" in consumer
 
 
 @pytest.mark.parametrize(
@@ -629,7 +626,8 @@ def test_nasdaq_holiday_is_named_and_macro_calendar_remains_independent() -> Non
     assert cash["status"] == "holiday"
     assert cash["closed_reason"] == "HOLIDAY"
     assert cash["holiday_name"] == "Independence Day observed"
-    assert schedule["status"] == "AVAILABLE"
+    assert schedule["status"] == "UNAVAILABLE"
+    assert schedule["session_state_verified"] is False
 
 
 def test_early_close_is_explicit_and_not_a_full_holiday() -> None:

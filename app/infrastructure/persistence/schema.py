@@ -1258,6 +1258,121 @@ ALTER TABLE research_gap_items
   ADD COLUMN field_states_json TEXT NOT NULL DEFAULT '{}';
 """
 
+MARKET_CONTEXT_SYNC_SCHEMA = """
+CREATE TABLE IF NOT EXISTS market_context_sync_sections (
+  symbol TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  snapshot_revision INTEGER NOT NULL,
+  section_name TEXT NOT NULL,
+  section_revision INTEGER NOT NULL,
+  fingerprint TEXT NOT NULL,
+  record_count INTEGER NOT NULL,
+  data_as_of TEXT NULL,
+  freshness TEXT NOT NULL,
+  valid_until TEXT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id,section_name),
+  UNIQUE(symbol,snapshot_revision,section_name),
+  FOREIGN KEY(snapshot_id) REFERENCES market_context_snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_context_sync_sections_manifest
+  ON market_context_sync_sections(symbol,snapshot_revision,section_name);
+CREATE INDEX IF NOT EXISTS idx_market_context_sync_sections_revision
+  ON market_context_sync_sections(symbol,section_name,section_revision);
+
+CREATE TABLE IF NOT EXISTS market_context_sync_refresh_work (
+  work_id TEXT PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  refresh_reason TEXT NOT NULL,
+  request_fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL,
+  sections_json TEXT NOT NULL,
+  completed_sections_json TEXT NOT NULL DEFAULT '[]',
+  residual_sections_json TEXT NOT NULL DEFAULT '[]',
+  parent_work_id TEXT NULL,
+  target_snapshot_revision INTEGER NULL,
+  result_snapshot_id TEXT NULL,
+  next_retry_at TEXT NULL,
+  error_json TEXT NULL,
+  lease_owner TEXT NULL,
+  lease_expires_at TEXT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT NULL,
+  UNIQUE(symbol,generation),
+  FOREIGN KEY(parent_work_id) REFERENCES market_context_sync_refresh_work(work_id),
+  FOREIGN KEY(result_snapshot_id) REFERENCES market_context_snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_context_sync_work_active
+  ON market_context_sync_refresh_work(symbol,status,generation);
+
+CREATE TABLE IF NOT EXISTS market_context_sync_waiters (
+  work_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  requested_sections_json TEXT NOT NULL,
+  attached_at TEXT NOT NULL,
+  PRIMARY KEY(work_id,consumer_id,request_id),
+  UNIQUE(consumer_id,request_id),
+  FOREIGN KEY(work_id) REFERENCES market_context_sync_refresh_work(work_id)
+);
+
+CREATE TABLE IF NOT EXISTS market_context_delivery_acks (
+  consumer_id TEXT NOT NULL,
+  delivery_id TEXT NOT NULL,
+  snapshot_revision INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  section_revisions_json TEXT NOT NULL,
+  acknowledged_at TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  payload_fingerprint TEXT NOT NULL,
+  PRIMARY KEY(consumer_id,delivery_id),
+  FOREIGN KEY(delivery_id) REFERENCES market_context_outbox(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS market_context_consumer_state (
+  consumer_id TEXT PRIMARY KEY,
+  last_delivery_created TEXT NULL,
+  last_delivery_notified TEXT NULL,
+  last_delivery_acknowledged TEXT NULL,
+  last_snapshot_revision_acknowledged INTEGER NULL,
+  section_revisions_json TEXT NOT NULL DEFAULT '{}',
+  pending_delivery_count INTEGER NOT NULL DEFAULT 0,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  last_error_json TEXT NULL,
+  gap_detected INTEGER NOT NULL DEFAULT 0,
+  resync_required INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_context_delivery_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  delivery_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  attempted_at TEXT NOT NULL,
+  next_retry_at TEXT NULL,
+  error_json TEXT NULL,
+  UNIQUE(delivery_id,consumer_id,attempt_number),
+  FOREIGN KEY(delivery_id) REFERENCES market_context_outbox(event_id)
+);
+
+ALTER TABLE market_context_outbox ADD COLUMN base_revision INTEGER NULL;
+ALTER TABLE market_context_outbox
+  ADD COLUMN contract_version TEXT NOT NULL DEFAULT '1.0';
+ALTER TABLE market_context_outbox
+  ADD COLUMN triggers_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE market_context_outbox ADD COLUMN manifest_url TEXT NULL;
+ALTER TABLE market_context_outbox ADD COLUMN changes_url TEXT NULL;
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -1280,4 +1395,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("018_invalid_source_quarantine_and_reconciliation", SOURCE_QUARANTINE_SCHEMA),
     ("019_backend_invocation_lifecycle_and_reconciliation_audit", BACKEND_INVOCATION_LIFECYCLE_SCHEMA),
     ("020_event_driven_lifecycle_outbox_telemetry_and_incidents", EVENT_DRIVEN_LIFECYCLE_SCHEMA),
+    ("021_market_context_sync_producer_protocol", MARKET_CONTEXT_SYNC_SCHEMA),
 )

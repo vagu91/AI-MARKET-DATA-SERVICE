@@ -22,7 +22,19 @@ def build_session_aware_schedule(
     now = _aware(now or datetime.now(UTC))
     local = now.astimezone(NEW_YORK)
     existing = dict(schedule or {})
-    holidays = list(existing.get("holidays") or [])
+    all_holidays = list(existing.get("holidays") or [])
+    holidays = [
+        item
+        for item in all_holidays
+        if not (
+            isinstance(item, dict)
+            and str((item.get("validation") or {}).get("status") or "").lower()
+            in {"rejected", "invalid", "quarantined"}
+        )
+    ]
+    quarantined_holidays = [
+        item for item in all_holidays if item not in holidays
+    ]
     holidays_by_date = {
         str(item.get("date")): item
         for item in holidays
@@ -123,9 +135,19 @@ def build_session_aware_schedule(
         None,
     )
     existing_cash = existing.get("nasdaq_cash_session") or {}
-    official_cash = str(existing_cash.get("status") or "").lower() in {"found", "available"} and "nasdaq" in str(
-        f"{existing_cash.get('source') or ''} {existing_cash.get('provider') or ''}"
-    ).lower()
+    official_cash = (
+        str(existing_cash.get("status") or "").lower()
+        in {"found", "available", "weekend", "market_closed", "open"}
+        and "nasdaq"
+        in str(
+            f"{existing_cash.get('source') or ''} "
+            f"{existing_cash.get('provider') or ''}"
+        ).lower()
+        and str(
+            (existing_cash.get("validation") or {}).get("status") or "accepted"
+        ).lower()
+        not in {"rejected", "invalid", "quarantined"}
+    )
     cash_view = {**existing_cash, **cash}
     if official_cash:
         cash_view.update(
@@ -140,7 +162,13 @@ def build_session_aware_schedule(
         )
     return {
         **existing,
-        "status": "AVAILABLE",
+        "status": (
+            "AVAILABLE"
+            if official_cash and futures["session_state_verified"]
+            else "PARTIAL"
+            if official_cash or futures["session_state_verified"]
+            else "UNAVAILABLE"
+        ),
         "context_date": local.date().isoformat(),
         "market_session_status": cash["status"],
         "last_market_session_date": last_session.isoformat(),
@@ -154,6 +182,7 @@ def build_session_aware_schedule(
         },
         "next_holiday": next_holiday,
         "next_early_close": next_early_close,
+        "quarantined_holidays": quarantined_holidays,
         "calendar_source_ranking": [
             "official_cme_calendar",
             "official_cme_globex_calendar",
@@ -164,12 +193,44 @@ def build_session_aware_schedule(
         "schedule_version": SCHEDULE_VERSION,
         "official_document_discovered": official_document_discovered,
         "official_schedule_parsed": official_schedule_parsed,
-        "session_state_verified": bool(futures["session_state_verified"]),
-        "data_origin_is_official": False,
-        "distribution_source_is_official": False,
-        "source_is_primary_originator": False,
+        "session_state_verified": bool(
+            official_cash and futures["session_state_verified"]
+        ),
+        "nasdaq_cash_session_verified": official_cash,
+        "mnq_futures_session_verified": bool(
+            futures["session_state_verified"]
+        ),
+        "data_origin_is_official": bool(
+            official_cash and futures["session_state_verified"]
+        ),
+        "distribution_source_is_official": bool(
+            official_cash and futures["session_state_verified"]
+        ),
+        "source_is_primary_originator": bool(
+            official_cash and futures["session_state_verified"]
+        ),
         "source_is_official_redistributor": False,
-        "source": _schedule_source(existing),
+        "source": (
+            "Nasdaq and CME official schedules"
+            if official_cash and futures["session_state_verified"]
+            else "mixed verified and deterministic session rules"
+            if official_cash or futures["session_state_verified"]
+            else "deterministic unverified fallback"
+        ),
+        "validation": {
+            "status": (
+                "accepted"
+                if official_cash and futures["session_state_verified"]
+                else "partial"
+                if official_cash or futures["session_state_verified"]
+                else "unavailable"
+            ),
+            "reason_code": (
+                None
+                if official_cash and futures["session_state_verified"]
+                else "SESSION_SOURCE_COVERAGE_INCOMPLETE"
+            ),
+        },
         "warnings": _schedule_warnings(
             existing,
             official_cme=bool(futures["session_state_verified"]),

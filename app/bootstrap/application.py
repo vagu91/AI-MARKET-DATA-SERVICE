@@ -50,6 +50,9 @@ from app.services.ai_research_worker import AIResearchWorker
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.research_scheduler_service import ResearchSchedulerService
+from app.services.market_context_sync_refresh_worker import (
+    MarketContextSyncRefreshWorker,
+)
 from app.services.temporal_validation_service import TemporalValidationService
 from app.infrastructure.persistence.database_safety import assert_test_database_isolated
 from app.services.lifecycle_due_resolver import (
@@ -151,6 +154,10 @@ def build_application_state(
         settings,
         deterministic_runtime=deterministic_provider_runtime,
     )
+    market_context_sync_refresh_worker = MarketContextSyncRefreshWorker(
+        settings,
+        deterministic_runtime=deterministic_provider_runtime,
+    )
     official_actual_resolver = DeterministicActualResolver(
         settings,
         providers={
@@ -190,5 +197,6 @@ def build_application_state(
         "market_context_snapshots": market_context_snapshots,
         "ai_research_worker": ai_research_worker,
         "research_scheduler": research_scheduler,
+        "market_context_sync_refresh_worker": market_context_sync_refresh_worker,
         "lifecycle_due_resolver": lifecycle_due_resolver,
     }

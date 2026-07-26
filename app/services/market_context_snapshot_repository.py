@@ -36,6 +36,9 @@ from app.services.event_occurrence_lifecycle_service import (
     classify_occurrence_lifecycle,
 )
 from app.services.observability_contract_service import TelemetryRepository
+from app.services.market_context_sync_service import (
+    persist_sync_sections_in_transaction,
+)
 
 
 _SNAPSHOT_LOCKS: dict[str, threading.RLock] = {}
@@ -304,6 +307,17 @@ class MarketContextSnapshotRepository:
                     "LINKED" if research is not None else "NOT_REQUIRED",
                 ),
             )
+            sync_section_metadata, sync_changed_sections = (
+                persist_sync_sections_in_transaction(
+                    conn,
+                    symbol=symbol,
+                    snapshot_id=snapshot_id,
+                    snapshot_revision=revision,
+                    debug_payload=debug,
+                    data_as_of=data_as_of,
+                    created_at=now,
+                )
+            )
             if trigger_type:
                 outbox_event = self.outbox.emit_in_transaction(
                     conn,
@@ -341,6 +355,11 @@ class MarketContextSnapshotRepository:
                     },
                     reason=trigger_type,
                     trigger_metadata=trigger_metadata,
+                    base_revision=(
+                        int(revision) - 1 if previous is not None else 0
+                    ),
+                    changed_sections_override=sync_changed_sections,
+                    section_metadata=sync_section_metadata,
                 )
             if resolved_lifecycle is not None:
                 persist_lifecycle_in_transaction(
@@ -439,8 +458,6 @@ class MarketContextSnapshotRepository:
             raise ValueError("consumer_contract_invalid")
         if consumer.get("schema_version") != "2.1":
             raise ValueError("consumer_schema_invalid")
-        if len(self._json(consumer).encode("utf-8")) >= 90_000:
-            raise ValueError("consumer_payload_exceeds_90kb")
         if self.source_policy.invalid_sources(
             debug,
             allow_test_reserved=self.allow_test_reserved_sources,

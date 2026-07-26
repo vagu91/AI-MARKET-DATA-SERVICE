@@ -99,7 +99,7 @@ def test_real_bootstrap_runtime_snapshot_consumer_lifecycle_and_outbox(
     assert result["ai_invocations"] == 0
     assert result["outbox_count"] == 1
     assert result["persistence_counts"]["snapshots"] == 1
-    assert result["persistence_counts"]["lifecycle_rows"] == 1
+    assert result["persistence_counts"]["lifecycle_rows"] == 2
     assert result["persistence_counts"]["outbox"] == 1
 
 

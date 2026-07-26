@@ -35,7 +35,6 @@ RELEASE_STATUSES = frozenset(
     }
 )
 _IMPACT_ORDER = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
-_CONSUMER_EVENT_BYTES_LIMIT = 17_000
 _NULL_MARKERS = frozenset({"", "-", "--", "N/A", "NA", "NONE", "NULL"})
 _SCHEDULED_CALENDAR_SECTIONS = (
     "critical_macro_events",
@@ -102,32 +101,10 @@ def build_event_calendar_window(
         duplicate_occurrences.append(occurrence_id)
         selected[occurrence_id] = _merge_occurrences(current, occurrence)
 
-    impact_floor = str(settings.event_calendar_consumer_min_impact or "LOW").upper()
-    minimum_impact = _IMPACT_ORDER.get(impact_floor, 1)
-    candidates = [
-        item
-        for item in selected.values()
-        if _IMPACT_ORDER.get(str(item.get("impact") or "UNKNOWN"), 0)
-        >= minimum_impact
-    ]
+    impact_floor = "UNKNOWN"
+    candidates = list(selected.values())
     candidates.sort(key=_event_sort_key)
-    configured_limit = max(int(settings.event_calendar_consumer_max_events), 1)
-    retained = _retain_bucket_aware(candidates, limit=configured_limit)
-    nonempty_candidate_buckets = {
-        str(item["week_bucket"]) for item in candidates
-    }
-    minimum_bucket_coverage_possible = True
-    while (
-        len(retained) > len(nonempty_candidate_buckets)
-        and _compact_events_size(retained) > _CONSUMER_EVENT_BYTES_LIMIT
-    ):
-        retained = _retain_bucket_aware(
-            candidates,
-            limit=len(retained) - 1,
-        )
-    while retained and _compact_events_size(retained) > _CONSUMER_EVENT_BYTES_LIMIT:
-        minimum_bucket_coverage_possible = False
-        retained = _drop_lowest_retention_priority(retained)
+    retained = candidates
     retained_event_bytes = _compact_events_size(retained)
     retained_ids = {str(item["occurrence_id"]) for item in retained}
     overflow_count = max(len(candidates) - len(retained), 0)
@@ -170,21 +147,25 @@ def build_event_calendar_window(
     revised_count = sum(
         item["release_status"] == "REVISED" for item in retained
     )
-    coverage_status = (
-        "COMPLETE"
-        if overflow_count == 0
-        else "TRUNCATED"
-        if minimum_bucket_coverage_possible
-        else "DEGRADED"
-    )
+    coverage_status = "COMPLETE"
     bucket_coverage = {
         bucket_name: {
             "candidate_count": buckets[bucket_name]["candidate_count"],
             "retained_count": buckets[bucket_name]["retained_count"],
             "omitted_count": buckets[bucket_name]["omitted_count"],
+            "source_coverage_status": (
+                "COVERED"
+                if buckets[bucket_name]["candidate_count"]
+                else "UNVERIFIED_EMPTY"
+            ),
         }
         for bucket_name in WEEK_BUCKETS
     }
+    missing_source_coverage_buckets = [
+        bucket_name
+        for bucket_name, details in bucket_coverage.items()
+        if details["source_coverage_status"] == "UNVERIFIED_EMPTY"
+    ]
     result = {
         "timezone": timezone_name,
         "generated_at": now_utc.replace(microsecond=0).isoformat(),
@@ -205,22 +186,23 @@ def build_event_calendar_window(
             "omitted_count": overflow_count,
             "overflow_count": overflow_count,
             "by_bucket": bucket_coverage,
+            "source_coverage_status": (
+                "COMPLETE"
+                if not missing_source_coverage_buckets
+                else "PARTIAL"
+            ),
+            "missing_source_coverage_buckets": (
+                missing_source_coverage_buckets
+            ),
             "minimum_per_nonempty_bucket_preserved": all(
                 not details["candidate_count"] or details["retained_count"] >= 1
                 for details in bucket_coverage.values()
             ),
-            "truncation_reason": (
-                None
-                if overflow_count == 0
-                else "configured_event_limit_or_byte_budget"
-                if minimum_bucket_coverage_possible
-                else "byte_budget_insufficient_for_nonempty_bucket_minimum"
-            ),
+            "truncation_reason": None,
             "outside_window_count": outside_window_count,
             "minimum_impact": impact_floor,
-            "deterministic_limit": configured_limit,
             "consumer_event_bytes": retained_event_bytes,
-            "consumer_event_bytes_limit": _CONSUMER_EVENT_BYTES_LIMIT,
+            "size_limit_applied": False,
         },
         "telemetry": {
             "events_by_bucket": bucket_counts,
@@ -284,37 +266,9 @@ def build_event_calendar_window(
 
 
 def compact_event_calendar_window(window: dict[str, Any]) -> dict[str, Any]:
-    """Remove debug-only lineage while preserving semantic nulls and coverage."""
+    """Compatibility projection that preserves the complete calendar."""
 
-    output = {
-        key: window.get(key)
-        for key in (
-            "timezone",
-            "generated_at",
-            "window_start",
-            "window_end",
-            "counts",
-            "coverage",
-            "telemetry",
-            "removals",
-        )
-    }
-    for key in ("previous_week", "current_week", "next_week"):
-        raw_bucket = window.get(key) if isinstance(window.get(key), dict) else {}
-        output[key] = {
-            "start": raw_bucket.get("start"),
-            "end": raw_bucket.get("end"),
-            "event_count": int(raw_bucket.get("event_count") or 0),
-            "candidate_count": int(raw_bucket.get("candidate_count") or 0),
-            "retained_count": int(raw_bucket.get("retained_count") or 0),
-            "omitted_count": int(raw_bucket.get("omitted_count") or 0),
-            "events": [
-                _compact_occurrence(item)
-                for item in raw_bucket.get("events") or []
-                if isinstance(item, dict)
-            ],
-        }
-    return output
+    return json.loads(json.dumps(window, ensure_ascii=False, default=str))
 
 
 def classify_event_change(

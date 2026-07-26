@@ -235,19 +235,21 @@ def test_equal_url_is_deduplicated():
     assert context["diagnostics"]["duplicate_count"] == 1
 
 
-def test_equal_normalized_title_and_publisher_is_deduplicated():
+def test_equal_normalized_title_and_publisher_remain_distinct_records():
     rows = [article("Nvidia faces export controls", url="https://one.test/a"), article("NVIDIA faces export controls!", url="https://two.test/a")]
     context = build_news_context(rows, now=NOW)
-    assert context["diagnostics"]["duplicate_count"] == 1
+    assert context["diagnostics"]["duplicate_count"] == 0
+    assert len(context["latest"]) == 2
 
 
-def test_reuters_through_two_aggregators_is_one_independent_source():
+def test_reuters_through_two_aggregators_preserves_both_records():
     rows = [
         article("Nvidia faces export controls", source="Reuters", url="https://finance.yahoo.com/news/a"),
         article("Nvidia faces export controls", source="Reuters", url="https://msn.com/news/a"),
     ]
     context = build_news_context(rows, now=NOW)
-    assert context["diagnostics"]["duplicate_count"] == 1
+    assert context["diagnostics"]["duplicate_count"] == 0
+    assert len(context["latest"]) == 2
     assert context["latest"][0]["independent_source_count"] == 1
 
 

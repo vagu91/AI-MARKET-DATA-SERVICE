@@ -451,9 +451,14 @@ def test_no_data_without_claims_does_not_create_snapshot(tmp_path: Path) -> None
 
 def test_offline_replay_reconstructs_overflow_and_closes_regression() -> None:
     result = replay()
-    assert result["reconstructed_before_size_bytes"] > 90_000
-    assert result["after_size_bytes"] < 90_000
+    assert (
+        result["reconstructed_before_size_bytes"]
+        == result["after_size_bytes"]
+    )
     assert result["after_section_sizes"]
+    assert result["size_limit_applied"] is False
+    assert result["records_removed_for_size"] == 0
+    assert result["compacted_item_count_absent"] is True
     assert result["provider_only_ai_jobs"] == 0
     assert result["database_counts"]["ai_research_jobs"] == 0
     assert result["database_counts"]["research_runs"] == 0

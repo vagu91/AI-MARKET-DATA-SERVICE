@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 
 from app.api.deps import (
     get_deterministic_provider_runtime,
@@ -65,6 +65,10 @@ from app.services.market_context_outbox_service import (
 )
 from app.services.research_agent_enablement import safe_research_agent_capabilities
 from app.services.execution_context import ExecutionContext
+from app.services.market_context_sync_service import (
+    MarketContextSyncService,
+    SyncContractError,
+)
 
 router = APIRouter()
 
@@ -515,6 +519,162 @@ async def market_context_mnq_consumer(
         enrichment_orchestrator=enrichment_orchestrator,
         deterministic_runtime=deterministic_runtime,
     )
+
+
+@router.get("/market-context/mnq/sync/manifest")
+async def market_context_sync_manifest(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _market_context_sync(enrichment_orchestrator).manifest()
+
+
+@router.get("/market-context/mnq/sync/full")
+async def market_context_sync_full(
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _market_context_sync(enrichment_orchestrator).full()
+
+
+@router.post("/market-context/mnq/sync/plan")
+async def market_context_sync_plan(
+    payload: dict[str, object] = Body(...),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).plan(payload)
+    )
+
+
+@router.post("/market-context/mnq/sync/sections")
+async def market_context_sync_sections(
+    payload: dict[str, object] = Body(...),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).sections(
+            consumer_id=str(payload.get("consumer_id") or ""),
+            target_snapshot_revision=int(
+                payload.get("target_snapshot_revision") or 0
+            ),
+            sections=payload.get("sections") or [],
+            include_lineage=bool(payload.get("include_lineage")),
+        )
+    )
+
+
+@router.get("/market-context/mnq/sync/changes")
+async def market_context_sync_changes(
+    since_revision: int = Query(..., ge=1),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).changes(
+            since_revision=since_revision
+        )
+    )
+
+
+@router.post("/market-context/mnq/sync/refresh")
+async def market_context_sync_refresh(
+    response: Response,
+    payload: dict[str, object] = Body(...),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    try:
+        status_code, result = _market_context_sync(
+            enrichment_orchestrator
+        ).request_refresh(payload)
+    except SyncContractError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.code,
+        ) from exc
+    response.status_code = status_code
+    return result
+
+
+@router.get("/market-context/mnq/sync/requests/{work_id}")
+async def market_context_sync_request_status(
+    work_id: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).work_status(
+            work_id
+        )
+    )
+
+
+@router.post("/market-context/mnq/sync/ack")
+async def market_context_sync_ack(
+    payload: dict[str, object] = Body(...),
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).acknowledge(
+            payload
+        )
+    )
+
+
+@router.get("/market-context/mnq/sync/consumers/{consumer_id}")
+async def market_context_sync_consumer_state(
+    consumer_id: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).consumer_state(
+            consumer_id
+        )
+    )
+
+
+@router.get("/market-context/mnq/sync/deliveries/{delivery_id}")
+async def market_context_sync_delivery(
+    delivery_id: str,
+    enrichment_orchestrator: EnrichmentOrchestrator = Depends(
+        get_enrichment_orchestrator
+    ),
+) -> dict[str, object]:
+    return _sync_call(
+        lambda: _market_context_sync(enrichment_orchestrator).notification(
+            delivery_id
+        )
+    )
+
+
+def _market_context_sync(
+    enrichment_orchestrator: EnrichmentOrchestrator,
+) -> MarketContextSyncService:
+    return MarketContextSyncService(enrichment_orchestrator.settings)
+
+
+def _sync_call(operation):
+    try:
+        return operation()
+    except SyncContractError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.code,
+        ) from exc
 
 
 @router.get("/market-context/outbox/events")

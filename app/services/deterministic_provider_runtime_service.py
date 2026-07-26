@@ -230,7 +230,6 @@ class DeterministicProviderRuntimeService:
                 )
         census_items = await self._census_due(contract, telemetry)
         items.extend(census_items)
-        items = _dedupe(items, "occurrence_id")[:20]
         return _section(
             items,
             provider="BLS/BEA/CENSUS",
@@ -406,7 +405,7 @@ class DeterministicProviderRuntimeService:
                 for item in earnings
                 if item.get("symbol")
             )
-        )[:3]
+        )
         news_start = start - timedelta(days=2)
         for symbol in symbols:
             try:
@@ -440,7 +439,7 @@ class DeterministicProviderRuntimeService:
                 warnings=[] if earnings else ["no_earnings_in_window"],
             ),
             "candidate_news_count": len(candidates),
-            "company_news_candidates": candidates[:20],
+            "company_news_candidates": candidates,
             "candidate_news_policy": (
                 "DISCOVERY_ONLY; requires Source Gateway verification, "
                 "deduplication, freshness and materiality before current news"
@@ -630,17 +629,6 @@ def _released_events(contract: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _csv(value: str) -> list[str]:
     return [item.strip().upper() for item in str(value).split(",") if item.strip()]
-
-
-def _dedupe(items: Iterable[dict[str, Any]], key: str) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in items:
-        identity = str(item.get(key) or item)
-        if identity not in seen:
-            seen.add(identity)
-            output.append(item)
-    return output
 
 
 def _latest_time(items: Iterable[dict[str, Any]]) -> Any:

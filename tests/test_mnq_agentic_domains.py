@@ -707,8 +707,8 @@ def test_schema_20_remains_compatible_without_additional_migration(
     cfg = settings(tmp_path)
     first = migrate_database(cfg.database_path)
     second = migrate_database(cfg.database_path)
-    assert len(MIGRATIONS) == 20
-    assert first["schema_version"] == second["schema_version"] == 20
+    assert len(MIGRATIONS) == 21
+    assert first["schema_version"] == second["schema_version"] == 21
     assert second["applied"] == []
 
 
