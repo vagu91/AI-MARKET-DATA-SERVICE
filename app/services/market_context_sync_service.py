@@ -166,7 +166,14 @@ def persist_sync_sections_in_transaction(
     metadata: dict[str, dict[str, Any]] = {}
     changed: list[str] = []
     for section_name in SECTION_NAMES:
-        payload = sections[section_name]
+        raw_payload = sections[section_name]
+        raw_valid_until = _find_temporal_value(
+            raw_payload,
+            ("valid_until", "fresh_until"),
+        )
+        payload, temporal_corrections = _reconcile_temporal_invariants(
+            raw_payload
+        )
         fingerprint = material_fingerprint(payload)
         previous = conn.execute(
             """
@@ -191,10 +198,6 @@ def persist_sync_sections_in_transaction(
             section_revision = int(maximum or 0) + 1
             changed.append(section_name)
         status, reason = section_status(payload)
-        raw_valid_until = _find_temporal_value(
-            payload,
-            ("valid_until", "fresh_until"),
-        )
         section_data_as_of = _find_temporal_value(
             payload,
             (
@@ -220,6 +223,8 @@ def persist_sync_sections_in_transaction(
         raw_expiry = parse_datetime(raw_valid_until)
         floor_value = parse_datetime(temporal_floor)
         temporal_invariant_corrected = bool(
+            temporal_corrections
+            or
             floor_value is not None
             and (raw_expiry is None or raw_expiry < floor_value)
         )
@@ -230,9 +235,7 @@ def persist_sync_sections_in_transaction(
         )
         freshness = section_freshness(
             status=status,
-            valid_until=(
-                None if temporal_invariant_corrected else valid_until
-            ),
+            valid_until=valid_until,
             payload=payload,
             reference=parse_datetime(created_at) or datetime.now(UTC),
         )
@@ -310,6 +313,7 @@ def persist_sync_sections_in_transaction(
                 temporal_invariant_corrected
             ),
             "inherited_valid_until": raw_valid_until,
+            "temporal_correction_count": len(temporal_corrections),
         }
     return metadata, changed
 
@@ -534,6 +538,9 @@ def reconcile_delivered_section(
     elif delivered:
         context["status"] = "AVAILABLE"
         context.pop("reason", None)
+    else:
+        context["status"] = "NO_DATA"
+        context["reason"] = "NO_DELIVERED_ARTICLES"
     context["usable_for_analysis"] = bool(delivered)
     delivered_article_ids = {
         str(item.get("article_id"))
@@ -3012,6 +3019,75 @@ def _find_temporal_value(payload: Any, keys: tuple[str, ...]) -> str | None:
             if parsed is not None:
                 values.append((_aware(parsed), str(raw)))
     return max(values, default=(None, None), key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC))[1]
+
+
+def _reconcile_temporal_invariants(
+    payload: Any,
+) -> tuple[Any, list[dict[str, str]]]:
+    """Correct record-level expiry floors before hashing or delivery."""
+
+    corrections: list[dict[str, str]] = []
+    floor_keys = (
+        "data_as_of",
+        "as_of",
+        "published_at",
+        "event_at",
+        "observed_at",
+        "retrieved_at",
+    )
+    expiry_keys = ("valid_until", "fresh_until")
+
+    def walk(value: Any, path: str) -> Any:
+        if isinstance(value, list):
+            return [
+                walk(item, f"{path}[{index}]")
+                for index, item in enumerate(value)
+            ]
+        if not isinstance(value, dict):
+            return value
+        output = {
+            key: walk(item, f"{path}.{key}")
+            for key, item in value.items()
+        }
+        floor_raw = _find_temporal_value(output, floor_keys)
+        floor = parse_datetime(floor_raw)
+        if floor is None:
+            return output
+        effective_floor = _aware(floor).isoformat()
+        for key in expiry_keys:
+            if key not in output:
+                continue
+            inherited = output.get(key)
+            expiry = parse_datetime(inherited)
+            if expiry is not None and _aware(expiry) >= _aware(floor):
+                continue
+            output[key] = effective_floor
+            corrections.append(
+                {
+                    "path": f"{path}.{key}",
+                    "inherited_value": (
+                        "" if inherited is None else str(inherited)
+                    ),
+                    "effective_value": effective_floor,
+                    "temporal_floor": effective_floor,
+                }
+            )
+        return output
+
+    corrected = walk(payload, "$")
+    if corrections and isinstance(corrected, dict):
+        disclosures = (
+            dict(corrected.get("producer_disclosures") or {})
+            if isinstance(corrected.get("producer_disclosures"), dict)
+            else {}
+        )
+        disclosures["temporal_reconciliation"] = {
+            "status": "CORRECTED",
+            "correction_count": len(corrections),
+            "corrections": corrections,
+        }
+        corrected["producer_disclosures"] = disclosures
+    return corrected, corrections
 
 
 def _find_key_values(value: Any, key: str) -> list[Any]:

@@ -676,11 +676,9 @@ def test_cash_closed_while_futures_open_on_sunday_evening() -> None:
     )
 
     assert schedule["nasdaq_cash_session"]["is_open"] is False
-    assert schedule["mnq_futures_session"]["is_open"] is None
-    assert (
-        schedule["mnq_futures_session"]["closed_reason"]
-        == "UNVERIFIED_SCHEDULE"
-    )
+    assert schedule["mnq_futures_session"]["is_open"] is True
+    assert schedule["mnq_futures_session"]["session_reason"] == "GLOBEX_OPEN"
+    assert schedule["mnq_futures_session"]["closed_reason"] is None
 
 
 def test_futures_maintenance_break_is_distinct_from_cash_close() -> None:

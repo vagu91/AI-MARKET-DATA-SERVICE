@@ -229,6 +229,7 @@ def test_unavailable_cme_calendar_is_unknown_on_holiday_sensitive_date() -> None
     mnq = schedule["mnq_futures_session"]
     assert mnq["status"] == "unknown"
     assert mnq["is_open"] is None
+    assert mnq["session_reason"] == "UNVERIFIED_HOLIDAY_SCHEDULE"
     assert mnq["closed_reason"] == "UNVERIFIED_HOLIDAY_SCHEDULE"
     assert mnq["session_state_verified"] is False
     assert mnq["data_origin_is_official"] is False

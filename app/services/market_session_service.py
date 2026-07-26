@@ -408,6 +408,9 @@ def _futures_session(
                 if calculated_status == "weekend"
                 else "MAINTENANCE_BREAK"
             )
+        elif calculated_status == "open":
+            is_open = True
+            closed_reason = None
         else:
             is_open = None
             closed_reason = (
@@ -450,6 +453,11 @@ def _futures_session(
         "calculated_status": calculated_status,
         "is_open": is_open,
         "closed_reason": closed_reason,
+        "session_reason": (
+            "GLOBEX_OPEN"
+            if is_open is True and calculated_status == "open"
+            else closed_reason
+        ),
         "holiday_name": holiday_name,
         "is_early_close": is_early_close,
         "market": "CME equity index futures",
@@ -480,7 +488,7 @@ def _futures_session(
             "OFFICIAL_HOLIDAY_OVERRIDE"
             if schedule_verified
             else "BASE_WEEKLY_RULE"
-            if calculated_status in {"weekend", "maintenance_break"}
+            if calculated_status in {"weekend", "maintenance_break", "open"}
             else "BASE_WEEKLY_RULE_WITH_UNVERIFIED_OVERRIDE"
         ),
         "holiday_override_status": (

@@ -1,8 +1,11 @@
-# Snapshot 92 live-blocker forensic closure
+# Snapshot 92 live-blocker forensic closure and PR #25 adversarial review
 
 Date of source validation: 2026-07-26
 Mode of this closure: redacted fixture and offline replay only
 Database schema: 21, unchanged
+Review branch: `codex/close-snapshot92-live-blockers-20260726`
+Initial review HEAD: `2ebf25df852ffc48ce969370fb779bdb7263c3d5`
+Base: `main@94c8044a03be477d7217a290571aca5a48fec68f`
 
 ## Evidence integrity
 
@@ -17,7 +20,8 @@ artifacts. The two source artifacts had:
 The tracked reproduction is
 `tests/fixtures/snapshot_92_live_blockers_redacted.json`. It contains no
 secrets, personal data, credentials, local paths, operational database content,
-or AI Trader payload.
+or AI Trader payload. Its final SHA-256 is
+`4B8CB1C37AD0AD4D573D81030AB46DF217796818580F99BFEDD6A0850CDED4AB`.
 
 ## Root causes
 
@@ -41,6 +45,31 @@ or AI Trader payload.
    records, causing current rates retrieved on July 26 to inherit a July 13
    expiry.
 
+The adversarial review found six additional contract defects in the first
+version of PR #25:
+
+1. `catch_up_backlog_after` counted only immediately due rows and omitted
+   durable `BACKOFF` rows. A 17-row residual therefore appeared as backlog zero.
+2. `writes` counted only snapshot rematerializations, not lifecycle
+   transitions. One snapshot was reported for 34 lifecycle writes plus one
+   snapshot write.
+3. The real schedule-discovery merge retained omitted occurrences but did not
+   label them `UNCONFIRMED_REMOVAL` or ensure their missing-actual lifecycle
+   remained operational. The earlier projection test injected a pre-corrected
+   comparison and therefore did not exercise this path.
+4. A post-quarantine empty news section could retain an inherited `AVAILABLE`
+   status even though accepted and delivered counts were zero.
+5. An ordinary Globex-open interval became `is_open=null` whenever holiday
+   overrides were unavailable, even though the base weekly rule was
+   deterministic.
+6. Temporal correction was applied to section-manifest metadata after the
+   fingerprint had been computed. Nested delivered records could still violate
+   the invariant and the fingerprint described the uncorrected payload.
+
+The review also found that partial provider resolutions were omitted from
+`actuals_recovered` and `revisions_reconciled`; those counters now include both
+partial and coalesced final resolutions.
+
 ## Before and after
 
 | Stage | Live snapshot 92 before | Offline closure after |
@@ -52,16 +81,18 @@ or AI Trader payload.
 | Next-week snapshot | 25 | 25 |
 | Catch-up status | false `COMPLETED` | `WAITING_BACKOFF` |
 | Catch-up claimed/resolved/residual | 18 / 0 / 18 | 17 redacted / 0 / 17 |
-| Catch-up materialization | 0 writes | 1 atomic snapshot write |
+| Catch-up materialization | 0 writes | 34 lifecycle writes + 1 atomic snapshot write |
 | News candidate/accepted/delivered/rejected | 100 / 4 digest / 0 / inconsistent | 3 / 2 / 2 / 1 redacted |
 | News usability | `true` with quarantined empty payload | `true` only with 2 delivered articles |
 | Cash/MNQ weekend | `UNKNOWN` / `UNKNOWN` | closed `WEEKEND` / closed `WEEKEND` |
 | Rates validity | July 24 datum, July 13 expiry | expiry floored to July 26 retrieval |
 
-The redacted replay intentionally has 17 discovered actual gaps rather than the
-18-row live lifecycle backlog because it reproduces the exact 14+3 schedule
-discovery subset. It proves the fixed-point property without disclosing the
-remaining live row.
+The replay intentionally retains only the redacted 14+3 discovery subset. The
+independent adversarial test starts with 18 lifecycle rows, discovers all 17
+additional rows, and uses `max_per_tick=20`. Tick one reports 35 total backlog,
+claims 20, leaves 15 due plus 20 in backoff, and remains `IN_PROGRESS`. Tick two
+claims the remaining 15 and reports 35 in backoff as `WAITING_BACKOFF`. An early
+third tick performs zero writes and creates no revision.
 
 ## Discovery, resolution, persistence, materialization and delivery
 
@@ -96,6 +127,14 @@ entry in `actual_missing_ids`. Exact-occurrence resolution continues to require
 the semantic metric and exact reference period. No value is invented and no
 AI numeric resolution is permitted.
 
+The adversarial suite also resolves both IDs through the real lifecycle scan.
+It asserts exact reference periods `2026-06` and `2026-Q2`, atomically projects
+the official offline-fixture values, changes release status to `PUBLISHED`,
+removes both IDs from `actual_missing_ids`, rematerializes one coalesced
+resolution snapshot, and proves full/selective section equality. The NO_DATA
+variant retains both rows in current week with complete lineage and durable
+retry timestamps.
+
 ## News provenance and losslessness
 
 `source-policy-v5` admits Investor's Business Daily directly and admits
@@ -108,8 +147,10 @@ with confirmation false and explicit reliability.
 Post-withholding reconciliation derives every count, status, digest and
 usability flag from the same raw delivered set. Technical retry deduplication
 does not remove distinct providers or syndicated records. The replay also
-round-trips 13 distinct raw articles in a canonical payload larger than two
-megabytes without count or byte caps.
+round-trips 13 distinct raw Unicode articles in a 7,023,223-byte canonical
+payload without count or byte caps. A deliberately contradictory empty section
+is normalized to `NO_DATA`/`NO_DATA_AVAILABLE`, zero accepted/delivered records,
+four rejected candidates and `usable_for_analysis=false`.
 
 ## Session and temporal invariants
 
@@ -119,25 +160,59 @@ overrides. On the fixture weekend both sessions expose `is_open=false`,
 `holiday_override_status=UNVERIFIED`. Holiday name and early-close flags remain
 empty, so the timeout does not create official claims.
 
+The base-rule matrix separately checks Saturday, Sunday before Globex open,
+Sunday after open, an ordinary weeknight and the maintenance break. Verified
+holiday, observed-holiday, early-close, provider-timeout, valid LKG and missing
+or expired LKG cases remain covered by the CME and content-closure suites.
+Ordinary open intervals now report `GLOBEX_OPEN`; holiday-sensitive dates still
+report an unverified state instead of inventing an override.
+
 For every sync section:
 
 ```text
 effective valid_until >= max(data_as_of, observed_at, retrieved_at)
 ```
 
-When correction is required, inherited expiry is retained in internal metadata
-for audit, the effective value is clamped to the delivered temporal floor, and
-freshness is derived from delivered records.
+When correction is required, the inherited and effective values plus their
+record paths are disclosed under `producer_disclosures.temporal_reconciliation`.
+The corrected record is persisted before record counting, fingerprinting and
+serialization. Daily, weekly and already-valid mixed records are checked
+through both full and selective delivery.
+
+## Existing coverage independently rechecked
+
+The review did not duplicate cases that already had strong assertions. It
+reran and mapped the following existing coverage:
+
+- cancellation propagation, schedule/lifecycle lease expiry and recovery:
+  `test_event_calendar_forensic_blockers.py`;
+- atomic snapshot/section/outbox rollback and revision consistency:
+  `test_market_context_sync_protocol.py`;
+- payloads above one and five megabytes, Unicode equality, selective/delta
+  losslessness and revision pinning: `test_market_context_sync_protocol.py`;
+- consumer-specific ACK, wrong or partial ACK rejection, retry/dead-letter,
+  single-flight, waiter fan-out and heartbeat:
+  `test_market_context_sync_protocol.py`;
+- official actual provider matching and no-AI fallback:
+  `test_macro_actual_lifecycle_wiring.py`;
+- Reuters/Yahoo distribution policy, IBD, malformed and unknown sources,
+  single-source reliability, syndicated views, historical news and
+  non-destructive clustering: `test_news_intelligence_service.py` plus the
+  snapshot-92 adversarial tests;
+- stale, partial, quarantined and producer-truth readiness:
+  `test_ai_trader_readiness_contract.py`;
+- schema versions 1 through 20 upgraded to 21 and 21 reopened idempotently:
+  `test_event_calendar_catchup_batch.py`.
 
 ## Offline proof
 
 `scripts/replay_snapshot92_live_blockers_offline.py` was executed twice. Both
 outputs were byte-identical with SHA-256:
 
-`411B3EF9E48761DD794B66BE8B21AAA28A65CFCD01D9F5C7F3FD9431E867EB60`.
+`AA42D67C88AE5A4FCE8BD0A078AE236E00DF7A44D0B61DC6F8AF6EDB74056D20`.
 
 The canonical result also embeds the encoding-independent replay digest
-`D94107069B4E37C17B7DCF3CF741AE0245508E5295D4C49FA17235CF97305A25`.
+`E16D622A23379890A75A337C61ACF2E0F4E038F4D3DA4190FE3E16A41C2A2277`.
 
 The replay reports:
 
@@ -148,6 +223,26 @@ The replay reports:
 - 2 admitted news records and 1 quarantined record;
 - cash and MNQ deterministic weekend closure;
 - current monotonic rates validity;
-- a lossless multi-megabyte payload;
+- a lossless 7,023,223-byte Unicode payload;
 - zero live provider calls, AI jobs, AI backend invocations, AI enqueue,
   browser, delivery, trading, and operational database writes.
+
+## Verification ledger
+
+The focused adversarial file contains 13 tests, including six new independent
+tests added during this review. The extended offline groups completed as
+follows:
+
+```text
+snapshot-92 adversarial                         13 passed
+catch-up, cancellation, leases, actuals         54 passed
+sync protocol and readiness                     64 passed
+news, sessions and three-week projection       150 passed
+migration matrix (included above)               22 passed
+complete pytest suite                          1731 passed
+Ruff                                             passed
+py_compile                                     246 files passed
+compileall                                       passed
+git diff --check                                 passed
+offline replay x2                               byte-identical
+```

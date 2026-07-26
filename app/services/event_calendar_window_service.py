@@ -538,6 +538,16 @@ def _cross_stage_reconciliation(
         and item.get("occurrence_id")
         and item.get("status") == "REMOVED_FROM_CALENDAR"
     }
+    retained_unconfirmed_ids = {
+        str(item.get("occurrence_id") or item.get("canonical_event_key"))
+        for section in _SCHEDULED_CALENDAR_SECTIONS
+        for item in calendar.get(section) or []
+        if isinstance(item, dict)
+        and item.get("removal_status") == "UNCONFIRMED_REMOVAL"
+        and (item.get("occurrence_id") or item.get("canonical_event_key"))
+        and str(item.get("occurrence_id") or item.get("canonical_event_key"))
+        in delivered_ids
+    }
     delivered_stage = discovered_ids & delivered_ids
     quarantined_stage = (
         discovered_ids & quarantined_ids
@@ -563,7 +573,8 @@ def _cross_stage_reconciliation(
         "technical_retry_duplicate_count": len(exact_duplicate_ids),
         "confirmed_removal_count": len(removal_stage),
         "unconfirmed_removals_retained": sorted(
-            {
+            retained_unconfirmed_ids
+            | {
                 str(item.get("occurrence_id"))
                 for item in comparison.get("removals") or []
                 if isinstance(item, dict)

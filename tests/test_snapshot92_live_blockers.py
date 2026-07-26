@@ -242,7 +242,8 @@ def test_discovery_gaps_are_processed_same_tick_and_wait_in_backoff(
     assert len(resolver_calls) == 17
     assert first["catch_up_backlog_before"] == 17
     assert first["claimed"] == 17
-    assert first["catch_up_backlog_after"] == 0
+    assert first["catch_up_backlog_after"] == 17
+    assert first["catch_up_due_after"] == 0
     assert first["residual_count"] == 17
     assert first["status"] == "WAITING_BACKOFF"
     assert first["catch_up_pending_backoff"] == 17
@@ -255,12 +256,15 @@ def test_discovery_gaps_are_processed_same_tick_and_wait_in_backoff(
     ] == 3
     assert first["source_coverage"]["provider_result_count"] == 5
     assert first["source_coverage"]["provider_success_count"] == 5
-    assert first["writes"] == 1
+    assert first["lifecycle_writes"] == 34
+    assert first["snapshot_writes"] == 1
+    assert first["writes"] == 35
     assert len(first["rematerialized_snapshot_ids"]) == 1
     assert first["ai_invocations"] == first["ai_jobs_created"] == 0
     assert ai_jobs == ai_backends == 0
     assert second["status"] == "WAITING_BACKOFF"
     assert second["claimed"] == second["writes"] == 0
+    assert second["catch_up_backlog_after"] == 17
     with connect_sqlite(settings.database_path) as conn:
         assert (
             conn.execute(
@@ -287,6 +291,121 @@ def test_discovery_gaps_are_processed_same_tick_and_wait_in_backoff(
     selective_payload.pop("sync")
     full_payload.pop("sync")
     assert selective_payload == full_payload
+
+
+def test_fixed_point_counts_initial_discovery_due_and_backoff_bounded(
+    tmp_path: Path,
+) -> None:
+    from app.services.event_driven_lifecycle_service import (
+        compute_datum_lifecycle,
+    )
+
+    payload = fixture()
+    now = datetime.fromisoformat(str(payload["reference_now"]))
+    settings = cfg(
+        tmp_path,
+        event_calendar_catchup_batch_size=7,
+        event_calendar_catchup_max_per_tick=20,
+    )
+    MarketContextSnapshotRepository(settings).save_next(
+        symbol="MNQ",
+        refresh_mode="fixed-point-baseline",
+        debug_payload=baseline_payload(now),
+        ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+    scheduler = ResearchSchedulerService(settings, clock=lambda: now)
+    seed = dict(payload["discovery"][0])  # type: ignore[index]
+    for index in range(18):
+        entity_key = f"fixture:initial:{index:02d}"
+        row = {
+            **seed,
+            "occurrence_id": entity_key,
+            "canonical_event_key": entity_key,
+            "provider_event_id": f"initial-{index:02d}",
+        }
+        scheduler.lifecycle.upsert(
+            compute_datum_lifecycle(
+                "macro_actual",
+                entity_key,
+                row,
+                settings=settings,
+                now=now,
+                fields_attempted=["actual"],
+            ),
+            payload=row,
+            work_status="READY",
+        )
+    assert scheduler.lifecycle.count_due(now=now) == 18
+
+    class Acquire:
+        last_provider_results = [SimpleNamespace(errors=[])]
+
+        def __call__(self, **_: object) -> list[dict[str, object]]:
+            return list(payload["discovery"])  # type: ignore[arg-type]
+
+    calls: list[str] = []
+
+    def no_data(item: dict[str, object]) -> dict[str, object]:
+        calls.append(str(item["entity_key"]))
+        return {
+            "status": "NO_DATA",
+            "reason": "offline_no_data",
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+        }
+
+    kwargs = {
+        "resolver": no_data,
+        "ai_enqueue": lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        "schedule_acquire": Acquire(),
+        "execution_context": ExecutionContext.provider_only(
+            correlation_id="fixed-point-18-plus-17",
+            allow_live_providers=True,
+        ),
+    }
+    first = scheduler.startup_catch_up(**kwargs)
+    second = scheduler.startup_catch_up(**kwargs)
+    snapshot_count = MarketContextSnapshotRepository(settings).latest(
+        "MNQ"
+    )["revision"]
+    third = scheduler.startup_catch_up(
+        **{
+            **kwargs,
+            "resolver": lambda _: (_ for _ in ()).throw(
+                AssertionError("backoff must suppress resolver")
+            ),
+        }
+    )
+
+    assert first["catch_up_backlog_before"] == 35
+    assert first["claimed"] == 20
+    assert first["catch_up_due_after"] == 15
+    assert first["catch_up_pending_backoff"] == 20
+    assert first["catch_up_backlog_after"] == 35
+    assert first["status"] == "IN_PROGRESS"
+    assert second["claimed"] == 15
+    assert second["catch_up_due_after"] == 0
+    assert second["catch_up_pending_backoff"] == 35
+    assert second["catch_up_backlog_after"] == 35
+    assert second["status"] == "WAITING_BACKOFF"
+    assert third["claimed"] == third["writes"] == 0
+    assert third["catch_up_backlog_after"] == 35
+    assert third["checkpoint_written"] is False
+    assert len(calls) == 35
+    assert (
+        MarketContextSnapshotRepository(settings).latest("MNQ")["revision"]
+        == snapshot_count
+    )
+    assert all(
+        result["actuals_recovered"] == 0
+        for result in (first, second, third)
+    )
+    assert all(
+        result["ai_invocations"] == result["ai_jobs_created"] == 0
+        for result in (first, second, third)
+    )
 
 
 def test_retry_exhaustion_is_not_reported_as_completed(
@@ -395,7 +514,7 @@ def test_multi_megabyte_news_reconciliation_does_not_cap_or_deduplicate() -> Non
         {
             "article_id": f"large-{index}",
             "source": "Reuters",
-            "summary": f"{index}:" + ("x" * 180_000),
+            "summary": f"{index}:€漢字🙂" + ("x" * 450_000),
         }
         for index in range(13)
     ]
@@ -413,7 +532,7 @@ def test_multi_megabyte_news_reconciliation_does_not_cap_or_deduplicate() -> Non
         },
     )
 
-    assert len(canonical_json(section).encode("utf-8")) > 2_000_000
+    assert len(canonical_json(section).encode("utf-8")) > 5_000_000
     assert len(section["context"]["articles"]) == 13
     assert section["context"]["delivered_raw_article_count"] == 13
 
@@ -460,4 +579,319 @@ def test_rates_temporal_invariant_uses_delivered_observation(
     assert datetime.fromisoformat(rates["valid_until"]) >= datetime.fromisoformat(
         str(payload["rates"]["retrieved_at"])  # type: ignore[index]
     )
-    assert rates["freshness"] == "CURRENT"
+    assert rates["freshness"] == "EXPIRED"
+
+
+def test_empty_news_cannot_remain_available_or_usable() -> None:
+    section = reconcile_delivered_section(
+        "news",
+        {
+            "context": {
+                "status": "AVAILABLE",
+                "articles": [],
+                "latest": [],
+                "historical_articles": [],
+                "accepted_article_count": 4,
+                "delivered_raw_article_count": 0,
+                "candidate_article_count": 4,
+                "search_completed": True,
+                "historical_coverage_status": "VERIFIED_COMPLETE",
+                "usable_for_analysis": True,
+                "diagnostics": {
+                    "raw_article_count": 4,
+                    "accepted_count": 4,
+                },
+            },
+            "latest": [],
+            "digest": {
+                "status": "AVAILABLE",
+                "accepted_article_count": 4,
+            },
+        },
+    )
+
+    context = section["context"]
+    assert context["status"] == "NO_DATA"
+    assert context["reason"] == "NO_DELIVERED_ARTICLES"
+    assert context["accepted_article_count"] == 0
+    assert context["delivered_raw_article_count"] == 0
+    assert context["usable_for_analysis"] is False
+    assert context["rejected_article_count"] == 4
+    assert section["digest"]["status"] == "NO_DATA_AVAILABLE"
+    assert section["digest"]["accepted_article_count"] == 0
+
+
+def test_weekly_futures_rule_is_informative_without_holiday_override() -> None:
+    scenarios = (
+        (datetime(2026, 7, 25, 12, tzinfo=UTC), False, "WEEKEND"),
+        (datetime(2026, 7, 26, 20, tzinfo=UTC), False, "WEEKEND"),
+        (datetime(2026, 7, 26, 23, tzinfo=UTC), True, "GLOBEX_OPEN"),
+        (datetime(2026, 7, 28, 2, tzinfo=UTC), True, "GLOBEX_OPEN"),
+        (
+            datetime(2026, 7, 27, 21, 30, tzinfo=UTC),
+            False,
+            "MAINTENANCE_BREAK",
+        ),
+    )
+    for now, expected_open, reason in scenarios:
+        session = build_session_aware_schedule({}, now=now)[
+            "mnq_futures_session"
+        ]
+        assert session["is_open"] is expected_open
+        assert session["session_reason"] == reason
+        assert session["verification_scope"] == "BASE_WEEKLY_RULE"
+        assert session["holiday_override_status"] == "UNVERIFIED"
+        assert session["holiday_name"] is None
+        assert session["is_early_close"] is False
+
+
+def test_temporal_corrections_are_inside_delivered_records_and_fingerprint(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 26, 16, tzinfo=UTC)
+    settings = cfg(tmp_path)
+    records = [
+        {
+            "series": "daily",
+            "data_as_of": "2026-07-24T00:00:00+00:00",
+            "valid_until": "2026-07-13T00:00:00+00:00",
+            "value": 1,
+        },
+        {
+            "series": "weekly",
+            "observed_at": "2026-07-25T00:00:00+00:00",
+            "valid_until": "2026-07-20T00:00:00+00:00",
+            "value": 2,
+        },
+        {
+            "series": "already-valid",
+            "data_as_of": "2026-07-23T00:00:00+00:00",
+            "valid_until": "2026-07-30T00:00:00+00:00",
+            "value": 3,
+        },
+    ]
+    MarketContextSnapshotRepository(settings).save_next(
+        symbol="MNQ",
+        refresh_mode="temporal-adversarial",
+        debug_payload={
+            **baseline_payload(now),
+            "rates_context": {"status": "AVAILABLE", "records": records},
+        },
+        ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+    sync = MarketContextSyncService(settings)
+    full = sync.full()
+    revision = int(full["snapshot_revision"])
+    selective = sync.sections(
+        consumer_id="temporal-adversarial",
+        target_snapshot_revision=revision,
+        sections=["rates"],
+        include_lineage=True,
+    )
+    full_rates = dict(full["sections"]["rates"])
+    selective_rates = dict(selective["sections"]["rates"])
+    full_sync = full_rates.pop("sync")
+    selective_sync = selective_rates.pop("sync")
+
+    assert full_rates == selective_rates
+    assert full_sync["fingerprint"] == selective_sync["fingerprint"]
+    for record in full_rates["context"]["records"]:
+        floor = record.get("data_as_of") or record.get("observed_at")
+        assert datetime.fromisoformat(record["valid_until"]) >= datetime.fromisoformat(
+            floor
+        )
+    disclosure = full_rates["producer_disclosures"][
+        "temporal_reconciliation"
+    ]
+    assert disclosure["correction_count"] == 2
+    assert full_sync["fingerprint"]
+
+
+def _baseline_with_named_unconfirmed(
+    payload: dict[str, object],
+    now: datetime,
+) -> dict[str, object]:
+    prior = [
+        dict(item["previous_occurrence"])
+        for item in payload["unconfirmed_removals"]  # type: ignore[index]
+    ]
+    baseline = baseline_payload(now)
+    baseline["event_calendar"] = {
+        **dict(baseline["event_calendar"]),  # type: ignore[arg-type]
+        "critical_macro_events": [*prior, *next_week_rows()],
+    }
+    return baseline
+
+
+def test_real_discovery_retains_named_unconfirmed_actuals_and_backoff(
+    tmp_path: Path,
+) -> None:
+    payload = fixture()
+    now = datetime.fromisoformat(str(payload["reference_now"]))
+    settings = cfg(tmp_path)
+    MarketContextSnapshotRepository(settings).save_next(
+        symbol="MNQ",
+        refresh_mode="named-unconfirmed-baseline",
+        debug_payload=_baseline_with_named_unconfirmed(payload, now),
+        ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+
+    class Acquire:
+        last_provider_results = [SimpleNamespace(errors=[])]
+
+        def __call__(self, **_: object) -> list[dict[str, object]]:
+            return list(payload["discovery"])  # type: ignore[arg-type]
+
+    result = ResearchSchedulerService(
+        settings, clock=lambda: now
+    ).startup_catch_up(
+        resolver=lambda _: {
+            "status": "NO_DATA",
+            "reason": "offline_no_data",
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+        },
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=Acquire(),
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="named-unconfirmed-no-data",
+            allow_live_providers=True,
+        ),
+    )
+    components = MarketContextSnapshotRepository(settings).latest_components(
+        "MNQ"
+    )
+    window = build_event_calendar_window(
+        components,
+        settings=settings,
+        now=now,
+    )
+    named_ids = set(payload["expectations"]["actual_missing_ids"])  # type: ignore[index]
+    visible = {
+        item["occurrence_id"]: item
+        for item in window["current_week"]["events"]
+        if item.get("occurrence_id") in named_ids
+    }
+    lifecycle = {
+        item["entity_key"]: item
+        for item in ResearchSchedulerService(
+            settings, clock=lambda: now
+        ).lifecycle.list_items()
+    }
+
+    assert set(visible) == named_ids
+    assert all(item["actual"] is None for item in visible.values())
+    assert all(
+        item["release_status"] == "AWAITING_ACTUAL"
+        for item in visible.values()
+    )
+    assert all(
+        item["removal_status"] == "UNCONFIRMED_REMOVAL"
+        for item in visible.values()
+    )
+    assert named_ids <= set(window["actual_missing_ids"])
+    assert all(lifecycle[item]["work_status"] == "BACKOFF" for item in named_ids)
+    assert all(lifecycle[item]["next_retry_at"] for item in named_ids)
+    assert result["status"] == "WAITING_BACKOFF"
+    assert result["actuals_recovered"] == 0
+    assert result["ai_invocations"] == result["ai_jobs_created"] == 0
+
+
+def test_named_actuals_are_recovered_by_exact_occurrence_without_ai(
+    tmp_path: Path,
+) -> None:
+    payload = fixture()
+    now = datetime.fromisoformat(str(payload["reference_now"]))
+    settings = cfg(tmp_path)
+    MarketContextSnapshotRepository(settings).save_next(
+        symbol="MNQ",
+        refresh_mode="named-actual-baseline",
+        debug_payload=_baseline_with_named_unconfirmed(payload, now),
+        ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+    named_ids = set(payload["expectations"]["actual_missing_ids"])  # type: ignore[index]
+
+    class Acquire:
+        last_provider_results = [SimpleNamespace(errors=[])]
+
+        def __call__(self, **_: object) -> list[dict[str, object]]:
+            return list(payload["discovery"])  # type: ignore[arg-type]
+
+    recovered: dict[str, str] = {}
+
+    def resolve(item: dict[str, object]) -> dict[str, object]:
+        entity_key = str(item["entity_key"])
+        item_payload = dict(item.get("payload") or {})  # type: ignore[arg-type]
+        if entity_key not in named_ids:
+            return {"status": "NO_DATA", "reason": "offline_no_data"}
+        expected_period = str(item_payload["reference_period"])
+        recovered[entity_key] = expected_period
+        return {
+            "status": "RESOLVED",
+            "datum": {
+                **item_payload,
+                "occurrence_id": entity_key,
+                "canonical_event_key": entity_key,
+                "reference_period": expected_period,
+                "actual": "101.25" if "146392" in entity_key else "2.75",
+                "release_status": "PUBLISHED",
+                "source": "official-offline-fixture",
+                "retrieved_at": now.isoformat(),
+            },
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+        }
+
+    result = ResearchSchedulerService(
+        settings, clock=lambda: now
+    ).startup_catch_up(
+        resolver=resolve,
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=Acquire(),
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="named-actual-recovery",
+            allow_live_providers=True,
+        ),
+    )
+    components = MarketContextSnapshotRepository(settings).latest_components(
+        "MNQ"
+    )
+    window = build_event_calendar_window(
+        components,
+        settings=settings,
+        now=now,
+    )
+    current = {
+        item["occurrence_id"]: item
+        for item in window["current_week"]["events"]
+        if item.get("occurrence_id") in named_ids
+    }
+    sync = MarketContextSyncService(settings)
+    full = sync.full()
+    revision = int(full["snapshot_revision"])
+    selective = sync.sections(
+        consumer_id="named-actual-recovery",
+        target_snapshot_revision=revision,
+        sections=["event_calendar"],
+        include_lineage=True,
+    )
+
+    assert set(recovered) == named_ids
+    assert recovered["xtb:146392:2026-07-24"] == "2026-06"
+    assert recovered["xtb:146945:2026-07-24"] == "2026-Q2"
+    assert all(item["actual"] not in (None, "") for item in current.values())
+    assert all(
+        item["release_status"] == "PUBLISHED" for item in current.values()
+    )
+    assert named_ids.isdisjoint(window["actual_missing_ids"])
+    assert result["actuals_recovered"] == 2
+    assert result["snapshot_writes"] == 2
+    assert result["ai_invocations"] == result["ai_jobs_created"] == 0
+    full_section = dict(full["sections"]["event_calendar"])
+    selective_section = dict(selective["sections"]["event_calendar"])
+    assert full_section.pop("sync") == selective_section.pop("sync")
+    assert full_section == selective_section

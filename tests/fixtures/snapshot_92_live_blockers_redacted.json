@@ -70,6 +70,18 @@
     "discovery_current_count": 3,
     "next_week_count": 25,
     "actual_missing_ids": ["xtb:146392:2026-07-24", "xtb:146945:2026-07-24"],
+    "actual_reference_periods": {
+      "xtb:146392:2026-07-24": "2026-06",
+      "xtb:146945:2026-07-24": "2026-Q2"
+    },
+    "fixed_point": {
+      "initial_due": 18,
+      "discovered": 17,
+      "max_per_tick": 20,
+      "tick_one_due_after": 15,
+      "tick_one_pending_backoff": 20,
+      "total_backlog_after": 35
+    },
     "ai_jobs": 0,
     "ai_backend_invocations": 0,
     "ai_enqueue_invocations": 0

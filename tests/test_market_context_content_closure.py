@@ -501,10 +501,10 @@ def test_cme_timeout_fails_closed_and_valid_lkg_is_used() -> None:
     )
 
     assert unavailable["status"] == "PARTIAL"
-    assert unavailable["mnq_futures_session"]["is_open"] is None
+    assert unavailable["mnq_futures_session"]["is_open"] is True
     assert (
         unavailable["mnq_futures_session"]["closed_reason"]
-        == "UNVERIFIED_SCHEDULE"
+        is None
     )
     assert lkg["mnq_futures_session"]["is_open"] is True
     assert lkg["last_verified_cme_calendar_used"] is True
