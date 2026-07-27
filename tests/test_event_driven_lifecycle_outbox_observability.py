@@ -688,7 +688,7 @@ def test_migration_21_is_idempotent_and_preserves_rows(tmp_path: Path) -> None:
     second = migrate_database(settings.database_path)
     with connect_sqlite(settings.database_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM anomaly_incidents").fetchone()[0]
-    assert first["schema_version"] == second["schema_version"] == 21
+    assert first["schema_version"] == second["schema_version"] == 22
     assert count == 1
 
 

@@ -38,6 +38,15 @@ from scripts.replay_snapshot91_sync_offline import replay
 ROOT = Path(__file__).resolve().parents[1]
 NY = ZoneInfo("America/New_York")
 NOW = datetime(2026, 7, 22, 12, tzinfo=NY)
+COMPLETE_COVERAGE_PROOF = {
+    "request_succeeded": True,
+    "scope_match": True,
+    "pagination_complete": True,
+    "parsing_succeeded": True,
+    "records_valid": True,
+    "expected_sources_complete": True,
+    "authentic_empty": True,
+}
 
 
 def cfg(tmp_path: Path, **overrides: object) -> Settings:
@@ -599,6 +608,8 @@ def test_provider_first_schedule_catchup_is_restart_independent_and_idempotent(
             }
         ]
 
+    acquire.coverage_proof = COMPLETE_COVERAGE_PROOF  # type: ignore[attr-defined]
+
     settings = cfg(
         tmp_path,
         event_calendar_catchup_enabled=True,
@@ -624,7 +635,9 @@ def test_provider_first_schedule_catchup_is_restart_independent_and_idempotent(
     assert first["source_coverage"]["status"] == "VERIFIED_COMPLETE"
     assert first["source_coverage"]["persisted_gap_count"] == 1
     assert second["source_coverage"]["persisted_gap_count"] == 0
-    assert second["source_coverage"]["unchanged_occurrence_count"] == 1
+    assert second["source_coverage"]["unchanged_occurrence_count"] == 0
+    assert second["source_coverage"]["provider_calls"] == 0
+    assert len(calls) == 1
     assert len(scheduler.lifecycle.list_items()) == count_after_first == 1
     assert calls[0]["start"].astimezone(NY).date() == (
         current_monday - timedelta(days=7)
@@ -711,7 +724,8 @@ def test_schedule_catchup_uses_persistent_single_flight(
 
     assert second["status"] == "PARTIAL"
     assert second["reason"] == "schedule_catchup_single_flight_active"
-    assert completed["status"] == "VERIFIED_COMPLETE"
+    assert completed["status"] == "PARTIAL"
+    assert completed["provider_calls_executed"] == 1
     assert calls == 1
 
 

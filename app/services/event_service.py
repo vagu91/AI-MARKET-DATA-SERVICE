@@ -28,6 +28,7 @@ class EventService:
         self.temporal_validation = temporal_validation
         self.last_enrichment_metadata: dict[str, object] = {}
         self.last_provider_results: list[object] = []
+        self.last_coverage_proof: dict[str, object] = {}
 
     async def list_events(
         self,
@@ -38,11 +39,15 @@ class EventService:
     ) -> list[EconomicEvent]:
         events: list[EconomicEvent] = []
         self.last_provider_results = []
+        self.last_coverage_proof = {}
+        parsed_sources = 0
+        quarantined_count = 0
         for provider in self.providers:
             result = await provider.fetch_safe()
             self.last_provider_results.append(result.metadata)
             if not isinstance(result.data, list):
                 continue
+            parsed_sources += 1
             for raw in result.data:
                 event = EconomicEvent.model_validate(raw)
                 if event.country.upper() != country.upper():
@@ -55,6 +60,7 @@ class EventService:
                         entity_table="provider_ingestion",
                     )
                 ):
+                    quarantined_count += 1
                     continue
                 if event.time_utc:
                     event_time = event.time_utc.astimezone(UTC)
@@ -69,6 +75,31 @@ class EventService:
                     if end and event_date.date() > end.date():
                         continue
                 events.append(event)
+        errors = [
+            error
+            for metadata in self.last_provider_results
+            for error in list(getattr(metadata, "errors", []) or [])
+        ]
+        expected_sources_complete = (
+            len(self.last_provider_results) == len(self.providers)
+            and parsed_sources == len(self.providers)
+        )
+        self.last_coverage_proof = {
+            "request_succeeded": not errors and expected_sources_complete,
+            "scope_match": start is not None and end is not None,
+            "pagination_complete": expected_sources_complete,
+            "parsing_succeeded": parsed_sources == len(self.providers),
+            "records_valid": quarantined_count == 0,
+            "expected_sources_complete": expected_sources_complete,
+            # Empty provider datasets lack affirmative range-coverage proof.
+            "authentic_empty": False,
+            "requested_scope": {
+                "country": country.upper(),
+                "start": start.isoformat() if start else None,
+                "end": end.isoformat() if end else None,
+            },
+            "quarantined_count": quarantined_count,
+        }
         events = sorted(events, key=lambda event: event.time_utc or datetime.max.replace(tzinfo=UTC))
         if enrich and self.enrichment_service and start and end:
             events, metadata = await self.enrichment_service.enrich_events(

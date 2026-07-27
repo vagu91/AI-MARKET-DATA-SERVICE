@@ -1407,6 +1407,79 @@ ALTER TABLE market_context_outbox ADD COLUMN manifest_url TEXT NULL;
 ALTER TABLE market_context_outbox ADD COLUMN changes_url TEXT NULL;
 """
 
+DB_FIRST_EVENT_COVERAGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS event_calendar_coverage (
+  coverage_date TEXT NOT NULL,
+  data_domain TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  provider_name TEXT NOT NULL,
+  query_scope TEXT NOT NULL,
+  symbol TEXT NOT NULL DEFAULT '',
+  contract_version TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  window_end TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'VERIFIED_COMPLETE','VERIFIED_EMPTY','PARTIAL','UNKNOWN',
+    'PROVIDER_UNAVAILABLE','QUARANTINED'
+  )),
+  record_count INTEGER NOT NULL DEFAULT 0 CHECK(record_count>=0),
+  provider_called INTEGER NOT NULL DEFAULT 0 CHECK(provider_called IN (0,1)),
+  scope_verified INTEGER NOT NULL DEFAULT 0 CHECK(scope_verified IN (0,1)),
+  request_succeeded INTEGER NOT NULL DEFAULT 0 CHECK(request_succeeded IN (0,1)),
+  pagination_complete INTEGER NOT NULL DEFAULT 0 CHECK(pagination_complete IN (0,1)),
+  parsing_succeeded INTEGER NOT NULL DEFAULT 0 CHECK(parsing_succeeded IN (0,1)),
+  records_valid INTEGER NOT NULL DEFAULT 0 CHECK(records_valid IN (0,1)),
+  expected_sources_complete INTEGER NOT NULL DEFAULT 0 CHECK(expected_sources_complete IN (0,1)),
+  authentic_empty INTEGER NOT NULL DEFAULT 0 CHECK(authentic_empty IN (0,1)),
+  retrieved_at TEXT NULL,
+  valid_until TEXT NULL,
+  next_revision_check_at TEXT NULL,
+  next_retry_at TEXT NULL,
+  lineage_json TEXT NOT NULL DEFAULT '{}',
+  content_fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(
+    coverage_date,data_domain,entity_type,provider_name,query_scope,
+    symbol,contract_version,policy_version
+  ),
+  CHECK(status NOT IN ('VERIFIED_COMPLETE','VERIFIED_EMPTY') OR (
+    provider_called=1 AND scope_verified=1 AND request_succeeded=1
+    AND pagination_complete=1 AND parsing_succeeded=1
+    AND records_valid=1 AND expected_sources_complete=1
+  )),
+  CHECK(status!='VERIFIED_EMPTY' OR (
+    authentic_empty=1 AND record_count=0
+  )),
+  CHECK(status!='VERIFIED_COMPLETE' OR record_count>0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_calendar_coverage_due
+  ON event_calendar_coverage(
+    data_domain,entity_type,provider_name,query_scope,symbol,
+    contract_version,policy_version,coverage_date,status,valid_until,
+    next_revision_check_at,next_retry_at
+  );
+
+ALTER TABLE economic_events_history
+  ADD COLUMN completeness_status TEXT NOT NULL DEFAULT 'INCOMPLETE'
+  CHECK(completeness_status IN (
+    'COMPLETE_FINAL','COMPLETE_REVISIONABLE','AWAITING_ACTUAL',
+    'INCOMPLETE','QUARANTINED'
+  ));
+ALTER TABLE economic_events_history
+  ADD COLUMN outcome_contract_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE economic_events_history
+  ADD COLUMN publication_grace_until TEXT NULL;
+ALTER TABLE economic_events_history
+  ADD COLUMN next_revision_check_at TEXT NULL;
+ALTER TABLE economic_events_history
+  ADD COLUMN removal_status TEXT NULL;
+ALTER TABLE economic_events_history
+  ADD COLUMN removal_lineage_json TEXT NOT NULL DEFAULT '{}';
+"""
+
 
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("001_initial_canonical_store", CANONICAL_SCHEMA),
@@ -1430,4 +1503,5 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("019_backend_invocation_lifecycle_and_reconciliation_audit", BACKEND_INVOCATION_LIFECYCLE_SCHEMA),
     ("020_event_driven_lifecycle_outbox_telemetry_and_incidents", EVENT_DRIVEN_LIFECYCLE_SCHEMA),
     ("021_market_context_sync_producer_protocol", MARKET_CONTEXT_SYNC_SCHEMA),
+    ("022_db_first_event_calendar_coverage", DB_FIRST_EVENT_COVERAGE_SCHEMA),
 )

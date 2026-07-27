@@ -110,6 +110,15 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
         )
 
         class ScheduleAcquire:
+            coverage_proof = {
+                "request_succeeded": True,
+                "scope_match": True,
+                "pagination_complete": True,
+                "parsing_succeeded": True,
+                "records_valid": True,
+                "expected_sources_complete": True,
+                "authentic_empty": True,
+            }
             last_provider_results = [
                 SimpleNamespace(errors=[]) for _ in range(5)
             ]

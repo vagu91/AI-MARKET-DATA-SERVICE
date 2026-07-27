@@ -68,6 +68,10 @@ class XtbEconomicCalendarProvider:
             retrieved_at=retrieved_at,
             minimum_impact=self.settings.xtb_calendar_min_impact,
             lookahead_days=self.settings.xtb_calendar_lookahead_days,
+            lookback_days=max(
+                int(self.settings.event_calendar_catchup_lookback_days),
+                1,
+            ),
         )
         valid_until = (retrieved_at + timedelta(minutes=self.settings.xtb_calendar_ttl_minutes)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         logger.info(
@@ -119,8 +123,9 @@ def normalize_xtb_events(
     retrieved_at: datetime,
     minimum_impact: int,
     lookahead_days: int,
+    lookback_days: int = 1,
 ) -> tuple[list[dict[str, Any]], int]:
-    start = retrieved_at.date() - timedelta(days=1)
+    start = retrieved_at.date() - timedelta(days=max(lookback_days, 1))
     end = retrieved_at.date() + timedelta(days=lookahead_days)
     selected: dict[tuple[Any, ...], dict[str, Any]] = {}
     rejected = 0
@@ -166,7 +171,7 @@ def normalize_xtb_events(
             "importance": impact,
             "impact": {0: "NONE", 1: "LOW", 2: "MEDIUM", 3: "HIGH"}.get(impact, "UNKNOWN"),
             "numerical_event": bool(raw.get("numericalEvent")),
-            "forecast": None,
+            "forecast": forecast,
             "forecast_display": raw.get("forecastString"),
             "consensus": forecast,
             "consensus_verified": forecast is not None,
@@ -176,7 +181,11 @@ def normalize_xtb_events(
             "actual": actual,
             "actual_display": raw.get("currentString") if actual is not None else None,
             "actual_is_official": False,
-            "reference_period": raw.get("period"),
+            "reference_period": _reference_period(
+                raw.get("period"),
+                release_date=event_date,
+            ),
+            "frequency": "monthly",
             "evaluation_method": raw.get("evaluationMethod"),
             "unit": raw.get("unit"),
             "order_of_magnitude": raw.get("orderOfMagnitude"),
@@ -201,6 +210,35 @@ def normalize_xtb_events(
         key = (source_event_id or indicator_id or _normalized(title), event["date"], event["release_at"])
         selected[key] = event
     return sorted(selected.values(), key=lambda item: (item["date"], item.get("release_at") or "", item["event_name"])), rejected
+
+
+def _reference_period(value: Any, *, release_date: date) -> str | None:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return None
+    months = {
+        "gennaio": 1,
+        "febbraio": 2,
+        "marzo": 3,
+        "aprile": 4,
+        "maggio": 5,
+        "giugno": 6,
+        "luglio": 7,
+        "agosto": 8,
+        "settembre": 9,
+        "ottobre": 10,
+        "novembre": 11,
+        "dicembre": 12,
+    }
+    month = months.get(text)
+    if month is not None:
+        year = (
+            release_date.year
+            if month <= release_date.month
+            else release_date.year - 1
+        )
+        return f"{year:04d}-{month:02d}"
+    return str(value).strip()
 
 
 def xtb_event_datetimes(event_date: date, short_time: Any, offset_value: Any) -> tuple[datetime | None, datetime | None]:

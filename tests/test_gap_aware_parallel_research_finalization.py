@@ -736,7 +736,7 @@ def test_25_schema_15_migrates_to_17_with_data_preserved(tmp_path: Path) -> None
         row = migrated.execute(
             "SELECT snapshot_id,research_link_status FROM market_context_snapshots"
         ).fetchone()
-    assert result["schema_version"] == 21
+    assert result["schema_version"] == 22
     assert row["snapshot_id"] == "legacy"
     assert row["research_link_status"] == "NOT_REQUIRED"
 

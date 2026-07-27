@@ -37,6 +37,15 @@ FIXTURE = (
     / "fixtures"
     / "snapshot_92_live_blockers_redacted.json"
 )
+COMPLETE_COVERAGE_PROOF = {
+    "request_succeeded": True,
+    "scope_match": True,
+    "pagination_complete": True,
+    "parsing_succeeded": True,
+    "records_valid": True,
+    "expected_sources_complete": True,
+    "authentic_empty": True,
+}
 
 
 def fixture() -> dict[str, object]:
@@ -191,6 +200,7 @@ def test_discovery_gaps_are_processed_same_tick_and_wait_in_backoff(
     )
 
     class ScheduleAcquire:
+        coverage_proof = COMPLETE_COVERAGE_PROOF
         last_provider_results = [
             SimpleNamespace(errors=[]) for _ in range(5)
         ]
@@ -343,6 +353,7 @@ def test_fixed_point_counts_initial_discovery_due_and_backoff_bounded(
     assert scheduler.lifecycle.count_due(now=now) == 18
 
     class Acquire:
+        coverage_proof = COMPLETE_COVERAGE_PROOF
         last_provider_results = [SimpleNamespace(errors=[])]
 
         def __call__(self, **_: object) -> list[dict[str, object]]:
@@ -427,6 +438,7 @@ def test_early_backoff_tick_is_byte_idempotent_with_advancing_clock(
     )
 
     class Acquire:
+        coverage_proof = COMPLETE_COVERAGE_PROOF
         last_provider_results = [SimpleNamespace(errors=[])]
 
         def __init__(self) -> None:
@@ -1063,6 +1075,7 @@ def test_real_discovery_retains_named_unconfirmed_actuals_and_backoff(
     )
 
     class Acquire:
+        coverage_proof = COMPLETE_COVERAGE_PROOF
         last_provider_results = [SimpleNamespace(errors=[])]
 
         def __call__(self, **_: object) -> list[dict[str, object]]:
@@ -1140,6 +1153,7 @@ def test_named_actuals_are_recovered_by_exact_occurrence_without_ai(
     named_ids = set(payload["expectations"]["actual_missing_ids"])  # type: ignore[index]
 
     class Acquire:
+        coverage_proof = COMPLETE_COVERAGE_PROOF
         last_provider_results = [SimpleNamespace(errors=[])]
 
         def __call__(self, **_: object) -> list[dict[str, object]]:

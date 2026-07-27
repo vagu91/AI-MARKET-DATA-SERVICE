@@ -746,8 +746,8 @@ def test_migration_21_is_additive_and_idempotent(tmp_path: Path) -> None:
     settings = cfg(tmp_path)
     first = migrate_database(settings.database_path)
     second = migrate_database(settings.database_path)
-    assert first["schema_version"] == second["schema_version"] == 21
-    assert first["applied"][-1] == "021_market_context_sync_producer_protocol"
+    assert first["schema_version"] == second["schema_version"] == 22
+    assert first["applied"][-1] == "022_db_first_event_calendar_coverage"
     assert second["applied"] == []
 
 

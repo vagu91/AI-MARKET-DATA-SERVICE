@@ -25,15 +25,17 @@ def migrate_database(path: Path) -> dict[str, object]:
             )
             """
         )
-        existing = {
-            int(row["version"])
-            for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
-        }
+        conn.commit()
         for index, (name, sql) in enumerate(MIGRATIONS, start=1):
-            if index in existing:
-                continue
             try:
-                conn.execute("BEGIN")
+                conn.execute("BEGIN IMMEDIATE")
+                already_applied = conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version=?",
+                    (index,),
+                ).fetchone()
+                if already_applied is not None:
+                    conn.rollback()
+                    continue
                 for statement in _split_sql(sql):
                     conn.execute(statement)
                 conn.execute(

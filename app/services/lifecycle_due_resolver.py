@@ -175,9 +175,31 @@ class ExactOccurrenceActualProviderAdapter:
             return self._no_data("exact_occurrence_reference_period_mismatch")
 
         observation = period_matches[0]
+        observed_frequency = str(
+            observation.get("frequency") or frequency
+        ).lower()
+        if observed_frequency != frequency:
+            return self._no_data("exact_occurrence_frequency_mismatch")
+        expected_unit = _normalized_unit(payload.get("unit"))
+        observed_unit = _normalized_unit(observation.get("unit"))
+        if expected_unit and observed_unit and expected_unit != observed_unit:
+            return self._no_data("exact_occurrence_unit_mismatch")
+        if str(
+            observation.get("validation_status") or "accepted"
+        ).lower() in {
+            "rejected",
+            "invalid",
+            "quarantined",
+            "stale",
+            "expired",
+        }:
+            return self._no_data("exact_occurrence_validation_rejected")
+        raw_lineage = observation.get("field_lineage") or observation.get(
+            "lineage"
+        )
         lineage = (
-            dict(observation.get("field_lineage") or {})
-            if isinstance(observation.get("field_lineage"), dict)
+            dict(raw_lineage or {})
+            if isinstance(raw_lineage, dict)
             else {}
         )
         actual_lineage = (
@@ -188,6 +210,15 @@ class ExactOccurrenceActualProviderAdapter:
         source_field = str(actual_lineage.get("source_field") or "").lower()
         if source_field not in {"actual", "current"}:
             return self._no_data("actual_field_lineage_invalid")
+        for field in ("forecast", "previous"):
+            if observation.get(field) in (None, ""):
+                continue
+            proof = lineage.get(field) or {}
+            if (
+                not isinstance(proof, dict)
+                or str(proof.get("source_field") or "").lower() != field
+            ):
+                return self._no_data(f"{field}_field_lineage_invalid")
         value = observation.get("actual")
         if value in (None, ""):
             return self._no_data("actual_value_missing")
@@ -296,6 +327,7 @@ class MacroActualLifecycleProviderAdapter:
         self.event_service = event_service
         self.actual_resolver = actual_resolver
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.source_policy = SourcePolicyService(settings.source_policy_path)
 
     def resolve(self, item: dict[str, Any]) -> dict[str, Any]:
         now = self.clock()
@@ -383,6 +415,33 @@ class MacroActualLifecycleProviderAdapter:
             return {
                 "status": "NO_DATA",
                 "reason": "macro_actual_exact_occurrence_not_found",
+            }
+
+        direct = _exact_calendar_actual_datum(
+            payload,
+            exact=exact,
+            canonical_key=expected_key,
+            release=release,
+            source_accepted=not self.source_policy.invalid_sources(
+                exact,
+                allow_test_reserved=(
+                    self.settings.environment.lower() == "test"
+                ),
+            ),
+        )
+        if direct is not None:
+            missing_fields = _missing_requested_fields(
+                direct,
+                list(item.get("fields_attempted") or []),
+            )
+            return {
+                "status": "PARTIAL" if missing_fields else "RESOLVED",
+                "reason": "exact_calendar_actual_resolved",
+                "datum": direct,
+                "missing_fields": missing_fields,
+                "provider_request_attempted": True,
+                "provider_request_completed": True,
+                "provider_request_failed": False,
             }
 
         resolution = self.actual_resolver.resolve_event(
@@ -971,6 +1030,125 @@ def _same_release_minute(
         and observed.replace(second=0, microsecond=0)
         == expected.replace(second=0, microsecond=0)
     )
+
+
+def _exact_calendar_actual_datum(
+    payload: dict[str, Any],
+    *,
+    exact: dict[str, Any],
+    canonical_key: str,
+    release: datetime,
+    source_accepted: bool,
+) -> dict[str, Any] | None:
+    if not source_accepted or exact.get("actual") in (None, ""):
+        return None
+    expected_frequency = str(payload.get("frequency") or "monthly").lower()
+    frequency = str(exact.get("frequency") or expected_frequency).lower()
+    if frequency != expected_frequency:
+        return None
+    validation_status = str(
+        exact.get("validation_status") or "accepted"
+    ).lower()
+    if validation_status in {
+        "rejected",
+        "invalid",
+        "quarantined",
+        "stale",
+        "expired",
+    }:
+        return None
+    expected_period = normalize_reference_period(
+        payload.get("reference_period") or payload.get("period"),
+        frequency=frequency,
+    )
+    observed_period = normalize_reference_period(
+        exact.get("reference_period") or exact.get("period"),
+        frequency=frequency,
+    )
+    if not expected_period or observed_period != expected_period:
+        return None
+    raw_lineage = exact.get("field_lineage") or exact.get("lineage") or {}
+    lineage = dict(raw_lineage) if isinstance(raw_lineage, dict) else {}
+    actual_lineage = lineage.get("actual") or {}
+    if (
+        not isinstance(actual_lineage, dict)
+        or str(actual_lineage.get("source_field") or "").lower()
+        not in {"actual", "current"}
+    ):
+        return None
+    for field in ("forecast", "previous"):
+        if exact.get(field) in (None, ""):
+            continue
+        field_proof = lineage.get(field) or {}
+        if (
+            not isinstance(field_proof, dict)
+            or str(field_proof.get("source_field") or "").lower() != field
+        ):
+            return None
+    expected_unit = _normalized_unit(payload.get("unit"))
+    observed_unit = _normalized_unit(exact.get("unit"))
+    if expected_unit and observed_unit and expected_unit != observed_unit:
+        return None
+    source = exact.get("source") or exact.get("source_originator")
+    source_url = exact.get("source_url") or exact.get("canonical_url")
+    if not source or not source_url:
+        return None
+    return {
+        **payload,
+        "canonical_event_key": canonical_key,
+        "occurrence_id": canonical_key,
+        "release_at": release.isoformat(),
+        "time_utc": release.isoformat(),
+        "reference_period": observed_period,
+        "period": observed_period,
+        "frequency": frequency,
+        "actual": exact["actual"],
+        "forecast": (
+            exact.get("forecast")
+            if exact.get("forecast") not in (None, "")
+            else payload.get("forecast")
+        ),
+        "consensus": (
+            exact.get("consensus")
+            if exact.get("consensus") not in (None, "")
+            else payload.get("consensus")
+        ),
+        "previous": (
+            exact.get("previous")
+            if exact.get("previous") not in (None, "")
+            else payload.get("previous")
+        ),
+        "unit": exact.get("unit") or payload.get("unit"),
+        "release_status": "PUBLISHED",
+        "source": source,
+        "publisher": exact.get("publisher") or source,
+        "source_originator": exact.get("source_originator") or source,
+        "distribution_source": exact.get("distribution_source"),
+        "source_url": source_url,
+        "canonical_url": exact.get("canonical_url") or source_url,
+        "retrieved_at": exact.get("retrieved_at"),
+        "validation_status": exact.get("validation_status") or "accepted",
+        "field_lineage": {
+            **(
+                dict(payload.get("field_lineage") or {})
+                if isinstance(payload.get("field_lineage"), dict)
+                else {}
+            ),
+            **lineage,
+        },
+    }
+
+
+def _normalized_unit(value: Any) -> str:
+    text = str(value or "").strip().casefold().replace("-", "_")
+    aliases = {
+        "k": "thousands_annual_rate",
+        "thousand": "thousands_annual_rate",
+        "thousands": "thousands_annual_rate",
+        "index_points": "index",
+        "points": "index",
+    }
+    return aliases.get(text, text)
 
 
 def _official_actual_datum(

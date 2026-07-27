@@ -201,18 +201,28 @@ def build_event_calendar_window(
         for bucket_name in WEEK_BUCKETS
     }
     missing_actual_count = sum(
-        item["release_status"] in {"AWAITING_ACTUAL", "UNAVAILABLE"}
-        and item["is_past"]
+        _actual_is_due(item, now=now_utc)
         for item in retained
     )
     actual_missing_ids = sorted(
         {
             str(item["occurrence_id"])
             for item in retained
-            if item["release_status"] in {"AWAITING_ACTUAL", "UNAVAILABLE"}
-            and item["is_past"]
-            and item.get("actual") in (None, "")
+            if _actual_is_due(item, now=now_utc)
         }
+    )
+    gap_inventory = _gap_inventory(full)
+    complete_actual_ids = {
+        str(item["occurrence_id"])
+        for item in retained
+        if item.get("actual") not in (None, "")
+    }
+    actual_missing_ids = sorted(
+        set(actual_missing_ids)
+        | (
+            set(gap_inventory["actual_missing_ids"])
+            - complete_actual_ids
+        )
     )
     revised_count = sum(
         item["release_status"] == "REVISED" for item in retained
@@ -317,6 +327,27 @@ def build_event_calendar_window(
             "total": len(retained),
         },
         "actual_missing_ids": actual_missing_ids,
+        "incomplete_occurrence_ids": gap_inventory[
+            "incomplete_occurrence_ids"
+        ],
+        "unknown_coverage_days": gap_inventory[
+            "unknown_coverage_days"
+        ],
+        "partial_coverage_days": gap_inventory[
+            "partial_coverage_days"
+        ],
+        "quarantined_occurrence_ids": sorted(
+            {
+                str(item["occurrence_id"])
+                for item in quarantined_occurrences
+                if item.get("occurrence_id")
+            }
+            | set(gap_inventory["quarantined_occurrence_ids"])
+        ),
+        "unconfirmed_removal_ids": gap_inventory[
+            "unconfirmed_removal_ids"
+        ],
+        "next_retry_at": gap_inventory["next_retry_at"],
         "coverage": {
             "status": coverage_status,
             "source_candidate_count": source_candidate_count,
@@ -442,6 +473,77 @@ def build_event_calendar_window(
         },
     )
     return result
+
+
+def _gap_inventory(full: dict[str, Any]) -> dict[str, Any]:
+    calendar = (
+        full.get("event_calendar")
+        if isinstance(full.get("event_calendar"), dict)
+        else {}
+    )
+    coverage = (
+        calendar.get("source_coverage")
+        if isinstance(calendar.get("source_coverage"), dict)
+        else {}
+    )
+    daily = (
+        coverage.get("daily_matrix")
+        if isinstance(coverage.get("daily_matrix"), dict)
+        else {}
+    )
+    explicit = (
+        calendar.get("gap_inventory")
+        if isinstance(calendar.get("gap_inventory"), dict)
+        else {}
+    )
+    lifecycle = (
+        full.get("event_calendar_gap_inventory")
+        if isinstance(full.get("event_calendar_gap_inventory"), dict)
+        else {}
+    )
+
+    def values(key: str) -> list[str]:
+        return sorted(
+            {
+                str(item)
+                for source in (explicit, lifecycle, coverage, daily)
+                for item in source.get(key) or []
+                if item
+            }
+        )
+
+    unconfirmed = values("unconfirmed_removal_ids")
+    if not unconfirmed:
+        unconfirmed = sorted(
+            {
+                str(item)
+                for item in coverage.get(
+                    "unconfirmed_removal_occurrence_ids"
+                )
+                or []
+                if item
+            }
+        )
+    actual_missing = values("actual_missing_ids")
+    actual_missing = sorted(set(actual_missing) | set(unconfirmed))
+    retry_values = [
+        str(source.get("next_retry_at"))
+        for source in (explicit, lifecycle, coverage, daily)
+        if source.get("next_retry_at")
+    ]
+    return {
+        "actual_missing_ids": actual_missing,
+        "incomplete_occurrence_ids": values(
+            "incomplete_occurrence_ids"
+        ),
+        "unknown_coverage_days": values("unknown_coverage_days"),
+        "partial_coverage_days": values("partial_coverage_days"),
+        "quarantined_occurrence_ids": values(
+            "quarantined_occurrence_ids"
+        ),
+        "unconfirmed_removal_ids": unconfirmed,
+        "next_retry_at": min(retry_values) if retry_values else None,
+    }
 
 
 def compact_event_calendar_window(window: dict[str, Any]) -> dict[str, Any]:
@@ -1017,6 +1119,9 @@ def _canonical_occurrence(
         ),
         "valid_until": valid_until,
         "next_refresh_at": next_refresh_at,
+        "publication_grace_until": _iso_or_none(
+            item.get("publication_grace_until")
+        ),
         "removal_status": _nullable(item.get("removal_status")),
         "comparison_lineage": (
             item.get("comparison_lineage")
@@ -1037,7 +1142,25 @@ def _canonical_occurrence(
     occurrence["lifecycle"] = lifecycle_classification.as_dict()
     occurrence["lifecycle_entity_type"] = lifecycle_classification.entity_type
     occurrence["outcome_contract"] = lifecycle_classification.outcome_contract
+    occurrence["actual_required"] = (
+        lifecycle_classification.operational
+        and "actual" in lifecycle_classification.outcome_fields
+    )
     return occurrence, None
+
+
+def _actual_is_due(item: dict[str, Any], *, now: datetime) -> bool:
+    if not item.get("actual_required"):
+        return False
+    if (
+        item.get("actual") not in (None, "")
+        or not item.get("is_past")
+        or item.get("release_status")
+        not in {"AWAITING_ACTUAL", "UNAVAILABLE"}
+    ):
+        return False
+    grace = parse_datetime(item.get("publication_grace_until"))
+    return grace is None or grace <= now
 
 
 def _scheduled_time(

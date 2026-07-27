@@ -652,7 +652,7 @@ def test_migration_14_adds_gateway_and_semantic_lineage_without_recreating_datab
 ) -> None:
     cfg = settings(tmp_path)
     result = migrate_database(cfg.database_path)
-    assert result["schema_version"] == 21
+    assert result["schema_version"] == 22
     with connect_sqlite(cfg.database_path) as conn:
         tables = {
             row[0]
