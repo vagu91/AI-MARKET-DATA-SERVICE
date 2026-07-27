@@ -624,7 +624,9 @@ def test_provider_first_schedule_catchup_is_restart_independent_and_idempotent(
     assert first["source_coverage"]["status"] == "VERIFIED_COMPLETE"
     assert first["source_coverage"]["persisted_gap_count"] == 1
     assert second["source_coverage"]["persisted_gap_count"] == 0
-    assert second["source_coverage"]["unchanged_occurrence_count"] == 1
+    assert second["source_coverage"]["unchanged_occurrence_count"] == 0
+    assert second["source_coverage"]["provider_calls"] == 0
+    assert len(calls) == 1
     assert len(scheduler.lifecycle.list_items()) == count_after_first == 1
     assert calls[0]["start"].astimezone(NY).date() == (
         current_monday - timedelta(days=7)

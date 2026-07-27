@@ -301,8 +301,28 @@ def _cash_session(
     current_close_time = _early_close_time(early_closes.get(day_key)) or CASH_CLOSE
     current_close = datetime.combine(day, current_close_time, NEW_YORK)
     is_open = status == "open"
+    local_time = local.timetz().replace(tzinfo=None)
+    phase = (
+        "REGULAR"
+        if is_open
+        else "PREMARKET"
+        if (
+            local.weekday() < 5
+            and day_key not in closed_dates
+            and time(4, 0) <= local_time < CASH_OPEN
+        )
+        else "AFTER_HOURS"
+        if (
+            local.weekday() < 5
+            and day_key not in closed_dates
+            and CASH_CLOSE <= local_time < time(20, 0)
+        )
+        else "CLOSED"
+    )
     return {
         "status": status,
+        "session_state": "OPEN" if is_open else "CLOSED",
+        "phase": phase,
         "is_open": is_open,
         "closed_reason": (
             None
@@ -450,6 +470,13 @@ def _futures_session(
     )
     return {
         "status": status,
+        "session_state": (
+            "GLOBEX_OPEN"
+            if is_open is True and calculated_status == "open"
+            else "CLOSED"
+            if is_open is False
+            else "UNKNOWN"
+        ),
         "calculated_status": calculated_status,
         "is_open": is_open,
         "closed_reason": closed_reason,

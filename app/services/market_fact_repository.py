@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import re
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from app.core.text_normalization import normalize_payload_text
 from app.core.redaction import redact_payload
@@ -18,6 +18,7 @@ from app.services.temporal_validation_service import (
     TemporalValidationService,
 )
 from app.services.source_policy_service import SourcePolicyService
+from app.services.data_freshness_service import parse_datetime
 from app.infrastructure.persistence.database_safety import assert_test_database_isolated
 
 FACT_COLUMNS = [
@@ -258,6 +259,12 @@ def _event_record_payload(row: Any) -> dict[str, Any]:
         "source_url": row["source_url"], "reliability": row["official_reliability"],
         "actual": row["actual"], "actual_source": row["actual_source"],
         "actual_source_url": row["actual_source_url"], "surprise_value": row["surprise_value"],
+        "completeness_status": row["completeness_status"],
+        "outcome_contract": decode(row["outcome_contract_json"], {}),
+        "publication_grace_until": row["publication_grace_until"],
+        "next_revision_check_at": row["next_revision_check_at"],
+        "removal_status": row["removal_status"],
+        "removal_lineage": decode(row["removal_lineage_json"], {}),
         "surprise_direction": row["surprise_direction"], "release_at": row["release_at"],
         "event_kind": row["event_kind"], "temporal_status": str(row["temporal_status"] or row["status"] or "").upper(),
         "temporal_audit_status": row["temporal_audit_status"],
@@ -309,8 +316,14 @@ def init_market_db(settings: Settings) -> None:
 
 
 class MarketFactRepository:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         init_market_db(settings)
         self.temporal_validation = TemporalValidationService(settings)
         self.source_policy = SourcePolicyService()
@@ -535,13 +548,14 @@ class MarketFactRepository:
     def upsert_economic_event(self, event: Any, event_key: str, *, valid_until: str | None = None) -> None:
         from app.services.temporal_domain_service import canonical_event_key, temporal_event_state
 
-        timestamp = now_iso()
+        event_now = self.clock().astimezone(UTC)
+        timestamp = event_now.replace(microsecond=0).isoformat()
         payload = normalize_payload_text(event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event))
         invalid_sources = self.source_policy.invalid_sources(
             payload,
             allow_test_reserved=self.settings.environment.lower() == "test",
         )
-        time_utc = payload.get("time_utc")
+        time_utc = payload.get("time_utc") or payload.get("release_at")
         forecast = (payload.get("enrichment") or {}).get("forecast") if isinstance(payload.get("enrichment"), dict) else None
         previous = (payload.get("enrichment") or {}).get("previous") if isinstance(payload.get("enrichment"), dict) else None
         consensus = (payload.get("enrichment") or {}).get("consensus") if isinstance(payload.get("enrichment"), dict) else None
@@ -550,6 +564,49 @@ class MarketFactRepository:
             actual = (payload.get("enrichment") or {}).get("actual")
         temporal = temporal_event_state(payload)
         actual = temporal["actual"]
+        release_datetime = parse_datetime(
+            payload.get("release_at")
+            or payload.get("time_utc")
+            or payload.get("date")
+        )
+        if release_datetime is not None:
+            payload.setdefault("date", release_datetime.date().isoformat())
+            payload.setdefault("time_utc", release_datetime.isoformat())
+        if not payload.get("name") and payload.get("event_name"):
+            payload["name"] = payload["event_name"]
+        is_past = (
+            release_datetime is not None
+            and release_datetime <= event_now
+        )
+        completeness_status = (
+            "COMPLETE"
+            if actual not in (None, "")
+            else "AWAITING_ACTUAL"
+            if is_past
+            else "INCOMPLETE"
+        )
+        outcome_contract = {
+            "required_fields": ["actual"],
+            "reference_period": (
+                payload.get("reference_period") or payload.get("period")
+            ),
+            "frequency": payload.get("frequency"),
+            "unit": payload.get("unit"),
+        }
+        publication_grace_until = (
+            (
+                release_datetime + timedelta(minutes=30)
+            ).astimezone(UTC).isoformat()
+            if release_datetime is not None
+            else None
+        )
+        next_revision_check_at = (
+            (event_now + timedelta(days=7))
+            .replace(microsecond=0)
+            .isoformat()
+            if actual not in (None, "")
+            else None
+        )
         canonical_key = canonical_event_key(payload)
         decision = self.temporal_validation.policy.evaluate(
             payload,
@@ -578,6 +635,23 @@ class MarketFactRepository:
             if existing is not None:
                 event_key = str(existing["event_key"])
                 existing_raw = decode(existing["raw_payload_json"], {})
+                if (
+                    existing_raw == payload
+                    and existing["actual"] == (
+                        None if actual is None else str(actual)
+                    )
+                    and existing["forecast"] == (
+                        None if forecast is None else str(forecast)
+                    )
+                    and existing["previous"] == (
+                        None if previous is None else str(previous)
+                    )
+                    and existing["consensus"] == (
+                        None if consensus is None else str(consensus)
+                    )
+                ):
+                    conn.rollback()
+                    return
                 payload = _merge_event_payload(existing_raw, payload, existing)
                 if actual in (None, "") and existing["actual"] not in (None, ""):
                     actual = existing["actual"]
@@ -603,6 +677,7 @@ class MarketFactRepository:
                 existing_lineage = decode(existing["field_lineage_json"], {})
                 field_lineage = {**existing_lineage, **field_lineage}
             if audit_status == QUARANTINED_STATUS:
+                completeness_status = "QUARANTINED"
                 payload["temporal_status"] = QUARANTINED_STATUS
                 payload["temporal_audit_status"] = QUARANTINED_STATUS
                 payload["temporal_invalid_reason"] = invalid_reason
@@ -615,7 +690,10 @@ class MarketFactRepository:
                     raw_payload_json, created_at, updated_at, canonical_event_key,event_kind,
                     temporal_status,field_lineage_json,temporal_audit_status,
                     temporal_invalid_reason,source_audit_status,source_invalid_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ,completeness_status,outcome_contract_json,
+                    publication_grace_until,next_revision_check_at,
+                    removal_status,removal_lineage_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_key) DO UPDATE SET
                     country=excluded.country,
                     category=excluded.category,
@@ -668,6 +746,18 @@ class MarketFactRepository:
                       economic_events_history.source_invalid_reason,
                       excluded.source_invalid_reason
                     ),
+                    completeness_status=excluded.completeness_status,
+                    outcome_contract_json=excluded.outcome_contract_json,
+                    publication_grace_until=excluded.publication_grace_until,
+                    next_revision_check_at=excluded.next_revision_check_at,
+                    removal_status=COALESCE(
+                      excluded.removal_status,
+                      economic_events_history.removal_status
+                    ),
+                    removal_lineage_json=CASE
+                      WHEN excluded.removal_status IS NULL
+                      THEN economic_events_history.removal_lineage_json
+                      ELSE excluded.removal_lineage_json END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -703,6 +793,12 @@ class MarketFactRepository:
                     invalid_reason,
                     source_audit_status,
                     source_invalid_reason,
+                    completeness_status,
+                    encode(outcome_contract) or "{}",
+                    publication_grace_until,
+                    next_revision_check_at,
+                    payload.get("removal_status"),
+                    encode(payload.get("comparison_lineage") or {}) or "{}",
                 ),
             )
             stored = conn.execute(

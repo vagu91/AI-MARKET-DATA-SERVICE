@@ -1,0 +1,60 @@
+{
+  "fixture": "snapshot_94_monday_live_blockers_redacted_v1",
+  "derived_from": "monday-provider-live-validation-20260727T093918Z",
+  "reference_now": "2026-07-27T09:40:00+00:00",
+  "forensic_before": {
+    "snapshot_revision": 94,
+    "calendar_counts": {"previous": 0, "current": 25, "next": 7},
+    "source_candidates": 41,
+    "delivered_occurrences": 32,
+    "exact_duplicates": 9,
+    "actual_missing_count": 0,
+    "news_candidates": 100,
+    "news_delivered": 0,
+    "full_sync_sections": 17,
+    "full_sync_bytes": 1007063,
+    "full_sync_sha256": "14FD834D3999C97DC34526D59D593D6C33F6D209F090959435685D078CF1D74C"
+  },
+  "expected_after": {
+    "calendar_counts": {"previous": 14, "current": 3, "next": 25},
+    "actual_missing_before": 2,
+    "actual_missing_after": 0,
+    "unconfirmed_removal_visible": 1,
+    "market_schedule": {
+      "nasdaq_cash_state": "CLOSED",
+      "nasdaq_phase": "PREMARKET",
+      "mnq_state": "GLOBEX_OPEN",
+      "section_status": "PARTIAL"
+    }
+  },
+  "actuals": [
+    {
+      "occurrence_id": "xtb:146392:2026-07-24",
+      "name": "New Home Sales",
+      "actual": 628.0,
+      "reference_period": "2026-06",
+      "forecast": 610.0,
+      "previous": 618.0
+    },
+    {
+      "occurrence_id": "xtb:146945:2026-07-24",
+      "name": "Flash Services PMI",
+      "actual": 53.6,
+      "reference_period": "2026-07",
+      "forecast": 52.0,
+      "previous": 51.2
+    }
+  ],
+  "news_expectations": {
+    "accepted_publishers": ["Investor's Business Daily", "Reuters", "Reuters"],
+    "reuters_updates": 2,
+    "unknown_publisher_distributed_by_yahoo": "QUARANTINED",
+    "technical_dedup_only": true
+  },
+  "safety": {
+    "live_provider_calls": 0,
+    "ai_calls": 0,
+    "operational_database_opened": false,
+    "consumer_payload_sha256": "BCED28DECDF98D65AF9843C3CF3FF23DAB0A164C721B8BEF9B3E0D7697699DD4"
+  }
+}
