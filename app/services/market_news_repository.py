@@ -141,6 +141,7 @@ class MarketNewsRepository:
         updates = ", ".join(
             (
                 f"{column}=CASE WHEN market_news.source_audit_status='QUARANTINED' "
+                "AND excluded.source_audit_status='QUARANTINED' "
                 f"THEN market_news.{column} ELSE excluded.{column} END"
                 if column in {
                     "source_url",
@@ -191,20 +192,28 @@ class MarketNewsRepository:
         *,
         symbols: list[str] | None = None,
         days: int = 7,
-        limit: int = 200,
+        limit: int | None = 200,
         current_only: bool = False,
+        include_quarantined: bool = False,
     ) -> list[dict[str, Any]]:
         cutoff = (self.clock() - timedelta(days=max(days, 1))).replace(microsecond=0).isoformat()
-        with connect_market_db(self.settings) as conn:
-            rows = conn.execute(
-                """
+        audit_filter = (
+            ""
+            if include_quarantined
+            else "AND source_audit_status='ACTIVE'"
+        )
+        query = f"""
                 SELECT * FROM market_news
                 WHERE COALESCE(published_at, retrieved_at) >= ?
-                  AND source_audit_status='ACTIVE'
-                ORDER BY COALESCE(published_at, retrieved_at) DESC LIMIT ?
-                """,
-                (cutoff, limit),
-            ).fetchall()
+                  {audit_filter}
+                ORDER BY COALESCE(published_at, retrieved_at) DESC
+        """
+        parameters: tuple[Any, ...] = (cutoff,)
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters = (cutoff, max(int(limit), 1))
+        with connect_market_db(self.settings) as conn:
+            rows = conn.execute(query, parameters).fetchall()
         items = [self._row(row) for row in rows]
         now = self.clock()
         for item in items:

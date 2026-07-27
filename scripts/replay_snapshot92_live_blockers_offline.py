@@ -31,6 +31,7 @@ from app.services.market_context_sync_service import (
     canonical_json,
 )
 from app.services.market_news_repository import MarketNewsRepository
+from app.services.market_session_service import build_session_aware_schedule
 from app.services.news_intelligence_runtime_service import (
     NewsIntelligenceRuntimeService,
 )
@@ -379,7 +380,10 @@ def _baseline_payload(
         },
         "macro_snapshot": {},
         "rates_context": fixture["rates"],
-        "market_schedule": fixture["market_schedule"],
+        "market_schedule": build_session_aware_schedule(
+            fixture["market_schedule"],
+            now=now,
+        ),
         "nasdaq_context": {"earnings": {}},
         "news_context": news_context,
         "latest_news": news_context["latest"],

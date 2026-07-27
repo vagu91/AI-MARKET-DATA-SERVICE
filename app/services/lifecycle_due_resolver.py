@@ -138,6 +138,7 @@ class ExactOccurrenceActualProviderAdapter:
         expected_period = normalize_reference_period(
             payload.get("reference_period") or payload.get("period"),
             frequency=frequency,
+            release_date=expected_release,
         )
         if not expected_key or expected_release is None or not expected_period:
             return self._no_data("expected_occurrence_semantics_missing")
@@ -168,13 +169,33 @@ class ExactOccurrenceActualProviderAdapter:
             if normalize_reference_period(
                 row.get("reference_period") or row.get("period"),
                 frequency=frequency,
+                release_date=expected_release,
             )
             == expected_period
         ]
         if not period_matches:
             return self._no_data("exact_occurrence_reference_period_mismatch")
+        semantic_values = {
+            (
+                str(row.get("actual")),
+                str(row.get("forecast")),
+                str(row.get("previous")),
+                _normalized_unit(row.get("unit")),
+            )
+            for row in period_matches
+        }
+        if len(semantic_values) > 1:
+            return self._no_data("exact_occurrence_observation_ambiguous")
 
         observation = period_matches[0]
+        if (
+            payload.get("forecast") not in (None, "")
+            and payload.get("previous") not in (None, "")
+            and observation.get("forecast") == payload.get("previous")
+            and observation.get("previous") == payload.get("forecast")
+            and payload.get("forecast") != payload.get("previous")
+        ):
+            return self._no_data("forecast_previous_fields_swapped")
         observed_frequency = str(
             observation.get("frequency") or frequency
         ).lower()
@@ -194,6 +215,9 @@ class ExactOccurrenceActualProviderAdapter:
             "expired",
         }:
             return self._no_data("exact_occurrence_validation_rejected")
+        retrieved_at = parse_datetime(observation.get("retrieved_at"))
+        if retrieved_at is not None and retrieved_at < expected_release:
+            return self._no_data("exact_occurrence_validation_stale")
         raw_lineage = observation.get("field_lineage") or observation.get(
             "lineage"
         )
@@ -233,9 +257,17 @@ class ExactOccurrenceActualProviderAdapter:
             "period": expected_period,
             "frequency": frequency,
             "actual": value,
-            "forecast": payload.get("forecast"),
+            "forecast": (
+                observation.get("forecast")
+                if observation.get("forecast") not in (None, "")
+                else payload.get("forecast")
+            ),
             "consensus": payload.get("consensus"),
-            "previous": payload.get("previous"),
+            "previous": (
+                observation.get("previous")
+                if observation.get("previous") not in (None, "")
+                else payload.get("previous")
+            ),
             "unit": observation.get("unit") or payload.get("unit"),
             "release_status": "PUBLISHED",
             "source": (
@@ -1057,13 +1089,18 @@ def _exact_calendar_actual_datum(
         "expired",
     }:
         return None
+    retrieved_at = parse_datetime(exact.get("retrieved_at"))
+    if retrieved_at is not None and retrieved_at < release:
+        return None
     expected_period = normalize_reference_period(
         payload.get("reference_period") or payload.get("period"),
         frequency=frequency,
+        release_date=release,
     )
     observed_period = normalize_reference_period(
         exact.get("reference_period") or exact.get("period"),
         frequency=frequency,
+        release_date=release,
     )
     if not expected_period or observed_period != expected_period:
         return None

@@ -400,3 +400,28 @@ Senior Analyst starts only after the requested sync is durably complete. Its
 context is immutable for the analysis lifetime. New material data causes
 consumer-side invalidation or a new analysis; it is never injected into an
 analysis already running.
+
+## Degraded but usable sections
+
+Readiness is derived only from the delivered section payload and its persisted
+`sync` metadata. A `PARTIAL` or stale section with a nonzero delivered record
+count is usable with disclosure: it appears in both `sections_available` and
+`sections_degraded`. It is not placed in `sections_unavailable`. A quarantined,
+provider-unavailable or zero-record no-data section remains unavailable.
+`READY` still requires no degraded or unavailable sections, so this distinction
+does not inflate the overall decision.
+
+`market_schedule` preserves Nasdaq cash and MNQ/Globex as separate sessions.
+When the CME holiday cross-check is unavailable, an accepted, versioned weekly
+Globex rule remains deliverable with its CME trading-hours URL and lineage.
+The section is `PARTIAL`, with the missing cross-check disclosed; it is not
+converted to `QUARANTINED` merely because official holiday verification is
+temporarily unavailable.
+
+News projection reads the complete selected DB interval without SQL `LIMIT`.
+Publisher and distributor are independent fields. Quarantined rows may be
+included as diagnostic candidates, but a rejected source-policy outcome can
+never enter accepted news. Each rejection retains title, available content,
+URL, timestamps, publisher, distributor, lineage, policy outcome and exact
+reason. Technical deduplication requires an identical record identity and
+content; temporally distinct Reuters updates remain distinct.

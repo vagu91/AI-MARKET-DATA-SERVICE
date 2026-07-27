@@ -12,6 +12,7 @@ FUTURES_OPEN_SUNDAY = time(18, 0)
 FUTURES_DAILY_CLOSE = time(17, 0)
 FUTURES_DAILY_REOPEN = time(18, 0)
 SCHEDULE_VERSION = "us_equities_cme_globex_v1"
+CME_TRADING_HOURS_URL = "https://www.cmegroup.com/trading-hours.html"
 
 
 def build_session_aware_schedule(
@@ -118,6 +119,11 @@ def build_session_aware_schedule(
     else:
         futures.update(
             {
+                "source": "versioned CME Globex weekly session rule",
+                "source_url": CME_TRADING_HOURS_URL,
+                "source_classification": (
+                    "versioned_static_last_known_good"
+                ),
                 "calendar_crosscheck_status": str(
                     cme_calendar.get("status") or "not_available"
                 ),
@@ -129,6 +135,11 @@ def build_session_aware_schedule(
                 "source_is_primary_originator": False,
                 "source_is_official_redistributor": False,
                 "is_official_source": False,
+                "validation": {
+                    "status": "accepted",
+                    "reason_code": None,
+                    "policy_version": "source-policy-v5",
+                },
             }
         )
     last_session = _previous_cash_session(local.date(), closed_dates)
@@ -230,6 +241,13 @@ def build_session_aware_schedule(
             else "deterministic base session rule; holiday override unverified"
             if deterministic_base_verified
             else "unverified schedule; deterministic state withheld"
+        ),
+        "source_url": (
+            cme_calendar.get("source_url")
+            or CME_TRADING_HOURS_URL
+        ),
+        "source_classification": (
+            "mixed_verified_and_versioned_schedule"
         ),
         "validation": {
             "status": (

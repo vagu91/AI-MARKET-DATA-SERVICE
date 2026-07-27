@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import date, datetime
 from typing import Any
 
 
@@ -186,10 +187,42 @@ def derive_official_actual(
     }
 
 
-def normalize_reference_period(value: Any, *, frequency: str) -> str | None:
+def normalize_reference_period(
+    value: Any,
+    *,
+    frequency: str,
+    release_date: date | datetime | None = None,
+) -> str | None:
     text = str(value or "").strip().lower()
     if not text:
         return None
+    localized_months = {
+        "gennaio": 1,
+        "febbraio": 2,
+        "marzo": 3,
+        "aprile": 4,
+        "maggio": 5,
+        "giugno": 6,
+        "luglio": 7,
+        "agosto": 8,
+        "settembre": 9,
+        "ottobre": 10,
+        "novembre": 11,
+        "dicembre": 12,
+    }
+    if frequency == "monthly" and text in localized_months and release_date:
+        anchor = (
+            release_date.date()
+            if isinstance(release_date, datetime)
+            else release_date
+        )
+        month_number = localized_months[text]
+        year = (
+            anchor.year
+            if month_number <= anchor.month
+            else anchor.year - 1
+        )
+        return f"{year:04d}-{month_number:02d}"
     month = re.search(r"(?:month:)?(20\d{2})[-/m: ]0?(1[0-2]|[1-9])", text)
     if frequency == "monthly" and month:
         return f"{month.group(1)}-{int(month.group(2)):02d}"

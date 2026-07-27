@@ -1528,14 +1528,17 @@ class ResearchSchedulerService:
             timezone,
         ).astimezone(UTC)
         next_end_date = current_start + timedelta(days=13)
+        window_end = datetime.combine(
+            next_end_date + timedelta(days=1),
+            datetime.min.time(),
+            timezone,
+        ).astimezone(UTC)
         provider_name = "economic_calendar_composite"
         query_scope = "country=US"
         policy_version = self.market_facts.source_policy.policy_version
         requested_days = [
             previous_start + timedelta(days=offset)
-            for offset in range(
-                (local_now.date() - previous_start).days + 1
-            )
+            for offset in range((next_end_date - previous_start).days + 1)
         ]
         missing_days = self.calendar_coverage.missing_dates(
             requested_days,
@@ -1546,7 +1549,7 @@ class ResearchSchedulerService:
         )
         coverage = {
             "window_start": window_start.isoformat(),
-            "window_end": now.astimezone(UTC).isoformat(),
+            "window_end": window_end.isoformat(),
             "provider_calls": 0,
             "persisted_gap_count": 0,
             "unchanged_occurrence_count": 0,
@@ -1557,6 +1560,10 @@ class ResearchSchedulerService:
                     "candidate_count": 0,
                 },
                 "CURRENT_WEEK": {
+                    "status": "UNVERIFIED_EMPTY",
+                    "candidate_count": 0,
+                },
+                "NEXT_WEEK": {
                     "status": "UNVERIFIED_EMPTY",
                     "candidate_count": 0,
                 },
@@ -1572,7 +1579,7 @@ class ResearchSchedulerService:
                 _contiguous_date_segments(
                     missing_days,
                     timezone=timezone,
-                    upper_bound=now,
+                    upper_bound=window_end,
                 )
             ),
             "provider_calls_executed": 0,
@@ -1595,7 +1602,7 @@ class ResearchSchedulerService:
         for segment_start, segment_end in _contiguous_date_segments(
             missing_days,
             timezone=timezone,
-            upper_bound=now,
+            upper_bound=window_end,
         ):
             coverage["provider_calls"] += 1
             coverage["provider_calls_executed"] += 1
@@ -1652,7 +1659,11 @@ class ResearchSchedulerService:
         if missing_days and failed_segments and not rows:
             retry_at = (now + timedelta(minutes=5)).astimezone(UTC)
             for day in missing_days:
-                day_start, day_end = _local_day_bounds(day, timezone, now)
+                day_start, day_end = _local_day_bounds(
+                    day,
+                    timezone,
+                    window_end,
+                )
                 changed = self.calendar_coverage.record_day(
                     day,
                     provider_name=provider_name,
@@ -1709,7 +1720,11 @@ class ResearchSchedulerService:
                 else "CURRENT_WEEK"
                 if current_start
                 <= release_local.date()
-                <= local_now.date()
+                < current_start + timedelta(days=7)
+                else "NEXT_WEEK"
+                if current_start + timedelta(days=7)
+                <= release_local.date()
+                <= next_end_date
                 else None
             )
             if bucket_name is None:
@@ -1783,7 +1798,11 @@ class ResearchSchedulerService:
                 local_day = release.astimezone(timezone).date().isoformat()
                 rows_by_day[local_day] = rows_by_day.get(local_day, 0) + 1
         for day in missing_days:
-            day_start, day_end = _local_day_bounds(day, timezone, now)
+            day_start, day_end = _local_day_bounds(
+                day,
+                timezone,
+                window_end,
+            )
             count = rows_by_day.get(day.isoformat(), 0)
             day_proof = next(
                 (
@@ -1816,6 +1835,11 @@ class ResearchSchedulerService:
                 if not count and positive_proof
                 else "PARTIAL"
             )
+            next_retry_at = (
+                None
+                if status in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
+                else now + timedelta(hours=2)
+            )
             changed = self.calendar_coverage.record_day(
                 day,
                 provider_name=provider_name,
@@ -1837,6 +1861,7 @@ class ResearchSchedulerService:
                     if day < local_now.date()
                     else now + timedelta(hours=2)
                 ),
+                next_retry_at=next_retry_at,
                 lineage={
                     "provider_result_count": len(provider_results),
                     "query_scope": query_scope,
@@ -1847,7 +1872,7 @@ class ResearchSchedulerService:
             coverage["coverage_metadata_writes"] += int(changed)
         matrix = self.calendar_coverage.matrix(
             start_date=previous_start,
-            end_date=local_now.date(),
+            end_date=next_end_date,
             provider_name=provider_name,
             query_scope=query_scope,
             now=now,
@@ -1860,12 +1885,27 @@ class ResearchSchedulerService:
         coverage["partial_coverage_days"] = matrix[
             "partial_coverage_days"
         ]
+        coverage["authoritative_dates"] = sorted(
+            day
+            for day, proof in matrix["by_date"].items()
+            if proof["status"]
+            in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
+            and proof["provider_called"]
+            and proof["scope_verified"]
+        )
         for bucket_name, (first, last) in {
             "PREVIOUS_WEEK": (
                 previous_start,
                 current_start - timedelta(days=1),
             ),
-            "CURRENT_WEEK": (current_start, local_now.date()),
+            "CURRENT_WEEK": (
+                current_start,
+                current_start + timedelta(days=6),
+            ),
+            "NEXT_WEEK": (
+                current_start + timedelta(days=7),
+                next_end_date,
+            ),
         }.items():
             statuses = [
                 matrix["by_date"].get(
@@ -2009,6 +2049,17 @@ class ResearchSchedulerService:
         }
         coverage_start = parse_datetime(source_coverage.get("window_start"))
         coverage_end = parse_datetime(source_coverage.get("window_end"))
+        authoritative_dates = {
+            str(item)
+            for item in source_coverage.get("authoritative_dates") or []
+            if item
+        }
+        calendar_timezone = ZoneInfo(
+            str(
+                self.settings.event_calendar_timezone
+                or "America/New_York"
+            )
+        )
         unconfirmed_removals: list[str] = []
         lifecycle_keys = {
             (str(item["entity_type"]), str(item["entity_key"]))
@@ -2032,6 +2083,10 @@ class ResearchSchedulerService:
                     or release_at is None
                     or release_at < coverage_start
                     or release_at > coverage_end
+                    or release_at.astimezone(
+                        calendar_timezone
+                    ).date().isoformat()
+                    not in authoritative_dates
                 ):
                     continue
                 annotated = {

@@ -535,6 +535,9 @@ def reconcile_delivered_section(
     ).upper() == "UNVERIFIED_EMPTY":
         context["status"] = "PARTIAL"
         context["reason"] = "HISTORICAL_COVERAGE_UNVERIFIED"
+    elif delivered and diagnostics["excluded_count"]:
+        context["status"] = "PARTIAL"
+        context["reason"] = "SOURCE_POLICY_EXCLUDED_RECORDS"
     elif delivered:
         context["status"] = "AVAILABLE"
         context.pop("reason", None)
@@ -578,7 +581,11 @@ def reconcile_delivered_section(
         {
             "status": (
                 "AVAILABLE"
-                if delivered and not quarantine.get("record_count")
+                if (
+                    delivered
+                    and not quarantine.get("record_count")
+                    and not diagnostics["excluded_count"]
+                )
                 else "PARTIAL"
                 if delivered
                 else "QUARANTINED"
@@ -2876,24 +2883,39 @@ def delivery_readiness(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         name: producer_availability_classification(value)
         for name, value in metadata.items()
     }
-    available = [
-        name for name, classification in classifications.items()
-        if classification is None
-    ]
+    usable = {
+        name: (
+            classification is None
+            or (
+                classification
+                in {"PARTIAL_AT_PRODUCER", "STALE_AT_PRODUCER"}
+                and int(metadata[name].get("record_count") or 0) > 0
+            )
+        )
+        for name, classification in classifications.items()
+    }
+    available = [name for name, is_usable in usable.items() if is_usable]
     degraded = [
         name for name, classification in classifications.items()
-        if classification is not None
+        if usable[name] and classification is not None
     ]
+    unavailable = [name for name, is_usable in usable.items() if not is_usable]
     ratio = round(len(available) / max(len(statuses), 1), 4)
     return {
-        "status": "READY" if not degraded else "PARTIAL",
+        "status": (
+            "READY"
+            if not degraded and not unavailable
+            else "PARTIAL"
+        ),
         "calculated_from_delivered_payload": True,
         "available_section_count": len(available),
-        "unavailable_section_count": len(degraded),
+        "degraded_section_count": len(degraded),
+        "unavailable_section_count": len(unavailable),
         "section_count": len(statuses),
         "coverage_ratio": ratio,
         "sections_available": available,
-        "sections_unavailable": degraded,
+        "sections_degraded": degraded,
+        "sections_unavailable": unavailable,
         "section_status": statuses,
         "producer_classification": classifications,
     }

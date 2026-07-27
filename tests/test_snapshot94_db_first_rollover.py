@@ -182,9 +182,15 @@ def test_valid_daily_coverage_suppresses_provider_calls(
         now=NOW,
     )
     assert first["provider_calls"] == 1
+    assert len(first["requested_dates"]) == 21
+    assert first["by_bucket"]["NEXT_WEEK"]["status"] == "VERIFIED_COMPLETE"
     assert second["provider_calls"] == 0
     assert len(calls) == 1
     assert second["targeted_gap_dates"] == []
+    assert second["canonical_writes"] == 0
+    assert second["coverage_metadata_writes"] == 0
+    assert second["snapshot_writes"] == 0
+    assert second["outbox_writes"] == 0
 
 
 def test_only_unknown_day_is_reacquired(tmp_path: Path) -> None:
@@ -192,7 +198,7 @@ def test_only_unknown_day_is_reacquired(tmp_path: Path) -> None:
     repo = EventCalendarCoverageRepository(settings, clock=lambda: NOW)
     scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
     previous_start = date(2026, 7, 20)
-    for offset in range(8):
+    for offset in range(21):
         day = previous_start + timedelta(days=offset)
         if day == date(2026, 7, 24):
             continue
@@ -596,6 +602,13 @@ def test_unproven_empty_stays_partial_and_is_not_suppressed(
         now=NOW,
     )
     assert first["status"] == second["status"] == "PARTIAL"
-    assert acquire.calls == 2
+    assert acquire.calls == 1
+    assert first["provider_calls"] == 1
+    assert second["provider_calls"] == 0
+    assert second["targeted_gap_dates"] == []
+    assert second["canonical_writes"] == 0
+    assert second["coverage_metadata_writes"] == 0
+    assert second["snapshot_writes"] == 0
+    assert second["outbox_writes"] == 0
     assert first["provider_calls_executed"] == 1
     assert first["coverage_metadata_writes"] > 0

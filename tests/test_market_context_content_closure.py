@@ -281,7 +281,8 @@ def test_occurrence_identity_preserves_times_sources_and_exact_duplicates(
 
     assert set(events) == {"series-release", "series-release-later"}
     assert len(events["series-release"]["source_evidence"]) == 2
-    assert window["coverage"]["source_candidate_count"] == 4
+    assert window["coverage"]["source_candidate_count"] == 3
+    assert window["coverage"]["raw_source_candidate_count"] == 4
     assert window["coverage"]["delivered_valid_source_record_count"] == 3
     assert window["coverage"]["delivered_occurrence_count"] == 2
     assert window["coverage"]["exact_duplicate_count"] == 1

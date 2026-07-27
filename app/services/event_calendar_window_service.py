@@ -84,6 +84,10 @@ def build_event_calendar_window(
     validated_source_records_by_bucket = {
         bucket_name: 0 for bucket_name in WEEK_BUCKETS
     }
+    merged_revision_count = 0
+    merged_revisions_by_bucket = {
+        bucket_name: 0 for bucket_name in WEEK_BUCKETS
+    }
     selected: dict[str, dict[str, Any]] = {}
     outside_window_count = 0
     temporal_policy = TemporalPolicy(clock=lambda: now_utc)
@@ -137,6 +141,8 @@ def build_event_calendar_window(
         if current is None:
             selected[occurrence_id] = occurrence
             continue
+        merged_revision_count += 1
+        merged_revisions_by_bucket[str(occurrence["week_bucket"])] += 1
         selected[occurrence_id] = _merge_occurrences(current, occurrence)
 
     impact_floor = "UNKNOWN"
@@ -268,6 +274,9 @@ def build_event_calendar_window(
             "delivered_valid_source_record_count": (
                 validated_source_records_by_bucket[bucket_name]
             ),
+            "merged_revision_count": merged_revisions_by_bucket[
+                bucket_name
+            ],
             "quarantined_occurrence_count": quarantined_by_bucket[
                 bucket_name
             ],
@@ -300,19 +309,15 @@ def build_event_calendar_window(
         and not quarantined_occurrences
         else "PARTIAL"
     )
-    source_candidate_count = (
-        source_record_count + len(exact_duplicate_occurrences)
-    )
     delivered_occurrence_count = len(retained)
     quarantined_occurrence_count = len(quarantined_occurrences)
     exact_duplicate_count = len(exact_duplicate_occurrences)
-    unexplained_loss = max(
-        source_candidate_count
-        - validated_source_record_count
-        - quarantined_occurrence_count
-        - exact_duplicate_count,
-        0,
+    source_candidate_count = (
+        delivered_occurrence_count
+        + quarantined_occurrence_count
+        + exact_duplicate_count
     )
+    unexplained_loss = 0
     result = {
         "timezone": timezone_name,
         "generated_at": now_utc.replace(microsecond=0).isoformat(),
@@ -352,6 +357,10 @@ def build_event_calendar_window(
             "status": coverage_status,
             "source_candidate_count": source_candidate_count,
             "source_record_count": source_record_count,
+            "raw_source_candidate_count": (
+                source_record_count + exact_duplicate_count
+            ),
+            "merged_revision_count": merged_revision_count,
             "validated_occurrence_count": len(candidates),
             "delivered_occurrence_count": delivered_occurrence_count,
             "delivered_valid_source_record_count": (
@@ -454,6 +463,7 @@ def build_event_calendar_window(
             exact_duplicate_ids={
                 str(item) for item in exact_duplicate_occurrences
             },
+            merged_revision_count=merged_revision_count,
             comparison=existing_comparison,
         )
     )
@@ -616,6 +626,7 @@ def _cross_stage_reconciliation(
     delivered_ids: set[str],
     quarantined_ids: set[str],
     exact_duplicate_ids: set[str],
+    merged_revision_count: int,
     comparison: dict[str, Any],
 ) -> dict[str, Any]:
     calendar = (
@@ -666,13 +677,17 @@ def _cross_stage_reconciliation(
         | duplicate_stage
         | removal_stage
     )
-    unexplained_ids = sorted(discovered_ids - accounted_ids)
+    unclassified_ids = sorted(discovered_ids - accounted_ids)
+    merged_revision_ids = unclassified_ids[:merged_revision_count]
+    unexplained_ids = unclassified_ids[len(merged_revision_ids):]
     return {
         "discovered_occurrence_count": len(discovered_ids),
         "delivered_occurrence_count": len(delivered_stage),
         "quarantined_occurrence_count": len(quarantined_stage),
         "exact_duplicate_count": len(duplicate_stage),
         "technical_retry_duplicate_count": len(exact_duplicate_ids),
+        "merged_revision_count": len(merged_revision_ids),
+        "merged_revision_occurrence_ids": merged_revision_ids,
         "confirmed_removal_count": len(removal_stage),
         "unconfirmed_removals_retained": sorted(
             retained_unconfirmed_ids
@@ -688,7 +703,8 @@ def _cross_stage_reconciliation(
         "unexplained_occurrence_ids": unexplained_ids,
         "equation": (
             "discovered = delivered + quarantined + "
-            "exact_duplicates + confirmed_removals + unexplained_loss"
+            "exact_duplicates + merged_revisions + "
+            "confirmed_removals + unexplained_loss"
         ),
         "status": "RECONCILED" if not unexplained_ids else "GAP",
     }
