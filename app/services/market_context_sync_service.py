@@ -2901,6 +2901,50 @@ def delivery_readiness(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
     ]
     unavailable = [name for name, is_usable in usable.items() if not is_usable]
     ratio = round(len(available) / max(len(statuses), 1), 4)
+    analysis_requirements = {
+        "trading_context": (
+            "market_schedule",
+            "nasdaq",
+            "risk",
+        ),
+        "macro_analysis": (
+            "macro",
+            "macro_actuals",
+            "event_calendar",
+        ),
+        "news_analysis": ("news",),
+        "event_risk_analysis": ("event_calendar",),
+    }
+    analysis_readiness = {}
+    for analysis, required_sections in analysis_requirements.items():
+        usable_required = [
+            name
+            for name in required_sections
+            if usable.get(name, False)
+        ]
+        degraded_required = [
+            name
+            for name in usable_required
+            if classifications.get(name) is not None
+        ]
+        missing_required = [
+            name
+            for name in required_sections
+            if not usable.get(name, False)
+        ]
+        analysis_readiness[analysis] = {
+            "status": (
+                "AVAILABLE"
+                if not missing_required and not degraded_required
+                else "PARTIAL"
+                if usable_required
+                else "UNAVAILABLE"
+            ),
+            "usable_sections": usable_required,
+            "degraded_sections": degraded_required,
+            "missing_sections": missing_required,
+            "calculated_from_delivered_payload": True,
+        }
     return {
         "status": (
             "READY"
@@ -2918,6 +2962,7 @@ def delivery_readiness(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "sections_unavailable": unavailable,
         "section_status": statuses,
         "producer_classification": classifications,
+        "analysis_readiness": analysis_readiness,
     }
 
 

@@ -91,6 +91,7 @@ def replay() -> tuple[dict[str, Any], dict[str, Any]]:
             "two_independent_replays_byte_identical": True,
         },
         "fixed_point": {
+            **first_summary["fixed_point"],
             "two_consecutive_full_reads_byte_identical": first_summary[
                 "full_sync"
             ]["two_consecutive_replays_byte_identical"],

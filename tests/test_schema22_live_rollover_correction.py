@@ -11,12 +11,16 @@ from app.core.config import Settings
 from app.services.lifecycle_due_resolver import (
     ExactOccurrenceActualProviderAdapter,
 )
+from app.services.event_calendar_window_service import (
+    _cross_stage_reconciliation,
+)
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
 from app.services.market_context_sync_service import delivery_readiness
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.news_intelligence_service import build_news_context
+from app.services.official_actual_semantics import normalize_reference_period
 from app.services.research_scheduler_service import ResearchSchedulerService
 from scripts.replay_schema22_live_rollover_offline import replay
 
@@ -170,6 +174,28 @@ def test_actual_semantics_fail_closed(
     assert reason in result["reason"]
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Giugno", "2026-06"),
+        ("June", "2026-06"),
+        ("2026-06", "2026-06"),
+        ("Luglio", "2026-07"),
+        ("July", "2026-07"),
+        ("2026-07", "2026-07"),
+    ],
+)
+def test_monthly_reference_period_accepts_localized_equivalents(
+    value: str,
+    expected: str,
+) -> None:
+    assert normalize_reference_period(
+        value,
+        frequency="monthly",
+        release_date=datetime(2026, 7, 24, tzinfo=UTC),
+    ) == expected
+
+
 def test_ambiguous_actual_observations_fail_closed() -> None:
     fixture = actual_fixture()
     previous = fixture["unconfirmed_removals"][1]["previous_occurrence"]
@@ -180,6 +206,64 @@ def test_ambiguous_actual_observations_fail_closed() -> None:
     ).resolve(actual_item(previous))
     assert result["status"] == "NO_DATA"
     assert "exact_occurrence_observation_ambiguous" in result["reason"]
+
+
+def test_semantic_occurrence_match_allows_distributor_id_change() -> None:
+    fixture = actual_fixture()
+    previous = fixture["unconfirmed_removals"][1]["previous_occurrence"]
+    observation = {
+        **fixture["actual_provider_observations"][1],
+        "occurrence_id": "different-distributor-id",
+        "provider_event_id": "different-distributor-id",
+    }
+    result = ExactOccurrenceActualProviderAdapter(
+        lambda _: [observation]
+    ).resolve(actual_item(previous))
+    assert result["status"] == "RESOLVED"
+    assert result["datum"]["actual"] == 53.6
+
+
+def test_latest_timestamped_actual_revision_is_preserved() -> None:
+    fixture = actual_fixture()
+    previous = fixture["unconfirmed_removals"][0]["previous_occurrence"]
+    first = dict(fixture["actual_provider_observations"][0])
+    revised = {
+        **first,
+        "actual": 629.25,
+        "retrieved_at": "2026-07-26T16:54:00+00:00",
+    }
+    result = ExactOccurrenceActualProviderAdapter(
+        lambda _: [first, revised]
+    ).resolve(actual_item(previous))
+    assert result["status"] == "RESOLVED"
+    assert result["datum"]["actual"] == 629.25
+    assert result["datum"]["release_status"] == "REVISED"
+    assert result["datum"]["revision"]["from"] == 628.0
+    assert result["datum"]["revision"]["to"] == 629.25
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected_status"),
+    [
+        (0, "RESOLVED"),
+        (53.625, "RESOLVED"),
+        (None, "NO_DATA"),
+    ],
+)
+def test_actual_numeric_edge_cases(
+    actual: float | None,
+    expected_status: str,
+) -> None:
+    fixture = actual_fixture()
+    previous = fixture["unconfirmed_removals"][1]["previous_occurrence"]
+    observation = {
+        **fixture["actual_provider_observations"][1],
+        "actual": actual,
+    }
+    result = ExactOccurrenceActualProviderAdapter(
+        lambda _: [observation]
+    ).resolve(actual_item(previous))
+    assert result["status"] == expected_status
 
 
 def test_news_projection_has_no_sql_top_n_and_explains_rejections(
@@ -236,6 +320,16 @@ def test_news_projection_has_no_sql_top_n_and_explains_rejections(
     assert rejected["policy_outcome"]["status"] == "rejected"
     assert rejected["reason"]
     assert rejected["content"] == "Unknown publisher content remains quarantined."
+    equal_timestamp_keys = [
+        row["news_key"]
+        for row in rows
+        if row["published_at"] == NOW.replace(
+            hour=12,
+            minute=0,
+            second=0,
+        ).isoformat()
+    ]
+    assert equal_timestamp_keys == sorted(equal_timestamp_keys)
 
 
 def test_readiness_distinguishes_usable_degraded_from_unavailable() -> None:
@@ -270,6 +364,51 @@ def test_readiness_distinguishes_usable_degraded_from_unavailable() -> None:
     assert readiness["available_section_count"] == 2
     assert readiness["unavailable_section_count"] == 1
     assert readiness["status"] == "PARTIAL"
+    assert (
+        readiness["analysis_readiness"]["event_risk_analysis"][
+            "status"
+        ]
+        == "PARTIAL"
+    )
+    assert (
+        readiness["analysis_readiness"]["trading_context"]["status"]
+        == "UNAVAILABLE"
+    )
+
+
+def test_revision_count_cannot_mask_an_unexplained_occurrence() -> None:
+    full = {
+        "event_calendar": {
+            "source_coverage": {
+                "discovered_occurrence_ids": ["delivered", "missing"],
+            }
+        }
+    }
+    unexplained = _cross_stage_reconciliation(
+        full,
+        delivered_ids={"delivered"},
+        quarantined_ids=set(),
+        exact_duplicate_ids=set(),
+        merged_revision_count=1,
+        merged_revision_aliases={},
+        comparison={},
+    )
+    assert unexplained["unexplained_occurrence_ids"] == ["missing"]
+    assert unexplained["status"] == "GAP"
+
+    mapped = _cross_stage_reconciliation(
+        full,
+        delivered_ids={"delivered"},
+        quarantined_ids=set(),
+        exact_duplicate_ids=set(),
+        merged_revision_count=1,
+        merged_revision_aliases={"missing": "delivered"},
+        comparison={},
+    )
+    assert mapped["unexplained_loss"] == 0
+    assert mapped["merged_revision_aliases"] == {
+        "missing": "delivered"
+    }
 
 
 def test_schema22_forensic_replay_closes_every_observed_blocker() -> None:
@@ -293,6 +432,24 @@ def test_schema22_forensic_replay_closes_every_observed_blocker() -> None:
     assert accounting["unexplained_loss"] == 0
     assert len(full["sections"]) == 17
     assert summary["full_sync"]["two_independent_replays_byte_identical"]
+    fixed_point = summary["fixed_point"]
+    assert all(
+        fixed_point[key] == 0
+        for key in (
+            "provider_calls",
+            "resolver_evaluations",
+            "canonical_writes",
+            "lifecycle_writes",
+            "coverage_writes",
+            "snapshot_writes",
+            "outbox_writes",
+            "provider_state_mutations",
+            "new_retries",
+            "new_revisions",
+        )
+    )
+    assert fixed_point["persistent_state_byte_identical"]
+    assert fixed_point["full_sync_byte_identical"]
     assert set(summary["side_effects"].values()) == {0}
     assert set(summary["second_replay_side_effects"].values()) == {0}
 

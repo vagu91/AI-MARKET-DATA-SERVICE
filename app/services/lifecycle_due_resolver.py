@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
@@ -155,6 +156,17 @@ class ExactOccurrenceActualProviderAdapter:
             == expected_key
         ]
         if not identity_matches:
+            identity_matches = [
+                dict(row)
+                for row in observations
+                if isinstance(row, dict)
+                and _semantic_occurrence_match(
+                    row,
+                    payload=payload,
+                    expected_release=expected_release,
+                )
+            ]
+        if not identity_matches:
             return self._no_data("exact_occurrence_not_found")
         release_matches = [
             row
@@ -184,10 +196,48 @@ class ExactOccurrenceActualProviderAdapter:
             )
             for row in period_matches
         }
+        revision: dict[str, Any] | None = None
         if len(semantic_values) > 1:
-            return self._no_data("exact_occurrence_observation_ambiguous")
-
-        observation = period_matches[0]
+            comparison_values = {
+                (
+                    str(row.get("forecast")),
+                    str(row.get("previous")),
+                    _normalized_unit(row.get("unit")),
+                )
+                for row in period_matches
+            }
+            retrieved = [
+                parse_datetime(row.get("retrieved_at"))
+                for row in period_matches
+            ]
+            if (
+                len(comparison_values) != 1
+                or any(value is None for value in retrieved)
+                or len(set(retrieved)) != len(retrieved)
+                or any(value < expected_release for value in retrieved if value)
+            ):
+                return self._no_data(
+                    "exact_occurrence_observation_ambiguous"
+                )
+            ordered = sorted(
+                zip(retrieved, period_matches),
+                key=lambda item: item[0],
+            )
+            observation = ordered[-1][1]
+            revision = {
+                "from": ordered[-2][1].get("actual"),
+                "to": observation.get("actual"),
+                "observation_count": len(ordered),
+                "selected_retrieved_at": observation.get("retrieved_at"),
+            }
+        else:
+            observation = max(
+                period_matches,
+                key=lambda row: (
+                    parse_datetime(row.get("retrieved_at"))
+                    or expected_release
+                ),
+            )
         if (
             payload.get("forecast") not in (None, "")
             and payload.get("previous") not in (None, "")
@@ -269,7 +319,8 @@ class ExactOccurrenceActualProviderAdapter:
                 else payload.get("previous")
             ),
             "unit": observation.get("unit") or payload.get("unit"),
-            "release_status": "PUBLISHED",
+            "release_status": "REVISED" if revision else "PUBLISHED",
+            "revision": revision or payload.get("revision"),
             "source": (
                 observation.get("source")
                 or observation.get("source_originator")
@@ -1097,6 +1148,7 @@ def _exact_calendar_actual_datum(
         frequency=frequency,
         release_date=release,
     )
+
     observed_period = normalize_reference_period(
         exact.get("reference_period") or exact.get("period"),
         frequency=frequency,
@@ -1174,6 +1226,38 @@ def _exact_calendar_actual_datum(
             **lineage,
         },
     }
+
+
+def _semantic_occurrence_match(
+    event: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+    expected_release: datetime,
+) -> bool:
+    def normalized_name(value: Any) -> str:
+        return " ".join(
+            re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        )
+
+    expected_name = normalized_name(
+        payload.get("name")
+        or payload.get("event_name")
+        or payload.get("title")
+    )
+    observed_name = normalized_name(
+        event.get("name")
+        or event.get("event_name")
+        or event.get("title")
+    )
+    expected_country = str(payload.get("country") or "").upper()
+    observed_country = str(event.get("country") or "").upper()
+    return bool(
+        expected_name
+        and expected_name == observed_name
+        and expected_country
+        and expected_country == observed_country
+        and _same_release_minute(event, expected_release)
+    )
 
 
 def _normalized_unit(value: Any) -> str:

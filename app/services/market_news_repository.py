@@ -206,7 +206,8 @@ class MarketNewsRepository:
                 SELECT * FROM market_news
                 WHERE COALESCE(published_at, retrieved_at) >= ?
                   {audit_filter}
-                ORDER BY COALESCE(published_at, retrieved_at) DESC
+                ORDER BY COALESCE(published_at, retrieved_at) DESC,
+                         news_key ASC
         """
         parameters: tuple[Any, ...] = (cutoff,)
         if limit is not None:

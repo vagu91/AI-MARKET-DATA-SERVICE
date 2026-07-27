@@ -66,6 +66,41 @@ versioned-schedule lineage. An unavailable official holiday cross-check yields
 Readiness now distinguishes usable degraded sections from unavailable ones
 without changing the conservative overall `PARTIAL` result.
 
+## Adversarial PR #27 follow-up
+
+The follow-up review found that the original replay did not traverse the
+productive `DiagnosticsService.full_model(refresh="force")` branch. That
+branch still used a 100-row active-news query and reconciled only the
+current/future provider envelope. It now invokes the same persistent
+schedule-catch-up seed used at startup, reads the canonical three-week window,
+unions it before reconciliation, and requests the complete active plus
+quarantined news interval. A provider-to-canonical-to-snapshot-to-full-sync
+test exercises this exact path.
+
+The review also closed these independent blockers:
+
+- two force refreshes could overlap schedule acquisition, and the second
+  catch-up mutated `provider_state` even with no due gaps; both paths now share
+  the persistent single-flight lease and the no-work preflight is read-only;
+- future absence inherited a segment-wide `authentic_empty` bit; future dates
+  now require an explicit date-level empty proof and otherwise remain
+  `PARTIAL`;
+- a globally partial 21-day window suppressed legitimate date-authoritative
+  removal evidence; removal decisions now use only the individually proven
+  date inside the requested bounds;
+- cross-stage accounting assigned arbitrary unexplained IDs to a revision
+  count; revisions with differing provider IDs now require an explicit
+  semantic alias, while every other ID remains unexplained and blocks closure;
+- English month labels, semantically equivalent distributor IDs, ordered
+  actual revisions, numeric zero and decimal precision were not covered;
+- equal-timestamp news rows lacked a stable tie-breaker;
+- delivered-payload readiness did not distinguish trading, macro, news and
+  event-risk analysis.
+
+Crash recovery is tested between canonical and coverage writes. No snapshot or
+outbox is emitted from the incomplete attempt; the retry completes the ledger
+and rematerializes only from coherent persisted state.
+
 ## Offline before/after
 
 `python -B -m scripts.replay_schema22_live_rollover_offline` uses only minimal
@@ -81,8 +116,19 @@ redacted fixtures and temporary SQLite databases. The final replay proves:
 - the occurrence candidate equation closes with `unexplained_loss=0`;
 - all 17 sections are present and no byte/count/top-N/lossy-summary cap applies;
 - independent replays and consecutive full reads are byte-identical;
+- the second catch-up has zero provider calls, resolver evaluations, canonical,
+  lifecycle, coverage, snapshot, outbox and provider-state writes, and creates
+  no retry or revision;
 - live provider, AI, browser, delivery, operational-DB and trading counters are
   all zero.
+
+The final adversarial replay contains 17 sections, is 398,964 bytes, and has
+SHA-256
+`3B631DC203ECA30327EACBD74395CB9C4E24AF9DBBB1AA9CB1CE3E8597726885`.
+The migration matrix covers 1→22, 20→22, 21→22 and 22→22, plus rollback and
+concurrent migrators. Ruff, `py_compile`, `compileall`, and
+`git diff --check` pass. The complete suite passes 1,805 tests; its only
+warning is the pre-existing Starlette/httpx TestClient deprecation.
 
 ## Residual risk
 

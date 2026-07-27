@@ -198,17 +198,29 @@ def normalize_reference_period(
         return None
     localized_months = {
         "gennaio": 1,
+        "january": 1,
         "febbraio": 2,
+        "february": 2,
         "marzo": 3,
+        "march": 3,
         "aprile": 4,
+        "april": 4,
         "maggio": 5,
+        "may": 5,
         "giugno": 6,
+        "june": 6,
         "luglio": 7,
+        "july": 7,
         "agosto": 8,
+        "august": 8,
         "settembre": 9,
+        "september": 9,
         "ottobre": 10,
+        "october": 10,
         "novembre": 11,
+        "november": 11,
         "dicembre": 12,
+        "december": 12,
     }
     if frequency == "monthly" and text in localized_months and release_date:
         anchor = (
