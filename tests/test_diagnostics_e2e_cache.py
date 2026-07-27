@@ -29,9 +29,14 @@ from app.models.nasdaq import (
     QQQHoldingsSummary,
 )
 from app.services.diagnostics_service import DiagnosticsService
+from app.services import diagnostics_service as diagnostics_module
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.market_news_repository import MarketNewsRepository
+from app.api.routes import _materialize_market_context
+from app.services.market_context_sync_service import (
+    MarketContextSyncService,
+)
 
 
 def settings(tmp_path, **overrides) -> Settings:
@@ -325,3 +330,122 @@ async def test_full_model_propagates_force_and_refresh_false_skips_orchestrator(
     force_values.clear()
     await service.full_model(country="US", days=30, symbol="MNQ", fetch_missing_nasdaq=False, refresh="false")
     assert force_values == []
+
+
+async def test_force_path_unions_canonical_window_and_reads_lossless_news(
+    tmp_path,
+    monkeypatch,
+):
+    service = diagnostics(tmp_path)
+    canonical = event(event_id="canonical-previous-week").model_copy(
+        update={
+            "date": "2026-07-24",
+            "time_utc": datetime(2026, 7, 24, 12, 30, tzinfo=UTC),
+            "time_local": datetime(2026, 7, 24, 8, 30, tzinfo=UTC),
+        }
+    )
+    service.event_materializer.load_from_history = (
+        lambda **_: ([canonical], {})
+    )
+    news_calls = []
+    service.news.stored = lambda **kwargs: news_calls.append(kwargs) or []
+    reconciled_ids: list[str] = []
+    original_reconcile = diagnostics_module.reconcile_calendar_events
+
+    def capture_reconcile(events, payloads, **kwargs):
+        reconciled_ids.extend(item.event_id for item in events)
+        return original_reconcile(events, payloads, **kwargs)
+
+    monkeypatch.setattr(
+        diagnostics_module,
+        "reconcile_calendar_events",
+        capture_reconcile,
+    )
+
+    await service.full_model(
+        country="US",
+        days=30,
+        symbol="MNQ",
+        fetch_missing_nasdaq=False,
+        refresh="force",
+    )
+
+    assert "canonical-previous-week" in reconciled_ids
+    assert news_calls == [
+        {
+            "days": 30,
+            "limit": None,
+            "include_quarantined": True,
+        }
+    ]
+
+
+async def test_force_provider_to_canonical_snapshot_and_full_sync(
+    tmp_path,
+):
+    service = diagnostics(tmp_path)
+    service.settings.event_calendar_catchup_enabled = True
+    current = event(event_id="force-productive-path").model_copy(
+        update={
+            "date": "2026-07-27",
+            "time_utc": datetime(2026, 7, 27, 12, 30, tzinfo=UTC),
+            "time_local": datetime(2026, 7, 27, 8, 30, tzinfo=UTC),
+        }
+    )
+
+    class CurrentEvents:
+        def __init__(self):
+            self.calls = 0
+            self.coverage_proof = {
+                "request_succeeded": True,
+                "scope_match": True,
+                "pagination_complete": True,
+                "parsing_succeeded": True,
+                "records_valid": True,
+                "expected_sources_complete": True,
+                "authentic_empty": True,
+            }
+            self.last_provider_results = []
+
+        async def list_events(self, **_):
+            self.calls += 1
+            return [current]
+
+    events = CurrentEvents()
+    service.event_service = events
+
+    model = await service.full_model(
+        country="US",
+        days=30,
+        symbol="MNQ",
+        fetch_missing_nasdaq=False,
+        refresh="force",
+    )
+    stored = _materialize_market_context(
+        model,
+        refresh="force",
+        view="debug",
+        settings=service.settings,
+    )
+    full = MarketContextSyncService(service.settings).full()
+
+    assert events.calls == 1
+    assert (
+        model["data_quality"]["force_schedule_coverage"][
+            "provider_calls"
+        ]
+        == 1
+    )
+    assert stored["snapshot_id"] == full["snapshot_id"]
+    assert len(full["sections"]) == 17
+    assert any(
+        item.get("event_id") == "force-productive-path"
+        for section in (
+            "critical_macro_events",
+            "fed_communications",
+            "other_economic_events",
+        )
+        for item in (
+            model.get("event_calendar", {}).get(section) or []
+        )
+    )

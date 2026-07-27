@@ -206,6 +206,7 @@ discovered occurrences
 = delivered canonical occurrences
 + quarantined occurrences
 + exact technical duplicates
++ merged source revisions
 + confirmed removals
 + unexplained loss
 ```
@@ -231,6 +232,44 @@ unconfirmed actuals, news publisher/distributor policy, deterministic weekend
 closure, temporal monotonicity, a multi-megabyte lossless news payload, and
 zero AI/live-provider/delivery/trading side effects. Repeated runs are
 byte-identical.
+
+## Schema-22 rollover and provider scope
+
+The durable coverage inventory always spans exactly 21 New York calendar
+dates: the complete previous, current and next Monday-Sunday buckets. Future
+dates may remain `PARTIAL`, `UNKNOWN` or retryable; their presence in the
+ledger is not evidence of completeness. `VERIFIED_COMPLETE` and
+`VERIFIED_EMPTY` still require a successful scoped call, complete pagination
+and parsing, all expected sources, valid records, finite validity, and—for an
+empty day—`authentic_empty`.
+
+Provider response scope and DB projection scope are different contracts. A
+current/next-only response is unioned with the canonical three-week database
+window before snapshot materialization. Absence can become
+`UNCONFIRMED_REMOVAL` only for a local calendar date explicitly listed in
+`authoritative_dates`; an omission outside that set has no removal semantics.
+This prevents a Monday provider refresh from deleting the prior week.
+
+Candidate accounting is occurrence-based:
+
+```text
+source_candidate_count
+= delivered_occurrence_count
++ quarantined_occurrence_count
++ exact_duplicate_count
+```
+
+Multiple validated source revisions for one occurrence remain losslessly in
+`source_evidence` and are reported separately as `merged_revision_count`;
+`raw_source_candidate_count` records the source-row inventory. Neither is
+misreported as unexplained loss.
+
+`scripts/replay_schema22_live_rollover_offline.py` reconstructs the observed
+snapshot-96 regression from redacted fixtures. It proves 0/25/7 becomes
+14/3/25, the two exact actuals are recovered, the news and schedule projections
+remain usable, the 21-day ledger is materialized, and two independent full
+syncs are byte-identical with zero live, AI, browser, delivery, operational-DB
+or trading side effects.
 
 ## Temporal admission
 

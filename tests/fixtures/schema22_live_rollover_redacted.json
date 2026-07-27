@@ -1,0 +1,65 @@
+{
+  "fixture": "schema22_live_rollover_redacted_v1",
+  "derived_from": [
+    "schema22-db-first-live-validation-20260727T131808Z",
+    "schema22-full-sync-validation-20260727T132243Z",
+    "schema22-provider-force-live-20260727T132641Z"
+  ],
+  "reference_now": "2026-07-27T13:28:00+00:00",
+  "snapshot_95": {
+    "calendar_counts": {
+      "previous": 21,
+      "current": 53,
+      "next": 9
+    },
+    "candidate_accounting": {
+      "source_candidates": 97,
+      "delivered": 83,
+      "quarantined": 0,
+      "exact_duplicates": 3,
+      "unexplained": 11
+    },
+    "actual_missing": 2,
+    "news_candidates": 100,
+    "news_delivered": 0,
+    "market_schedule": "QUARANTINED",
+    "full_sync_bytes": 1251177,
+    "full_sync_sha256": "CB145D13C4EBE2A9B75C5EA27DB983B5E2B59A9371CBF4B5CD9412A61B654B85"
+  },
+  "snapshot_96": {
+    "provider_scope": "current_and_future_only",
+    "calendar_counts": {
+      "previous": 0,
+      "current": 25,
+      "next": 7
+    },
+    "candidate_accounting": {
+      "source_candidates": 42,
+      "delivered": 32,
+      "quarantined": 0,
+      "exact_duplicates": 10,
+      "unexplained": 0
+    },
+    "news_rows_added": 16,
+    "news_delivered": 0,
+    "debug_market_schedule": "PARTIAL",
+    "sync_market_schedule": "QUARANTINED",
+    "full_sync_bytes": 1195442,
+    "full_sync_sha256": "650338E5B60109D70533A701858B85F65F2D0069D2CBA6AE169F078E61C4BB8D"
+  },
+  "expected_after": {
+    "calendar_counts": {
+      "previous": 14,
+      "current": 3,
+      "next": 25
+    },
+    "actual_missing": 0,
+    "admitted_news": 3,
+    "quarantined_news": 1,
+    "market_schedule": "PARTIAL",
+    "ledger_dates": 21,
+    "live_provider_calls": 0,
+    "ai_invocations": 0,
+    "operational_database_writes": 0
+  }
+}

@@ -301,6 +301,8 @@ def test_deterministic_ordering_deduplication_limits_and_coverage(
     assert window["coverage"]["overflow_count"] == 0
     assert window["telemetry"]["duplicate_occurrence_count"] == 0
     assert window["coverage"]["delivered_valid_source_record_count"] == 5
+    assert window["coverage"]["source_candidate_count"] == 4
+    assert window["coverage"]["merged_revision_count"] == 1
 
 
 def test_unscheduled_news_is_never_projected_as_future_event(

@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.core.config import Settings
+from app.infrastructure.persistence.database import connect_sqlite
 from app.infrastructure.persistence.provider_cache_repository import (
     ProviderCacheRepository,
 )
@@ -281,7 +282,8 @@ def test_occurrence_identity_preserves_times_sources_and_exact_duplicates(
 
     assert set(events) == {"series-release", "series-release-later"}
     assert len(events["series-release"]["source_evidence"]) == 2
-    assert window["coverage"]["source_candidate_count"] == 4
+    assert window["coverage"]["source_candidate_count"] == 3
+    assert window["coverage"]["raw_source_candidate_count"] == 4
     assert window["coverage"]["delivered_valid_source_record_count"] == 3
     assert window["coverage"]["delivered_occurrence_count"] == 2
     assert window["coverage"]["exact_duplicate_count"] == 1
@@ -626,18 +628,42 @@ def test_provider_first_schedule_catchup_is_restart_independent_and_idempotent(
         schedule_acquire=acquire,
     )
     count_after_first = len(scheduler.lifecycle.list_items())
+    with connect_sqlite(settings.database_path) as conn:
+        provider_state_before = dict(
+            conn.execute(
+                """
+                SELECT status,reason,retryable,next_retry_at,
+                       payload_json,updated_at
+                FROM provider_state
+                WHERE state_key='provider_first_schedule_catchup'
+                """
+            ).fetchone()
+        )
     second = scheduler.startup_catch_up(
         resolver=lambda _: pytest.fail("schedule-only item is not due"),
         ai_enqueue=ai_unreachable,
         schedule_acquire=acquire,
     )
+    with connect_sqlite(settings.database_path) as conn:
+        provider_state_after = dict(
+            conn.execute(
+                """
+                SELECT status,reason,retryable,next_retry_at,
+                       payload_json,updated_at
+                FROM provider_state
+                WHERE state_key='provider_first_schedule_catchup'
+                """
+            ).fetchone()
+        )
 
-    assert first["source_coverage"]["status"] == "VERIFIED_COMPLETE"
+    assert first["source_coverage"]["status"] == "PARTIAL"
     assert first["source_coverage"]["persisted_gap_count"] == 1
     assert second["source_coverage"]["persisted_gap_count"] == 0
     assert second["source_coverage"]["unchanged_occurrence_count"] == 0
     assert second["source_coverage"]["provider_calls"] == 0
     assert len(calls) == 1
+    assert provider_state_after == provider_state_before
+    assert second["resolver_evaluations"] == 0
     assert len(scheduler.lifecycle.list_items()) == count_after_first == 1
     assert calls[0]["start"].astimezone(NY).date() == (
         current_monday - timedelta(days=7)

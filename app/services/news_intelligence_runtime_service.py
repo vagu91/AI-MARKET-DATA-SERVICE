@@ -33,7 +33,7 @@ class NewsIntelligenceRuntimeService:
         news_items: list[dict[str, Any]],
         *,
         refresh_mode: str,
-        limit: int = 12,
+        limit: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         cached = None if refresh_mode == "force" else self.facts.get_fact(NEWS_SNAPSHOT_KEY)
         if cached is not None:

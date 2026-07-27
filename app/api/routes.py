@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 
@@ -30,6 +31,9 @@ from app.services.diagnostics_service import (
     _sentiment_context_from_runtime,
 )
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
+from app.services.economic_event_materialization_service import (
+    EconomicEventMaterializationService,
+)
 from app.services.macro_service import MacroService
 from app.services.macro_consensus_service import merge_consensus_provider_payloads
 from app.services.market_fact_repository import MarketFactRepository, init_market_db
@@ -360,8 +364,37 @@ async def market_context_mnq(
     candidates.persist_provider_payload(investing_payload)
     candidates.persist_provider_payload(xtb_payload)
     facts_repository = MarketFactRepository(enrichment_orchestrator.settings)
+    calendar_timezone = ZoneInfo(
+        str(
+            enrichment_orchestrator.settings.event_calendar_timezone
+            or "America/New_York"
+        )
+    )
+    local_now = now.astimezone(calendar_timezone)
+    current_week_start = local_now.date() - timedelta(
+        days=local_now.weekday()
+    )
+    canonical_window_start = datetime.combine(
+        current_week_start - timedelta(days=7),
+        datetime.min.time(),
+        calendar_timezone,
+    )
+    canonical_window_end = datetime.combine(
+        current_week_start + timedelta(days=13),
+        datetime.max.time(),
+        calendar_timezone,
+    )
+    canonical_events, _ = EconomicEventMaterializationService(
+        enrichment_orchestrator.settings,
+        facts=facts_repository,
+    ).load_from_history(
+        country="US",
+        start=canonical_window_start,
+        end=canonical_window_end,
+        refresh_mode="false",
+    )
     upcoming = reconcile_calendar_events(
-        upcoming,
+        [*upcoming, *canonical_events],
         [investing_payload, xtb_payload],
         now=now,
         temporal_validation=facts_repository.temporal_validation,
@@ -392,7 +425,9 @@ async def market_context_mnq(
         )
     event_windows = await event_window_service.event_windows(symbol="MNQ")
     nasdaq_context, nasdaq_quality = await diagnostics._nasdaq_db_first(symbol="MNQ", fetch_missing=False)
-    news_items = MarketNewsRepository(enrichment_orchestrator.settings).stored(days=30, limit=100)
+    news_items = MarketNewsRepository(
+        enrichment_orchestrator.settings
+    ).stored(days=30, limit=None, include_quarantined=True)
     news_context, news_runtime = diagnostics.news_intelligence.materialize(
         news_items,
         refresh_mode="auto",

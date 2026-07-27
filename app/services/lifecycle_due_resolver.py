@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
@@ -138,6 +139,7 @@ class ExactOccurrenceActualProviderAdapter:
         expected_period = normalize_reference_period(
             payload.get("reference_period") or payload.get("period"),
             frequency=frequency,
+            release_date=expected_release,
         )
         if not expected_key or expected_release is None or not expected_period:
             return self._no_data("expected_occurrence_semantics_missing")
@@ -154,6 +156,17 @@ class ExactOccurrenceActualProviderAdapter:
             == expected_key
         ]
         if not identity_matches:
+            identity_matches = [
+                dict(row)
+                for row in observations
+                if isinstance(row, dict)
+                and _semantic_occurrence_match(
+                    row,
+                    payload=payload,
+                    expected_release=expected_release,
+                )
+            ]
+        if not identity_matches:
             return self._no_data("exact_occurrence_not_found")
         release_matches = [
             row
@@ -168,13 +181,71 @@ class ExactOccurrenceActualProviderAdapter:
             if normalize_reference_period(
                 row.get("reference_period") or row.get("period"),
                 frequency=frequency,
+                release_date=expected_release,
             )
             == expected_period
         ]
         if not period_matches:
             return self._no_data("exact_occurrence_reference_period_mismatch")
-
-        observation = period_matches[0]
+        semantic_values = {
+            (
+                str(row.get("actual")),
+                str(row.get("forecast")),
+                str(row.get("previous")),
+                _normalized_unit(row.get("unit")),
+            )
+            for row in period_matches
+        }
+        revision: dict[str, Any] | None = None
+        if len(semantic_values) > 1:
+            comparison_values = {
+                (
+                    str(row.get("forecast")),
+                    str(row.get("previous")),
+                    _normalized_unit(row.get("unit")),
+                )
+                for row in period_matches
+            }
+            retrieved = [
+                parse_datetime(row.get("retrieved_at"))
+                for row in period_matches
+            ]
+            if (
+                len(comparison_values) != 1
+                or any(value is None for value in retrieved)
+                or len(set(retrieved)) != len(retrieved)
+                or any(value < expected_release for value in retrieved if value)
+            ):
+                return self._no_data(
+                    "exact_occurrence_observation_ambiguous"
+                )
+            ordered = sorted(
+                zip(retrieved, period_matches),
+                key=lambda item: item[0],
+            )
+            observation = ordered[-1][1]
+            revision = {
+                "from": ordered[-2][1].get("actual"),
+                "to": observation.get("actual"),
+                "observation_count": len(ordered),
+                "selected_retrieved_at": observation.get("retrieved_at"),
+            }
+        else:
+            observation = max(
+                period_matches,
+                key=lambda row: (
+                    parse_datetime(row.get("retrieved_at"))
+                    or expected_release
+                ),
+            )
+        if (
+            payload.get("forecast") not in (None, "")
+            and payload.get("previous") not in (None, "")
+            and observation.get("forecast") == payload.get("previous")
+            and observation.get("previous") == payload.get("forecast")
+            and payload.get("forecast") != payload.get("previous")
+        ):
+            return self._no_data("forecast_previous_fields_swapped")
         observed_frequency = str(
             observation.get("frequency") or frequency
         ).lower()
@@ -194,6 +265,9 @@ class ExactOccurrenceActualProviderAdapter:
             "expired",
         }:
             return self._no_data("exact_occurrence_validation_rejected")
+        retrieved_at = parse_datetime(observation.get("retrieved_at"))
+        if retrieved_at is not None and retrieved_at < expected_release:
+            return self._no_data("exact_occurrence_validation_stale")
         raw_lineage = observation.get("field_lineage") or observation.get(
             "lineage"
         )
@@ -233,11 +307,20 @@ class ExactOccurrenceActualProviderAdapter:
             "period": expected_period,
             "frequency": frequency,
             "actual": value,
-            "forecast": payload.get("forecast"),
+            "forecast": (
+                observation.get("forecast")
+                if observation.get("forecast") not in (None, "")
+                else payload.get("forecast")
+            ),
             "consensus": payload.get("consensus"),
-            "previous": payload.get("previous"),
+            "previous": (
+                observation.get("previous")
+                if observation.get("previous") not in (None, "")
+                else payload.get("previous")
+            ),
             "unit": observation.get("unit") or payload.get("unit"),
-            "release_status": "PUBLISHED",
+            "release_status": "REVISED" if revision else "PUBLISHED",
+            "revision": revision or payload.get("revision"),
             "source": (
                 observation.get("source")
                 or observation.get("source_originator")
@@ -1057,13 +1140,19 @@ def _exact_calendar_actual_datum(
         "expired",
     }:
         return None
+    retrieved_at = parse_datetime(exact.get("retrieved_at"))
+    if retrieved_at is not None and retrieved_at < release:
+        return None
     expected_period = normalize_reference_period(
         payload.get("reference_period") or payload.get("period"),
         frequency=frequency,
+        release_date=release,
     )
+
     observed_period = normalize_reference_period(
         exact.get("reference_period") or exact.get("period"),
         frequency=frequency,
+        release_date=release,
     )
     if not expected_period or observed_period != expected_period:
         return None
@@ -1137,6 +1226,38 @@ def _exact_calendar_actual_datum(
             **lineage,
         },
     }
+
+
+def _semantic_occurrence_match(
+    event: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+    expected_release: datetime,
+) -> bool:
+    def normalized_name(value: Any) -> str:
+        return " ".join(
+            re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        )
+
+    expected_name = normalized_name(
+        payload.get("name")
+        or payload.get("event_name")
+        or payload.get("title")
+    )
+    observed_name = normalized_name(
+        event.get("name")
+        or event.get("event_name")
+        or event.get("title")
+    )
+    expected_country = str(payload.get("country") or "").upper()
+    observed_country = str(event.get("country") or "").upper()
+    return bool(
+        expected_name
+        and expected_name == observed_name
+        and expected_country
+        and expected_country == observed_country
+        and _same_release_minute(event, expected_release)
+    )
 
 
 def _normalized_unit(value: Any) -> str:

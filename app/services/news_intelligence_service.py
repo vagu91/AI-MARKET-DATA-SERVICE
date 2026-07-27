@@ -191,7 +191,12 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         aggregator_url = source_url
         if canonical_url == source_url:
             canonical_url = None
-    original = str(article.get("original_publisher") or source or "").strip()
+    original = str(
+        article.get("original_publisher")
+        or article.get("publisher")
+        or source
+        or ""
+    ).strip()
     inferred = _publisher_from_title(title)
     if original.lower() in AGGREGATORS and inferred:
         original = inferred
@@ -263,7 +268,7 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         if aggregator_url and domain == "finance.yahoo.com"
         else domain
         if aggregator_url
-        else article.get("distribution_source")
+        else article.get("distribution_source") or article.get("distributor")
     )
     classified.update(
         {
@@ -465,7 +470,11 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     now = now or datetime.now(UTC)
     article = dict(raw)
     article["title"] = clean_text(article.get("title")) or ""
-    article["summary"] = _clean_summary(article.get("summary") or article.get("content_snippet"))
+    article["summary"] = _clean_summary(
+        article.get("summary")
+        or article.get("content_snippet")
+        or article.get("content")
+    )
     article["retrieved_at"] = _iso_datetime(article.get("retrieved_at")) or now.replace(microsecond=0).isoformat()
     article.update(_recover_timestamp(article, now=now))
     article["provider_type"] = str(article.get("provider_type") or "RSS").split(".")[-1]
@@ -534,7 +543,13 @@ def build_news_context(
     diagnostics = _diagnostics(normalized, representatives, excluded, duplicates, clusters)
     quality = _news_quality(normalized, representatives, excluded, clusters)
     context = {
-        "status": "available" if latest else "no_data_available",
+        "status": (
+            "partial"
+            if latest and excluded
+            else "available"
+            if latest
+            else "no_data_available"
+        ),
         "pipeline_version": PIPELINE_VERSION,
         "latest": latest,
         "directly_relevant": [item for item in latest if item.get("relevance_tier") == "direct"],
@@ -581,7 +596,13 @@ def build_news_digest(
     confirmation_ratio = sum(1 for cluster in clusters if cluster.get("confirmed")) / len(clusters) if clusters else 0.0
     confidence = round(min(0.98, reliability * 0.55 + float(quality.get("news_quality_score") or 0) * 0.3 + confirmation_ratio * 0.15), 3) if latest else 0.0
     return {
-        "status": "available" if latest else "no_data_available",
+        "status": (
+            "partial"
+            if latest and int(diagnostics.get("excluded_count") or 0)
+            else "available"
+            if latest
+            else "no_data_available"
+        ),
         "pipeline_version": PIPELINE_VERSION,
         "generated_at_utc": (generated_at or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "coverage_window_hours": coverage_window_hours,
@@ -712,6 +733,21 @@ def _score_article(article: dict[str, Any], *, now: datetime) -> dict[str, Any]:
 
 
 def _exclusion_reason(article: dict[str, Any], *, now: datetime) -> str | None:
+    validation = (
+        article.get("validation")
+        if isinstance(article.get("validation"), dict)
+        else {}
+    )
+    if str(validation.get("status") or "").lower() in {
+        "rejected",
+        "invalid",
+        "quarantined",
+    }:
+        return str(
+            validation.get("reason_code")
+            or article.get("source_invalid_reason")
+            or "source_policy_rejected"
+        )
     if news_content_status(article) == "invalid_content":
         return "missing_content"
     personal = _personal_finance_reason(f"{article.get('title')} {article.get('summary') or ''}".lower())
@@ -990,14 +1026,16 @@ def _syndication_key(article: dict[str, Any]) -> str:
 
 
 def _compact_exclusion(article: dict[str, Any]) -> dict[str, Any]:
+    policy_outcome = article.get("validation")
     return {
-        "article_id": article.get("article_id"),
-        "title": article.get("title"),
-        "source": article.get("source"),
-        "source_classification": article.get("source_classification"),
+        **{
+            key: value
+            for key, value in article.items()
+            if key not in {"validation", "source_audit_status"}
+        },
         "reason": article.get("exclusion_reason"),
-        "relevance_score": article.get("relevance_score"),
-        "published_at": article.get("published_at"),
+        "policy_outcome": policy_outcome,
+        "quarantine_status": "WITHHELD_FROM_ACCEPTED_NEWS",
     }
 
 

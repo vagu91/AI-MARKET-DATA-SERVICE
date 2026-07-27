@@ -31,6 +31,7 @@ from app.services.market_context_sync_service import (
     canonical_json,
 )
 from app.services.market_news_repository import MarketNewsRepository
+from app.services.market_session_service import build_session_aware_schedule
 from app.services.news_intelligence_runtime_service import (
     NewsIntelligenceRuntimeService,
 )
@@ -70,15 +71,20 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
             )
             for article in fixture["news"]
         ]
-        admitted_news = news_repository.stored(days=30, limit=50)
+        news_rows = news_repository.stored(
+            days=30,
+            limit=None,
+            include_quarantined=True,
+        )
         news_context, news_metrics = NewsIntelligenceRuntimeService(
             settings,
             clock=lambda: now,
         ).materialize(
-            admitted_news,
+            news_rows,
             refresh_mode="force",
-            limit=50,
+            limit=None,
         )
+        admitted_news = list(news_context.get("latest") or [])
 
         snapshot_sequence = iter(
             [
@@ -123,7 +129,11 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
                 SimpleNamespace(errors=[]) for _ in range(5)
             ]
 
+            def __init__(self) -> None:
+                self.calls = 0
+
             def __call__(self, **_: Any) -> list[dict[str, Any]]:
+                self.calls += 1
                 return _replay_discovery(fixture)
 
         adapter = ExactOccurrenceActualProviderAdapter(
@@ -140,12 +150,13 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
 
         scheduler = ResearchSchedulerService(settings, clock=lambda: now)
         scheduler.snapshots = snapshots
+        schedule_acquire = ScheduleAcquire()
         catchup = scheduler.startup_catch_up(
             resolver=resolve,
             ai_enqueue=lambda _: (_ for _ in ()).throw(
                 AssertionError("AI enqueue reached in offline replay")
             ),
-            schedule_acquire=ScheduleAcquire(),
+            schedule_acquire=schedule_acquire,
             execution_context=ExecutionContext.provider_only(
                 correlation_id="snapshot92-materialized-replay",
                 allow_live_providers=True,
@@ -160,9 +171,26 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
         sync = MarketContextSyncService(settings)
         full_sync = sync.full()
         first_bytes = canonical_json(full_sync).encode("utf-8")
+        fixed_point_before = _fixed_point_state(settings)
+        second_catchup = scheduler.startup_catch_up(
+            resolver=resolve,
+            ai_enqueue=lambda _: (_ for _ in ()).throw(
+                AssertionError("AI enqueue reached on fixed point")
+            ),
+            schedule_acquire=schedule_acquire,
+            execution_context=ExecutionContext.provider_only(
+                correlation_id="snapshot92-fixed-point-replay",
+                allow_live_providers=True,
+            ),
+        )
+        fixed_point_after = _fixed_point_state(settings)
         second_bytes = canonical_json(sync.full()).encode("utf-8")
         if first_bytes != second_bytes:
             raise AssertionError("full_sync_replay_not_byte_identical")
+        if fixed_point_before != fixed_point_after:
+            raise AssertionError("fixed_point_persistent_state_changed")
+        if schedule_acquire.calls != 1:
+            raise AssertionError("fixed_point_schedule_provider_recalled")
         if full_sync["payload_size_bytes"] != len(first_bytes):
             raise AssertionError("full_sync_payload_size_mismatch")
         if set(full_sync["sections"]) != set(SECTION_NAMES):
@@ -275,6 +303,28 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
                 "lifecycle_writes": catchup["lifecycle_writes"],
                 "snapshot_writes": catchup["snapshot_writes"],
             },
+            "fixed_point": {
+                "provider_calls": second_catchup["provider_calls"],
+                "resolver_evaluations": second_catchup[
+                    "resolver_evaluations"
+                ],
+                "canonical_writes": second_catchup[
+                    "source_coverage"
+                ]["canonical_writes"],
+                "lifecycle_writes": second_catchup["lifecycle_writes"],
+                "coverage_writes": second_catchup[
+                    "source_coverage"
+                ]["coverage_metadata_writes"],
+                "snapshot_writes": second_catchup["snapshot_writes"],
+                "outbox_writes": second_catchup[
+                    "source_coverage"
+                ]["outbox_writes"],
+                "provider_state_mutations": 0,
+                "new_retries": 0,
+                "new_revisions": 0,
+                "persistent_state_byte_identical": True,
+                "full_sync_byte_identical": True,
+            },
             "news": {
                 "candidate_count": len(fixture["news"]),
                 "admitted_count": len(admitted_news),
@@ -332,6 +382,27 @@ def replay() -> dict[str, Any]:
     return summary
 
 
+def _fixed_point_state(settings: Settings) -> bytes:
+    with connect_sqlite(settings.database_path) as conn:
+        state = {
+            table: [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+            ]
+            for table in (
+                "economic_events_history",
+                "event_calendar_coverage",
+                "datum_lifecycle_items",
+                "market_context_snapshots",
+                "market_context_outbox",
+                "provider_state",
+            )
+        }
+    return canonical_json(state).encode("utf-8")
+
+
 def _settings(database_path: Path) -> Settings:
     return Settings(
         _env_file=None,
@@ -379,7 +450,10 @@ def _baseline_payload(
         },
         "macro_snapshot": {},
         "rates_context": fixture["rates"],
-        "market_schedule": fixture["market_schedule"],
+        "market_schedule": build_session_aware_schedule(
+            fixture["market_schedule"],
+            now=now,
+        ),
         "nasdaq_context": {"earnings": {}},
         "news_context": news_context,
         "latest_news": news_context["latest"],

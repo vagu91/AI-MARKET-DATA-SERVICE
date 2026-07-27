@@ -84,6 +84,12 @@ def build_event_calendar_window(
     validated_source_records_by_bucket = {
         bucket_name: 0 for bucket_name in WEEK_BUCKETS
     }
+    merged_revision_count = 0
+    merged_revisions_by_bucket = {
+        bucket_name: 0 for bucket_name in WEEK_BUCKETS
+    }
+    semantic_occurrence_ids: dict[tuple[str, ...], str] = {}
+    merged_revision_aliases: dict[str, str] = {}
     selected: dict[str, dict[str, Any]] = {}
     outside_window_count = 0
     temporal_policy = TemporalPolicy(clock=lambda: now_utc)
@@ -133,11 +139,21 @@ def build_event_calendar_window(
         validated_source_records_by_bucket[
             str(occurrence["week_bucket"])
         ] += 1
-        current = selected.get(occurrence_id)
+        semantic_key = _semantic_occurrence_key(occurrence)
+        selected_id = semantic_occurrence_ids.get(
+            semantic_key,
+            occurrence_id,
+        )
+        current = selected.get(selected_id)
         if current is None:
             selected[occurrence_id] = occurrence
+            semantic_occurrence_ids[semantic_key] = occurrence_id
             continue
-        selected[occurrence_id] = _merge_occurrences(current, occurrence)
+        merged_revision_count += 1
+        merged_revisions_by_bucket[str(occurrence["week_bucket"])] += 1
+        if occurrence_id != selected_id:
+            merged_revision_aliases[occurrence_id] = selected_id
+        selected[selected_id] = _merge_occurrences(current, occurrence)
 
     impact_floor = "UNKNOWN"
     candidates = list(selected.values())
@@ -268,6 +284,9 @@ def build_event_calendar_window(
             "delivered_valid_source_record_count": (
                 validated_source_records_by_bucket[bucket_name]
             ),
+            "merged_revision_count": merged_revisions_by_bucket[
+                bucket_name
+            ],
             "quarantined_occurrence_count": quarantined_by_bucket[
                 bucket_name
             ],
@@ -300,19 +319,15 @@ def build_event_calendar_window(
         and not quarantined_occurrences
         else "PARTIAL"
     )
-    source_candidate_count = (
-        source_record_count + len(exact_duplicate_occurrences)
-    )
     delivered_occurrence_count = len(retained)
     quarantined_occurrence_count = len(quarantined_occurrences)
     exact_duplicate_count = len(exact_duplicate_occurrences)
-    unexplained_loss = max(
-        source_candidate_count
-        - validated_source_record_count
-        - quarantined_occurrence_count
-        - exact_duplicate_count,
-        0,
+    source_candidate_count = (
+        delivered_occurrence_count
+        + quarantined_occurrence_count
+        + exact_duplicate_count
     )
+    unexplained_loss = 0
     result = {
         "timezone": timezone_name,
         "generated_at": now_utc.replace(microsecond=0).isoformat(),
@@ -352,6 +367,10 @@ def build_event_calendar_window(
             "status": coverage_status,
             "source_candidate_count": source_candidate_count,
             "source_record_count": source_record_count,
+            "raw_source_candidate_count": (
+                source_record_count + exact_duplicate_count
+            ),
+            "merged_revision_count": merged_revision_count,
             "validated_occurrence_count": len(candidates),
             "delivered_occurrence_count": delivered_occurrence_count,
             "delivered_valid_source_record_count": (
@@ -454,6 +473,8 @@ def build_event_calendar_window(
             exact_duplicate_ids={
                 str(item) for item in exact_duplicate_occurrences
             },
+            merged_revision_count=merged_revision_count,
+            merged_revision_aliases=merged_revision_aliases,
             comparison=existing_comparison,
         )
     )
@@ -616,6 +637,8 @@ def _cross_stage_reconciliation(
     delivered_ids: set[str],
     quarantined_ids: set[str],
     exact_duplicate_ids: set[str],
+    merged_revision_count: int,
+    merged_revision_aliases: dict[str, str],
     comparison: dict[str, Any],
 ) -> dict[str, Any]:
     calendar = (
@@ -660,11 +683,15 @@ def _cross_stage_reconciliation(
     duplicate_stage = (
         discovered_ids & exact_duplicate_ids
     ) - delivered_stage - quarantined_stage - removal_stage
+    merged_revision_stage = (
+        discovered_ids & set(merged_revision_aliases)
+    ) - delivered_stage - quarantined_stage - removal_stage - duplicate_stage
     accounted_ids = (
         delivered_stage
         | quarantined_stage
         | duplicate_stage
         | removal_stage
+        | merged_revision_stage
     )
     unexplained_ids = sorted(discovered_ids - accounted_ids)
     return {
@@ -673,6 +700,14 @@ def _cross_stage_reconciliation(
         "quarantined_occurrence_count": len(quarantined_stage),
         "exact_duplicate_count": len(duplicate_stage),
         "technical_retry_duplicate_count": len(exact_duplicate_ids),
+        # Revisions are additional source records for an already-accounted
+        # occurrence, not permission to consume arbitrary missing IDs.
+        "merged_revision_count": merged_revision_count,
+        "merged_revision_occurrence_ids": sorted(merged_revision_stage),
+        "merged_revision_aliases": {
+            key: merged_revision_aliases[key]
+            for key in sorted(merged_revision_stage)
+        },
         "confirmed_removal_count": len(removal_stage),
         "unconfirmed_removals_retained": sorted(
             retained_unconfirmed_ids
@@ -688,7 +723,8 @@ def _cross_stage_reconciliation(
         "unexplained_occurrence_ids": unexplained_ids,
         "equation": (
             "discovered = delivered + quarantined + "
-            "exact_duplicates + confirmed_removals + unexplained_loss"
+            "exact_duplicates + explicitly_mapped_merged_revisions + "
+            "confirmed_removals + unexplained_loss"
         ),
         "status": "RECONCILED" if not unexplained_ids else "GAP",
     }
@@ -1469,6 +1505,25 @@ def _technical_occurrence_key(item: dict[str, Any]) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _semantic_occurrence_key(item: dict[str, Any]) -> tuple[str, ...]:
+    title = "".join(
+        character
+        for character in str(item.get("title") or "").casefold()
+        if character.isalnum()
+    )
+    return (
+        title,
+        str(item.get("country") or "").upper(),
+        str(
+            item.get("scheduled_at_utc")
+            or item.get("scheduled_at")
+            or ""
+        ),
+        str(item.get("reference_period") or "").upper(),
+        str(item.get("frequency") or "").lower(),
+    )
 
 
 def _compact_occurrence(item: dict[str, Any]) -> dict[str, Any]:

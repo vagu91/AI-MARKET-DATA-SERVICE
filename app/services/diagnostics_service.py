@@ -5,6 +5,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderMetadata, ProviderType
@@ -47,6 +48,7 @@ from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
 from app.services.fed_expectations_service import FedExpectationsService
 from app.services.risk_context_runtime_service import RiskContextRuntimeService
+from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.social_sentiment_service import SocialSentimentService
 from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
@@ -135,6 +137,15 @@ class DiagnosticsService:
             correlation_id=f"market-context-{uuid.uuid4()}",
             allow_live_providers=fetch_missing,
         )
+        force_schedule_coverage: dict[str, Any] = {}
+        if (
+            force
+            and self.settings.event_calendar_catchup_enabled
+            and callable(getattr(self.event_service, "list_events", None))
+        ):
+            force_schedule_coverage = (
+                await self._force_schedule_catch_up(now=now)
+            )
 
         async def load_macro() -> tuple[MacroLatestResponse, dict[str, Any]]:
             try:
@@ -173,28 +184,34 @@ class DiagnosticsService:
                         **materialization,
                     }
                 }
-            try:
-                events = await asyncio.wait_for(
-                    self._official_events(country=country, start=now, end=now + timedelta(days=days)),
-                    timeout=max(float(self.settings.timeout_events_seconds), 1.0),
-                )
-            except TimeoutError:
-                events, materialization = self.event_materializer.load_from_history(
+            if force_schedule_coverage:
+                events = self._canonical_three_week_events(
                     country=country,
-                    start=now,
-                    end=now + timedelta(days=days),
-                    refresh_mode=refresh,
+                    now=now,
                 )
-                return events, {
-                    "data_quality": {
-                        "refresh_mode": refresh,
-                        "events_found": len(events),
-                        "enrichment_status": "events_timeout_fallback_to_history" if events else "events_timeout",
-                        "missing_critical_fields": [] if events else ["events_not_available"],
-                        "warnings": [f"events_fetch_timeout_after_{self.settings.timeout_events_seconds}s"],
-                        **materialization,
+            else:
+                try:
+                    events = await asyncio.wait_for(
+                        self._official_events(country=country, start=now, end=now + timedelta(days=days)),
+                        timeout=max(float(self.settings.timeout_events_seconds), 1.0),
+                    )
+                except TimeoutError:
+                    events, materialization = self.event_materializer.load_from_history(
+                        country=country,
+                        start=now,
+                        end=now + timedelta(days=days),
+                        refresh_mode=refresh,
+                    )
+                    return events, {
+                        "data_quality": {
+                            "refresh_mode": refresh,
+                            "events_found": len(events),
+                            "enrichment_status": "events_timeout_fallback_to_history" if events else "events_timeout",
+                            "missing_critical_fields": [] if events else ["events_not_available"],
+                            "warnings": [f"events_fetch_timeout_after_{self.settings.timeout_events_seconds}s"],
+                            **materialization,
+                        }
                     }
-                }
             enrichment_timeout = max(float(self.settings.timeout_events_seconds), 1.0)
             enrichment_timeout += 5.0
             try:
@@ -295,8 +312,12 @@ class DiagnosticsService:
             candidates = EventValueCandidateRepository(self.settings)
             candidates.persist_provider_payload(investing_payload)
             candidates.persist_provider_payload(xtb_payload)
+        canonical_events = self._canonical_three_week_events(
+            country=country,
+            now=now,
+        )
         enriched = reconcile_calendar_events(
-            enriched,
+            [*enriched, *canonical_events],
             [investing_payload, xtb_payload],
             now=now,
             temporal_validation=self.facts.temporal_validation,
@@ -338,7 +359,11 @@ class DiagnosticsService:
                 from app.models.macro import EventWindowsResponse
 
                 event_windows = EventWindowsResponse(symbol=symbol, checked_at_utc=datetime.now(UTC).isoformat())
-        news_items = self.news.stored(days=days, limit=100)
+        news_items = self.news.stored(
+            days=days,
+            limit=None,
+            include_quarantined=True,
+        )
         news_context, news_runtime = self.news_intelligence.materialize(
             news_items,
             refresh_mode=refresh,
@@ -371,6 +396,7 @@ class DiagnosticsService:
             "news_pipeline": news_pipeline,
             "news_intelligence": news_runtime,
             "macro_pipeline": macro_pipeline,
+            "force_schedule_coverage": force_schedule_coverage,
         }
         contract = build_market_context_contract(
             symbol=symbol,
@@ -422,6 +448,67 @@ class DiagnosticsService:
         contract["risk_sentiment"] = risk_sentiment
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
         return harden_market_context(contract, settings=self.settings)
+
+    def _canonical_three_week_events(
+        self,
+        *,
+        country: str,
+        now: datetime,
+    ) -> list[Any]:
+        """Read the complete previous/current/next local-week DB window."""
+
+        calendar_timezone = ZoneInfo(
+            str(
+                self.settings.event_calendar_timezone
+                or "America/New_York"
+            )
+        )
+        local_now = now.astimezone(calendar_timezone)
+        current_week_start = local_now.date() - timedelta(
+            days=local_now.weekday()
+        )
+        window_start = datetime.combine(
+            current_week_start - timedelta(days=7),
+            datetime.min.time(),
+            calendar_timezone,
+        )
+        window_end = datetime.combine(
+            current_week_start + timedelta(days=13),
+            datetime.max.time(),
+            calendar_timezone,
+        )
+        events, _ = self.event_materializer.load_from_history(
+            country=country,
+            start=window_start,
+            end=window_end,
+            refresh_mode="false",
+        )
+        return events
+
+    async def _force_schedule_catch_up(
+        self,
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        scheduler = ResearchSchedulerService(self.settings)
+        result: dict[str, Any] = {}
+        deadline = perf_counter() + max(
+            float(self.settings.timeout_events_seconds),
+            5.0,
+        )
+        while perf_counter() < deadline:
+            result = await asyncio.to_thread(
+                scheduler._seed_canonical_schedule_gaps,
+                schedule_acquire=self.event_service.list_events,
+                now=now,
+            )
+            if (
+                result.get("reason")
+                != "schedule_catchup_single_flight_active"
+            ):
+                return result
+            await asyncio.sleep(0.05)
+        raise TimeoutError("force_schedule_single_flight_timeout")
 
     def temporal_integrity(self) -> dict[str, Any]:
         model_facts = self.facts.search_facts(limit=1000)

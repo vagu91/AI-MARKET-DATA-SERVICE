@@ -799,9 +799,12 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         by_title["US expands Nvidia chip export controls"],
         by_title["US expands Nvidia chip export controls — update"],
     ]
-    rejected = by_title[
-        "Unknown publisher claims Nvidia development"
-    ]
+    rejected = next(
+        item
+        for item in context["excluded"]
+        if item["title"]
+        == "Unknown publisher claims Nvidia development"
+    )
 
     assert ibd["validation"]["status"] == "accepted"
     assert ibd["confirmation"]["confirmed"] is False
@@ -816,7 +819,7 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         for item in reuters
     )
     assert len({item["published_at"] for item in reuters}) == 2
-    assert rejected["validation"]["status"] == "rejected"
+    assert rejected["policy_outcome"]["status"] == "rejected"
     policy = SourcePolicyService()
     assert policy.policy_version == "source-policy-v5"
 
@@ -842,9 +845,8 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
     assert news["context"]["status"] == "PARTIAL"
     assert news["digest"]["status"] == "PARTIAL"
     assert news["digest"]["accepted_article_count"] == 3
-    assert news["producer_disclosures"]["quarantine"][
-        "record_count"
-    ] >= 1
+    assert len(news["context"]["excluded"]) == 1
+    assert news["context"]["excluded"][0]["reason"]
 
 
 def test_multi_megabyte_news_reconciliation_does_not_cap_or_deduplicate() -> None:
