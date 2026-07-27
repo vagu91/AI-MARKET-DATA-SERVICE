@@ -19,18 +19,22 @@ from app.services.event_calendar_window_service import (
     build_event_calendar_window,
 )
 from app.services.execution_context import ExecutionContext
+from app.services.lifecycle_due_resolver import (
+    ExactOccurrenceActualProviderAdapter,
+)
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
 from app.services.market_context_sync_service import (
+    SECTION_NAMES,
+    MarketContextSyncService,
     canonical_json,
-    extract_sync_sections,
-    reconcile_delivered_section,
 )
-from app.services.market_session_service import build_session_aware_schedule
-from app.services.news_intelligence_service import build_news_context
+from app.services.market_news_repository import MarketNewsRepository
+from app.services.news_intelligence_runtime_service import (
+    NewsIntelligenceRuntimeService,
+)
 from app.services.research_scheduler_service import ResearchSchedulerService
-from app.services.temporal_domain_service import canonical_event_key
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,257 +43,70 @@ FIXTURE = (
 )
 
 
-def replay() -> dict[str, Any]:
+def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
     source_bytes = FIXTURE.read_bytes()
     fixture = json.loads(source_bytes)
     now = datetime.fromisoformat(fixture["reference_now"])
-    settings = Settings(
-        _env_file=None,
-        environment="test",
-        source_policy_path=ROOT / "config" / "source_policy.json",
-        event_calendar_catchup_enabled=True,
-        event_calendar_catchup_batch_size=7,
-        event_calendar_catchup_max_per_tick=40,
-        event_calendar_catchup_lookback_days=730,
-    )
-    discovery = list(fixture["discovery"])
-    discovered_ids = [canonical_event_key(item) for item in discovery]
-    window = build_event_calendar_window(
-        {
-            "event_calendar": {
-                "critical_macro_events": [
-                    *discovery,
-                    *_next_week_rows(),
-                ],
-                "fed_communications": [],
-                "other_economic_events": [],
-                "source_coverage": {
-                    "discovered_occurrence_ids": discovered_ids,
-                    "by_bucket": {
-                        bucket: {"status": "VERIFIED_COMPLETE"}
-                        for bucket in (
-                            "PREVIOUS_WEEK",
-                            "CURRENT_WEEK",
-                            "NEXT_WEEK",
-                        )
-                    },
-                },
-            },
-            "event_calendar_window": {
-                "audit": {
-                    "comparison": {
-                        "removals": fixture["unconfirmed_removals"]
-                    }
-                }
-            },
-        },
-        settings=settings,
-        now=now,
-    )
-    raw_news = build_news_context(fixture["news"], now=now)
-    news = extract_sync_sections(
-        {
-            "news_context": raw_news,
-            "latest_news": raw_news["latest"],
-            "news_digest": raw_news["digest"],
-        }
-    )["news"]
-    schedule = build_session_aware_schedule(
-        fixture["market_schedule"],
-        now=now,
-    )
-    catchup = _replay_catchup(
-        fixture=fixture,
-        now=now,
-    )
-    large_rows = [
-        {
-            "article_id": f"large-{index}",
-            "source": "Reuters",
-            "summary": f"{index}:" + ("x" * 180_000),
-        }
-        for index in range(13)
-    ]
-    large_news = reconcile_delivered_section(
-        "news",
-        {
-            "context": {
-                "articles": large_rows,
-                "latest": large_rows,
-                "historical_articles": [],
-                "search_completed": True,
-            },
-            "latest": large_rows,
-            "digest": {},
-        },
-    )
-    large_bytes = canonical_json(large_news).encode("utf-8")
-    delivered_news = list(news["context"]["articles"])
-    rates = fixture["rates"]
-    effective_valid_until = max(
-        datetime.fromisoformat(rates["valid_until"]),
-        datetime.fromisoformat(rates["data_as_of"] + "T00:00:00+00:00"),
-        datetime.fromisoformat(rates["retrieved_at"]),
-    ).isoformat()
-    result = {
-        "mode": "OFFLINE_SNAPSHOT_92_LIVE_BLOCKER_REPLAY",
-        "fixture_integrity": {
-            "sha256": hashlib.sha256(source_bytes).hexdigest().upper(),
-            "bytes": len(source_bytes),
-        },
-        "forensic_before": fixture["forensic_before"],
-        "calendar_after": {
-            "bucket_counts": window["counts"]["by_bucket"],
-            "actual_missing_ids": sorted(
-                set(fixture["expectations"]["actual_missing_ids"])
-                & set(window["actual_missing_ids"])
-            ),
-            "unconfirmed_removals_retained": window["coverage"][
-                "cross_stage_reconciliation"
-            ]["unconfirmed_removals_retained"],
-            "cross_stage": window["coverage"][
-                "cross_stage_reconciliation"
-            ],
-            "omitted_for_size_count": window["coverage"][
-                "omitted_for_size_count"
-            ],
-            "omitted_for_count_count": window["coverage"][
-                "omitted_for_count_count"
-            ],
-        },
-        "catchup_after": catchup,
-        "news_after": {
-            "candidate_article_count": news["context"]["diagnostics"][
-                "raw_article_count"
-            ],
-            "accepted_article_count": news["context"][
-                "accepted_article_count"
-            ],
-            "delivered_raw_article_count": news["context"][
-                "delivered_raw_article_count"
-            ],
-            "historical_article_count": news["context"][
-                "historical_article_count"
-            ],
-            "rejected_article_count": news["context"]["diagnostics"][
-                "excluded_count"
-            ],
-            "status": news["context"]["status"],
-            "digest_status": news["digest"]["status"],
-            "usable_for_analysis": news["context"]["usable_for_analysis"],
-            "publishers": sorted(
-                {
-                    str(item.get("original_publisher"))
-                    for item in delivered_news
-                }
-            ),
-            "distribution_sources": sorted(
-                {
-                    str(item.get("distribution_source"))
-                    for item in delivered_news
-                    if item.get("distribution_source")
-                }
-            ),
-            "quarantined_record_count": news["producer_disclosures"][
-                "quarantine"
-            ]["record_count"],
-        },
-        "market_schedule_after": {
-            key: {
-                field: schedule[key].get(field)
-                for field in (
-                    "status",
-                    "is_open",
-                    "closed_reason",
-                    "verification_scope",
-                    "holiday_override_status",
-                    "holiday_name",
-                    "is_early_close",
-                )
-            }
-            for key in ("nasdaq_cash_session", "mnq_futures_session")
-        },
-        "rates_after": {
-            "data_as_of": rates["data_as_of"],
-            "inherited_valid_until": rates["valid_until"],
-            "effective_valid_until": effective_valid_until,
-            "freshness": rates["freshness"],
-            "temporal_invariant_holds": (
-                datetime.fromisoformat(effective_valid_until)
-                >= datetime.fromisoformat(rates["retrieved_at"])
-            ),
-        },
-        "lossless_multi_megabyte": {
-            "payload_bytes": len(large_bytes),
-            "record_count": len(large_news["context"]["articles"]),
-            "sha256": hashlib.sha256(large_bytes).hexdigest().upper(),
-        },
-        "side_effects": {
-            "live_provider_calls": 0,
-            "ai_jobs": 0,
-            "ai_backend_invocations": 0,
-            "ai_enqueue_invocations": 0,
-            "browser_calls": 0,
-            "delivery_attempts": 0,
-            "trading_calls": 0,
-            "operational_database_writes": 0,
-        },
-    }
-    encoded = canonical_json(result).encode("utf-8")
-    result["replay_sha256"] = hashlib.sha256(encoded).hexdigest().upper()
-    return result
+    named_ids = set(fixture["expectations"]["actual_missing_ids"])
 
-
-def _replay_catchup(
-    *,
-    fixture: dict[str, Any],
-    now: datetime,
-) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(
-        prefix="snapshot92-offline-",
+        prefix="snapshot92-materialized-",
         ignore_cleanup_errors=True,
     ) as raw:
-        settings = Settings(
-            _env_file=None,
-            environment="test",
-            database_path=Path(raw) / "replay.sqlite",
-            source_policy_path=ROOT / "config" / "source_policy.json",
-            event_calendar_catchup_enabled=True,
-            event_calendar_catchup_batch_size=7,
-            event_calendar_catchup_max_per_tick=40,
-            event_calendar_catchup_lookback_days=730,
+        settings = _settings(Path(raw) / "replay.sqlite")
+        news_repository = MarketNewsRepository(
+            settings,
+            clock=lambda: now,
         )
-        MarketContextSnapshotRepository(settings).save_next(
+        news_writes = [
+            news_repository.upsert_news(
+                {
+                    **article,
+                    "created_at": (
+                        article.get("created_at")
+                        or article.get("retrieved_at")
+                    ),
+                }
+            )
+            for article in fixture["news"]
+        ]
+        admitted_news = news_repository.stored(days=30, limit=50)
+        news_context, news_metrics = NewsIntelligenceRuntimeService(
+            settings,
+            clock=lambda: now,
+        ).materialize(
+            admitted_news,
+            refresh_mode="force",
+            limit=50,
+        )
+
+        snapshot_sequence = iter(
+            [
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000002",
+                "00000000-0000-4000-8000-000000000003",
+                "00000000-0000-4000-8000-000000000004",
+            ]
+        )
+        snapshots = MarketContextSnapshotRepository(
+            settings,
+            clock=lambda: now,
+            id_factory=lambda: next(snapshot_sequence),
+        )
+        baseline = snapshots.save_next(
             symbol="MNQ",
-            refresh_mode="offline_snapshot92_baseline",
-            debug_payload={
-                "symbol": "MNQ",
-                "generated_at_utc": now.isoformat(),
-                "event_calendar": {
-                    "critical_macro_events": _next_week_rows(),
-                    "fed_communications": [],
-                    "other_economic_events": [],
-                    "source_coverage": {
-                        "by_bucket": {
-                            "PREVIOUS_WEEK": {
-                                "status": "UNVERIFIED_EMPTY"
-                            },
-                            "CURRENT_WEEK": {
-                                "status": "UNVERIFIED_EMPTY"
-                            },
-                            "NEXT_WEEK": {
-                                "status": "VERIFIED_COMPLETE"
-                            },
-                        }
-                    },
-                },
-                "macro_snapshot": {},
-                "market_schedule": {},
-                "nasdaq_context": {"earnings": {}},
-                "news_context": {},
-                "risk_context": {},
-            },
+            refresh_mode="snapshot92_materialized_baseline",
+            debug_payload=_baseline_payload(
+                fixture=fixture,
+                news_context=news_context,
+                now=now,
+            ),
             ai_enrichment={"status": "NOT_REQUIRED"},
+        )
+        window_before = build_event_calendar_window(
+            snapshots.latest_components("MNQ"),
+            settings=settings,
+            now=now,
         )
 
         class ScheduleAcquire:
@@ -298,39 +115,65 @@ def _replay_catchup(
             ]
 
             def __call__(self, **_: Any) -> list[dict[str, Any]]:
-                return list(fixture["discovery"])
+                return _replay_discovery(fixture)
+
+        adapter = ExactOccurrenceActualProviderAdapter(
+            lambda _: fixture["actual_provider_observations"]
+        )
+        resolved_actuals: dict[str, dict[str, Any]] = {}
+
+        def resolve(item: dict[str, Any]) -> dict[str, Any]:
+            result = adapter.resolve(item)
+            if result["status"] == "RESOLVED":
+                datum = dict(result["datum"])
+                resolved_actuals[str(datum["occurrence_id"])] = datum
+            return result
 
         scheduler = ResearchSchedulerService(settings, clock=lambda: now)
-        first = scheduler.startup_catch_up(
-            resolver=lambda _: {
-                "status": "NO_DATA",
-                "reason": "redacted_provider_envelope_no_data",
-                "provider_request_attempted": True,
-                "provider_request_completed": True,
-                "ai_eligible": True,
-            },
+        scheduler.snapshots = snapshots
+        catchup = scheduler.startup_catch_up(
+            resolver=resolve,
             ai_enqueue=lambda _: (_ for _ in ()).throw(
                 AssertionError("AI enqueue reached in offline replay")
             ),
             schedule_acquire=ScheduleAcquire(),
             execution_context=ExecutionContext.provider_only(
-                correlation_id="snapshot92-offline-replay",
+                correlation_id="snapshot92-materialized-replay",
                 allow_live_providers=True,
             ),
         )
-        second = scheduler.startup_catch_up(
-            resolver=lambda _: (_ for _ in ()).throw(
-                AssertionError("backoff item reclaimed too early")
-            ),
-            ai_enqueue=lambda _: (_ for _ in ()).throw(
-                AssertionError("AI enqueue reached in offline replay")
-            ),
-            schedule_acquire=ScheduleAcquire(),
-            execution_context=ExecutionContext.provider_only(
-                correlation_id="snapshot92-offline-replay",
-                allow_live_providers=True,
-            ),
+        window_after = build_event_calendar_window(
+            snapshots.latest_components("MNQ"),
+            settings=settings,
+            now=now,
         )
+
+        sync = MarketContextSyncService(settings)
+        full_sync = sync.full()
+        first_bytes = canonical_json(full_sync).encode("utf-8")
+        second_bytes = canonical_json(sync.full()).encode("utf-8")
+        if first_bytes != second_bytes:
+            raise AssertionError("full_sync_replay_not_byte_identical")
+        if full_sync["payload_size_bytes"] != len(first_bytes):
+            raise AssertionError("full_sync_payload_size_mismatch")
+        if set(full_sync["sections"]) != set(SECTION_NAMES):
+            raise AssertionError("full_sync_section_inventory_mismatch")
+
+        delivered = canonical_json(full_sync)
+        admitted_proof = [
+            {
+                "article_id": item.get("article_id"),
+                "title": item.get("title"),
+                "publisher": item.get("original_publisher"),
+                "distribution_source": item.get("distribution_source"),
+                "published_at": item.get("published_at"),
+                "validation": item.get("validation"),
+                "present_in_full_sync": (
+                    str(item.get("article_id")) in delivered
+                ),
+            }
+            for item in admitted_news
+        ]
         with connect_sqlite(settings.database_path) as conn:
             ai_jobs = int(
                 conn.execute(
@@ -342,38 +185,215 @@ def _replay_catchup(
                     "SELECT COUNT(*) FROM research_backend_invocations"
                 ).fetchone()[0]
             )
-        return {
-            "status": first["status"],
-            "completion_status": first["catch_up_completion_status"],
-            "backlog_before": first["catch_up_backlog_before"],
-            "backlog_after": first["catch_up_backlog_after"],
-            "claimed": first["claimed"],
-            "resolved_count": len(first["resolved"]),
-            "residual_count": first["residual_count"],
-            "pending_backoff": first["catch_up_pending_backoff"],
-            "writes": first["writes"],
-            "rematerialized_snapshot_count": len(
-                first["rematerialized_snapshot_ids"]
-            ),
-            "discovered_previous_count": first["source_coverage"][
-                "by_bucket"
-            ]["PREVIOUS_WEEK"]["candidate_count"],
-            "discovered_current_count": first["source_coverage"][
-                "by_bucket"
-            ]["CURRENT_WEEK"]["candidate_count"],
-            "provider_result_count": first["source_coverage"][
-                "provider_result_count"
+            quarantined_news = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM market_news
+                    WHERE source_audit_status='QUARANTINED'
+                    """
+                ).fetchone()[0]
+            )
+
+        summary = {
+            "mode": "OFFLINE_SNAPSHOT_92_MATERIALIZED_RESIDUAL_REPLAY",
+            "fixture_integrity": {
+                "sha256": _sha256(source_bytes),
+                "bytes": len(source_bytes),
+            },
+            "materialization": {
+                "baseline_snapshot_id": baseline["snapshot_id"],
+                "baseline_revision": baseline["revision"],
+                "final_snapshot_id": full_sync["snapshot_id"],
+                "final_revision": full_sync["snapshot_revision"],
+                "rematerialized_snapshot_ids": catchup[
+                    "rematerialized_snapshot_ids"
+                ],
+                "pipeline": [
+                    "structured_provider_fixture",
+                    "discovery",
+                    "lifecycle",
+                    "canonical_store",
+                    "snapshot",
+                    "full_sync",
+                ],
+            },
+            "calendar": {
+                "before": {
+                    "bucket_counts": window_before["counts"]["by_bucket"],
+                    "actual_missing_ids": sorted(
+                        named_ids
+                        & set(window_before["actual_missing_ids"])
+                    ),
+                },
+                "after": {
+                    "bucket_counts": window_after["counts"]["by_bucket"],
+                    "actual_missing_ids": sorted(
+                        named_ids
+                        & set(window_after["actual_missing_ids"])
+                    ),
+                    "unconfirmed_removals_retained": window_after[
+                        "coverage"
+                    ]["cross_stage_reconciliation"][
+                        "unconfirmed_removals_retained"
+                    ],
+                    "duplicates_removed": window_after["coverage"][
+                        "cross_stage_reconciliation"
+                    ].get("duplicate_occurrences_removed", 0),
+                    "omitted_for_size_count": window_after["coverage"][
+                        "omitted_for_size_count"
+                    ],
+                    "omitted_for_count_count": window_after["coverage"][
+                        "omitted_for_count_count"
+                    ],
+                    "source_coverage": catchup["source_coverage"],
+                },
+            },
+            "actuals": [
+                _actual_proof(resolved_actuals[occurrence_id])
+                for occurrence_id in sorted(named_ids)
             ],
-            "provider_success_count": first["source_coverage"][
-                "provider_success_count"
-            ],
-            "repeat_status": second["status"],
-            "repeat_claimed": second["claimed"],
-            "repeat_writes": second["writes"],
-            "ai_jobs": ai_jobs,
-            "ai_backend_invocations": ai_backends,
-            "ai_enqueue_invocations": 0,
+            "catchup": {
+                "status": catchup["status"],
+                "completion_status": catchup[
+                    "catch_up_completion_status"
+                ],
+                "backlog_before": catchup["catch_up_backlog_before"],
+                "backlog_after": catchup["catch_up_backlog_after"],
+                "pending_backoff": catchup["catch_up_pending_backoff"],
+                "claimed": catchup["claimed"],
+                "resolved_count": len(catchup["resolved"]),
+                "actuals_recovered": catchup["actuals_recovered"],
+                "lifecycle_writes": catchup["lifecycle_writes"],
+                "snapshot_writes": catchup["snapshot_writes"],
+            },
+            "news": {
+                "candidate_count": len(fixture["news"]),
+                "admitted_count": len(admitted_news),
+                "quarantined_count": quarantined_news,
+                "runtime_metrics": news_metrics,
+                "admitted_articles": admitted_proof,
+                "unknown_publisher_via_yahoo_admitted": False,
+                "temporal_distinct_reuters_delivered": (
+                    len(
+                        {
+                            item["published_at"]
+                            for item in admitted_news
+                            if item.get("original_publisher") == "Reuters"
+                        }
+                    )
+                    == 2
+                ),
+                "write_statuses": [
+                    row["source_audit_status"] for row in news_writes
+                ],
+            },
+            "full_sync": {
+                "delivery_type": full_sync["delivery_type"],
+                "contract": full_sync["contract"],
+                "section_count": len(full_sync["sections"]),
+                "section_record_counts": {
+                    name: full_sync["manifest"]["sections"][name][
+                        "record_count"
+                    ]
+                    for name in SECTION_NAMES
+                },
+                "payload_size_bytes": len(first_bytes),
+                "artifact_sha256": _sha256(first_bytes),
+                "contract_checksum": full_sync["checksum"],
+                "checksum_scope": full_sync["checksum_scope"],
+                "readiness": full_sync["readiness"],
+                "two_consecutive_replays_byte_identical": True,
+            },
+            "side_effects": {
+                "live_provider_calls": 0,
+                "ai_jobs": ai_jobs,
+                "ai_backend_invocations": ai_backends,
+                "ai_enqueue_invocations": 0,
+                "browser_calls": 0,
+                "delivery_attempts": 0,
+                "trading_calls": 0,
+                "operational_database_writes": 0,
+            },
         }
+        return summary, full_sync
+
+
+def replay() -> dict[str, Any]:
+    summary, _ = replay_artifacts()
+    return summary
+
+
+def _settings(database_path: Path) -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="test",
+        database_path=database_path,
+        source_policy_path=ROOT / "config" / "source_policy.json",
+        event_calendar_catchup_enabled=True,
+        event_calendar_catchup_batch_size=7,
+        event_calendar_catchup_max_per_tick=40,
+        event_calendar_catchup_lookback_days=730,
+    )
+
+
+def _baseline_payload(
+    *,
+    fixture: dict[str, Any],
+    news_context: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    prior = [
+        dict(item["previous_occurrence"])
+        for item in fixture["unconfirmed_removals"]
+    ]
+    return {
+        "symbol": "MNQ",
+        "generated_at_utc": now.isoformat(),
+        "event_calendar": {
+            "critical_macro_events": [*prior, *_next_week_rows()],
+            "fed_communications": [],
+            "other_economic_events": [],
+            "source_coverage": {
+                "by_bucket": {
+                    "PREVIOUS_WEEK": {"status": "UNVERIFIED_EMPTY"},
+                    "CURRENT_WEEK": {"status": "UNVERIFIED_EMPTY"},
+                    "NEXT_WEEK": {"status": "VERIFIED_COMPLETE"},
+                }
+            },
+        },
+        "event_calendar_window": {
+            "audit": {
+                "comparison": {
+                    "removals": fixture["unconfirmed_removals"][:1]
+                }
+            }
+        },
+        "macro_snapshot": {},
+        "rates_context": fixture["rates"],
+        "market_schedule": fixture["market_schedule"],
+        "nasdaq_context": {"earnings": {}},
+        "news_context": news_context,
+        "latest_news": news_context["latest"],
+        "news_digest": news_context["digest"],
+        "risk_context": {},
+    }
+
+
+def _replay_discovery(
+    fixture: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return a final 14/3 materialized window with one retained removal.
+
+    The S&P PMI occurrence is rediscovered, while New Home Sales is absent from
+    the current provider envelope and must remain visible as the one
+    unconfirmed removal.  One ordinary current fixture row plus those two
+    occurrences yields the required three current-week events.
+    """
+
+    previous = list(fixture["discovery"][:14])
+    ordinary_current = dict(fixture["discovery"][14])
+    pmi = dict(fixture["unconfirmed_removals"][1]["previous_occurrence"])
+    return [*previous, ordinary_current, pmi]
 
 
 def _next_week_rows(count: int = 25) -> list[dict[str, Any]]:
@@ -401,20 +421,59 @@ def _next_week_rows(count: int = 25) -> list[dict[str, Any]]:
     ]
 
 
+def _actual_proof(item: dict[str, Any]) -> dict[str, Any]:
+    lineage = (
+        item.get("field_lineage")
+        or (item.get("lineage") or {}).get("field_lineage")
+        or {}
+    )
+    return {
+        "occurrence_id": item.get("occurrence_id"),
+        "title": item.get("title") or item.get("name"),
+        "release_at": item.get("scheduled_at_utc")
+        or item.get("release_at"),
+        "reference_period": item.get("reference_period"),
+        "frequency": item.get("frequency"),
+        "actual": item.get("actual"),
+        "forecast": item.get("forecast"),
+        "consensus": item.get("consensus"),
+        "previous": item.get("previous"),
+        "unit": item.get("unit"),
+        "publisher": item.get("publisher")
+        or item.get("source_originator")
+        or item.get("source"),
+        "distribution_source": item.get("distribution_source"),
+        "source_url": item.get("source_url"),
+        "release_status": item.get("release_status"),
+        "validation_status": item.get("validation_status"),
+        "field_lineage": lineage,
+    }
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest().upper()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-    encoded = json.dumps(
-        replay(),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Backward-compatible alias for --summary-output.",
     )
-    if args.output is not None:
-        args.output.write_text(encoded + "\n", encoding="utf-8")
-    else:
-        print(encoded)
+    parser.add_argument("--summary-output", type=Path)
+    parser.add_argument("--full-sync-output", type=Path)
+    args = parser.parse_args()
+    summary, full_sync = replay_artifacts()
+    summary_bytes = canonical_json(summary).encode("utf-8")
+    full_sync_bytes = canonical_json(full_sync).encode("utf-8")
+    summary_path = args.summary_output or args.output
+    if summary_path is not None:
+        summary_path.write_bytes(summary_bytes)
+    if args.full_sync_output is not None:
+        args.full_sync_output.write_bytes(full_sync_bytes)
+    if summary_path is None and args.full_sync_output is None:
+        print(summary_bytes.decode("utf-8"))
 
 
 if __name__ == "__main__":

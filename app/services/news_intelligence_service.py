@@ -552,11 +552,16 @@ def build_news_context(
         "published_at_coverage_pct": quality["published_at_coverage_pct"],
         "canonical_url_coverage_pct": quality["canonical_url_coverage_pct"],
     }
-    context["digest"] = build_news_digest(context)
+    context["digest"] = build_news_digest(context, generated_at=now)
     return context
 
 
-def build_news_digest(news_context: dict[str, Any], *, coverage_window_hours: int = 24) -> dict[str, Any]:
+def build_news_digest(
+    news_context: dict[str, Any],
+    *,
+    coverage_window_hours: int = 24,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
     latest = list(news_context.get("latest") or [])
     clusters = list(news_context.get("clusters") or [])
     diagnostics = dict(news_context.get("diagnostics") or {})
@@ -578,7 +583,7 @@ def build_news_digest(news_context: dict[str, Any], *, coverage_window_hours: in
     return {
         "status": "available" if latest else "no_data_available",
         "pipeline_version": PIPELINE_VERSION,
-        "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "generated_at_utc": (generated_at or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "coverage_window_hours": coverage_window_hours,
         "candidate_article_count": int(diagnostics.get("raw_article_count") or 0),
         "accepted_article_count": int(diagnostics.get("accepted_count") or len(latest)),

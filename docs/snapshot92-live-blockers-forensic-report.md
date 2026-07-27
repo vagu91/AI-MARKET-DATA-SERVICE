@@ -22,7 +22,7 @@ The tracked reproduction is
 `tests/fixtures/snapshot_92_live_blockers_redacted.json`. It contains no
 secrets, personal data, credentials, local paths, operational database content,
 or AI Trader payload. Its final SHA-256 is
-`4B8CB1C37AD0AD4D573D81030AB46DF217796818580F99BFEDD6A0850CDED4AB`.
+`5A12CE6BA231A4F3F3A0606EA204E21464A4540C1EE9B0BDF19894B89EF2F45A`.
 
 ## Root causes
 
@@ -270,15 +270,113 @@ review plus six new independent executions from the final review. The extended
 offline groups completed as follows:
 
 ```text
-snapshot-92 adversarial                         19 passed
-catch-up, cancellation, leases, actuals        110 passed
-sync protocol and readiness                    127 passed
-news, sessions and three-week projection       197 passed
-migration matrix (included above)               22 passed
-complete pytest suite                          1737 passed
+snapshot-92 adversarial + residual closure      25 passed
+residual/news/actual/window/sync perimeter     215 passed
+migration matrix (1..20 plus current reopen)    21 passed
+complete pytest suite                          1743 passed
 Ruff                                             passed
-py_compile                                     246 files passed
+py_compile                                     247 files passed
 compileall                                       passed
 git diff --check                                 passed
-offline replay x2                               byte-identical
+offline replay x2                               byte-identical (summary and full)
 ```
+
+## Residual closure after fixed-point verification
+
+This section supersedes the earlier residual descriptions above. The
+fixed-point lifecycle repair at
+`9dcac9222c24971e21a377a7677b3621ac0ba34e` was not reworked. The new work
+closes only the four requested residuals through structured offline provider
+fixtures and production repositories/services.
+
+### Exact actual mapping
+
+`ExactOccurrenceActualProviderAdapter` accepts a value only when all of the
+following match the requested lifecycle item: canonical occurrence identity,
+release minute, normalized reference period, frequency, and an `actual` field
+lineage whose source field is `actual` or `current`. A title-only match is
+insufficient. Forecast and previous values are copied from the original XTB
+occurrence and cannot be promoted to actual. A monthly event whose provider
+observation says `2026-Q2` is rejected.
+
+The complete redacted serialized resolutions are:
+
+```json
+{"actual":628.0,"consensus":null,"distribution_source":"XTB Economic Calendar","field_lineage":{"actual":{"originator":"U.S. Census Bureau / HUD","source_field":"actual"},"forecast":{"distributor":"XTB Economic Calendar","source_field":"forecast"},"previous":{"distributor":"XTB Economic Calendar","source_field":"previous"}},"forecast":610.0,"frequency":"monthly","occurrence_id":"xtb:146392:2026-07-24","previous":618.0,"publisher":"U.S. Census Bureau / HUD","reference_period":"2026-06","release_at":"2026-07-24T12:30:00+00:00","release_status":"PUBLISHED","source_url":"https://www.census.gov/construction/nrs/","title":"New Home Sales","unit":"thousands_annual_rate","validation_status":"accepted"}
+```
+
+```json
+{"actual":53.6,"consensus":null,"distribution_source":"XTB Economic Calendar","field_lineage":{"actual":{"originator":"S&P Global","source_field":"actual"},"forecast":{"distributor":"XTB Economic Calendar","source_field":"forecast"},"previous":{"distributor":"XTB Economic Calendar","source_field":"previous"}},"forecast":52.0,"frequency":"monthly","occurrence_id":"xtb:146945:2026-07-24","previous":51.2,"publisher":"S&P Global","reference_period":"2026-07","release_at":"2026-07-24T14:00:00+00:00","release_status":"PUBLISHED","source_url":"https://www.spglobal.com/marketintelligence/en/mi/research-analysis/","title":"Flash Services PMI","unit":"index","validation_status":"accepted"}
+```
+
+The first value is 628 thousand (equivalent to 628,000 units). The second is
+53.6 for the July 2026 monthly Flash Services PMI; `2026-Q2` is no longer
+present in its occurrence or expected-period contract.
+
+### Productive news path
+
+The replay executes provider fixture -> `MarketNewsRepository` source-policy
+validation -> temporary SQLite persistence -> news runtime materialization ->
+market-context snapshot -> full sync. Yahoo is retained as distributor, never
+used to confer trust on an unknown original publisher.
+
+The admitted raw articles present in the full sync are:
+
+| Article ID | Title | Publisher | Distributor | Published | Validation | Full sync |
+|---|---|---|---|---|---|---|
+| `af30c080faf92874` | US expands Nvidia chip export controls — update | Reuters | Yahoo Finance | `2026-07-26T13:40:00+00:00` | accepted, source-policy-v5 | yes |
+| `f42cac7932c54496` | US expands Nvidia chip export controls | Reuters | Yahoo Finance | `2026-07-26T13:10:00+00:00` | accepted, source-policy-v5 | yes |
+| `a7c0f21c0de5c8a4` | Nvidia earnings outlook lifts semiconductor shares | Investor's Business Daily | Investor's Business Daily | `2026-07-26T13:00:00+00:00` | accepted, source-policy-v5 | yes |
+
+The Yahoo-distributed unknown publisher is quarantined. Counts are 4
+candidates, 3 admitted/delivered and 1 quarantined. The two similar Reuters
+records have distinct IDs, URLs, summaries, content snippets, lineage and
+timestamps and both survive; the runtime reports `duplicate_count=0`.
+
+### Three-week materialized replay
+
+The replay uses the productive chain
+`discovery -> lifecycle -> canonical store -> snapshot -> full-sync`.
+
+- Before resolution, both named IDs are in `actual_missing_ids`.
+- After resolution, bucket counts are exactly 14 previous, 3 current and 25
+  next, with no count/size omission and no destructive duplicate removal.
+- After resolution, `actual_missing_ids` is empty and both releases are
+  `PUBLISHED`.
+- `xtb:146392:2026-07-24` remains visibly retained as the one
+  `UNCONFIRMED_REMOVAL`; the structured S&P observation confirms the PMI
+  occurrence and clears that provisional marker.
+- Catch-up recovers 2 actuals, moves revision 1 to revision 3 and records two
+  rematerialized snapshot IDs. The 16 unrelated redacted events remain
+  truthfully in durable backoff; no actual is invented for them.
+- Previous/current source buckets are verified, not `UNVERIFIED_EMPTY`.
+
+### Distinct summary and authentic full-sync artifacts
+
+The generated artifacts are intentionally different:
+
+- `docs/snapshot92-residual-replay-summary.json`: validation/report summary,
+  8,100 bytes, SHA-256
+  `5EBCD2D60B555955A348EDC544E84DD1CD0E6A11762909B6D869243CD49327F5`;
+- `docs/snapshot92-residual-full-sync.json`: the actual canonical
+  `FULL_SNAPSHOT` consumer deliverable, 359,903 UTF-8 bytes, SHA-256
+  `BCEC583B8CFBEE03DE0C821CBAC8B6DCB6F1CCE4E7BBB022ABED1078121E8DF3`.
+
+The full-sync contract checksum is
+`45510627c2c20872817d2c419119111511f448c67a851034b87a064f7f1c0d02`
+with scope `CANONICAL_DELIVERY_WITHOUT_MEASUREMENT_FIELDS`.
+`payload_size_bytes=359903` equals the exact canonical UTF-8 file length.
+Two independent executions, as well as two consecutive productive reads of
+each materialized revision, are byte-identical. There is no size cap.
+
+Per-section record counts are:
+
+```json
+{"cross_asset_context":0,"earnings":0,"earnings_intelligence":0,"event_calendar":60,"fed":0,"geopolitical_regulatory_risk":0,"macro":0,"macro_actuals":0,"market_internals":0,"market_schedule":1,"nasdaq":0,"news":6,"options_positioning":0,"positioning":0,"rates":1,"risk":0,"vix":0}
+```
+
+All 17 named sections are present. Both actual values and occurrence IDs are
+serialized in `event_calendar`; all three admitted raw articles, including
+publisher/distributor, URL, timestamps, headline, summary, content and lineage,
+are serialized in `news`. Manifest, readiness, revisions, lineage, checksum
+and exact payload size are part of the deliverable itself.

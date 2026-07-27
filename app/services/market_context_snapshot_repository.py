@@ -5,7 +5,7 @@ import json
 import threading
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.core.redaction import redact_payload
@@ -54,8 +54,16 @@ def _serialized_materialization(method):
 
 
 class MarketContextSnapshotRepository:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         assert_test_database_isolated(
             settings.database_path,
             environment=settings.environment,
@@ -99,8 +107,8 @@ class MarketContextSnapshotRepository:
         trigger_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Allocate revision and persist both payloads in one SQLite write transaction."""
-        now = datetime.now(UTC).replace(microsecond=0).isoformat()
-        snapshot_id = f"mcs-{uuid.uuid4()}"
+        now = self.clock().replace(microsecond=0).isoformat()
+        snapshot_id = f"mcs-{self.id_factory()}"
         symbol = symbol.upper()
         temporal_debug = self.temporal_validation.sanitize_payload(
             redact_payload(dict(debug_payload)),

@@ -13,6 +13,9 @@ from app.services.event_calendar_window_service import (
     build_event_calendar_window,
 )
 from app.services.execution_context import ExecutionContext
+from app.services.lifecycle_due_resolver import (
+    ExactOccurrenceActualProviderAdapter,
+)
 from app.services.market_context_snapshot_repository import (
     MarketContextSnapshotRepository,
 )
@@ -780,8 +783,9 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
     ibd = by_title[
         "Nvidia earnings outlook lifts semiconductor shares"
     ]
-    reuters = by_title[
-        "Reuters: US expands Nvidia chip export controls"
+    reuters = [
+        by_title["US expands Nvidia chip export controls"],
+        by_title["US expands Nvidia chip export controls — update"],
     ]
     rejected = by_title[
         "Unknown publisher claims Nvidia development"
@@ -790,12 +794,16 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
     assert ibd["validation"]["status"] == "accepted"
     assert ibd["confirmation"]["confirmed"] is False
     assert ibd["confirmed_by_multiple_sources"] is False
-    assert reuters["validation"]["status"] == "accepted"
-    assert reuters["original_publisher"] == "Reuters"
-    assert reuters["distribution_source"] == "Yahoo Finance"
-    assert reuters["distribution_url"].startswith(
-        "https://finance.yahoo.com/"
+    assert all(
+        item["validation"]["status"] == "accepted"
+        and item["original_publisher"] == "Reuters"
+        and item["distribution_source"] == "Yahoo Finance"
+        and item["distribution_url"].startswith(
+            "https://finance.yahoo.com/"
+        )
+        for item in reuters
     )
+    assert len({item["published_at"] for item in reuters}) == 2
     assert rejected["validation"]["status"] == "rejected"
     policy = SourcePolicyService()
     assert policy.policy_version == "source-policy-v5"
@@ -808,20 +816,20 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         }
     )["news"]
     delivered = news["context"]["articles"]
-    assert len(delivered) == 2
+    assert len(delivered) == 3
     assert {item["original_publisher"] for item in delivered} == {
         "Investor's Business Daily",
         "Reuters",
     }
-    assert news["context"]["accepted_article_count"] == 2
-    assert news["context"]["delivered_raw_article_count"] == 2
+    assert news["context"]["accepted_article_count"] == 3
+    assert news["context"]["delivered_raw_article_count"] == 3
     assert news["context"]["historical_article_count"] == 0
     assert news["context"]["diagnostics"]["excluded_count"] == 1
     assert news["context"]["rejected_article_count"] == 1
     assert news["context"]["usable_for_analysis"] is True
     assert news["context"]["status"] == "PARTIAL"
     assert news["digest"]["status"] == "PARTIAL"
-    assert news["digest"]["accepted_article_count"] == 2
+    assert news["digest"]["accepted_article_count"] == 3
     assert news["producer_disclosures"]["quarantine"][
         "record_count"
     ] >= 1
@@ -1137,30 +1145,19 @@ def test_named_actuals_are_recovered_by_exact_occurrence_without_ai(
         def __call__(self, **_: object) -> list[dict[str, object]]:
             return list(payload["discovery"])  # type: ignore[arg-type]
 
+    adapter = ExactOccurrenceActualProviderAdapter(
+        lambda _: payload["actual_provider_observations"]  # type: ignore[index]
+    )
     recovered: dict[str, str] = {}
 
     def resolve(item: dict[str, object]) -> dict[str, object]:
         entity_key = str(item["entity_key"])
-        item_payload = dict(item.get("payload") or {})  # type: ignore[arg-type]
-        if entity_key not in named_ids:
-            return {"status": "NO_DATA", "reason": "offline_no_data"}
-        expected_period = str(item_payload["reference_period"])
-        recovered[entity_key] = expected_period
-        return {
-            "status": "RESOLVED",
-            "datum": {
-                **item_payload,
-                "occurrence_id": entity_key,
-                "canonical_event_key": entity_key,
-                "reference_period": expected_period,
-                "actual": "101.25" if "146392" in entity_key else "2.75",
-                "release_status": "PUBLISHED",
-                "source": "official-offline-fixture",
-                "retrieved_at": now.isoformat(),
-            },
-            "provider_request_attempted": True,
-            "provider_request_completed": True,
-        }
+        result = adapter.resolve(item)  # type: ignore[arg-type]
+        if result["status"] == "RESOLVED":
+            recovered[entity_key] = str(
+                result["datum"]["reference_period"]
+            )
+        return result
 
     result = ResearchSchedulerService(
         settings, clock=lambda: now
@@ -1200,7 +1197,9 @@ def test_named_actuals_are_recovered_by_exact_occurrence_without_ai(
 
     assert set(recovered) == named_ids
     assert recovered["xtb:146392:2026-07-24"] == "2026-06"
-    assert recovered["xtb:146945:2026-07-24"] == "2026-Q2"
+    assert recovered["xtb:146945:2026-07-24"] == "2026-07"
+    assert current["xtb:146392:2026-07-24"]["actual"] == 628.0
+    assert current["xtb:146945:2026-07-24"]["actual"] == 53.6
     assert all(item["actual"] not in (None, "") for item in current.values())
     assert all(
         item["release_status"] == "PUBLISHED" for item in current.values()
