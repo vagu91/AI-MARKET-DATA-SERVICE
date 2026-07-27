@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping, Protocol
 from app.core.config import Settings
 from app.services.data_freshness_service import parse_datetime
 from app.services.event_driven_lifecycle_service import compute_datum_lifecycle
+from app.services.official_actual_semantics import normalize_reference_period
 from app.services.research_agent_enablement import research_agent_enablement
 from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key
@@ -84,6 +85,199 @@ class CallableLifecycleProviderAdapter:
             "datum": datum,
             "missing_fields": missing_fields,
             **request_telemetry,
+        }
+
+
+class ExactOccurrenceActualProviderAdapter:
+    """Select an actual only from a structured, exact-occurrence observation.
+
+    The adapter deliberately treats occurrence identity, release minute,
+    reference period, and field lineage as part of the value.  It therefore
+    cannot promote a forecast/previous field or a differently-perioded release
+    merely because the event title looks similar.
+    """
+
+    performs_io = True
+
+    def __init__(
+        self,
+        acquire: Callable[[dict[str, Any]], Any],
+        *,
+        name: str = "exact_occurrence_actual",
+    ) -> None:
+        self.acquire = acquire
+        self.name = name
+
+    def resolve(self, item: dict[str, Any]) -> dict[str, Any]:
+        output = self.acquire(item)
+        if inspect.isawaitable(output):
+            output = asyncio.run(output)
+        observations = (
+            list(output)
+            if isinstance(output, (list, tuple))
+            else list((output or {}).get("observations") or [])
+            if isinstance(output, dict)
+            else []
+        )
+        payload = (
+            dict(item.get("payload") or {})
+            if isinstance(item.get("payload"), dict)
+            else {}
+        )
+        expected_key = str(
+            payload.get("canonical_event_key")
+            or payload.get("occurrence_id")
+            or canonical_event_key(payload)
+        )
+        expected_release = parse_datetime(
+            item.get("event_at")
+            or payload.get("release_at")
+            or payload.get("time_utc")
+        )
+        frequency = str(payload.get("frequency") or "monthly").lower()
+        expected_period = normalize_reference_period(
+            payload.get("reference_period") or payload.get("period"),
+            frequency=frequency,
+        )
+        if not expected_key or expected_release is None or not expected_period:
+            return self._no_data("expected_occurrence_semantics_missing")
+
+        identity_matches = [
+            dict(row)
+            for row in observations
+            if isinstance(row, dict)
+            and str(
+                row.get("occurrence_id")
+                or row.get("canonical_event_key")
+                or canonical_event_key(row)
+            )
+            == expected_key
+        ]
+        if not identity_matches:
+            return self._no_data("exact_occurrence_not_found")
+        release_matches = [
+            row
+            for row in identity_matches
+            if _same_release_minute(row, expected_release)
+        ]
+        if not release_matches:
+            return self._no_data("exact_occurrence_release_mismatch")
+        period_matches = [
+            row
+            for row in release_matches
+            if normalize_reference_period(
+                row.get("reference_period") or row.get("period"),
+                frequency=frequency,
+            )
+            == expected_period
+        ]
+        if not period_matches:
+            return self._no_data("exact_occurrence_reference_period_mismatch")
+
+        observation = period_matches[0]
+        lineage = (
+            dict(observation.get("field_lineage") or {})
+            if isinstance(observation.get("field_lineage"), dict)
+            else {}
+        )
+        actual_lineage = (
+            dict(lineage.get("actual") or {})
+            if isinstance(lineage.get("actual"), dict)
+            else {}
+        )
+        source_field = str(actual_lineage.get("source_field") or "").lower()
+        if source_field not in {"actual", "current"}:
+            return self._no_data("actual_field_lineage_invalid")
+        value = observation.get("actual")
+        if value in (None, ""):
+            return self._no_data("actual_value_missing")
+
+        datum = {
+            **payload,
+            "canonical_event_key": expected_key,
+            "occurrence_id": expected_key,
+            "release_at": expected_release.isoformat(),
+            "time_utc": expected_release.isoformat(),
+            "reference_period": expected_period,
+            "period": expected_period,
+            "frequency": frequency,
+            "actual": value,
+            "forecast": payload.get("forecast"),
+            "consensus": payload.get("consensus"),
+            "previous": payload.get("previous"),
+            "unit": observation.get("unit") or payload.get("unit"),
+            "release_status": "PUBLISHED",
+            "source": (
+                observation.get("source")
+                or observation.get("source_originator")
+            ),
+            "publisher": (
+                observation.get("publisher")
+                or observation.get("source_originator")
+            ),
+            "source_originator": observation.get("source_originator"),
+            "distribution_source": observation.get("distribution_source"),
+            "source_url": observation.get("source_url"),
+            "canonical_url": (
+                observation.get("canonical_url")
+                or observation.get("source_url")
+            ),
+            "retrieved_at": observation.get("retrieved_at"),
+            "validation_status": (
+                observation.get("validation_status") or "accepted"
+            ),
+            "removal_status": (
+                None
+                if observation.get("occurrence_confirmed") is True
+                else payload.get("removal_status")
+            ),
+            "comparison_lineage": (
+                {
+                    **(
+                        dict(payload.get("comparison_lineage") or {})
+                        if isinstance(
+                            payload.get("comparison_lineage"), dict
+                        )
+                        else {}
+                    ),
+                    "confirmation_source": (
+                        observation.get("source")
+                        or observation.get("source_originator")
+                    ),
+                }
+                if observation.get("occurrence_confirmed") is True
+                else payload.get("comparison_lineage")
+            ),
+            "field_lineage": {
+                **(
+                    dict(payload.get("field_lineage") or {})
+                    if isinstance(payload.get("field_lineage"), dict)
+                    else {}
+                ),
+                **lineage,
+            },
+        }
+        missing_fields = _missing_requested_fields(
+            datum,
+            list(item.get("fields_attempted") or []),
+        )
+        return {
+            "status": "PARTIAL" if missing_fields else "RESOLVED",
+            "reason": f"{self.name}_resolved",
+            "datum": datum,
+            "missing_fields": missing_fields,
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+            "provider_request_failed": False,
+        }
+
+    def _no_data(self, reason: str) -> dict[str, Any]:
+        return {
+            "status": "NO_DATA",
+            "reason": f"{self.name}_{reason}",
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+            "provider_request_failed": False,
         }
 
 

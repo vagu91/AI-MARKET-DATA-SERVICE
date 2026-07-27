@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from app.core.text_normalization import normalize_payload_text
 from app.core.redaction import redact_payload
@@ -15,15 +15,23 @@ from app.services.market_fact_repository import (
     decode,
     encode,
     init_market_db,
-    now_iso,
 )
 from app.services.news_intelligence_service import normalize_news_article
-from app.services.source_policy_service import SourcePolicyService
+from app.services.source_policy_service import (
+    SourcePolicyService,
+    SourceUrlValidation,
+)
 
 
 class MarketNewsRepository:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.keys = FactKeyService()
         self.freshness = DataFreshnessService(settings)
         self.source_policy = SourcePolicyService(settings.source_policy_path)
@@ -41,14 +49,31 @@ class MarketNewsRepository:
         source_url = str(article.get("source_url") or article.get("url") or "")
         if not source_url:
             raise ValueError("news source_url is required")
-        timestamp = now_iso()
+        current = self.clock()
+        timestamp = current.replace(microsecond=0).isoformat()
         published_at = parse_datetime(article.get("published_at"))
-        if published_at and published_at > datetime.now(UTC) + timedelta(minutes=5):
+        if published_at and published_at > current + timedelta(minutes=5):
             raise ValueError("future_news_timestamp")
         policy = self.source_policy.validate(article, field_semantics="news")
         source_validation = self.source_policy.validate_url(
             source_url,
             allow_test_reserved=self.settings.environment.lower() == "test",
+        )
+        reserved_fixture_source = (
+            self.settings.environment.lower() == "test"
+            and source_validation.accepted
+            and not policy.accepted
+            and bool(policy.reasons)
+            and set(policy.reasons).issubset(
+                {
+                    "SOURCE_HOST_RESERVED",
+                    "SOURCE_HOST_LOCALHOST",
+                    "SOURCE_HOST_NON_PUBLIC_IP",
+                }
+            )
+        )
+        source_admitted = source_validation.accepted and (
+            policy.accepted or reserved_fixture_source
         )
         topics = list(article.get("topics") or [])
         payload = {
@@ -80,11 +105,28 @@ class MarketNewsRepository:
             "source_tier": article.get("source_tier") or policy.tier,
             "source_classification": article.get("source_classification") or policy.classification,
             "source_audit_status": (
-                "ACTIVE" if source_validation.accepted else "QUARANTINED"
+                "ACTIVE"
+                if source_admitted
+                else "QUARANTINED"
             ),
-            "source_invalid_reason": source_validation.reason_code,
+            "source_invalid_reason": (
+                source_validation.reason_code
+                or (",".join(policy.reasons) if not policy.accepted else None)
+            ),
         }
-        if not source_validation.accepted:
+        article["validation"] = {
+            "status": (
+                "accepted"
+                if source_validation.accepted and policy.accepted
+                else "unverified"
+                if reserved_fixture_source
+                else "rejected"
+            ),
+            "reason_code": payload["source_invalid_reason"],
+            "policy_version": policy.policy_version,
+        }
+        payload["raw_payload_json"] = encode(article)
+        if not source_admitted:
             payload["reliability"] = 0.0
             payload["confidence"] = 0.0
             payload["is_official"] = 0
@@ -94,7 +136,7 @@ class MarketNewsRepository:
             topics=topics,
         )
         payload["next_refresh_at"] = article.get("next_refresh_at") or self.freshness.next_refresh_at(payload["valid_until"])
-        payload["lifecycle_status"] = "CURRENT" if (parse_datetime(payload["valid_until"]) or datetime.min.replace(tzinfo=UTC)) > datetime.now(UTC) else "EXPIRED"
+        payload["lifecycle_status"] = "CURRENT" if (parse_datetime(payload["valid_until"]) or datetime.min.replace(tzinfo=UTC)) > current else "EXPIRED"
         columns = list(payload)
         updates = ", ".join(
             (
@@ -123,12 +165,21 @@ class MarketNewsRepository:
                 """,
                 [payload[column] for column in columns],
             )
-            if not source_validation.accepted:
+            if not source_admitted:
                 _record_source_quarantine(
                     conn,
                     entity_table="market_news",
                     entity_key=str(payload["news_key"]),
-                    invalid=source_validation,
+                    invalid=(
+                        source_validation
+                        if not source_validation.accepted
+                        else SourceUrlValidation(
+                            accepted=False,
+                            url=source_url,
+                            domain=policy.domain,
+                            reason_code=payload["source_invalid_reason"],
+                        )
+                    ),
                     previous_status="ACTIVE",
                     lineage={"canonical_url": payload["canonical_url"]},
                 )
@@ -143,7 +194,7 @@ class MarketNewsRepository:
         limit: int = 200,
         current_only: bool = False,
     ) -> list[dict[str, Any]]:
-        cutoff = (datetime.now(UTC) - timedelta(days=max(days, 1))).replace(microsecond=0).isoformat()
+        cutoff = (self.clock() - timedelta(days=max(days, 1))).replace(microsecond=0).isoformat()
         with connect_market_db(self.settings) as conn:
             rows = conn.execute(
                 """
@@ -155,7 +206,7 @@ class MarketNewsRepository:
                 (cutoff, limit),
             ).fetchall()
         items = [self._row(row) for row in rows]
-        now = datetime.now(UTC)
+        now = self.clock()
         for item in items:
             valid_until = parse_datetime(item.get("valid_until"))
             item["lifecycle_status"] = "CURRENT" if valid_until and valid_until > now else "EXPIRED"
@@ -186,6 +237,7 @@ class MarketNewsRepository:
                 "matched_entities", "topic_classifications", "relevance_score", "relevance_reasons",
                 "relevance_tier", "exclusion_reason", "duplicate_group_id", "duplicate_of", "syndication_group",
                 "independent_source_count", "pipeline_version", "warnings", "content_status",
+                "distribution_source", "distributor", "publisher", "validation", "lineage", "content",
             ):
                 if data.get(key) in (None, "") and key in data["raw_payload"]:
                     data[key] = data["raw_payload"][key]

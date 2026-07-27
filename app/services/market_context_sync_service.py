@@ -166,7 +166,14 @@ def persist_sync_sections_in_transaction(
     metadata: dict[str, dict[str, Any]] = {}
     changed: list[str] = []
     for section_name in SECTION_NAMES:
-        payload = sections[section_name]
+        raw_payload = sections[section_name]
+        raw_valid_until = _find_temporal_value(
+            raw_payload,
+            ("valid_until", "fresh_until"),
+        )
+        payload, temporal_corrections = _reconcile_temporal_invariants(
+            raw_payload
+        )
         fingerprint = material_fingerprint(payload)
         previous = conn.execute(
             """
@@ -191,11 +198,41 @@ def persist_sync_sections_in_transaction(
             section_revision = int(maximum or 0) + 1
             changed.append(section_name)
         status, reason = section_status(payload)
-        valid_until = _find_temporal_value(payload, ("valid_until", "fresh_until"))
         section_data_as_of = _find_temporal_value(
             payload,
-            ("data_as_of", "as_of", "published_at", "event_at"),
+            (
+                "data_as_of",
+                "as_of",
+                "published_at",
+                "event_at",
+                "observed_at",
+                "retrieved_at",
+            ),
         ) or data_as_of
+        temporal_floor = _find_temporal_value(
+            payload,
+            (
+                "data_as_of",
+                "as_of",
+                "published_at",
+                "event_at",
+                "observed_at",
+                "retrieved_at",
+            ),
+        )
+        raw_expiry = parse_datetime(raw_valid_until)
+        floor_value = parse_datetime(temporal_floor)
+        temporal_invariant_corrected = bool(
+            temporal_corrections
+            or
+            floor_value is not None
+            and (raw_expiry is None or raw_expiry < floor_value)
+        )
+        valid_until = (
+            floor_value.isoformat()
+            if temporal_invariant_corrected and floor_value is not None
+            else raw_valid_until
+        )
         freshness = section_freshness(
             status=status,
             valid_until=valid_until,
@@ -272,6 +309,11 @@ def persist_sync_sections_in_transaction(
             "valid_until": valid_until,
             "status": status,
             "reason": reason,
+            "temporal_invariant_corrected": (
+                temporal_invariant_corrected
+            ),
+            "inherited_valid_until": raw_valid_until,
+            "temporal_correction_count": len(temporal_corrections),
         }
     return metadata, changed
 
@@ -455,7 +497,8 @@ def reconcile_delivered_section(
         for item in context.get("supporting") or []
         if _record_identity(item) in delivered_ids
     ]
-    context["accepted_article_count"] = len(current)
+    context["accepted_article_count"] = len(delivered)
+    context["current_article_count"] = len(current)
     context["delivered_raw_article_count"] = len(delivered)
     context["historical_article_count"] = len(historical)
     context["historical_context_available"] = bool(historical)
@@ -464,6 +507,18 @@ def reconcile_delivered_section(
         diagnostics.get("accepted_count") or 0
     )
     diagnostics["accepted_count"] = len(delivered)
+    candidate_count = max(
+        int(context.get("candidate_article_count") or 0),
+        int(diagnostics.get("raw_article_count") or 0),
+        len(delivered),
+    )
+    diagnostics["raw_article_count"] = candidate_count
+    diagnostics["excluded_count"] = max(
+        int(diagnostics.get("excluded_count") or 0),
+        candidate_count - len(delivered),
+    )
+    context["candidate_article_count"] = candidate_count
+    context["rejected_article_count"] = diagnostics["excluded_count"]
     context["diagnostics"] = diagnostics
     quarantine = (
         (output.get("producer_disclosures") or {}).get("quarantine")
@@ -480,6 +535,69 @@ def reconcile_delivered_section(
     ).upper() == "UNVERIFIED_EMPTY":
         context["status"] = "PARTIAL"
         context["reason"] = "HISTORICAL_COVERAGE_UNVERIFIED"
+    elif delivered:
+        context["status"] = "AVAILABLE"
+        context.pop("reason", None)
+    else:
+        context["status"] = "NO_DATA"
+        context["reason"] = "NO_DELIVERED_ARTICLES"
+    context["usable_for_analysis"] = bool(delivered)
+    delivered_article_ids = {
+        str(item.get("article_id"))
+        for item in delivered
+        if item.get("article_id")
+    }
+    context["clusters"] = [
+        {
+            **cluster,
+            "article_ids": [
+                article_id
+                for article_id in cluster.get("article_ids") or []
+                if str(article_id) in delivered_article_ids
+            ],
+            "representative_articles": [
+                item
+                for item in cluster.get("representative_articles") or []
+                if str(item.get("article_id")) in delivered_article_ids
+            ],
+        }
+        for cluster in context.get("clusters") or []
+        if isinstance(cluster, dict)
+        and any(
+            str(article_id) in delivered_article_ids
+            for article_id in cluster.get("article_ids") or []
+        )
+    ]
+    output["latest"] = current
+    digest = (
+        dict(output.get("digest") or {})
+        if isinstance(output.get("digest"), dict)
+        else {}
+    )
+    digest.update(
+        {
+            "status": (
+                "AVAILABLE"
+                if delivered and not quarantine.get("record_count")
+                else "PARTIAL"
+                if delivered
+                else "QUARANTINED"
+                if quarantine.get("record_count")
+                else "NO_DATA_AVAILABLE"
+            ),
+            "candidate_article_count": candidate_count,
+            "accepted_article_count": len(delivered),
+            "delivered_article_count": len(delivered),
+            "historical_article_count": len(historical),
+            "excluded_article_count": max(
+                int(digest.get("excluded_article_count") or 0),
+                candidate_count - len(delivered),
+            ),
+            "cluster_count": len(context["clusters"]),
+        }
+    )
+    output["digest"] = digest
+    context["digest"] = dict(digest)
     output["context"] = context
     return output
 
@@ -2901,6 +3019,75 @@ def _find_temporal_value(payload: Any, keys: tuple[str, ...]) -> str | None:
             if parsed is not None:
                 values.append((_aware(parsed), str(raw)))
     return max(values, default=(None, None), key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC))[1]
+
+
+def _reconcile_temporal_invariants(
+    payload: Any,
+) -> tuple[Any, list[dict[str, str]]]:
+    """Correct record-level expiry floors before hashing or delivery."""
+
+    corrections: list[dict[str, str]] = []
+    floor_keys = (
+        "data_as_of",
+        "as_of",
+        "published_at",
+        "event_at",
+        "observed_at",
+        "retrieved_at",
+    )
+    expiry_keys = ("valid_until", "fresh_until")
+
+    def walk(value: Any, path: str) -> Any:
+        if isinstance(value, list):
+            return [
+                walk(item, f"{path}[{index}]")
+                for index, item in enumerate(value)
+            ]
+        if not isinstance(value, dict):
+            return value
+        output = {
+            key: walk(item, f"{path}.{key}")
+            for key, item in value.items()
+        }
+        floor_raw = _find_temporal_value(output, floor_keys)
+        floor = parse_datetime(floor_raw)
+        if floor is None:
+            return output
+        effective_floor = _aware(floor).isoformat()
+        for key in expiry_keys:
+            if key not in output:
+                continue
+            inherited = output.get(key)
+            expiry = parse_datetime(inherited)
+            if expiry is not None and _aware(expiry) >= _aware(floor):
+                continue
+            output[key] = effective_floor
+            corrections.append(
+                {
+                    "path": f"{path}.{key}",
+                    "inherited_value": (
+                        "" if inherited is None else str(inherited)
+                    ),
+                    "effective_value": effective_floor,
+                    "temporal_floor": effective_floor,
+                }
+            )
+        return output
+
+    corrected = walk(payload, "$")
+    if corrections and isinstance(corrected, dict):
+        disclosures = (
+            dict(corrected.get("producer_disclosures") or {})
+            if isinstance(corrected.get("producer_disclosures"), dict)
+            else {}
+        )
+        disclosures["temporal_reconciliation"] = {
+            "status": "CORRECTED",
+            "correction_count": len(corrections),
+            "corrections": corrections,
+        }
+        corrected["producer_disclosures"] = disclosures
+    return corrected, corrections
 
 
 def _find_key_values(value: Any, key: str) -> list[Any]:

@@ -1395,6 +1395,8 @@ def _session(session: dict[str, Any]) -> dict[str, Any]:
         "valid_until",
         "retrieved_at",
         "freshness",
+        "verification_scope",
+        "holiday_override_status",
     )
 
 

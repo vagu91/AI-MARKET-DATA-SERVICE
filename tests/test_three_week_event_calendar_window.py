@@ -615,10 +615,14 @@ def test_saturday_sessions_are_both_closed_with_explicit_reasons() -> None:
 
     assert schedule["nasdaq_cash_session"]["is_open"] is False
     assert schedule["nasdaq_cash_session"]["closed_reason"] == "WEEKEND"
-    assert schedule["mnq_futures_session"]["is_open"] is None
+    assert schedule["mnq_futures_session"]["is_open"] is False
     assert (
         schedule["mnq_futures_session"]["closed_reason"]
-        == "UNVERIFIED_SCHEDULE"
+        == "WEEKEND"
+    )
+    assert (
+        schedule["mnq_futures_session"]["verification_scope"]
+        == "BASE_WEEKLY_RULE"
     )
 
 
@@ -672,11 +676,9 @@ def test_cash_closed_while_futures_open_on_sunday_evening() -> None:
     )
 
     assert schedule["nasdaq_cash_session"]["is_open"] is False
-    assert schedule["mnq_futures_session"]["is_open"] is None
-    assert (
-        schedule["mnq_futures_session"]["closed_reason"]
-        == "UNVERIFIED_SCHEDULE"
-    )
+    assert schedule["mnq_futures_session"]["is_open"] is True
+    assert schedule["mnq_futures_session"]["session_reason"] == "GLOBEX_OPEN"
+    assert schedule["mnq_futures_session"]["closed_reason"] is None
 
 
 def test_futures_maintenance_break_is_distinct_from_cash_close() -> None:
@@ -688,8 +690,9 @@ def test_futures_maintenance_break_is_distinct_from_cash_close() -> None:
     futures = schedule["mnq_futures_session"]
     assert futures["status"] == "maintenance_break"
     assert futures["calculated_status"] == "maintenance_break"
-    assert futures["is_open"] is None
-    assert futures["closed_reason"] == "UNVERIFIED_SCHEDULE"
+    assert futures["is_open"] is False
+    assert futures["closed_reason"] == "MAINTENANCE_BREAK"
+    assert futures["verification_scope"] == "BASE_WEEKLY_RULE"
     assert futures["maintenance_break"]["start"] == "17:00:00"
     assert futures["next_open_at"] == futures["next_open"]
 

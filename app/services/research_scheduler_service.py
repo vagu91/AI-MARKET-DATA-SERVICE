@@ -142,7 +142,11 @@ class ResearchSchedulerService:
         ai_decisions: list[dict[str, str]] = []
         deferred: list[str] = []
         backoff: list[str] = []
+        exhausted_no_data: list[str] = []
         item_outcomes: list[dict[str, str | None]] = []
+        partial_actuals_recovered = 0
+        partial_revisions_reconciled = 0
+        provider_only_finalized: set[str] = set()
         effective_triggers: list[dict[str, str]] = []
         provider_resolution_batch: list[
             tuple[
@@ -372,6 +376,23 @@ class ResearchSchedulerService:
                         refresh_reason="provider_partial_resolution",
                     ).as_dict()
                 if isinstance(datum, dict) and datum:
+                    prior_actual = (
+                        (item.get("payload") or {}).get("actual")
+                        if isinstance(item.get("payload"), dict)
+                        else None
+                    )
+                    current_actual = datum.get("actual")
+                    if prior_actual in (None, "") and current_actual not in (
+                        None,
+                        "",
+                    ):
+                        partial_actuals_recovered += 1
+                    elif (
+                        prior_actual not in (None, "")
+                        and current_actual not in (None, "")
+                        and str(prior_actual) != str(current_actual)
+                    ):
+                        partial_revisions_reconciled += 1
                     snapshot = self._rematerialize_provider_resolution(
                         item=item,
                         datum=datum,
@@ -568,6 +589,81 @@ class ResearchSchedulerService:
                     },
                 )
                 continue
+            if (
+                provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
+                and not allow_ai_residual
+            ):
+                exhausted = bool(
+                    provider_result.get("retry_deadline_exhausted")
+                    or provider_status == "EXHAUSTED"
+                )
+                no_data_payload = {
+                    **(
+                        item.get("payload")
+                        if isinstance(item.get("payload"), dict)
+                        else {}
+                    ),
+                    "actual": (
+                        (item.get("payload") or {}).get("actual")
+                        if isinstance(item.get("payload"), dict)
+                        else None
+                    ),
+                    "release_status": (
+                        (item.get("payload") or {}).get("release_status")
+                        if isinstance(item.get("payload"), dict)
+                        else None
+                    )
+                    or "AWAITING_ACTUAL",
+                    "reason": str(
+                        provider_result.get("reason")
+                        or "provider_returned_no_data"
+                    ),
+                    "fields_attempted": list(
+                        item.get("fields_attempted") or []
+                    ),
+                }
+                no_data_lifecycle = compute_datum_lifecycle(
+                    str(item.get("entity_type") or "unknown"),
+                    str(item.get("entity_key") or ""),
+                    no_data_payload,
+                    settings=self.settings,
+                    now=now,
+                    attempt_count=int(item.get("attempt_count") or 0) + 1,
+                    no_data=not exhausted,
+                    fields_attempted=list(
+                        item.get("fields_attempted") or []
+                    ),
+                    session_state=item.get("session_state"),
+                    triggering_event=effective_trigger_type,
+                    retry_class="NO_DATA",
+                    refresh_reason=str(
+                        provider_result.get("reason")
+                        or "provider_returned_no_data"
+                    ),
+                )
+                work_status = "NO_DATA" if exhausted else "BACKOFF"
+                self.lifecycle.upsert(
+                    no_data_lifecycle,
+                    payload=no_data_payload,
+                    work_status=work_status,
+                )
+                residual.append(unresolved)
+                if exhausted:
+                    exhausted_no_data.append(item_id)
+                    outcome = "EXHAUSTED_NO_DATA"
+                else:
+                    backoff.append(item_id)
+                    deferred.append(item_id)
+                    outcome = "WAITING_BACKOFF"
+                item_outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": outcome,
+                        "effective_trigger_type": effective_trigger_type,
+                    }
+                )
+                provider_only_finalized.add(item_id)
+                continue
             residual.append(unresolved)
             ai_decisions.append(
                 {
@@ -665,7 +761,10 @@ class ResearchSchedulerService:
                     )
         for item in residual:
             item_id = str(item["item_id"])
-            if item_id in queued_item_ids:
+            if (
+                item_id in queued_item_ids
+                or item_id in provider_only_finalized
+            ):
                 continue
             agent_status = next(
                 (
@@ -732,8 +831,25 @@ class ResearchSchedulerService:
                     ),
                 }
             )
+        outcome_statuses = {
+            str(item.get("status") or "") for item in item_outcomes
+        }
+        scan_status = (
+            "PARTIAL"
+            if len(outcome_statuses) > 1
+            and outcome_statuses.difference({"RESOLVED"})
+            else "WAITING_BACKOFF"
+            if outcome_statuses.intersection({"BACKOFF", "WAITING_BACKOFF"})
+            else "EXHAUSTED_NO_DATA"
+            if outcome_statuses == {"EXHAUSTED_NO_DATA"}
+            else "COMPLETED_WITH_GAPS"
+            if outcome_statuses.intersection(
+                {"NO_DATA", "DISABLED", "IDLE", "EXHAUSTED_NO_DATA"}
+            )
+            else "COMPLETED"
+        )
         return {
-            "status": "COMPLETED",
+            "status": scan_status,
             "claimed": len(claimed),
             "provider_calls": actual_provider_requests,
             "resolver_evaluations": resolver_evaluations,
@@ -745,6 +861,7 @@ class ResearchSchedulerService:
             "rematerialized_snapshot_ids": rematerialized,
             "deferred": deferred,
             "backoff": backoff,
+            "exhausted_no_data": exhausted_no_data,
             "residual_count": len(residual),
             "ai_eligible_count": len(ai_eligible),
             "ai_decisions": ai_decisions,
@@ -757,7 +874,10 @@ class ResearchSchedulerService:
             "provider_resolutions_coalesced": (
                 len(provider_resolution_batch) > 1
             ),
-            "actuals_recovered": sum(
+            "lifecycle_writes": len(claimed),
+            "snapshot_writes": len(rematerialized),
+            "writes": len(claimed) + len(rematerialized),
+            "actuals_recovered": partial_actuals_recovered + sum(
                 1
                 for item, datum, _, _ in provider_resolution_batch
                 if (
@@ -768,7 +888,7 @@ class ResearchSchedulerService:
                 in (None, "")
                 and datum.get("actual") not in (None, "")
             ),
-            "revisions_reconciled": sum(
+            "revisions_reconciled": partial_revisions_reconciled + sum(
                 1
                 for item, datum, _, _ in provider_resolution_batch
                 if (
@@ -930,10 +1050,6 @@ class ResearchSchedulerService:
         execution_context: ExecutionContext | None,
     ) -> dict[str, Any]:
         now = self.clock()
-        schedule_coverage = self._seed_canonical_schedule_gaps(
-            schedule_acquire=schedule_acquire,
-            now=now,
-        )
         window_start = now - timedelta(
             days=int(self.settings.event_calendar_catchup_lookback_days)
         )
@@ -951,21 +1067,101 @@ class ResearchSchedulerService:
             )
         )
         checkpoint = self._read_event_calendar_catchup_checkpoint()
-        backlog_before = self.lifecycle.count_due(
+        preexisting_due = self.lifecycle.count_due(
             now=now,
             due_since=window_start,
             entity_types=event_entity_types,
         )
         (
-            pending_backoff_before,
-            next_retry_at_before,
-        ) = self._event_calendar_catchup_backoff_state(
+            preexisting_pending_retry,
+            preexisting_pending_backoff,
+            preexisting_next_retry_at,
+        ) = self._event_calendar_catchup_pending_state(
+            now=now,
             window_start=window_start,
             entity_types=event_entity_types,
         )
+        stable_early_backoff = (
+            preexisting_due == 0
+            and preexisting_pending_retry > 0
+            and checkpoint.get("completion_status") == "WAITING_BACKOFF"
+            and int(
+                checkpoint.get(
+                    "pending_retry",
+                    checkpoint.get("pending_backoff") or 0,
+                )
+                or 0
+            )
+            == preexisting_pending_retry
+            and checkpoint.get("next_retry_at")
+            == preexisting_next_retry_at
+        )
+        if stable_early_backoff:
+            source_coverage = (
+                dict(checkpoint.get("source_coverage") or {})
+                if isinstance(checkpoint.get("source_coverage"), dict)
+                else {}
+            )
+            return {
+                **_empty_catchup_result(),
+                "status": "WAITING_BACKOFF",
+                "checkpoint_written": False,
+                "catch_up_window_start": window_start.isoformat(),
+                "catch_up_window_hours": int(
+                    self.settings.event_calendar_catchup_lookback_days
+                )
+                * 24,
+                "catch_up_backlog_before": preexisting_pending_retry,
+                "catch_up_backlog_after": preexisting_pending_retry,
+                "catch_up_due_after": 0,
+                "catch_up_pending_retry": preexisting_pending_retry,
+                "catch_up_pending_backoff": preexisting_pending_backoff,
+                "catch_up_next_retry_at": preexisting_next_retry_at,
+                "catch_up_batch_size": int(
+                    self.settings.event_calendar_catchup_batch_size
+                ),
+                "catch_up_max_per_tick": int(
+                    self.settings.event_calendar_catchup_max_per_tick
+                ),
+                "catch_up_cursor": checkpoint.get("cursor"),
+                "catch_up_tick_count": int(
+                    checkpoint.get("tick_count") or 0
+                ),
+                "catch_up_completion_status": "WAITING_BACKOFF",
+                "catch_up_provider_only": True,
+                "source_coverage": source_coverage,
+                "telemetry_emitted": False,
+            }
+
+        schedule_coverage = self._seed_canonical_schedule_gaps(
+            schedule_acquire=schedule_acquire,
+            now=now,
+        )
+        due_before = self.lifecycle.count_due(
+            now=now,
+            due_since=window_start,
+            entity_types=event_entity_types,
+        )
+        (
+            pending_retry_before,
+            pending_backoff_before,
+            next_retry_at_before,
+        ) = self._event_calendar_catchup_pending_state(
+            now=now,
+            window_start=window_start,
+            entity_types=event_entity_types,
+        )
+        schedule_lifecycle_writes = int(
+            schedule_coverage.get("persisted_gap_count") or 0
+        )
+        schedule_snapshot_writes = int(
+            bool(schedule_coverage.get("rematerialized_snapshot_id"))
+        )
         if (
-            backlog_before == 0
-            and pending_backoff_before == 0
+            due_before == 0
+            and pending_retry_before == 0
+            and schedule_lifecycle_writes == 0
+            and schedule_snapshot_writes == 0
             and checkpoint.get("completion_status") == "COMPLETED"
         ):
             return {
@@ -981,10 +1177,14 @@ class ResearchSchedulerService:
                 "ai_invocations": 0,
                 "ai_jobs_created": 0,
                 "writes": 0,
+                "lifecycle_writes": 0,
+                "snapshot_writes": 0,
                 "checkpoint_written": False,
                 "catch_up_cursor": checkpoint.get("cursor"),
                 "catch_up_backlog_before": 0,
                 "catch_up_backlog_after": 0,
+                "catch_up_due_after": 0,
+                "catch_up_pending_retry": 0,
                 "catch_up_pending_backoff": 0,
                 "catch_up_next_retry_at": None,
                 "catch_up_tick_count": int(
@@ -995,13 +1195,22 @@ class ResearchSchedulerService:
                 "source_coverage": schedule_coverage,
                 "telemetry_emitted": False,
             }
-        if backlog_before == 0 and pending_backoff_before > 0:
+        backlog_before = due_before + pending_retry_before
+        if due_before == 0 and pending_retry_before > 0:
             transition_required = (
                 checkpoint.get("completion_status") != "WAITING_BACKOFF"
-                or int(checkpoint.get("pending_backoff") or 0)
-                != pending_backoff_before
+                or int(
+                    checkpoint.get(
+                        "pending_retry",
+                        checkpoint.get("pending_backoff") or 0,
+                    )
+                    or 0
+                )
+                != pending_retry_before
                 or checkpoint.get("next_retry_at")
                 != next_retry_at_before
+                or schedule_lifecycle_writes > 0
+                or schedule_snapshot_writes > 0
             )
             tick_count = int(checkpoint.get("tick_count") or 0)
             checkpoint_written = False
@@ -1009,11 +1218,13 @@ class ResearchSchedulerService:
             if transition_required:
                 tick_count += 1
                 checkpoint_payload = {
-                    "backlog_before": 0,
+                    "backlog_before": backlog_before,
                     "claimed": 0,
                     "resolved": 0,
                     "backoff": 0,
-                    "backlog_after": 0,
+                    "backlog_after": pending_retry_before,
+                    "due_after": 0,
+                    "pending_retry": pending_retry_before,
                     "pending_backoff": pending_backoff_before,
                     "next_retry_at": next_retry_at_before,
                     "cursor": checkpoint.get("cursor"),
@@ -1038,15 +1249,28 @@ class ResearchSchedulerService:
             return {
                 **_empty_catchup_result(),
                 "status": "WAITING_BACKOFF",
-                "writes": 0,
+                "lifecycle_writes": schedule_lifecycle_writes,
+                "snapshot_writes": schedule_snapshot_writes,
+                "writes": (
+                    schedule_lifecycle_writes + schedule_snapshot_writes
+                ),
+                "rematerialized_snapshot_ids": (
+                    [
+                        str(schedule_coverage["rematerialized_snapshot_id"])
+                    ]
+                    if schedule_coverage.get("rematerialized_snapshot_id")
+                    else []
+                ),
                 "checkpoint_written": checkpoint_written,
                 "catch_up_window_start": window_start.isoformat(),
                 "catch_up_window_hours": int(
                     self.settings.event_calendar_catchup_lookback_days
                 )
                 * 24,
-                "catch_up_backlog_before": 0,
-                "catch_up_backlog_after": 0,
+                "catch_up_backlog_before": backlog_before,
+                "catch_up_backlog_after": pending_retry_before,
+                "catch_up_due_after": 0,
+                "catch_up_pending_retry": pending_retry_before,
                 "catch_up_pending_backoff": pending_backoff_before,
                 "catch_up_next_retry_at": next_retry_at_before,
                 "catch_up_batch_size": int(
@@ -1071,16 +1295,16 @@ class ResearchSchedulerService:
             self.settings.event_calendar_catchup_batch_size
         )
         cursor = checkpoint.get("cursor")
-        backlog_after = backlog_before
+        due_after = due_before
         while (
             aggregate["claimed"] < max_per_tick
-            and backlog_after > 0
+            and due_after > 0
         ):
             remaining = max_per_tick - int(aggregate["claimed"])
             batch = self.scan_due_items(
                 owner="event-calendar-catch-up",
                 resolver=resolver,
-                ai_enqueue=ai_enqueue,
+                ai_enqueue=None,
                 due_since=window_start,
                 execution_context=execution_context,
                 force=True,
@@ -1093,7 +1317,7 @@ class ResearchSchedulerService:
             _accumulate_catchup_result(aggregate, batch)
             if batch.get("catch_up_cursor"):
                 cursor = batch["catch_up_cursor"]
-            backlog_after = self.lifecycle.count_due(
+            due_after = self.lifecycle.count_due(
                 now=now,
                 due_since=window_start,
                 entity_types=event_entity_types,
@@ -1102,17 +1326,39 @@ class ResearchSchedulerService:
                 break
 
         (
+            pending_retry,
             pending_backoff,
             next_retry_at,
-        ) = self._event_calendar_catchup_backoff_state(
+        ) = self._event_calendar_catchup_pending_state(
+            now=now,
             window_start=window_start,
             entity_types=event_entity_types,
         )
+        (
+            terminal_gap_count,
+            exhausted_no_data_count,
+        ) = self._event_calendar_catchup_terminal_gap_state(
+            window_start=window_start,
+            entity_types=event_entity_types,
+        )
+        backlog_after = due_after + pending_retry
         completion_status = (
             "IN_PROGRESS"
-            if backlog_after > 0
+            if due_after > 0
             else "WAITING_BACKOFF"
-            if pending_backoff > 0
+            if pending_retry > 0
+            else "PARTIAL"
+            if aggregate["resolved"]
+            and (
+                int(aggregate["residual_count"]) > 0
+                or terminal_gap_count > 0
+            )
+            else "EXHAUSTED_NO_DATA"
+            if terminal_gap_count > 0
+            and exhausted_no_data_count == terminal_gap_count
+            else "COMPLETED_WITH_GAPS"
+            if terminal_gap_count > 0
+            or int(aggregate["residual_count"]) > 0
             else "COMPLETED"
         )
         tick_count = int(checkpoint.get("tick_count") or 0) + 1
@@ -1122,7 +1368,11 @@ class ResearchSchedulerService:
             "resolved": len(aggregate["resolved"]),
             "backoff": len(aggregate["backoff"]),
             "backlog_after": backlog_after,
+            "due_after": due_after,
+            "pending_retry": pending_retry,
             "pending_backoff": pending_backoff,
+            "terminal_gap_count": terminal_gap_count,
+            "exhausted_no_data_count": exhausted_no_data_count,
             "next_retry_at": next_retry_at,
             "cursor": cursor,
             "tick_count": tick_count,
@@ -1151,7 +1401,28 @@ class ResearchSchedulerService:
         return {
             **aggregate,
             "status": completion_status,
-            "writes": len(aggregate["rematerialized_snapshot_ids"]),
+            "lifecycle_writes": (
+                int(aggregate.get("lifecycle_writes") or 0)
+                + schedule_lifecycle_writes
+            ),
+            "snapshot_writes": (
+                int(aggregate.get("snapshot_writes") or 0)
+                + schedule_snapshot_writes
+            ),
+            "writes": (
+                int(aggregate.get("lifecycle_writes") or 0)
+                + schedule_lifecycle_writes
+                + int(aggregate.get("snapshot_writes") or 0)
+                + schedule_snapshot_writes
+            ),
+            "rematerialized_snapshot_ids": [
+                *(
+                    [str(schedule_coverage["rematerialized_snapshot_id"])]
+                    if schedule_coverage.get("rematerialized_snapshot_id")
+                    else []
+                ),
+                *aggregate["rematerialized_snapshot_ids"],
+            ],
             "checkpoint_written": True,
             "catch_up_window_start": window_start.isoformat(),
             "catch_up_window_hours": int(
@@ -1160,7 +1431,11 @@ class ResearchSchedulerService:
             * 24,
             "catch_up_backlog_before": backlog_before,
             "catch_up_backlog_after": backlog_after,
+            "catch_up_due_after": due_after,
+            "catch_up_pending_retry": pending_retry,
             "catch_up_pending_backoff": pending_backoff,
+            "catch_up_terminal_gap_count": terminal_gap_count,
+            "catch_up_exhausted_no_data_count": exhausted_no_data_count,
             "catch_up_next_retry_at": next_retry_at,
             "catch_up_batch_size": batch_size,
             "catch_up_max_per_tick": max_per_tick,
@@ -1285,7 +1560,10 @@ class ResearchSchedulerService:
                 bucket["status"] = "PROVIDER_UNAVAILABLE"
             return coverage
 
-        provider_owner = getattr(schedule_acquire, "__self__", None)
+        provider_owner = (
+            getattr(schedule_acquire, "__self__", None)
+            or schedule_acquire
+        )
         provider_results = list(
             getattr(provider_owner, "last_provider_results", []) or []
         )
@@ -1323,6 +1601,11 @@ class ResearchSchedulerService:
         persisted = 0
         unchanged = 0
         quarantined = 0
+        discovered_occurrence_ids: list[str] = []
+        discovered_rows: list[dict[str, Any]] = []
+        discovered_lifecycles: list[
+            tuple[DatumLifecycle, dict[str, Any], str]
+        ] = []
         for payload in rows:
             release = parse_datetime(
                 payload.get("release_at")
@@ -1356,18 +1639,22 @@ class ResearchSchedulerService:
                 coverage["by_bucket"][bucket_name]["status"] = "QUARANTINED"
                 continue
             occurrence_key = canonical_event_key(payload)
+            canonical_payload = {
+                **payload,
+                "canonical_event_key": occurrence_key,
+                "occurrence_id": (
+                    payload.get("occurrence_id") or occurrence_key
+                ),
+                "release_at": release.isoformat(),
+            }
             classification = classify_occurrence_lifecycle(
-                {
-                    **payload,
-                    "canonical_event_key": occurrence_key,
-                    "release_at": release.isoformat(),
-                }
+                canonical_payload
             )
             entity_type = classification.entity_type
             lifecycle = compute_datum_lifecycle(
                 entity_type,
                 occurrence_key,
-                payload,
+                canonical_payload,
                 settings=self.settings,
                 now=now,
                 fields_attempted=list(classification.outcome_fields),
@@ -1375,19 +1662,20 @@ class ResearchSchedulerService:
                 refresh_reason="provider_first_canonical_schedule_catchup",
             )
             existed = (entity_type, occurrence_key) in existing_keys
-            actual_present = payload.get("actual") not in (None, "")
-            self.lifecycle.upsert(
-                lifecycle,
-                payload=payload,
-                work_status=(
-                    "COMPLETED"
-                    if actual_present or not classification.operational
-                    else "READY"
-                ),
+            actual_present = canonical_payload.get("actual") not in (None, "")
+            work_status = (
+                "COMPLETED"
+                if actual_present or not classification.operational
+                else "READY"
             )
+            discovered_occurrence_ids.append(occurrence_key)
+            discovered_rows.append(canonical_payload)
             if not existed:
                 persisted += 1
                 existing_keys.add((entity_type, occurrence_key))
+                discovered_lifecycles.append(
+                    (lifecycle, canonical_payload, work_status)
+                )
             else:
                 unchanged += 1
         for details in coverage["by_bucket"].values():
@@ -1404,9 +1692,241 @@ class ResearchSchedulerService:
                 "persisted_gap_count": persisted,
                 "unchanged_occurrence_count": unchanged,
                 "quarantined_occurrence_count": quarantined,
+                "discovered_occurrence_ids": sorted(
+                    set(discovered_occurrence_ids)
+                ),
             }
         )
+        rematerialized = self._rematerialize_schedule_discovery(
+            rows=discovered_rows,
+            lifecycles=discovered_lifecycles,
+            source_coverage=coverage,
+            now=now,
+        )
+        coverage["rematerialized_snapshot_id"] = (
+            rematerialized.get("snapshot_id")
+            if rematerialized is not None
+            else None
+        )
         return coverage
+
+    def _rematerialize_schedule_discovery(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        lifecycles: list[
+            tuple[DatumLifecycle, dict[str, Any], str]
+        ],
+        source_coverage: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Atomically commit discovered schedule rows and their lifecycle state."""
+
+        components = self.snapshots.latest_components("MNQ")
+        previous = self.snapshots.latest("MNQ")
+        if not components or previous is None:
+            for lifecycle, payload, work_status in lifecycles:
+                self.lifecycle.upsert(
+                    lifecycle,
+                    payload=payload,
+                    work_status=work_status,
+                )
+            return None
+        debug = dict(components)
+        calendar = dict(debug.get("event_calendar") or {})
+        section_names = (
+            "critical_macro_events",
+            "fed_communications",
+            "other_economic_events",
+        )
+        existing: dict[str, dict[str, Any]] = {}
+        section_by_key: dict[str, str] = {}
+        calendar_changed = False
+        for section_name in section_names:
+            for item in calendar.get(section_name) or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(
+                    item.get("canonical_event_key")
+                    or item.get("occurrence_id")
+                    or canonical_event_key(item)
+                )
+                existing[key] = item
+                section_by_key[key] = section_name
+        for item in rows:
+            key = str(
+                item.get("canonical_event_key")
+                or item.get("occurrence_id")
+                or canonical_event_key(item)
+            )
+            merged = {**existing.get(key, {}), **item}
+            if "removal_status" not in item:
+                merged.pop("removal_status", None)
+                merged.pop("comparison_lineage", None)
+            if existing.get(key) != merged:
+                calendar_changed = True
+            existing[key] = merged
+            if key not in section_by_key:
+                category = str(
+                    item.get("category")
+                    or item.get("event_type")
+                    or ""
+                ).upper()
+                section_by_key[key] = (
+                    "fed_communications"
+                    if "FOMC" in category or "FED" in category
+                    else "critical_macro_events"
+                    if str(item.get("impact") or "").upper() == "HIGH"
+                    else "other_economic_events"
+                )
+                calendar_changed = True
+        discovered_keys = {
+            str(
+                item.get("canonical_event_key")
+                or item.get("occurrence_id")
+                or canonical_event_key(item)
+            )
+            for item in rows
+        }
+        coverage_start = parse_datetime(source_coverage.get("window_start"))
+        coverage_end = parse_datetime(source_coverage.get("window_end"))
+        unconfirmed_removals: list[str] = []
+        lifecycle_keys = {
+            (str(item["entity_type"]), str(item["entity_key"]))
+            for item in self.lifecycle.list_items()
+        }
+        retained_actual_gaps = 0
+        if (
+            str(source_coverage.get("status") or "").upper()
+            == "VERIFIED_COMPLETE"
+            and coverage_start is not None
+            and coverage_end is not None
+        ):
+            for key, prior in list(existing.items()):
+                release_at = parse_datetime(
+                    prior.get("release_at")
+                    or prior.get("time_utc")
+                    or prior.get("date")
+                )
+                if (
+                    key in discovered_keys
+                    or release_at is None
+                    or release_at < coverage_start
+                    or release_at > coverage_end
+                ):
+                    continue
+                annotated = {
+                    **prior,
+                    "removal_status": "UNCONFIRMED_REMOVAL",
+                    "comparison_lineage": {
+                        "previous_source": (
+                            prior.get("source") or prior.get("provider")
+                        ),
+                        "previous_source_domain": prior.get("source_domain"),
+                        "confirmation_source": None,
+                    },
+                }
+                unconfirmed_removals.append(key)
+                if annotated != prior:
+                    existing[key] = annotated
+                    calendar_changed = True
+                classification = classify_occurrence_lifecycle(annotated)
+                lifecycle_key = (classification.entity_type, key)
+                if (
+                    classification.operational
+                    and annotated.get("actual") in (None, "")
+                    and lifecycle_key not in lifecycle_keys
+                ):
+                    lifecycles.append(
+                        (
+                            compute_datum_lifecycle(
+                                classification.entity_type,
+                                key,
+                                annotated,
+                                settings=self.settings,
+                                now=now,
+                                fields_attempted=list(
+                                    classification.outcome_fields
+                                ),
+                                triggering_event=classification.entity_type,
+                                refresh_reason=(
+                                    "unconfirmed_removal_actual_catchup"
+                                ),
+                            ),
+                            annotated,
+                            "READY",
+                        )
+                    )
+                    lifecycle_keys.add(lifecycle_key)
+                    retained_actual_gaps += 1
+        source_coverage["unconfirmed_removal_occurrence_ids"] = sorted(
+            unconfirmed_removals
+        )
+        source_coverage["persisted_unconfirmed_actual_count"] = (
+            retained_actual_gaps
+        )
+        source_coverage["persisted_gap_count"] = int(
+            source_coverage.get("persisted_gap_count") or 0
+        ) + retained_actual_gaps
+        if not calendar_changed and not lifecycles:
+            return None
+        for section_name in section_names:
+            calendar[section_name] = sorted(
+                [
+                    item
+                    for key, item in existing.items()
+                    if section_by_key.get(key) == section_name
+                ],
+                key=lambda item: (
+                    str(
+                        item.get("release_at")
+                        or item.get("time_utc")
+                        or item.get("date")
+                        or ""
+                    ),
+                    str(
+                        item.get("canonical_event_key")
+                        or item.get("occurrence_id")
+                        or ""
+                    ),
+                ),
+            )
+        previous_coverage = (
+            dict(calendar.get("source_coverage") or {})
+            if isinstance(calendar.get("source_coverage"), dict)
+            else {}
+        )
+        previous_by_bucket = (
+            dict(previous_coverage.get("by_bucket") or {})
+            if isinstance(previous_coverage.get("by_bucket"), dict)
+            else {}
+        )
+        discovered_by_bucket = (
+            dict(source_coverage.get("by_bucket") or {})
+            if isinstance(source_coverage.get("by_bucket"), dict)
+            else {}
+        )
+        calendar["source_coverage"] = {
+            **previous_coverage,
+            **source_coverage,
+            "by_bucket": {
+                **previous_by_bucket,
+                **discovered_by_bucket,
+            },
+        }
+        debug["event_calendar"] = calendar
+        debug["generated_at_utc"] = (
+            now.astimezone(UTC).replace(microsecond=0).isoformat()
+        )
+        return self.snapshots.save_next(
+            symbol="MNQ",
+            refresh_mode="event_calendar_schedule_discovery",
+            debug_payload=debug,
+            ai_enrichment={"status": "NOT_REQUIRED"},
+            trigger_type=None,
+            correlation_id="event-calendar-schedule-discovery",
+            resolved_items=lifecycles,
+        )
 
     def _acquire_schedule_seed_lease(
         self,
@@ -1687,20 +2207,77 @@ class ResearchSchedulerService:
             )
             conn.commit()
 
-    def _event_calendar_catchup_backoff_state(
+    def _event_calendar_catchup_pending_state(
         self,
         *,
+        now: datetime,
         window_start: datetime,
         entity_types: frozenset[str],
-    ) -> tuple[int, str | None]:
+    ) -> tuple[int, int, str | None]:
         placeholders = ",".join("?" for _ in entity_types)
+        reference = now.astimezone(UTC).replace(microsecond=0).isoformat()
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
                 f"""
                 SELECT COUNT(*) AS pending_count,
-                       MIN(next_retry_at) AS next_retry_at
+                       COALESCE(SUM(
+                         CASE WHEN work_status='BACKOFF' THEN 1 ELSE 0 END
+                       ),0) AS pending_backoff_count,
+                       MIN(
+                         CASE
+                           WHEN work_status='LEASED' THEN lease_expires_at
+                           ELSE COALESCE(next_retry_at,next_refresh_at)
+                         END
+                       ) AS next_retry_at
                 FROM datum_lifecycle_items
-                WHERE work_status='BACKOFF'
+                WHERE (
+                    work_status IN ('BACKOFF','LEASED')
+                    OR (
+                      work_status='IDLE'
+                      AND refresh_reason='provider_unresolved_ai_not_configured'
+                    )
+                  )
+                  AND entity_type IN ({placeholders})
+                  AND (
+                    CASE
+                      WHEN work_status='LEASED' THEN lease_expires_at
+                      ELSE COALESCE(next_retry_at,next_refresh_at)
+                    END
+                  )>?
+                  AND COALESCE(event_at,updated_at)>=?
+                """,
+                (
+                    *sorted(entity_types),
+                    reference,
+                    window_start.astimezone(UTC).replace(
+                        microsecond=0
+                    ).isoformat(),
+                ),
+            ).fetchone()
+        return (
+            int(row["pending_count"] if row else 0),
+            int(row["pending_backoff_count"] if row else 0),
+            str(row["next_retry_at"])
+            if row is not None and row["next_retry_at"]
+            else None,
+        )
+
+    def _event_calendar_catchup_terminal_gap_state(
+        self,
+        *,
+        window_start: datetime,
+        entity_types: frozenset[str],
+    ) -> tuple[int, int]:
+        placeholders = ",".join("?" for _ in entity_types)
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS terminal_gap_count,
+                       COALESCE(SUM(
+                         CASE WHEN work_status='NO_DATA' THEN 1 ELSE 0 END
+                       ),0) AS exhausted_no_data_count
+                FROM datum_lifecycle_items
+                WHERE work_status IN ('DISABLED','NO_DATA')
                   AND entity_type IN ({placeholders})
                   AND COALESCE(event_at,updated_at)>=?
                 """,
@@ -1712,10 +2289,8 @@ class ResearchSchedulerService:
                 ),
             ).fetchone()
         return (
-            int(row["pending_count"] if row else 0),
-            str(row["next_retry_at"])
-            if row is not None and row["next_retry_at"]
-            else None,
+            int(row["terminal_gap_count"] if row else 0),
+            int(row["exhausted_no_data_count"] if row else 0),
         )
 
     def _rematerialize_provider_resolution(
@@ -2266,6 +2841,7 @@ def _empty_catchup_result() -> dict[str, Any]:
         "rematerialized_snapshot_ids": [],
         "deferred": [],
         "backoff": [],
+        "exhausted_no_data": [],
         "item_outcomes": [],
         "effective_triggers": [],
         "residual_count": 0,
@@ -2274,6 +2850,9 @@ def _empty_catchup_result() -> dict[str, Any]:
         "ai_invocations": 0,
         "ai_jobs_created": 0,
         "provider_resolutions_coalesced": False,
+        "lifecycle_writes": 0,
+        "snapshot_writes": 0,
+        "writes": 0,
         "actuals_recovered": 0,
         "revisions_reconciled": 0,
     }
@@ -2297,6 +2876,9 @@ def _accumulate_catchup_result(
         "ai_jobs_created",
         "actuals_recovered",
         "revisions_reconciled",
+        "lifecycle_writes",
+        "snapshot_writes",
+        "writes",
     ):
         aggregate[field] = int(aggregate.get(field) or 0) + int(
             batch.get(field) or 0
@@ -2306,6 +2888,7 @@ def _accumulate_catchup_result(
         "rematerialized_snapshot_ids",
         "deferred",
         "backoff",
+        "exhausted_no_data",
         "item_outcomes",
         "effective_triggers",
         "ai_decisions",

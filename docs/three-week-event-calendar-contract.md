@@ -78,26 +78,47 @@ configured provider completed without errors.
 
 Event catch-up is separately opt-in and disabled by default. It:
 
-1. revalidates committed payload/cache;
-2. uses deterministic and official provider adapters;
-3. resolves the exact occurrence;
-4. processes batches bounded by `batch_size`, up to `max_per_tick`;
-5. commits the batch in one snapshot and at most one outbox envelope;
-6. never queues residual AI work implicitly.
+1. discovers and atomically persists canonical previous/current-week gaps;
+2. recalculates due work after discovery in the same tick;
+3. revalidates committed payload/cache;
+4. uses deterministic and official provider adapters;
+5. resolves the exact occurrence;
+6. processes batches bounded by `batch_size`, up to `max_per_tick`;
+7. commits material schedule/lifecycle changes in one snapshot and at most one
+   outbox envelope;
+8. never passes an enqueue callable to the provider-only scan.
 
 Catch-up state is stored in the existing schema-20 `provider_state` table. The
 checkpoint contains `backlog_before`, `claimed`, `resolved`, `backoff`,
-`backlog_after`, `pending_backoff`, `cursor`, `tick_count`, and
-`completion_status`. A dedicated provider-only application task continues
-bounded ticks independently of the AI-authorized lifecycle scanner. A completed
-checkpoint with no newly due work produces a read-only `ALREADY_COMPLETE`
-result: no snapshot, outbox, telemetry, or checkpoint rewrite.
+`backlog_after`, `pending_retry`, `pending_backoff`, terminal-gap counts,
+`cursor`, `tick_count`, and `completion_status`. Due work and future retry/lease
+work are disjoint sets: an expired backoff is due, never counted a second time
+as pending. Retryable provider gaps finalized as `IDLE` remain in
+`pending_retry`; ordinary future calendar rows do not. A dedicated
+provider-only application task continues bounded ticks independently of the
+AI-authorized lifecycle scanner. A completed checkpoint with no newly due work
+produces a read-only `ALREADY_COMPLETE` result: no snapshot, outbox, telemetry,
+or checkpoint rewrite.
 
 The default lookback is 730 days. Visible/recent and high-impact items are
 prioritized. Reconciled history outside the notification horizon is persisted
 without an outbox notification. Temporary provider failures enter deterministic
 backoff/negative-cache state and remain in `WAITING_BACKOFF`; they never enable
-AI.
+AI. A tick before the earliest retry is byte-idempotent even when the clock has
+advanced: it does not reacquire the discovery lease, call the schedule provider,
+rewrite provider state, emit telemetry, or create a snapshot.
+
+A successful provider request carrying a `NO_DATA` envelope is not a recovered
+datum. Before exhaustion it persists the complete occurrence with
+`AWAITING_ACTUAL` and a durable `BACKOFF`; after the retry deadline it reports
+`EXHAUSTED_NO_DATA`. Tick completion is disjoint: `IN_PROGRESS` means due work
+remains after the bound; `WAITING_BACKOFF` means only future retry/lease work
+remains; `PARTIAL` means this tick resolved items but terminal gaps remain;
+`EXHAUSTED_NO_DATA` means every terminal gap exhausted with no datum;
+`COMPLETED_WITH_GAPS` means other terminal gaps remain; and `COMPLETED` means no
+processable or terminal residual remains. Resolver requests, successful request
+envelopes, recovered actuals, lifecycle writes and rematerialized snapshot IDs
+are separate measurements.
 
 ## Trigger and session semantics
 
@@ -116,7 +137,11 @@ does not block macro occurrence persistence or outbox creation.
 Calendar disappearance alone is not cancellation. A previously visible
 occurrence missing from a later calendar is recorded as
 `UNCONFIRMED_REMOVAL`, with its previous occurrence and comparison lineage, and
-does not trigger. It becomes `REMOVED_FROM_CALENDAR` and may trigger
+does not trigger. While it remains inside the three-week window, the complete
+previous occurrence is rehydrated into the canonical event list with
+`removal_status=UNCONFIRMED_REMOVAL`. Its actual lifecycle remains retryable,
+and its ID remains in `actual_missing_ids` when a past actual is absent. It
+becomes `REMOVED_FROM_CALENDAR` and may trigger
 `EVENT_CANCELLED` or `EVENT_POSTPONED` only when an admitted source supplies an
 explicit cancellation/postponement confirmation. Unconfirmed tombstones remain
 available across subsequent snapshots so a later confirmation can reconcile
@@ -135,8 +160,11 @@ The deterministic `cme_equity_index_schedule_v1` parser normalizes equity-index
 futures closures, late opens, early closes, and maintenance overrides from a
 structured official payload. `data_origin_is_official=true` is emitted only
 when the requested date is inside the parsed coverage. If the schedule is
-missing or unparseable, static Globex rules remain explicitly unverified; on a
-holiday-sensitive weekday MNQ becomes `UNKNOWN` with
+missing or unparseable, normal weekend and maintenance closures remain
+deterministic with `verification_scope=BASE_WEEKLY_RULE`,
+`is_open=false`, and `holiday_override_status=UNVERIFIED`. No holiday or early
+close is inferred from that base rule. On a holiday-sensitive weekday MNQ
+becomes `UNKNOWN` with
 `UNVERIFIED_HOLIDAY_SCHEDULE` instead of being invented as open.
 
 ## Lossless consumer projection and source coverage
@@ -170,6 +198,21 @@ Permitted source coverage states are `VERIFIED_COMPLETE`, `PARTIAL`,
 without affirmative provider evidence is `UNVERIFIED_EMPTY`; non-empty data
 alone does not prove complete acquisition.
 
+`coverage.cross_stage_reconciliation` additionally proves the exclusive
+equation:
+
+```text
+discovered occurrences
+= delivered canonical occurrences
++ quarantined occurrences
++ exact technical duplicates
++ confirmed removals
++ unexplained loss
+```
+
+`unexplained_loss` must be zero for a reconciled stage. Unconfirmed removals
+are retained deliveries, never counted as confirmed loss.
+
 Occurrence identity never uses array position or normalized-title similarity.
 Different timestamps remain different occurrences. Multiple source records for
 one occurrence remain in `source_evidence` with provider IDs, URLs, retrieval
@@ -181,6 +224,13 @@ duplicate.
 from the complete pre-consumer lists, refreshes the sync section in memory, and
 verifies the candidate equation, exact payload size, historical-news
 consistency, and zero provider, AI, or operational-database side effects.
+
+`scripts/replay_snapshot92_live_blockers_offline.py` uses only the redacted
+snapshot-92 fixture. It exercises the 14+3 discovery fixed point, three buckets,
+unconfirmed actuals, news publisher/distributor policy, deterministic weekend
+closure, temporal monotonicity, a multi-megabyte lossless news payload, and
+zero AI/live-provider/delivery/trading side effects. Repeated runs are
+byte-identical.
 
 ## Temporal admission
 
