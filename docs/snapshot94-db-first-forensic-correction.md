@@ -94,10 +94,10 @@ The materialized offline full-sync replay contains all 17 sections and applies
 no count, byte, top-N, destructive deduplication, or lossy-summary cap. Two
 independent runs were byte-identical:
 
-- full sync: 379,592 bytes,
-  SHA-256 `673F96DBA383FA8A8B2FF31D3523CF33BB4B77D18BC3B88BFA7BEF274A905355`;
-- separate summary: 11,766 bytes,
-  SHA-256 `99F884274BC674BADDF26A0DF4CDB72DC074D90A94F83E1CFF3D1D1D2FC056E6`.
+- full sync: 383,680 bytes,
+  SHA-256 `917FE949ECFAA07E2F689984F9C99FE84F556CFA31B3554FDABA56AF7882F890`;
+- separate summary: 13,110 bytes,
+  SHA-256 `17988FA6775E1DB1D0EDCEC2B79AE0ED76B66BE2AAB940E74F9DF27395B19A99`.
 
 ## Validation
 
@@ -108,10 +108,57 @@ independent runs were byte-identical:
   zero-call fixed point; three migration expectations include schema 22; one
   canonical persistence defect now derives `date`/`time_utc` from
   `release_at`);
-- final full suite: 1,757 passed, one third-party deprecation warning;
+- pre-review full suite: 1,757 passed, one third-party deprecation warning;
 - Ruff: passed;
 - `py_compile` and `compileall`: passed;
 - migration replay: 1→22, 20→22, 21→22, 22→22 passed and idempotent;
 - offline replay twice: byte-identical summary and full sync.
+
+## Adversarial PR review
+
+The post-implementation adversarial review found and corrected five blockers:
+
+1. Including `window_start/window_end` in the primary key allowed multiple
+   logical rows for the same day as a current-day window advanced.
+2. A successful function return without affirmative scope, pagination,
+   parsing, expected-source, record-validity, and authentic-empty evidence
+   could create false terminal coverage.
+3. Coverage did not include contract and source-policy versions, so a policy
+   change could leave obsolete verification active.
+4. Two concurrent migrators could both observe a stale migration set and
+   execute the same `ALTER TABLE`.
+5. Exact actual promotion did not reject stale validation, incompatible
+   frequency/unit, or invalid forecast/previous field lineage.
+
+The logical coverage identity now includes date, domain, entity type,
+provider, query scope, symbol, contract version, and policy version. Window
+bounds are evidence, not identity. Terminal coverage requires all positive
+proof flags and a finite `valid_until`; an empty result additionally requires
+`authentic_empty`. Unproven empty, partial pagination, wrong scope, parsing
+loss, quarantine, missing source, provider failure, and policy/contract
+changes remain due.
+
+Migration locking now uses `BEGIN IMMEDIATE` plus an in-transaction version
+recheck. Concurrent writers produce one ledger row, and a forced failure
+after the schema-22 DDL rolls the entire migration back to schema 21.
+
+The migration was also executed on a temporary copy of the 215,019,520-byte
+snapshot-94 forensic database. It completed in 0.060 seconds, preserved an
+empty conservative ledger, passed `integrity_check`, and the principal lookup
+used `idx_event_calendar_coverage_due` rather than a table scan (1,000-query
+average: 0.0040 ms).
+
+The redacted live-news fixture now records all 100 candidates with exact
+exclusion totals: 79 stale/expired, 13 missing content, 3 low relevance,
+2 ambiguous topic, 2 personal finance, and 1 mortgage.
+
+The replay acquisition counters were: 0 avoided calls on the initial empty
+ledger, 1 due call, 1 executed call, 16 canonical writes, 14 coverage metadata
+writes, 1 schedule snapshot write, and 1 corresponding outbox write.
+
+Final adversarial validation: 1,776 tests passed, including proof-failure,
+logical-key, concurrent-writer, concurrent-migrator, crash rollback,
+schema-21 populated/empty-ledger, policy/contract invalidation, calendar,
+actual, news, schedule, sync, lifecycle, ACK, and consumer coverage.
 
 No merge is part of this correction.

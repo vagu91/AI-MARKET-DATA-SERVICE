@@ -175,6 +175,25 @@ class ExactOccurrenceActualProviderAdapter:
             return self._no_data("exact_occurrence_reference_period_mismatch")
 
         observation = period_matches[0]
+        observed_frequency = str(
+            observation.get("frequency") or frequency
+        ).lower()
+        if observed_frequency != frequency:
+            return self._no_data("exact_occurrence_frequency_mismatch")
+        expected_unit = _normalized_unit(payload.get("unit"))
+        observed_unit = _normalized_unit(observation.get("unit"))
+        if expected_unit and observed_unit and expected_unit != observed_unit:
+            return self._no_data("exact_occurrence_unit_mismatch")
+        if str(
+            observation.get("validation_status") or "accepted"
+        ).lower() in {
+            "rejected",
+            "invalid",
+            "quarantined",
+            "stale",
+            "expired",
+        }:
+            return self._no_data("exact_occurrence_validation_rejected")
         raw_lineage = observation.get("field_lineage") or observation.get(
             "lineage"
         )
@@ -191,6 +210,15 @@ class ExactOccurrenceActualProviderAdapter:
         source_field = str(actual_lineage.get("source_field") or "").lower()
         if source_field not in {"actual", "current"}:
             return self._no_data("actual_field_lineage_invalid")
+        for field in ("forecast", "previous"):
+            if observation.get(field) in (None, ""):
+                continue
+            proof = lineage.get(field) or {}
+            if (
+                not isinstance(proof, dict)
+                or str(proof.get("source_field") or "").lower() != field
+            ):
+                return self._no_data(f"{field}_field_lineage_invalid")
         value = observation.get("actual")
         if value in (None, ""):
             return self._no_data("actual_value_missing")
@@ -1014,11 +1042,21 @@ def _exact_calendar_actual_datum(
 ) -> dict[str, Any] | None:
     if not source_accepted or exact.get("actual") in (None, ""):
         return None
-    frequency = str(
-        exact.get("frequency")
-        or payload.get("frequency")
-        or "monthly"
+    expected_frequency = str(payload.get("frequency") or "monthly").lower()
+    frequency = str(exact.get("frequency") or expected_frequency).lower()
+    if frequency != expected_frequency:
+        return None
+    validation_status = str(
+        exact.get("validation_status") or "accepted"
     ).lower()
+    if validation_status in {
+        "rejected",
+        "invalid",
+        "quarantined",
+        "stale",
+        "expired",
+    }:
+        return None
     expected_period = normalize_reference_period(
         payload.get("reference_period") or payload.get("period"),
         frequency=frequency,
@@ -1037,6 +1075,19 @@ def _exact_calendar_actual_datum(
         or str(actual_lineage.get("source_field") or "").lower()
         not in {"actual", "current"}
     ):
+        return None
+    for field in ("forecast", "previous"):
+        if exact.get(field) in (None, ""):
+            continue
+        field_proof = lineage.get(field) or {}
+        if (
+            not isinstance(field_proof, dict)
+            or str(field_proof.get("source_field") or "").lower() != field
+        ):
+            return None
+    expected_unit = _normalized_unit(payload.get("unit"))
+    observed_unit = _normalized_unit(exact.get("unit"))
+    if expected_unit and observed_unit and expected_unit != observed_unit:
         return None
     source = exact.get("source") or exact.get("source_originator")
     source_url = exact.get("source_url") or exact.get("canonical_url")
@@ -1086,6 +1137,18 @@ def _exact_calendar_actual_datum(
             **lineage,
         },
     }
+
+
+def _normalized_unit(value: Any) -> str:
+    text = str(value or "").strip().casefold().replace("-", "_")
+    aliases = {
+        "k": "thousands_annual_rate",
+        "thousand": "thousands_annual_rate",
+        "thousands": "thousands_annual_rate",
+        "index_points": "index",
+        "points": "index",
+    }
+    return aliases.get(text, text)
 
 
 def _official_actual_datum(

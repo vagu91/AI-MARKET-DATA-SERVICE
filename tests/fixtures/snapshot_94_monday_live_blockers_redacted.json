@@ -46,6 +46,33 @@
     }
   ],
   "news_expectations": {
+    "live_candidate_count": 100,
+    "live_exclusion_reasons": {
+      "stale_or_expired": 79,
+      "missing_content": 13,
+      "low_relevance": 3,
+      "ambiguous_topic": 2,
+      "personal_finance": 2,
+      "mortgage": 1
+    },
+    "live_sources": {
+      "Barchart": 13,
+      "Moneywise": 10,
+      "Insider Monkey": 9,
+      "Yahoo Personal Finance": 9,
+      "24/7 Wall St.": 8,
+      "Reuters": 7,
+      "Yahoo Finance": 7,
+      "Motley Fool": 7,
+      "Investor's Business Daily": 7,
+      "TheStreet": 7,
+      "Federal Reserve RSS": 3,
+      "etf.com": 3,
+      "FX Empire": 2,
+      "Argus Research": 2,
+      "QSR": 1,
+      "other_redacted_sources": 5
+    },
     "accepted_publishers": ["Investor's Business Daily", "Reuters", "Reuters"],
     "reuters_updates": 2,
     "unknown_publisher_distributed_by_yahoo": "QUARANTINED",

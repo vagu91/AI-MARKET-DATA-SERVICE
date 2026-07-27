@@ -545,7 +545,7 @@ class MarketFactRepository:
             )
         ]
 
-    def upsert_economic_event(self, event: Any, event_key: str, *, valid_until: str | None = None) -> None:
+    def upsert_economic_event(self, event: Any, event_key: str, *, valid_until: str | None = None) -> bool:
         from app.services.temporal_domain_service import canonical_event_key, temporal_event_state
 
         event_now = self.clock().astimezone(UTC)
@@ -579,7 +579,7 @@ class MarketFactRepository:
             and release_datetime <= event_now
         )
         completeness_status = (
-            "COMPLETE"
+            "COMPLETE_REVISIONABLE"
             if actual not in (None, "")
             else "AWAITING_ACTUAL"
             if is_past
@@ -651,7 +651,7 @@ class MarketFactRepository:
                     )
                 ):
                     conn.rollback()
-                    return
+                    return False
                 payload = _merge_event_payload(existing_raw, payload, existing)
                 if actual in (None, "") and existing["actual"] not in (None, ""):
                     actual = existing["actual"]
@@ -849,6 +849,7 @@ class MarketFactRepository:
                         lineage={"field_lineage": field_lineage},
                     )
             conn.commit()
+        return True
 
     def apply_event_research_field(
         self,

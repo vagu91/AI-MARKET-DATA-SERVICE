@@ -201,17 +201,14 @@ def build_event_calendar_window(
         for bucket_name in WEEK_BUCKETS
     }
     missing_actual_count = sum(
-        item["release_status"] in {"AWAITING_ACTUAL", "UNAVAILABLE"}
-        and item["is_past"]
+        _actual_is_due(item, now=now_utc)
         for item in retained
     )
     actual_missing_ids = sorted(
         {
             str(item["occurrence_id"])
             for item in retained
-            if item["release_status"] in {"AWAITING_ACTUAL", "UNAVAILABLE"}
-            and item["is_past"]
-            and item.get("actual") in (None, "")
+            if _actual_is_due(item, now=now_utc)
         }
     )
     gap_inventory = _gap_inventory(full)
@@ -528,6 +525,7 @@ def _gap_inventory(full: dict[str, Any]) -> dict[str, Any]:
             }
         )
     actual_missing = values("actual_missing_ids")
+    actual_missing = sorted(set(actual_missing) | set(unconfirmed))
     retry_values = [
         str(source.get("next_retry_at"))
         for source in (explicit, lifecycle, coverage, daily)
@@ -1121,6 +1119,9 @@ def _canonical_occurrence(
         ),
         "valid_until": valid_until,
         "next_refresh_at": next_refresh_at,
+        "publication_grace_until": _iso_or_none(
+            item.get("publication_grace_until")
+        ),
         "removal_status": _nullable(item.get("removal_status")),
         "comparison_lineage": (
             item.get("comparison_lineage")
@@ -1141,7 +1142,25 @@ def _canonical_occurrence(
     occurrence["lifecycle"] = lifecycle_classification.as_dict()
     occurrence["lifecycle_entity_type"] = lifecycle_classification.entity_type
     occurrence["outcome_contract"] = lifecycle_classification.outcome_contract
+    occurrence["actual_required"] = (
+        lifecycle_classification.operational
+        and "actual" in lifecycle_classification.outcome_fields
+    )
     return occurrence, None
+
+
+def _actual_is_due(item: dict[str, Any], *, now: datetime) -> bool:
+    if not item.get("actual_required"):
+        return False
+    if (
+        item.get("actual") not in (None, "")
+        or not item.get("is_past")
+        or item.get("release_status")
+        not in {"AWAITING_ACTUAL", "UNAVAILABLE"}
+    ):
+        return False
+    grace = parse_datetime(item.get("publication_grace_until"))
+    return grace is None or grace <= now
 
 
 def _scheduled_time(

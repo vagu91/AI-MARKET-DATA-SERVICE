@@ -38,6 +38,15 @@ from scripts.replay_snapshot91_sync_offline import replay
 ROOT = Path(__file__).resolve().parents[1]
 NY = ZoneInfo("America/New_York")
 NOW = datetime(2026, 7, 22, 12, tzinfo=NY)
+COMPLETE_COVERAGE_PROOF = {
+    "request_succeeded": True,
+    "scope_match": True,
+    "pagination_complete": True,
+    "parsing_succeeded": True,
+    "records_valid": True,
+    "expected_sources_complete": True,
+    "authentic_empty": True,
+}
 
 
 def cfg(tmp_path: Path, **overrides: object) -> Settings:
@@ -599,6 +608,8 @@ def test_provider_first_schedule_catchup_is_restart_independent_and_idempotent(
             }
         ]
 
+    acquire.coverage_proof = COMPLETE_COVERAGE_PROOF  # type: ignore[attr-defined]
+
     settings = cfg(
         tmp_path,
         event_calendar_catchup_enabled=True,
@@ -713,7 +724,8 @@ def test_schedule_catchup_uses_persistent_single_flight(
 
     assert second["status"] == "PARTIAL"
     assert second["reason"] == "schedule_catchup_single_flight_active"
-    assert completed["status"] == "VERIFIED_COMPLETE"
+    assert completed["status"] == "PARTIAL"
+    assert completed["provider_calls_executed"] == 1
     assert calls == 1
 
 

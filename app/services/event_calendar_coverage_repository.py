@@ -12,6 +12,7 @@ from app.services.data_freshness_service import parse_datetime
 
 
 TERMINAL_COVERAGE = frozenset({"VERIFIED_COMPLETE", "VERIFIED_EMPTY"})
+EVENT_CALENDAR_CONTRACT_VERSION = "event-calendar-coverage-v2"
 
 
 class EventCalendarCoverageRepository:
@@ -34,6 +35,9 @@ class EventCalendarCoverageRepository:
         provider_name: str,
         query_scope: str,
         now: datetime,
+        symbol: str = "",
+        contract_version: str = EVENT_CALENDAR_CONTRACT_VERSION,
+        policy_version: str = "source-policy-v5",
     ) -> list[date]:
         requested = sorted(set(dates))
         if not requested:
@@ -47,11 +51,15 @@ class EventCalendarCoverageRepository:
                 WHERE data_domain='macro_calendar'
                   AND entity_type='economic_event'
                   AND provider_name=? AND query_scope=?
+                  AND symbol=? AND contract_version=? AND policy_version=?
                   AND coverage_date BETWEEN ? AND ?
                 """,
                 (
                     provider_name,
                     query_scope,
+                    symbol,
+                    contract_version,
+                    policy_version,
                     requested[0].isoformat(),
                     requested[-1].isoformat(),
                 ),
@@ -75,17 +83,45 @@ class EventCalendarCoverageRepository:
         record_count: int,
         provider_called: bool,
         scope_verified: bool,
+        proof: dict[str, bool] | None = None,
         lineage: dict[str, Any] | None = None,
         valid_until: datetime | None = None,
         next_revision_check_at: datetime | None = None,
         next_retry_at: datetime | None = None,
+        symbol: str = "",
+        contract_version: str = EVENT_CALENDAR_CONTRACT_VERSION,
+        policy_version: str = "source-policy-v5",
     ) -> bool:
         normalized_status = str(status).upper()
-        if (
-            normalized_status == "VERIFIED_EMPTY"
-            and (not provider_called or not scope_verified or record_count)
+        proof_value = {
+            key: bool((proof or {}).get(key))
+            for key in (
+                "request_succeeded",
+                "pagination_complete",
+                "parsing_succeeded",
+                "records_valid",
+                "expected_sources_complete",
+                "authentic_empty",
+            )
+        }
+        verified = normalized_status in TERMINAL_COVERAGE
+        common_proof = (
+            provider_called
+            and scope_verified
+            and proof_value["request_succeeded"]
+            and proof_value["pagination_complete"]
+            and proof_value["parsing_succeeded"]
+            and proof_value["records_valid"]
+            and proof_value["expected_sources_complete"]
+        )
+        if verified and (not common_proof or valid_until is None):
+            raise ValueError("verified_coverage_requires_complete_positive_proof")
+        if normalized_status == "VERIFIED_EMPTY" and (
+            record_count != 0 or not proof_value["authentic_empty"]
         ):
-            raise ValueError("verified_empty_requires_successful_scoped_call")
+            raise ValueError("verified_empty_requires_authentic_empty_proof")
+        if normalized_status == "VERIFIED_COMPLETE" and record_count <= 0:
+            raise ValueError("verified_complete_requires_records")
         now_text = self.clock().astimezone(UTC).replace(
             microsecond=0
         ).isoformat()
@@ -95,6 +131,7 @@ class EventCalendarCoverageRepository:
             "record_count": int(record_count),
             "provider_called": bool(provider_called),
             "scope_verified": bool(scope_verified),
+            "proof": proof_value,
             "valid_until": _iso(valid_until),
             "next_revision_check_at": _iso(next_revision_check_at),
             "next_retry_at": _iso(next_retry_at),
@@ -113,8 +150,9 @@ class EventCalendarCoverageRepository:
             "economic_event",
             provider_name,
             query_scope,
-            window_start.astimezone(UTC).isoformat(),
-            window_end.astimezone(UTC).isoformat(),
+            symbol,
+            contract_version,
+            policy_version,
         )
         with connect_sqlite(self.settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -124,7 +162,7 @@ class EventCalendarCoverageRepository:
                 FROM event_calendar_coverage
                 WHERE coverage_date=? AND data_domain=? AND entity_type=?
                   AND provider_name=? AND query_scope=?
-                  AND window_start=? AND window_end=?
+                  AND symbol=? AND contract_version=? AND policy_version=?
                 """,
                 key,
             ).fetchone()
@@ -138,19 +176,31 @@ class EventCalendarCoverageRepository:
                 """
                 INSERT INTO event_calendar_coverage(
                   coverage_date,data_domain,entity_type,provider_name,
-                  query_scope,window_start,window_end,status,record_count,
-                  provider_called,scope_verified,retrieved_at,valid_until,
+                  query_scope,symbol,contract_version,policy_version,
+                  window_start,window_end,status,record_count,
+                  provider_called,scope_verified,request_succeeded,
+                  pagination_complete,parsing_succeeded,
+                  records_valid,expected_sources_complete,authentic_empty,
+                  retrieved_at,valid_until,
                   next_revision_check_at,next_retry_at,lineage_json,
                   content_fingerprint,created_at,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(
                   coverage_date,data_domain,entity_type,provider_name,
-                  query_scope,window_start,window_end
+                  query_scope,symbol,contract_version,policy_version
                 ) DO UPDATE SET
+                  window_start=excluded.window_start,
+                  window_end=excluded.window_end,
                   status=excluded.status,
                   record_count=excluded.record_count,
                   provider_called=excluded.provider_called,
                   scope_verified=excluded.scope_verified,
+                  request_succeeded=excluded.request_succeeded,
+                  pagination_complete=excluded.pagination_complete,
+                  parsing_succeeded=excluded.parsing_succeeded,
+                  records_valid=excluded.records_valid,
+                  expected_sources_complete=excluded.expected_sources_complete,
+                  authentic_empty=excluded.authentic_empty,
                   retrieved_at=excluded.retrieved_at,
                   valid_until=excluded.valid_until,
                   next_revision_check_at=excluded.next_revision_check_at,
@@ -161,10 +211,18 @@ class EventCalendarCoverageRepository:
                 """,
                 (
                     *key,
+                    window_start.astimezone(UTC).isoformat(),
+                    window_end.astimezone(UTC).isoformat(),
                     normalized_status,
                     int(record_count),
                     int(provider_called),
                     int(scope_verified),
+                    int(proof_value["request_succeeded"]),
+                    int(proof_value["pagination_complete"]),
+                    int(proof_value["parsing_succeeded"]),
+                    int(proof_value["records_valid"]),
+                    int(proof_value["expected_sources_complete"]),
+                    int(proof_value["authentic_empty"]),
                     now_text if provider_called else None,
                     material["valid_until"],
                     material["next_revision_check_at"],
@@ -186,6 +244,9 @@ class EventCalendarCoverageRepository:
         provider_name: str,
         query_scope: str,
         now: datetime,
+        symbol: str = "",
+        contract_version: str = EVENT_CALENDAR_CONTRACT_VERSION,
+        policy_version: str = "source-policy-v5",
     ) -> dict[str, Any]:
         days = [
             start_date + timedelta(days=offset)
@@ -198,12 +259,16 @@ class EventCalendarCoverageRepository:
                 WHERE data_domain='macro_calendar'
                   AND entity_type='economic_event'
                   AND provider_name=? AND query_scope=?
+                  AND symbol=? AND contract_version=? AND policy_version=?
                   AND coverage_date BETWEEN ? AND ?
                 ORDER BY coverage_date
                 """,
                 (
                     provider_name,
                     query_scope,
+                    symbol,
+                    contract_version,
+                    policy_version,
                     start_date.isoformat(),
                     end_date.isoformat(),
                 ),
@@ -236,6 +301,8 @@ class EventCalendarCoverageRepository:
                     "record_count": row["record_count"],
                     "provider_called": bool(row["provider_called"]),
                     "scope_verified": bool(row["scope_verified"]),
+                    "contract_version": row["contract_version"],
+                    "policy_version": row["policy_version"],
                     "valid_until": row["valid_until"],
                     "next_revision_check_at": row[
                         "next_revision_check_at"
@@ -253,7 +320,10 @@ class EventCalendarCoverageRepository:
         if row is None or str(row["status"]) not in TERMINAL_COVERAGE:
             retry = parse_datetime(row["next_retry_at"]) if row else None
             return retry is None or retry <= now
-        for field in ("valid_until", "next_revision_check_at"):
+        valid_until = parse_datetime(row["valid_until"])
+        if valid_until is None or valid_until <= now:
+            return True
+        for field in ("next_revision_check_at",):
             due = parse_datetime(row[field])
             if due is not None and due <= now:
                 return True

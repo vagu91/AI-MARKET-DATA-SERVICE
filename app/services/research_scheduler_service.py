@@ -1530,6 +1530,7 @@ class ResearchSchedulerService:
         next_end_date = current_start + timedelta(days=13)
         provider_name = "economic_calendar_composite"
         query_scope = "country=US"
+        policy_version = self.market_facts.source_policy.policy_version
         requested_days = [
             previous_start + timedelta(days=offset)
             for offset in range(
@@ -1541,6 +1542,7 @@ class ResearchSchedulerService:
             provider_name=provider_name,
             query_scope=query_scope,
             now=now,
+            policy_version=policy_version,
         )
         coverage = {
             "window_start": window_start.isoformat(),
@@ -1565,6 +1567,19 @@ class ResearchSchedulerService:
             "targeted_gap_dates": [
                 day.isoformat() for day in missing_days
             ],
+            "provider_calls_avoided": len(requested_days) - len(missing_days),
+            "provider_calls_due": len(
+                _contiguous_date_segments(
+                    missing_days,
+                    timezone=timezone,
+                    upper_bound=now,
+                )
+            ),
+            "provider_calls_executed": 0,
+            "canonical_writes": 0,
+            "coverage_metadata_writes": 0,
+            "snapshot_writes": 0,
+            "outbox_writes": 0,
         }
         if missing_days and schedule_acquire is None:
             coverage["status"] = "UNVERIFIED_EMPTY"
@@ -1574,12 +1589,16 @@ class ResearchSchedulerService:
         provider_results: list[Any] = []
         provider_successes = 0
         failed_segments: list[tuple[datetime, datetime, str]] = []
+        segment_proofs: list[
+            tuple[datetime, datetime, dict[str, bool]]
+        ] = []
         for segment_start, segment_end in _contiguous_date_segments(
             missing_days,
             timezone=timezone,
             upper_bound=now,
         ):
             coverage["provider_calls"] += 1
+            coverage["provider_calls_executed"] += 1
             try:
                 output = schedule_acquire(
                     country="US",
@@ -1595,6 +1614,11 @@ class ResearchSchedulerService:
                 )
                 continue
             owner = getattr(schedule_acquire, "__self__", None) or schedule_acquire
+            proof = _normalized_coverage_proof(
+                getattr(owner, "last_coverage_proof", None)
+                or getattr(owner, "coverage_proof", None)
+            )
+            segment_proofs.append((segment_start, segment_end, proof))
             segment_results = list(
                 getattr(owner, "last_provider_results", []) or []
             )
@@ -1629,7 +1653,7 @@ class ResearchSchedulerService:
             retry_at = (now + timedelta(minutes=5)).astimezone(UTC)
             for day in missing_days:
                 day_start, day_end = _local_day_bounds(day, timezone, now)
-                self.calendar_coverage.record_day(
+                changed = self.calendar_coverage.record_day(
                     day,
                     provider_name=provider_name,
                     query_scope=query_scope,
@@ -1639,9 +1663,12 @@ class ResearchSchedulerService:
                     record_count=0,
                     provider_called=True,
                     scope_verified=False,
+                    proof={},
                     next_retry_at=retry_at,
                     lineage={"errors": [item[2] for item in failed_segments]},
+                    policy_version=policy_version,
                 )
+                coverage["coverage_metadata_writes"] += int(changed)
             coverage["status"] = "PROVIDER_UNAVAILABLE"
             coverage["reason"] = failed_segments[0][2]
             coverage["next_retry_at"] = retry_at.isoformat()
@@ -1657,6 +1684,7 @@ class ResearchSchedulerService:
         persisted = 0
         unchanged = 0
         quarantined = 0
+        quarantined_days: set[str] = set()
         discovered_occurrence_ids: list[str] = []
         discovered_rows: list[dict[str, Any]] = []
         discovered_lifecycles: list[
@@ -1672,6 +1700,7 @@ class ResearchSchedulerService:
                 quarantined += 1
                 continue
             release_local = release.astimezone(timezone)
+            local_day_key = release_local.date().isoformat()
             bucket_name = (
                 "PREVIOUS_WEEK"
                 if previous_start
@@ -1690,8 +1719,9 @@ class ResearchSchedulerService:
                 payload,
                 domain="macro_calendar",
             )
-            if not decision.accepted:
+            if not decision.accepted or not _schedule_record_complete(payload):
                 quarantined += 1
+                quarantined_days.add(local_day_key)
                 coverage["by_bucket"][bucket_name]["status"] = "QUARANTINED"
                 continue
             occurrence_key = canonical_event_key(payload)
@@ -1734,13 +1764,14 @@ class ResearchSchedulerService:
                 )
             else:
                 unchanged += 1
-            self.market_facts.upsert_economic_event(
+            wrote = self.market_facts.upsert_economic_event(
                 canonical_payload,
                 occurrence_key,
                 valid_until=(
                     now + timedelta(days=35)
                 ).astimezone(UTC).isoformat(),
             )
+            coverage["canonical_writes"] += int(bool(wrote))
         rows_by_day: dict[str, int] = {}
         for payload in discovered_rows:
             release = parse_datetime(
@@ -1754,18 +1785,48 @@ class ResearchSchedulerService:
         for day in missing_days:
             day_start, day_end = _local_day_bounds(day, timezone, now)
             count = rows_by_day.get(day.isoformat(), 0)
-            self.calendar_coverage.record_day(
+            day_proof = next(
+                (
+                    proof
+                    for start, end, proof in segment_proofs
+                    if start
+                    <= datetime.combine(
+                        day,
+                        datetime.min.time(),
+                        timezone,
+                    ).astimezone(UTC)
+                    < end
+                ),
+                {},
+            )
+            if day.isoformat() in quarantined_days:
+                day_proof = {
+                    **day_proof,
+                    "records_valid": False,
+                    "authentic_empty": False,
+                }
+            positive_proof = _coverage_proof_complete(
+                day_proof,
+                empty=count == 0,
+            )
+            status = (
+                "VERIFIED_COMPLETE"
+                if count and positive_proof
+                else "VERIFIED_EMPTY"
+                if not count and positive_proof
+                else "PARTIAL"
+            )
+            changed = self.calendar_coverage.record_day(
                 day,
                 provider_name=provider_name,
                 query_scope=query_scope,
                 window_start=day_start,
                 window_end=day_end,
-                status=(
-                    "VERIFIED_COMPLETE" if count else "VERIFIED_EMPTY"
-                ),
+                status=status,
                 record_count=count,
                 provider_called=True,
-                scope_verified=True,
+                scope_verified=bool(day_proof.get("scope_match")),
+                proof=day_proof,
                 valid_until=(
                     now + timedelta(hours=24)
                     if day >= local_now.date()
@@ -1779,14 +1840,18 @@ class ResearchSchedulerService:
                 lineage={
                     "provider_result_count": len(provider_results),
                     "query_scope": query_scope,
+                    "coverage_proof": day_proof,
                 },
+                policy_version=policy_version,
             )
+            coverage["coverage_metadata_writes"] += int(changed)
         matrix = self.calendar_coverage.matrix(
             start_date=previous_start,
             end_date=local_now.date(),
             provider_name=provider_name,
             query_scope=query_scope,
             now=now,
+            policy_version=policy_version,
         )
         coverage["daily_matrix"] = matrix
         coverage["unknown_coverage_days"] = matrix[
@@ -1860,6 +1925,8 @@ class ResearchSchedulerService:
             if rematerialized is not None
             else None
         )
+        coverage["snapshot_writes"] = int(rematerialized is not None)
+        coverage["outbox_writes"] = int(rematerialized is not None)
         return coverage
 
     def _rematerialize_schedule_discovery(
@@ -3014,6 +3081,49 @@ def _contiguous_date_segments(
         )
         for first, last in segments
     ]
+
+
+def _normalized_coverage_proof(value: Any) -> dict[str, bool]:
+    source = dict(value) if isinstance(value, dict) else {}
+    return {
+        key: bool(source.get(key))
+        for key in (
+            "request_succeeded",
+            "scope_match",
+            "pagination_complete",
+            "parsing_succeeded",
+            "records_valid",
+            "expected_sources_complete",
+            "authentic_empty",
+        )
+    }
+
+
+def _schedule_record_complete(payload: dict[str, Any]) -> bool:
+    return bool(
+        (payload.get("name") or payload.get("event_name") or payload.get("title"))
+        and payload.get("country")
+        and (payload.get("source") or payload.get("provider"))
+        and payload.get("source_url")
+    )
+
+
+def _coverage_proof_complete(
+    proof: dict[str, bool],
+    *,
+    empty: bool,
+) -> bool:
+    required = (
+        "request_succeeded",
+        "scope_match",
+        "pagination_complete",
+        "parsing_succeeded",
+        "records_valid",
+        "expected_sources_complete",
+    )
+    return all(proof.get(key) for key in required) and (
+        not empty or bool(proof.get("authentic_empty"))
+    )
 
 
 def _local_day_bounds(
