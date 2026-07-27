@@ -1,6 +1,7 @@
 # Snapshot 92 live-blocker forensic closure and PR #25 adversarial review
 
 Date of source validation: 2026-07-26
+Final independent adversarial review: 2026-07-27
 Mode of this closure: redacted fixture and offline replay only
 Database schema: 21, unchanged
 Review branch: `codex/close-snapshot92-live-blockers-20260726`
@@ -70,6 +71,32 @@ The review also found that partial provider resolutions were omitted from
 `actuals_recovered` and `revisions_reconciled`; those counters now include both
 partial and coalesced final resolutions.
 
+The final independent review of HEAD
+`3c401b41b9007016a7a7f30014467986ae614b7e` found four further lifecycle
+blockers:
+
+1. A tick one second into a durable lifecycle backoff still reacquired the
+   schedule-discovery lease and rewrote `provider_state`. The prior idempotency
+   test froze the clock and checked only snapshot count, so it did not prove
+   byte identity.
+2. An expired `BACKOFF` row was counted both as immediately due and as pending
+   backoff. Conversely, a provider residual finalized as retryable `IDLE` was
+   omitted from the real backlog.
+3. Leaving a lease for `IDLE` or `COMPLETED` preserved an obsolete
+   `next_retry_at`. The same occurrence could therefore be reclaimed repeatedly
+   until `max_per_tick`, inflating residual, write and provider-call counts.
+4. Tick completion considered only due/backoff counts plus the current
+   exhausted list. Persisted `DISABLED`/`NO_DATA` gaps could disappear from the
+   completion decision, allowing false `COMPLETED` and overlapping terminal
+   semantics.
+
+The closure adds a read-only early-backoff fast path, separates due work from
+future retry/lease work, clears obsolete retry timestamps on finalization, and
+derives terminal status from persisted gap rows. Six independent executions
+cover an advancing-clock byte comparison, expired-backoff non-overlap,
+retryable `IDLE`, pure exhausted no-data, disabled terminal gaps, and a mixed
+resolved/terminal `PARTIAL` outcome.
+
 ## Before and after
 
 | Stage | Live snapshot 92 before | Offline closure after |
@@ -93,6 +120,13 @@ additional rows, and uses `max_per_tick=20`. Tick one reports 35 total backlog,
 claims 20, leaves 15 due plus 20 in backoff, and remains `IN_PROGRESS`. Tick two
 claims the remaining 15 and reports 35 in backoff as `WAITING_BACKOFF`. An early
 third tick performs zero writes and creates no revision.
+
+The advancing-clock variant moves time forward by one second inside the same
+backoff, asserts that schedule acquisition is not called again, and compares the
+SQLite file byte-for-byte before and after the tick. The expired-retry variant
+proves one occurrence yields `backlog_before=1`, not two. Future retry and
+terminal-gap counts are now separately exposed while legacy
+`pending_backoff` remains available.
 
 ## Discovery, resolution, persistence, materialization and delivery
 
@@ -209,7 +243,9 @@ reran and mapped the following existing coverage:
 `scripts/replay_snapshot92_live_blockers_offline.py` was executed twice. Both
 outputs were byte-identical with SHA-256:
 
-`AA42D67C88AE5A4FCE8BD0A078AE236E00DF7A44D0B61DC6F8AF6EDB74056D20`.
+`4E472D93F849C19470EAEEA1EEFED22ED62144FA5F5CAD0BB1FE5E2F254F8ED1`.
+
+Each canonical output is 3,110 bytes.
 
 The canonical result also embeds the encoding-independent replay digest
 `E16D622A23379890A75A337C61ACF2E0F4E038F4D3DA4190FE3E16A41C2A2277`.
@@ -229,17 +265,17 @@ The replay reports:
 
 ## Verification ledger
 
-The focused adversarial file contains 13 tests, including six new independent
-tests added during this review. The extended offline groups completed as
-follows:
+The focused adversarial file contains 19 executions: 13 from the first PR
+review plus six new independent executions from the final review. The extended
+offline groups completed as follows:
 
 ```text
-snapshot-92 adversarial                         13 passed
-catch-up, cancellation, leases, actuals         54 passed
-sync protocol and readiness                     64 passed
-news, sessions and three-week projection       150 passed
+snapshot-92 adversarial                         19 passed
+catch-up, cancellation, leases, actuals        110 passed
+sync protocol and readiness                    127 passed
+news, sessions and three-week projection       197 passed
 migration matrix (included above)               22 passed
-complete pytest suite                          1731 passed
+complete pytest suite                          1737 passed
 Ruff                                             passed
 py_compile                                     246 files passed
 compileall                                       passed

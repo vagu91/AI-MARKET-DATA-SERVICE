@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.core.config import Settings
 from app.infrastructure.persistence.database import connect_sqlite
 from app.services.event_calendar_window_service import (
@@ -406,6 +408,322 @@ def test_fixed_point_counts_initial_discovery_due_and_backoff_bounded(
         result["ai_invocations"] == result["ai_jobs_created"] == 0
         for result in (first, second, third)
     )
+
+
+def test_early_backoff_tick_is_byte_idempotent_with_advancing_clock(
+    tmp_path: Path,
+) -> None:
+    payload = fixture()
+    current_time = [datetime.fromisoformat(str(payload["reference_now"]))]
+    settings = cfg(tmp_path)
+    MarketContextSnapshotRepository(settings).save_next(
+        symbol="MNQ",
+        refresh_mode="byte-idempotent-backoff-baseline",
+        debug_payload=baseline_payload(current_time[0]),
+        ai_enrichment={"status": "NOT_REQUIRED"},
+    )
+
+    class Acquire:
+        last_provider_results = [SimpleNamespace(errors=[])]
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, **_: object) -> list[dict[str, object]]:
+            self.calls += 1
+            return list(payload["discovery"])  # type: ignore[arg-type]
+
+    acquire = Acquire()
+    scheduler = ResearchSchedulerService(
+        settings,
+        clock=lambda: current_time[0],
+    )
+    first = scheduler.startup_catch_up(
+        resolver=lambda _: {
+            "status": "NO_DATA",
+            "reason": "offline_no_data",
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+        },
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=acquire,
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="byte-idempotent-backoff",
+            allow_live_providers=True,
+        ),
+    )
+    database_path = Path(settings.database_path)
+    before = database_path.read_bytes()
+    current_time[0] += timedelta(seconds=1)
+
+    second = scheduler.startup_catch_up(
+        resolver=lambda _: (_ for _ in ()).throw(
+            AssertionError("early backoff must suppress the resolver")
+        ),
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=acquire,
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="byte-idempotent-backoff",
+            allow_live_providers=True,
+        ),
+    )
+
+    assert first["status"] == second["status"] == "WAITING_BACKOFF"
+    assert second["claimed"] == second["writes"] == 0
+    assert second["checkpoint_written"] is False
+    assert acquire.calls == 1
+    assert database_path.read_bytes() == before
+
+
+def test_expired_backoff_is_not_double_counted_as_due_and_pending(
+    tmp_path: Path,
+) -> None:
+    from app.services.event_driven_lifecycle_service import (
+        compute_datum_lifecycle,
+    )
+
+    payload = fixture()
+    current_time = [datetime.fromisoformat(str(payload["reference_now"]))]
+    settings = cfg(tmp_path)
+    scheduler = ResearchSchedulerService(
+        settings,
+        clock=lambda: current_time[0],
+    )
+    row = dict(payload["discovery"][0])  # type: ignore[index]
+    scheduler.lifecycle.upsert(
+        compute_datum_lifecycle(
+            "macro_actual",
+            "fixture:expired-backoff",
+            row,
+            settings=settings,
+            now=current_time[0],
+            fields_attempted=["actual"],
+        ),
+        payload=row,
+        work_status="READY",
+    )
+    scheduler.scan_due_items(
+        owner="seed-expired-backoff",
+        resolver=lambda _: {
+            "status": "NO_DATA",
+            "reason": "offline_no_data",
+        },
+        ai_enqueue=None,
+        force=True,
+        allow_ai_residual=False,
+    )
+    lifecycle = {
+        item["entity_key"]: item for item in scheduler.lifecycle.list_items()
+    }
+    current_time[0] = datetime.fromisoformat(
+        str(lifecycle["fixture:expired-backoff"]["next_retry_at"])
+    )
+
+    result = scheduler.startup_catch_up(
+        resolver=lambda _: {
+            "status": "NO_DATA",
+            "reason": "offline_no_data_again",
+        },
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=None,
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="expired-backoff-non-overlap",
+            allow_live_providers=True,
+        ),
+    )
+
+    assert result["catch_up_backlog_before"] == 1
+    assert result["claimed"] == 1
+    assert result["catch_up_due_after"] == 0
+    assert result["catch_up_pending_retry"] == 1
+    assert result["catch_up_pending_backoff"] == 1
+    assert result["catch_up_backlog_after"] == 1
+    assert result["status"] == "WAITING_BACKOFF"
+
+
+def test_idle_retry_remains_in_real_backlog_instead_of_completed(
+    tmp_path: Path,
+) -> None:
+    from app.services.event_driven_lifecycle_service import (
+        compute_datum_lifecycle,
+    )
+
+    payload = fixture()
+    now = datetime.fromisoformat(str(payload["reference_now"]))
+    settings = cfg(tmp_path)
+    scheduler = ResearchSchedulerService(settings, clock=lambda: now)
+    row = dict(payload["discovery"][0])  # type: ignore[index]
+    scheduler.lifecycle.upsert(
+        compute_datum_lifecycle(
+            "macro_actual",
+            "fixture:idle-retry",
+            row,
+            settings=settings,
+            now=now,
+            fields_attempted=["actual"],
+        ),
+        payload=row,
+        work_status="READY",
+    )
+
+    result = scheduler.startup_catch_up(
+        resolver=lambda _: {
+            "status": "NOT_CONFIGURED",
+            "reason": "offline_provider_temporarily_not_configured",
+        },
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=None,
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="idle-retry-backlog",
+            allow_live_providers=True,
+        ),
+    )
+
+    assert result["resolved"] == []
+    assert result["residual_count"] == 1
+    assert result["catch_up_due_after"] == 0
+    assert result["catch_up_pending_retry"] == 1
+    assert result["catch_up_pending_backoff"] == 0
+    assert result["catch_up_backlog_after"] == 1
+    assert result["status"] == "WAITING_BACKOFF"
+
+
+@pytest.mark.parametrize(
+    ("provider_result", "expected_status"),
+    [
+        (
+            {
+                "status": "NO_DATA",
+                "reason": "offline_retry_deadline",
+                "retry_deadline_exhausted": True,
+            },
+            "EXHAUSTED_NO_DATA",
+        ),
+        (
+            {
+                "status": "NOT_CONFIGURED",
+                "reason": "offline_provider_disabled",
+                "agent_status": "DISABLED",
+            },
+            "COMPLETED_WITH_GAPS",
+        ),
+    ],
+)
+def test_terminal_gap_statuses_are_disjoint_from_completed(
+    tmp_path: Path,
+    provider_result: dict[str, object],
+    expected_status: str,
+) -> None:
+    from app.services.event_driven_lifecycle_service import (
+        compute_datum_lifecycle,
+    )
+
+    payload = fixture()
+    now = datetime.fromisoformat(str(payload["reference_now"]))
+    settings = cfg(tmp_path)
+    scheduler = ResearchSchedulerService(settings, clock=lambda: now)
+    row = dict(payload["discovery"][0])  # type: ignore[index]
+    scheduler.lifecycle.upsert(
+        compute_datum_lifecycle(
+            "macro_actual",
+            "fixture:terminal-gap",
+            row,
+            settings=settings,
+            now=now,
+            fields_attempted=["actual"],
+        ),
+        payload=row,
+        work_status="READY",
+    )
+
+    result = scheduler.startup_catch_up(
+        resolver=lambda _: provider_result,
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=None,
+        execution_context=ExecutionContext.provider_only(
+            correlation_id=f"terminal-gap-{expected_status.lower()}",
+            allow_live_providers=True,
+        ),
+    )
+
+    assert result["resolved"] == []
+    assert result["residual_count"] == 1
+    assert result["catch_up_backlog_after"] == 0
+    assert result["catch_up_terminal_gap_count"] == 1
+    assert result["status"] == expected_status
+    assert result["catch_up_completion_status"] == expected_status
+
+
+def test_mixed_resolution_and_terminal_gap_is_partial(
+    tmp_path: Path,
+) -> None:
+    from app.services.event_driven_lifecycle_service import (
+        compute_datum_lifecycle,
+    )
+
+    payload = fixture()
+    now = datetime.fromisoformat(str(payload["reference_now"]))
+    settings = cfg(tmp_path)
+    scheduler = ResearchSchedulerService(settings, clock=lambda: now)
+    seed = dict(payload["discovery"][0])  # type: ignore[index]
+    for suffix in ("resolved", "disabled"):
+        row = {
+            **seed,
+            "occurrence_id": f"fixture:mixed:{suffix}",
+            "canonical_event_key": f"fixture:mixed:{suffix}",
+            "provider_event_id": f"fixture-mixed-{suffix}",
+        }
+        scheduler.lifecycle.upsert(
+            compute_datum_lifecycle(
+                "macro_actual",
+                f"fixture:mixed:{suffix}",
+                row,
+                settings=settings,
+                now=now,
+                fields_attempted=["actual"],
+            ),
+            payload=row,
+            work_status="READY",
+        )
+
+    result = scheduler.startup_catch_up(
+        resolver=lambda item: (
+            {
+                "status": "RESOLVED",
+                "next_refresh_at": (now + timedelta(days=1)).isoformat(),
+            }
+            if str(item["entity_key"]).endswith("resolved")
+            else {
+                "status": "NOT_CONFIGURED",
+                "reason": "offline_provider_disabled",
+                "agent_status": "DISABLED",
+            }
+        ),
+        ai_enqueue=lambda _: (_ for _ in ()).throw(
+            AssertionError("AI must remain unreachable")
+        ),
+        schedule_acquire=None,
+        execution_context=ExecutionContext.provider_only(
+            correlation_id="mixed-resolution-terminal-gap",
+            allow_live_providers=True,
+        ),
+    )
+
+    assert len(result["resolved"]) == 1
+    assert result["residual_count"] == 1
+    assert result["catch_up_terminal_gap_count"] == 1
+    assert result["status"] == "PARTIAL"
+    assert result["catch_up_completion_status"] == "PARTIAL"
 
 
 def test_retry_exhaustion_is_not_reported_as_completed(

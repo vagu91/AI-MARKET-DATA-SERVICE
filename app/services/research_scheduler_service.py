@@ -1050,10 +1050,6 @@ class ResearchSchedulerService:
         execution_context: ExecutionContext | None,
     ) -> dict[str, Any]:
         now = self.clock()
-        schedule_coverage = self._seed_canonical_schedule_gaps(
-            schedule_acquire=schedule_acquire,
-            now=now,
-        )
         window_start = now - timedelta(
             days=int(self.settings.event_calendar_catchup_lookback_days)
         )
@@ -1071,15 +1067,87 @@ class ResearchSchedulerService:
             )
         )
         checkpoint = self._read_event_calendar_catchup_checkpoint()
+        preexisting_due = self.lifecycle.count_due(
+            now=now,
+            due_since=window_start,
+            entity_types=event_entity_types,
+        )
+        (
+            preexisting_pending_retry,
+            preexisting_pending_backoff,
+            preexisting_next_retry_at,
+        ) = self._event_calendar_catchup_pending_state(
+            now=now,
+            window_start=window_start,
+            entity_types=event_entity_types,
+        )
+        stable_early_backoff = (
+            preexisting_due == 0
+            and preexisting_pending_retry > 0
+            and checkpoint.get("completion_status") == "WAITING_BACKOFF"
+            and int(
+                checkpoint.get(
+                    "pending_retry",
+                    checkpoint.get("pending_backoff") or 0,
+                )
+                or 0
+            )
+            == preexisting_pending_retry
+            and checkpoint.get("next_retry_at")
+            == preexisting_next_retry_at
+        )
+        if stable_early_backoff:
+            source_coverage = (
+                dict(checkpoint.get("source_coverage") or {})
+                if isinstance(checkpoint.get("source_coverage"), dict)
+                else {}
+            )
+            return {
+                **_empty_catchup_result(),
+                "status": "WAITING_BACKOFF",
+                "checkpoint_written": False,
+                "catch_up_window_start": window_start.isoformat(),
+                "catch_up_window_hours": int(
+                    self.settings.event_calendar_catchup_lookback_days
+                )
+                * 24,
+                "catch_up_backlog_before": preexisting_pending_retry,
+                "catch_up_backlog_after": preexisting_pending_retry,
+                "catch_up_due_after": 0,
+                "catch_up_pending_retry": preexisting_pending_retry,
+                "catch_up_pending_backoff": preexisting_pending_backoff,
+                "catch_up_next_retry_at": preexisting_next_retry_at,
+                "catch_up_batch_size": int(
+                    self.settings.event_calendar_catchup_batch_size
+                ),
+                "catch_up_max_per_tick": int(
+                    self.settings.event_calendar_catchup_max_per_tick
+                ),
+                "catch_up_cursor": checkpoint.get("cursor"),
+                "catch_up_tick_count": int(
+                    checkpoint.get("tick_count") or 0
+                ),
+                "catch_up_completion_status": "WAITING_BACKOFF",
+                "catch_up_provider_only": True,
+                "source_coverage": source_coverage,
+                "telemetry_emitted": False,
+            }
+
+        schedule_coverage = self._seed_canonical_schedule_gaps(
+            schedule_acquire=schedule_acquire,
+            now=now,
+        )
         due_before = self.lifecycle.count_due(
             now=now,
             due_since=window_start,
             entity_types=event_entity_types,
         )
         (
+            pending_retry_before,
             pending_backoff_before,
             next_retry_at_before,
-        ) = self._event_calendar_catchup_backoff_state(
+        ) = self._event_calendar_catchup_pending_state(
+            now=now,
             window_start=window_start,
             entity_types=event_entity_types,
         )
@@ -1091,7 +1159,7 @@ class ResearchSchedulerService:
         )
         if (
             due_before == 0
-            and pending_backoff_before == 0
+            and pending_retry_before == 0
             and schedule_lifecycle_writes == 0
             and schedule_snapshot_writes == 0
             and checkpoint.get("completion_status") == "COMPLETED"
@@ -1116,6 +1184,7 @@ class ResearchSchedulerService:
                 "catch_up_backlog_before": 0,
                 "catch_up_backlog_after": 0,
                 "catch_up_due_after": 0,
+                "catch_up_pending_retry": 0,
                 "catch_up_pending_backoff": 0,
                 "catch_up_next_retry_at": None,
                 "catch_up_tick_count": int(
@@ -1126,12 +1195,18 @@ class ResearchSchedulerService:
                 "source_coverage": schedule_coverage,
                 "telemetry_emitted": False,
             }
-        backlog_before = due_before + pending_backoff_before
-        if due_before == 0 and pending_backoff_before > 0:
+        backlog_before = due_before + pending_retry_before
+        if due_before == 0 and pending_retry_before > 0:
             transition_required = (
                 checkpoint.get("completion_status") != "WAITING_BACKOFF"
-                or int(checkpoint.get("pending_backoff") or 0)
-                != pending_backoff_before
+                or int(
+                    checkpoint.get(
+                        "pending_retry",
+                        checkpoint.get("pending_backoff") or 0,
+                    )
+                    or 0
+                )
+                != pending_retry_before
                 or checkpoint.get("next_retry_at")
                 != next_retry_at_before
                 or schedule_lifecycle_writes > 0
@@ -1147,8 +1222,9 @@ class ResearchSchedulerService:
                     "claimed": 0,
                     "resolved": 0,
                     "backoff": 0,
-                    "backlog_after": pending_backoff_before,
+                    "backlog_after": pending_retry_before,
                     "due_after": 0,
+                    "pending_retry": pending_retry_before,
                     "pending_backoff": pending_backoff_before,
                     "next_retry_at": next_retry_at_before,
                     "cursor": checkpoint.get("cursor"),
@@ -1192,8 +1268,9 @@ class ResearchSchedulerService:
                 )
                 * 24,
                 "catch_up_backlog_before": backlog_before,
-                "catch_up_backlog_after": pending_backoff_before,
+                "catch_up_backlog_after": pending_retry_before,
                 "catch_up_due_after": 0,
+                "catch_up_pending_retry": pending_retry_before,
                 "catch_up_pending_backoff": pending_backoff_before,
                 "catch_up_next_retry_at": next_retry_at_before,
                 "catch_up_batch_size": int(
@@ -1249,20 +1326,39 @@ class ResearchSchedulerService:
                 break
 
         (
+            pending_retry,
             pending_backoff,
             next_retry_at,
-        ) = self._event_calendar_catchup_backoff_state(
+        ) = self._event_calendar_catchup_pending_state(
+            now=now,
             window_start=window_start,
             entity_types=event_entity_types,
         )
-        backlog_after = due_after + pending_backoff
+        (
+            terminal_gap_count,
+            exhausted_no_data_count,
+        ) = self._event_calendar_catchup_terminal_gap_state(
+            window_start=window_start,
+            entity_types=event_entity_types,
+        )
+        backlog_after = due_after + pending_retry
         completion_status = (
             "IN_PROGRESS"
             if due_after > 0
             else "WAITING_BACKOFF"
-            if pending_backoff > 0
+            if pending_retry > 0
+            else "PARTIAL"
+            if aggregate["resolved"]
+            and (
+                int(aggregate["residual_count"]) > 0
+                or terminal_gap_count > 0
+            )
+            else "EXHAUSTED_NO_DATA"
+            if terminal_gap_count > 0
+            and exhausted_no_data_count == terminal_gap_count
             else "COMPLETED_WITH_GAPS"
-            if aggregate["exhausted_no_data"]
+            if terminal_gap_count > 0
+            or int(aggregate["residual_count"]) > 0
             else "COMPLETED"
         )
         tick_count = int(checkpoint.get("tick_count") or 0) + 1
@@ -1273,7 +1369,10 @@ class ResearchSchedulerService:
             "backoff": len(aggregate["backoff"]),
             "backlog_after": backlog_after,
             "due_after": due_after,
+            "pending_retry": pending_retry,
             "pending_backoff": pending_backoff,
+            "terminal_gap_count": terminal_gap_count,
+            "exhausted_no_data_count": exhausted_no_data_count,
             "next_retry_at": next_retry_at,
             "cursor": cursor,
             "tick_count": tick_count,
@@ -1333,7 +1432,10 @@ class ResearchSchedulerService:
             "catch_up_backlog_before": backlog_before,
             "catch_up_backlog_after": backlog_after,
             "catch_up_due_after": due_after,
+            "catch_up_pending_retry": pending_retry,
             "catch_up_pending_backoff": pending_backoff,
+            "catch_up_terminal_gap_count": terminal_gap_count,
+            "catch_up_exhausted_no_data_count": exhausted_no_data_count,
             "catch_up_next_retry_at": next_retry_at,
             "catch_up_batch_size": batch_size,
             "catch_up_max_per_tick": max_per_tick,
@@ -2105,20 +2207,77 @@ class ResearchSchedulerService:
             )
             conn.commit()
 
-    def _event_calendar_catchup_backoff_state(
+    def _event_calendar_catchup_pending_state(
         self,
         *,
+        now: datetime,
         window_start: datetime,
         entity_types: frozenset[str],
-    ) -> tuple[int, str | None]:
+    ) -> tuple[int, int, str | None]:
         placeholders = ",".join("?" for _ in entity_types)
+        reference = now.astimezone(UTC).replace(microsecond=0).isoformat()
         with connect_sqlite(self.settings.database_path) as conn:
             row = conn.execute(
                 f"""
                 SELECT COUNT(*) AS pending_count,
-                       MIN(next_retry_at) AS next_retry_at
+                       COALESCE(SUM(
+                         CASE WHEN work_status='BACKOFF' THEN 1 ELSE 0 END
+                       ),0) AS pending_backoff_count,
+                       MIN(
+                         CASE
+                           WHEN work_status='LEASED' THEN lease_expires_at
+                           ELSE COALESCE(next_retry_at,next_refresh_at)
+                         END
+                       ) AS next_retry_at
                 FROM datum_lifecycle_items
-                WHERE work_status='BACKOFF'
+                WHERE (
+                    work_status IN ('BACKOFF','LEASED')
+                    OR (
+                      work_status='IDLE'
+                      AND refresh_reason='provider_unresolved_ai_not_configured'
+                    )
+                  )
+                  AND entity_type IN ({placeholders})
+                  AND (
+                    CASE
+                      WHEN work_status='LEASED' THEN lease_expires_at
+                      ELSE COALESCE(next_retry_at,next_refresh_at)
+                    END
+                  )>?
+                  AND COALESCE(event_at,updated_at)>=?
+                """,
+                (
+                    *sorted(entity_types),
+                    reference,
+                    window_start.astimezone(UTC).replace(
+                        microsecond=0
+                    ).isoformat(),
+                ),
+            ).fetchone()
+        return (
+            int(row["pending_count"] if row else 0),
+            int(row["pending_backoff_count"] if row else 0),
+            str(row["next_retry_at"])
+            if row is not None and row["next_retry_at"]
+            else None,
+        )
+
+    def _event_calendar_catchup_terminal_gap_state(
+        self,
+        *,
+        window_start: datetime,
+        entity_types: frozenset[str],
+    ) -> tuple[int, int]:
+        placeholders = ",".join("?" for _ in entity_types)
+        with connect_sqlite(self.settings.database_path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS terminal_gap_count,
+                       COALESCE(SUM(
+                         CASE WHEN work_status='NO_DATA' THEN 1 ELSE 0 END
+                       ),0) AS exhausted_no_data_count
+                FROM datum_lifecycle_items
+                WHERE work_status IN ('DISABLED','NO_DATA')
                   AND entity_type IN ({placeholders})
                   AND COALESCE(event_at,updated_at)>=?
                 """,
@@ -2130,10 +2289,8 @@ class ResearchSchedulerService:
                 ),
             ).fetchone()
         return (
-            int(row["pending_count"] if row else 0),
-            str(row["next_retry_at"])
-            if row is not None and row["next_retry_at"]
-            else None,
+            int(row["terminal_gap_count"] if row else 0),
+            int(row["exhausted_no_data_count"] if row else 0),
         )
 
     def _rematerialize_provider_resolution(

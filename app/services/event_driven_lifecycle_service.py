@@ -990,6 +990,7 @@ class LifecycleRepository:
                 UPDATE datum_lifecycle_items
                 SET work_status='COMPLETED',freshness_state='FRESH',
                     next_refresh_at=COALESCE(?,next_refresh_at),
+                    next_retry_at=NULL,
                     lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
                     updated_at=?
                 WHERE item_id=? AND work_status='LEASED' AND lease_owner=?
@@ -1016,6 +1017,10 @@ class LifecycleRepository:
                 UPDATE datum_lifecycle_items
                 SET work_status=?,refresh_reason=?,
                     next_refresh_at=COALESCE(?,next_refresh_at),
+                    next_retry_at=CASE
+                      WHEN ? IN ('BACKOFF','LEASED') THEN next_retry_at
+                      ELSE NULL
+                    END,
                     lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
                     updated_at=?
                 WHERE item_id=? AND work_status='LEASED' AND lease_owner=?
@@ -1024,6 +1029,7 @@ class LifecycleRepository:
                     work_status,
                     refresh_reason,
                     next_refresh_at,
+                    work_status,
                     timestamp,
                     item_id,
                     owner,
@@ -1050,6 +1056,10 @@ class LifecycleRepository:
                 UPDATE datum_lifecycle_items
                 SET work_status=?,refresh_reason=?,
                     next_refresh_at=COALESCE(?,next_refresh_at),
+                    next_retry_at=CASE
+                      WHEN ? IN ('BACKOFF','LEASED') THEN next_retry_at
+                      ELSE NULL
+                    END,
                     lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
                     updated_at=?
                 WHERE item_id=? AND work_status=?
@@ -1061,6 +1071,7 @@ class LifecycleRepository:
                     work_status,
                     refresh_reason,
                     next_refresh_at,
+                    work_status,
                     timestamp,
                     item_id,
                     expected_work_status,

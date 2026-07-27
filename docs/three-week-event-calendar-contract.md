@@ -90,26 +90,35 @@ Event catch-up is separately opt-in and disabled by default. It:
 
 Catch-up state is stored in the existing schema-20 `provider_state` table. The
 checkpoint contains `backlog_before`, `claimed`, `resolved`, `backoff`,
-`backlog_after`, `pending_backoff`, `cursor`, `tick_count`, and
-`completion_status`. A dedicated provider-only application task continues
-bounded ticks independently of the AI-authorized lifecycle scanner. A completed
-checkpoint with no newly due work produces a read-only `ALREADY_COMPLETE`
-result: no snapshot, outbox, telemetry, or checkpoint rewrite.
+`backlog_after`, `pending_retry`, `pending_backoff`, terminal-gap counts,
+`cursor`, `tick_count`, and `completion_status`. Due work and future retry/lease
+work are disjoint sets: an expired backoff is due, never counted a second time
+as pending. Retryable provider gaps finalized as `IDLE` remain in
+`pending_retry`; ordinary future calendar rows do not. A dedicated
+provider-only application task continues bounded ticks independently of the
+AI-authorized lifecycle scanner. A completed checkpoint with no newly due work
+produces a read-only `ALREADY_COMPLETE` result: no snapshot, outbox, telemetry,
+or checkpoint rewrite.
 
 The default lookback is 730 days. Visible/recent and high-impact items are
 prioritized. Reconciled history outside the notification horizon is persisted
 without an outbox notification. Temporary provider failures enter deterministic
 backoff/negative-cache state and remain in `WAITING_BACKOFF`; they never enable
-AI.
+AI. A tick before the earliest retry is byte-idempotent even when the clock has
+advanced: it does not reacquire the discovery lease, call the schedule provider,
+rewrite provider state, emit telemetry, or create a snapshot.
 
 A successful provider request carrying a `NO_DATA` envelope is not a recovered
 datum. Before exhaustion it persists the complete occurrence with
 `AWAITING_ACTUAL` and a durable `BACKOFF`; after the retry deadline it reports
-`EXHAUSTED_NO_DATA`. Tick completion uses `COMPLETED`,
-`COMPLETED_WITH_GAPS`, `WAITING_BACKOFF`, or `IN_PROGRESS` according to
-persisted state. Resolver requests, successful request envelopes, recovered
-actuals, lifecycle writes and rematerialized snapshot IDs are separate
-measurements.
+`EXHAUSTED_NO_DATA`. Tick completion is disjoint: `IN_PROGRESS` means due work
+remains after the bound; `WAITING_BACKOFF` means only future retry/lease work
+remains; `PARTIAL` means this tick resolved items but terminal gaps remain;
+`EXHAUSTED_NO_DATA` means every terminal gap exhausted with no datum;
+`COMPLETED_WITH_GAPS` means other terminal gaps remain; and `COMPLETED` means no
+processable or terminal residual remains. Resolver requests, successful request
+envelopes, recovered actuals, lifecycle writes and rematerialized snapshot IDs
+are separate measurements.
 
 ## Trigger and session semantics
 
