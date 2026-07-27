@@ -62,6 +62,29 @@ def canonical_event_key(event: dict[str, Any] | EconomicEvent) -> str:
     return f"event:{hashlib.sha256(stable.encode('utf-8')).hexdigest()[:24]}"
 
 
+def exact_occurrence_key(event: dict[str, Any] | EconomicEvent) -> str:
+    """Return the provider occurrence identity before semantic fallbacks.
+
+    An occurrence id is an immutable release identity.  The semantic hash is
+    intentionally only a fallback because title, period and provider metadata
+    can become richer between calendar reads without creating a new release.
+    """
+
+    item = event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event)
+    occurrence_id = str(item.get("occurrence_id") or "").strip()
+    if occurrence_id:
+        return occurrence_id
+    event_id = str(item.get("event_id") or "").strip()
+    if ":" in event_id:
+        return event_id
+    persisted = str(item.get("canonical_event_key") or "").strip()
+    if persisted:
+        return persisted
+    if event_id:
+        return event_id
+    return canonical_event_key(item)
+
+
 def temporal_event_state(
     event: dict[str, Any] | EconomicEvent,
     *,

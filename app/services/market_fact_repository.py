@@ -212,6 +212,18 @@ def _candidate_lineage(candidate: dict[str, Any], policy_version: str) -> dict[s
 
 def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row: Any) -> dict[str, Any]:
     merged = {**existing, **incoming}
+    for field in (
+        "occurrence_id",
+        "provider_event_id",
+        "source_event_id",
+        "reference_period",
+        "period",
+    ):
+        if (
+            incoming.get(field) in (None, "")
+            and existing.get(field) not in (None, "")
+        ):
+            merged[field] = existing[field]
     existing_enrichment = dict(existing.get("enrichment") or {})
     incoming_enrichment = dict(incoming.get("enrichment") or {})
     lineage = {
@@ -299,8 +311,51 @@ def _event_record_payload(row: Any) -> dict[str, Any]:
         payload["temporal_status"] = recalculated["temporal_status"]
         payload["actual"] = recalculated["actual"]
         payload["event_kind"] = recalculated["event_kind"]
-        payload["canonical_event_key"] = recalculated["canonical_event_key"]
+        # The persisted key is the audit identity for this row. Recomputing it
+        # from a richer/poorer projection can split one provider occurrence.
+        payload["canonical_event_key"] = row["canonical_event_key"]
     return payload
+
+
+def _merge_exact_occurrence_payloads(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    from app.services.temporal_domain_service import exact_occurrence_key
+
+    selected: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        key = exact_occurrence_key(row)
+        if key not in selected:
+            selected[key] = dict(row)
+            order.append(key)
+            continue
+        prior = selected[key]
+        merged = dict(prior)
+        for field, value in row.items():
+            if value not in (None, "", [], {}):
+                merged[field] = value
+        prior_enrichment = (
+            dict(prior.get("enrichment") or {})
+            if isinstance(prior.get("enrichment"), dict)
+            else {}
+        )
+        next_enrichment = (
+            dict(row.get("enrichment") or {})
+            if isinstance(row.get("enrichment"), dict)
+            else {}
+        )
+        merged["enrichment"] = {
+            **prior_enrichment,
+            **{
+                field: value
+                for field, value in next_enrichment.items()
+                if value not in (None, "", [], {})
+            },
+        }
+        merged["occurrence_id"] = key
+        selected[key] = merged
+    return [selected[key] for key in order]
 
 
 def connect_market_db(settings: Settings) -> Any:
@@ -546,11 +601,20 @@ class MarketFactRepository:
         ]
 
     def upsert_economic_event(self, event: Any, event_key: str, *, valid_until: str | None = None) -> bool:
-        from app.services.temporal_domain_service import canonical_event_key, temporal_event_state
+        from app.services.temporal_domain_service import (
+            canonical_event_key,
+            exact_occurrence_key,
+            temporal_event_state,
+        )
 
         event_now = self.clock().astimezone(UTC)
         timestamp = event_now.replace(microsecond=0).isoformat()
         payload = normalize_payload_text(event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event))
+        occurrence_key = exact_occurrence_key(payload)
+        provider_event_key = str(
+            payload.get("event_id") or occurrence_key
+        )
+        payload.setdefault("occurrence_id", occurrence_key)
         invalid_sources = self.source_policy.invalid_sources(
             payload,
             allow_test_reserved=self.settings.environment.lower() == "test",
@@ -612,12 +676,30 @@ class MarketFactRepository:
             payload,
             domain="macro_calendar",
         )
-        field_lineage = (payload.get("enrichment") or {}).get("field_lineage") if isinstance(payload.get("enrichment"), dict) else {}
+        field_lineage = (
+            (payload.get("enrichment") or {}).get("field_lineage")
+            if isinstance(payload.get("enrichment"), dict)
+            else {}
+        ) or {}
         with connect_market_db(self.settings) as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT * FROM economic_events_history WHERE event_key=? OR canonical_event_key=? ORDER BY updated_at DESC LIMIT 1",
-                (event_key, canonical_key),
+                """
+                SELECT * FROM economic_events_history
+                WHERE event_key=? OR canonical_event_key=? OR event_id=?
+                ORDER BY
+                  CASE WHEN event_key=? THEN 0
+                       WHEN event_id=? THEN 1 ELSE 2 END,
+                  updated_at DESC
+                LIMIT 1
+                """,
+                (
+                    event_key,
+                    canonical_key,
+                    provider_event_key,
+                    event_key,
+                    provider_event_key,
+                ),
             ).fetchone()
             terminal_status = temporal["temporal_status"]
             audit_status = "ACTIVE"
@@ -634,6 +716,7 @@ class MarketFactRepository:
                 invalid_reason = decision.reason_code
             if existing is not None:
                 event_key = str(existing["event_key"])
+                canonical_key = str(existing["canonical_event_key"])
                 existing_raw = decode(existing["raw_payload_json"], {})
                 if (
                     existing_raw == payload
@@ -674,7 +757,9 @@ class MarketFactRepository:
                     )
                     if not existing_decision.accepted:
                         decision = existing_decision
-                existing_lineage = decode(existing["field_lineage_json"], {})
+                existing_lineage = (
+                    decode(existing["field_lineage_json"], {}) or {}
+                )
                 field_lineage = {**existing_lineage, **field_lineage}
             if audit_status == QUARANTINED_STATUS:
                 completeness_status = "QUARANTINED"
@@ -1138,7 +1223,9 @@ class MarketFactRepository:
                 """,
                 (country.upper(), start_date, end_date),
             ).fetchall()
-        return [_event_record_payload(row) for row in rows]
+        return _merge_exact_occurrence_payloads(
+            [_event_record_payload(row) for row in rows]
+        )
 
     def economic_event_records(self, *, country: str = "US") -> list[dict[str, Any]]:
         with connect_market_db(self.settings) as conn:
@@ -1153,7 +1240,9 @@ class MarketFactRepository:
                 """,
                 (country.upper(),),
             ).fetchall()
-        return [_event_record_payload(row) for row in rows]
+        return _merge_exact_occurrence_payloads(
+            [_event_record_payload(row) for row in rows]
+        )
 
     def _event_history_row(self, canonical_event_key: str) -> Any | None:
         with connect_market_db(self.settings) as conn:

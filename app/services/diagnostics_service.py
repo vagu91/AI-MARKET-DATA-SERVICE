@@ -50,7 +50,7 @@ from app.services.fed_expectations_service import FedExpectationsService
 from app.services.risk_context_runtime_service import RiskContextRuntimeService
 from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.social_sentiment_service import SocialSentimentService
-from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
+from app.services.temporal_domain_service import exact_occurrence_key, reconcile_calendar_events
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
 from app.services.execution_context import ExecutionContext
 
@@ -140,8 +140,13 @@ class DiagnosticsService:
         force_schedule_coverage: dict[str, Any] = {}
         if (
             force
-            and self.settings.event_calendar_catchup_enabled
             and callable(getattr(self.event_service, "list_events", None))
+            and (
+                self.settings.event_calendar_catchup_enabled
+                or callable(
+                    getattr(self.event_service, "coverage_targets", None)
+                )
+            )
         ):
             force_schedule_coverage = (
                 await self._force_schedule_catch_up(now=now)
@@ -192,9 +197,14 @@ class DiagnosticsService:
             else:
                 try:
                     events = await asyncio.wait_for(
-                        self._official_events(country=country, start=now, end=now + timedelta(days=days)),
+                        self._fetch_official_events(
+                            country=country,
+                            start=now,
+                            end=now + timedelta(days=days),
+                        ),
                         timeout=max(float(self.settings.timeout_events_seconds), 1.0),
                     )
+                    self._persist_official_events(events)
                 except TimeoutError:
                     events, materialization = self.event_materializer.load_from_history(
                         country=country,
@@ -325,7 +335,7 @@ class DiagnosticsService:
         for event in enriched:
             self.facts.upsert_economic_event(
                 event,
-                event_key=canonical_event_key(event),
+                event_key=exact_occurrence_key(event),
                 valid_until=self.freshness.macro_valid_until(event),
             )
         consensus_quality = {field: 0 for field in (
@@ -800,10 +810,28 @@ class DiagnosticsService:
         return count
 
     async def _official_events(self, *, country: str, start: datetime, end: datetime):
+        events = await self._fetch_official_events(
+            country=country,
+            start=start,
+            end=end,
+        )
+        self._persist_official_events(events)
+        return events
+
+    async def _fetch_official_events(
+        self,
+        *,
+        country: str,
+        start: datetime,
+        end: datetime,
+    ):
         if hasattr(self.event_service, "list_events"):
             events = await self.event_service.list_events(country=country, start=start, end=end, enrich=False)
         else:
             events = await self.event_service.upcoming(country=country, days=max(1, (end - start).days))
+        return events
+
+    def _persist_official_events(self, events: list[Any]) -> None:
         for event in events:
             valid_until = self.freshness.macro_valid_until(event)
             self.facts.upsert_economic_event(
@@ -811,7 +839,6 @@ class DiagnosticsService:
                 event_key=f"{event.country}:{event.date}:{event.event_id}",
                 valid_until=valid_until,
             )
-        return events
 
     def _events_from_history(self, *, country: str, start: datetime, end: datetime) -> list:
         events, _ = self.event_materializer.load_from_history(

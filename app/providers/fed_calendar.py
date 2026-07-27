@@ -33,6 +33,7 @@ class FederalReserveCalendarProvider(BaseProvider):
     provider_type = ProviderType.SCRAPER
     reliability = 0.86
     cache_key = "provider:federal_reserve_calendar:events:v2"
+    authoritative_calendar_coverage = True
 
     def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
@@ -69,6 +70,31 @@ class FederalReserveCalendarProvider(BaseProvider):
             ),
             data=events,
         )
+
+    def coverage_dates(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[date]:
+        now = datetime.now(UTC)
+        months = {(now.year, now.month)}
+        months.add(
+            (now.year + 1, 1)
+            if now.month == 12
+            else (now.year, now.month + 1)
+        )
+        first = start.astimezone(self.eastern_tz).date()
+        last = (end.astimezone(self.eastern_tz) - datetime.resolution).date()
+        return [
+            first + (date.resolution * offset)
+            for offset in range((last - first).days + 1)
+            if (
+                (first + (date.resolution * offset)).year,
+                (first + (date.resolution * offset)).month,
+            )
+            in months
+        ]
 
     def _parse_month(self, html: str, source_url: str, year: int, month: int) -> list[dict[str, object]]:
         lines = html_text_lines(html)
