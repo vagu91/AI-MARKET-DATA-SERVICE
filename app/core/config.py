@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     bls_enabled: bool = Field(default=True, validation_alias="AI_MARKET_BLS_ENABLED")
     bea_enabled: bool = Field(default=True, validation_alias="AI_MARKET_BEA_ENABLED")
     census_enabled: bool = Field(default=True, validation_alias="AI_MARKET_CENSUS_ENABLED")
+    sp_global_pmi_enabled: bool = Field(
+        default=True, validation_alias="AI_MARKET_SP_GLOBAL_PMI_ENABLED"
+    )
     finnhub_enabled: bool = Field(default=True, validation_alias="AI_MARKET_FINNHUB_ENABLED")
     tradier_enabled: bool = Field(default=False, validation_alias="AI_MARKET_TRADIER_ENABLED")
     deterministic_options_positioning_enabled: bool = Field(
@@ -1079,6 +1082,16 @@ class Settings(BaseSettings):
     )
     fred_timeout_seconds: float = Field(
         default=10.0, validation_alias="AI_MARKET_FRED_TIMEOUT_SECONDS"
+    )
+    sp_global_pmi_index_url: str = Field(
+        default="https://www.pmi.spglobal.com/Public/Home/PressRelease",
+        validation_alias="AI_MARKET_SP_GLOBAL_PMI_INDEX_URL",
+    )
+    sp_global_pmi_release_url: str | None = Field(
+        default=None, validation_alias="AI_MARKET_SP_GLOBAL_PMI_RELEASE_URL"
+    )
+    sp_global_pmi_timeout_seconds: float = Field(
+        default=10.0, validation_alias="AI_MARKET_SP_GLOBAL_PMI_TIMEOUT_SECONDS"
     )
     fred_retry_attempts: int = Field(
         default=3, ge=1, le=6, validation_alias="AI_MARKET_FRED_RETRY_ATTEMPTS"

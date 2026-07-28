@@ -205,9 +205,11 @@ def test_materialized_three_week_replay_and_authentic_full_sync() -> None:
         "xtb:146945:2026-07-24",
     ]
     assert summary["calendar"]["after"]["actual_missing_ids"] == []
-    assert summary["calendar"]["after"][
-        "unconfirmed_removals_retained"
-    ] == ["xtb:146392:2026-07-24"]
+    assert set(
+        summary["calendar"]["after"][
+            "unconfirmed_removals_retained"
+        ]
+    ) == set(summary["calendar"]["before"]["actual_missing_ids"])
     assert summary["catchup"]["actuals_recovered"] == 2
     assert summary["materialization"]["final_revision"] > summary[
         "materialization"

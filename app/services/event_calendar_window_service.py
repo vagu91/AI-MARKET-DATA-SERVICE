@@ -1166,6 +1166,20 @@ def _canonical_occurrence(
         ),
         "trigger_class": _occurrence_trigger_class(item, release_status),
         "lineage": _full_lineage(item),
+        "actual_resolution": (
+            item.get("actual_resolution")
+            if isinstance(item.get("actual_resolution"), dict)
+            else (
+                ((item.get("enrichment") or {}).get("summary") or {}).get(
+                    "actual_resolution"
+                )
+                if isinstance(item.get("enrichment"), dict)
+                else {}
+            )
+        ),
+        "actual_resolution_status": _nullable(
+            item.get("actual_resolution_status")
+        ),
         "source_evidence": [_source_evidence(item)],
     }
     lifecycle_classification = classify_occurrence_lifecycle(
@@ -1434,6 +1448,17 @@ def _full_lineage(item: dict[str, Any]) -> dict[str, Any]:
         or enrichment.get("retrieved_at"),
         "removal_status": item.get("removal_status"),
         "comparison_lineage": item.get("comparison_lineage") or {},
+        "actual_resolution": (
+            item.get("actual_resolution")
+            if isinstance(item.get("actual_resolution"), dict)
+            else (
+                (enrichment.get("summary") or {}).get(
+                    "actual_resolution"
+                )
+                if isinstance(enrichment.get("summary"), dict)
+                else {}
+            )
+        ),
     }
 
 

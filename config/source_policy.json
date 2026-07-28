@@ -47,6 +47,7 @@
     "exploratory_context": {"allowed_tiers": [1, 2, 3, 4, 5], "required_confirmations": 1, "ttl_minutes": 60, "max_reliability": 0.70}
   },
   "rules": [
+    {"domain": "pmi.spglobal.com", "publisher": "S&P Global Market Intelligence", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.98, "multiple_confirmation": false, "aggregator": false},
     {"domain": "bls.gov", "publisher": "U.S. Bureau of Labor Statistics", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
     {"domain": "bea.gov", "publisher": "U.S. Bureau of Economic Analysis", "tier": 1, "data_types": ["actual", "event", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},
     {"domain": "federalreserve.gov", "publisher": "Federal Reserve", "tier": 1, "data_types": ["actual", "event", "speech", "news"], "official_actual": true, "consensus": false, "news": true, "base_reliability": 0.99, "multiple_confirmation": false, "aggregator": false},

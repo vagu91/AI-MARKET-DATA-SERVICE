@@ -248,6 +248,7 @@ class MarketNewsRepository:
                 "relevance_tier", "exclusion_reason", "duplicate_group_id", "duplicate_of", "syndication_group",
                 "independent_source_count", "pipeline_version", "warnings", "content_status",
                 "distribution_source", "distributor", "publisher", "validation", "lineage", "content",
+                "headline", "content_availability", "provenance", "provider", "provider_name",
             ):
                 if data.get(key) in (None, "") and key in data["raw_payload"]:
                     data[key] = data["raw_payload"][key]

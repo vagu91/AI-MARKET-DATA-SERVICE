@@ -39,6 +39,7 @@ class BeaReleaseScheduleProvider(BaseProvider):
     provider_type = ProviderType.SCRAPER
     reliability = 0.84
     cache_key = "provider:bea_release_schedule:events:v2"
+    authoritative_calendar_coverage = True
 
     def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
@@ -64,6 +65,22 @@ class BeaReleaseScheduleProvider(BaseProvider):
             ),
             data=self._parse(response.text),
         )
+
+    def coverage_dates(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[date]:
+        timezone = ZoneInfo("America/New_York")
+        first = start.astimezone(timezone).date()
+        last = (end.astimezone(timezone) - datetime.resolution).date()
+        year = datetime.now(UTC).year
+        return [
+            first + (date.resolution * offset)
+            for offset in range((last - first).days + 1)
+            if (first + (date.resolution * offset)).year == year
+        ]
 
     def _parse(self, html: str) -> list[dict[str, object]]:
         lines = html_text_lines(html)

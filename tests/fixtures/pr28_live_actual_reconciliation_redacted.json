@@ -1,0 +1,175 @@
+{
+  "fixture_id": "pr28-live-actual-reconciliation-redacted",
+  "evidence": {
+    "source": "PR #28 isolated live acceptance artifacts and sandbox history",
+    "captured_at": "2026-07-27T17:48:03Z",
+    "redaction": "No credentials, headers, cookies, host paths, or unrelated records",
+    "canonical_expectation_note": "The corrected Flash Services PMI forecast is the acceptance oracle; it was absent from the captured incomplete provider candidate and must be revalidated in the next isolated live run."
+  },
+  "controlled_http_boundary": {
+    "redaction": "Synthetic HTTP responses at the provider network boundary; no live request or secret",
+    "fred": {
+      "HSN1F": [
+        {
+          "date": "2026-06-01",
+          "value": "628",
+          "realtime_start": "2026-07-24"
+        },
+        {
+          "date": "2026-05-01",
+          "value": "618",
+          "realtime_start": "2026-06-25"
+        }
+      ],
+      "default": [
+        {
+          "date": "2026-07-24",
+          "value": "1",
+          "realtime_start": "2026-07-24"
+        }
+      ]
+    },
+    "sp_global": {
+      "status_code": 403,
+      "body": "forbidden",
+      "expected_reason_code": "sp_global_public_release_access_restricted"
+    }
+  },
+  "initial_events": [
+    {
+      "event_id": "xtb:146392:2026-07-24",
+      "provider": "XTB Economic Calendar",
+      "source_event_id": "146392",
+      "occurrence_id": "xtb:146392:2026-07-24",
+      "name": "Vendita case nuove",
+      "country": "US",
+      "category": "Economic",
+      "reference_period": "Giugno",
+      "frequency": "monthly",
+      "date": "2026-07-24",
+      "time_utc": "2026-07-24T14:00:00Z",
+      "release_at": "2026-07-24T14:00:00Z",
+      "impact": "HIGH",
+      "actual": null,
+      "forecast": 610.0,
+      "previous": 580.0,
+      "source": "XTB Economic Calendar",
+      "source_url": "https://www.xtb.com/it/calendario-economico",
+      "reliability": 0.8,
+      "enrichment": {
+        "actual": null,
+        "forecast": 610.0,
+        "consensus": 610.0,
+        "previous": 580.0
+      }
+    },
+    {
+      "event_id": "xtb:146945:2026-07-24",
+      "provider": "XTB Economic Calendar",
+      "source_event_id": "146945",
+      "occurrence_id": "xtb:146945:2026-07-24",
+      "name": "Indice PMI dei servizi",
+      "country": "US",
+      "category": "Economic",
+      "reference_period": "Luglio",
+      "frequency": "monthly",
+      "date": "2026-07-24",
+      "time_utc": "2026-07-24T13:45:00Z",
+      "release_at": "2026-07-24T13:45:00Z",
+      "impact": "HIGH",
+      "actual": null,
+      "forecast": 51.5,
+      "previous": 51.2,
+      "source": "XTB Economic Calendar",
+      "source_url": "https://www.xtb.com/it/calendario-economico",
+      "reliability": 0.8,
+      "enrichment": {
+        "actual": null,
+        "forecast": 51.5,
+        "consensus": 51.5,
+        "previous": 51.2
+      }
+    }
+  ],
+  "provider_payload": {
+    "status": "found",
+    "source": "XTB Economic Calendar",
+    "provider": "XTB Economic Calendar",
+    "source_url": "https://www.xtb.com/it/calendario-economico",
+    "retrieved_at": "2026-07-25T10:00:00Z",
+    "items": [
+      {
+        "occurrence_id": "xtb:146392:2026-07-24",
+        "source_event_id": "146392",
+        "event_name": "Vendita case nuove",
+        "normalized_event_type": "new_home_sales",
+        "country": "US",
+        "date": "2026-07-24",
+        "release_at": "2026-07-24T14:00:00Z",
+        "impact": "HIGH",
+        "actual": 628.0,
+        "forecast": 610.0,
+        "consensus": 610.0,
+        "consensus_verified": true,
+        "previous": 618.0,
+        "actual_is_official": false,
+        "reference_period": "Giugno",
+        "frequency": "monthly",
+        "source": "XTB Economic Calendar",
+        "source_url": "https://www.xtb.com/it/calendario-economico",
+        "reliability": 0.8,
+        "retrieved_at": "2026-07-25T10:00:00Z",
+        "lineage": {
+          "actual": {
+            "source": "XTB Economic Calendar",
+            "source_field": "current"
+          },
+          "consensus": {
+            "source": "XTB Economic Calendar",
+            "source_field": "forecast"
+          },
+          "previous": {
+            "source": "XTB Economic Calendar",
+            "source_field": "previous"
+          }
+        }
+      },
+      {
+        "occurrence_id": "xtb:146945:2026-07-24",
+        "source_event_id": "146945",
+        "event_name": "Indice PMI dei servizi",
+        "normalized_event_type": "services_pmi",
+        "country": "US",
+        "date": "2026-07-24",
+        "release_at": "2026-07-24T13:45:00Z",
+        "impact": "HIGH",
+        "actual": 53.6,
+        "forecast": 52.0,
+        "consensus": 52.0,
+        "consensus_verified": true,
+        "previous": 51.2,
+        "actual_is_official": false,
+        "reference_period": "Luglio",
+        "frequency": "monthly",
+        "source": "XTB Economic Calendar",
+        "source_url": "https://www.xtb.com/it/calendario-economico",
+        "reliability": 0.8,
+        "retrieved_at": "2026-07-25T10:00:00Z",
+        "lineage": {
+          "actual": {
+            "source": "XTB Economic Calendar",
+            "source_field": "current"
+          },
+          "consensus": {
+            "source": "XTB Economic Calendar",
+            "source_field": "forecast"
+          },
+          "previous": {
+            "source": "XTB Economic Calendar",
+            "source_field": "previous"
+          }
+        }
+      }
+    ]
+  }
+}

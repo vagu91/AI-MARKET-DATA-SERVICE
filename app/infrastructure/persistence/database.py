@@ -32,6 +32,18 @@ def connect_sqlite(path: Path, *, timeout_seconds: float = 30.0) -> sqlite3.Conn
     return conn
 
 
+def connect_sqlite_read_only(path: Path) -> sqlite3.Connection:
+    """Open an existing SQLite database without write-capable pragmas."""
+
+    uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 @dataclass(frozen=True)
 class Database:
     path: Path

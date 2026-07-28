@@ -716,7 +716,12 @@ def test_latest_jobs_is_newest_first_and_compact_view_omits_payloads(
         "job_type": "MNQ_MARKET_RESEARCH",
         "symbol": "MNQ",
         "correlation_id": "latest-order",
-        "request_payload": {"large_market_payload": "x" * 10_000},
+        "request_payload": {
+            "large_market_payload": "x" * 10_000,
+            "execution_context": ExecutionContext.explicit_ai(
+                correlation_id="latest-order",
+            ).as_payload(),
+        },
         "policy_version": "test-policy",
         "prompt_version": "test-prompt",
     }

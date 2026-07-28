@@ -136,7 +136,7 @@ def telemetry_counts(settings: Settings) -> dict[str, int]:
         }
 
 
-def test_provider_only_release_actual_executes_resolver_without_ai(
+def test_provider_only_release_actual_creates_no_persistent_job(
     tmp_path: Path,
 ) -> None:
     settings = cfg(
@@ -154,59 +154,16 @@ def test_provider_only_release_actual_executes_resolver_without_ai(
         now=datetime.now(UTC),
         execution_context=context,
     )
-    assert len(jobs) == 1
-    assert jobs[0]["job_type"] == "RELEASE_ACTUAL_REFRESH"
-    assert jobs[0]["request_payload"]["execution_context"] == context.as_payload()
-    resolver_calls: list[str] = []
-    backend_calls: list[str] = []
-
-    def resolver(job, _workspace, _timeout):
-        resolver_calls.append(str(job["job_id"]))
-        return {
-            "status": "NO_DATA",
-            "retryable": False,
-            "results": [],
-            "error": "official_actual_not_available",
-        }
-
-    def forbidden_backend(job, _workspace, _timeout):
-        backend_calls.append(str(job["job_id"]))
-        raise AssertionError("provider-only actual reached AI backend")
-
-    worker = AIResearchWorker(
-        settings,
-        executor=forbidden_backend,
-        actual_resolver=resolver,
-        worker_id="provider-only-worker",
-    )
-    assert worker.process_once() is True
-    completed = AIResearchJobRepository(settings).get(jobs[0]["job_id"])
-    assert completed["attempts"] == 1
-    assert completed["status"] == "NO_DATA"
-    assert resolver_calls == [jobs[0]["job_id"]]
-    assert backend_calls == []
+    assert jobs == []
+    assert table_count(settings, "ai_research_jobs") == 0
+    assert table_count(settings, "research_runs") == 0
     counts = telemetry_counts(settings)
-    assert counts.get("resolver_evaluation", 0) >= 1
-    assert counts.get("provider_request_attempted", 0) == 1
-    assert counts.get("provider_request_completed", 0) == 1
-    assert counts.get("provider_request_failed", 0) == 0
-    assert counts.get("ai_authorization", 0) == 0
+    assert counts.get("ai_authorization", 0) >= 1
+    assert counts.get("provider_request_attempted", 0) == 0
     assert counts.get("ai_invocation_attempted", 0) == 0
     assert counts.get("ai_invocation_completed", 0) == 0
     assert counts.get("ai_invocation_aborted", 0) == 0
     assert table_count(settings, "research_backend_invocations") == 0
-    with sqlite3.connect(settings.database_path) as connection:
-        tokens = connection.execute(
-            """
-            SELECT
-              COALESCE(SUM(json_extract(payload_json,'$.input_tokens')),0),
-              COALESCE(SUM(json_extract(payload_json,'$.output_tokens')),0),
-              COALESCE(SUM(json_extract(payload_json,'$.cached_tokens')),0)
-            FROM service_telemetry_events
-            WHERE event_name LIKE 'provider_request_%'
-            """
-        ).fetchone()
-    assert tokens == (0, 0, 0)
 
 
 def test_provider_failure_retries_deterministically_without_ai_fallback(
@@ -215,12 +172,12 @@ def test_provider_failure_retries_deterministically_without_ai_fallback(
     settings = cfg(
         tmp_path,
         official_actual_retry_seconds="17,31",
-        research_agents_enabled=False,
-        research_agent_macro_events_enabled=False,
+        research_agents_enabled=True,
+        research_agent_macro_events_enabled=True,
     )
     fixed_now = datetime(2026, 7, 25, 12, tzinfo=UTC)
     repository = AIResearchJobRepository(settings, clock=lambda: fixed_now)
-    context = ExecutionContext.provider_only(
+    context = ExecutionContext.explicit_ai(
         correlation_id="provider-retry",
         allow_live_providers=True,
     )
@@ -264,10 +221,9 @@ def test_provider_failure_retries_deterministically_without_ai_fallback(
     assert restored["last_retry_reason"] == "official_provider_transport_failed"
     assert backend_calls == []
     counts = telemetry_counts(settings)
-    assert counts.get("resolver_evaluation", 0) >= 1
     assert counts.get("provider_request_attempted", 0) == 1
     assert counts.get("provider_request_failed", 0) == 1
-    assert counts.get("ai_authorization", 0) == 0
+    assert counts.get("ai_authorization", 0) >= 1
     assert counts.get("ai_invocation_attempted", 0) == 0
     assert counts.get("ai_invocation_completed", 0) == 0
     assert counts.get("ai_invocation_aborted", 0) == 0
@@ -304,27 +260,10 @@ def test_persisted_test_origin_cannot_authorize_ai_outside_test_environment(
         policy_version="test",
         prompt_version="test",
     )
-    assert created is True
-    backend_calls: list[str] = []
-
-    def forbidden_backend(acquired, _workspace, _timeout):
-        backend_calls.append(str(acquired["job_id"]))
-        raise AssertionError("production accepted persisted test authority")
-
-    worker = AIResearchWorker(
-        settings,
-        repository=repository,
-        executor=forbidden_backend,
-        worker_id="non-test-worker",
-    )
-    assert worker.process_once() is False
-    rejected = repository.get(job["job_id"])
-    assert rejected["status"] == "REJECTED"
-    assert rejected["last_error"] == "AI_NOT_AUTHORIZED"
-    assert rejected["result_payload"]["diagnostic"][
-        "backend_invocation_attempted"
-    ] is False
-    assert backend_calls == []
+    assert created is False
+    assert job["last_error"] == "AI_NOT_AUTHORIZED"
+    assert job["job_id"] is None
+    assert table_count(settings, "ai_research_jobs") == 0
     assert table_count(settings, "research_backend_invocations") == 0
     assert telemetry_counts(settings).get("ai_invocation_attempted", 0) == 0
 
@@ -348,7 +287,7 @@ def test_explicit_context_is_persisted_and_worker_acquisition_is_fail_closed(
     assert len(jobs[0]["request_payload"]["event_keys"]) == 5
     assert jobs[0]["request_payload"]["execution_context"] == context.as_payload()
     repository = AIResearchJobRepository(settings)
-    unauthorized, _ = repository.enqueue(
+    unauthorized, unauthorized_created = repository.enqueue(
         idempotency_key="legacy-unauthorized",
         job_type="MISSING_EVENT_RESEARCH",
         symbol="MNQ",
@@ -377,18 +316,9 @@ def test_explicit_context_is_persisted_and_worker_acquisition_is_fail_closed(
         )
         is None
     )
-    rejected = repository.get(unauthorized["job_id"])
-    assert rejected["status"] == "REJECTED"
-    assert rejected["last_error"] == "AI_NOT_AUTHORIZED"
-    assert rejected["completed_at"] is not None
-    assert rejected["result_payload"]["diagnostic"] == {
-        "backend_invocation_attempted": False,
-        "category": "AI_NOT_AUTHORIZED",
-        "decision": "AI_SUPPRESSED",
-        "retryable": False,
-        "terminalized_at": rejected["completed_at"],
-    }
-    terminal_timestamp = rejected["completed_at"]
+    assert unauthorized_created is False
+    assert unauthorized["job_id"] is None
+    assert unauthorized["last_error"] == "AI_NOT_AUTHORIZED"
     assert (
         repository.acquire_next(
             "worker",
@@ -396,15 +326,13 @@ def test_explicit_context_is_persisted_and_worker_acquisition_is_fail_closed(
         )
         is None
     )
-    assert repository.get(unauthorized["job_id"])["completed_at"] == terminal_timestamp
     assert table_count(settings, "ai_research_job_attempts") == 1
     assert table_count(settings, "research_backend_invocations") == 0
     assert table_count(settings, "market_context_snapshots") == 0
     assert table_count(settings, "market_context_outbox") == 0
     with sqlite3.connect(settings.database_path) as connection:
         assert connection.execute(
-            "SELECT COUNT(*) FROM ai_research_job_attempts WHERE job_id=?",
-            (unauthorized["job_id"],),
+            "SELECT COUNT(*) FROM ai_research_jobs WHERE correlation_id='legacy'",
         ).fetchone()[0] == 0
 
 

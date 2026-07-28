@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
 
@@ -126,8 +126,9 @@ class ExactOccurrenceActualProviderAdapter:
             else {}
         )
         expected_key = str(
-            payload.get("canonical_event_key")
-            or payload.get("occurrence_id")
+            payload.get("occurrence_id")
+            or payload.get("event_id")
+            or payload.get("canonical_event_key")
             or canonical_event_key(payload)
         )
         expected_release = parse_datetime(
@@ -434,13 +435,20 @@ class MacroActualLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": "macro_actual_occurrence_not_released",
             }
+        atomic_provider_force = (
+            str(item.get("resolution_mode") or "")
+            == "prepare_atomic_provider_force"
+        )
         lookback_start = now - (
             timedelta(
                 days=int(
                     self.settings.event_calendar_catchup_lookback_days
                 )
             )
-            if self.settings.event_calendar_catchup_enabled
+            if (
+                self.settings.event_calendar_catchup_enabled
+                or atomic_provider_force
+            )
             else timedelta(
                 hours=int(self.settings.lifecycle_startup_catchup_hours)
             )
@@ -451,9 +459,16 @@ class MacroActualLifecycleProviderAdapter:
                 "reason": "macro_actual_occurrence_outside_lookback",
             }
 
-        expected_key = str(
-            payload.get("canonical_event_key")
-            or canonical_event_key(payload)
+        persisted_occurrence = str(
+            payload.get("occurrence_id") or payload.get("event_id") or ""
+        )
+        expected_key = (
+            persisted_occurrence
+            if persisted_occurrence.casefold().startswith("xtb:")
+            else str(
+                payload.get("canonical_event_key")
+                or canonical_event_key(payload)
+            )
         )
         entity_key = str(item.get("entity_key") or "")
         if entity_key.startswith("event:") and entity_key != expected_key:
@@ -461,25 +476,35 @@ class MacroActualLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": "macro_actual_item_identity_mismatch",
             }
-        tolerance = timedelta(minutes=1)
-        output = asyncio.run(
-            self.event_service.list_events(
-                country=str(payload.get("country") or "US"),
-                start=max(lookback_start, release - tolerance),
-                end=min(now, release + tolerance),
-                enrich=False,
+        exact = (
+            {
+                **payload,
+                "occurrence_id": expected_key,
+                "canonical_event_key": expected_key,
+            }
+            if atomic_provider_force
+            else None
+        )
+        if exact is None:
+            tolerance = timedelta(minutes=1)
+            output = asyncio.run(
+                self.event_service.list_events(
+                    country=str(payload.get("country") or "US"),
+                    start=max(lookback_start, release - tolerance),
+                    end=min(now, release + tolerance),
+                    enrich=False,
+                )
             )
-        )
-        rows = [_model_dump(row) for row in output]
-        exact = next(
-            (
-                row
-                for row in rows
-                if canonical_event_key(row) == expected_key
-                and _same_release_minute(row, release)
-            ),
-            None,
-        )
+            rows = [_model_dump(row) for row in output]
+            exact = next(
+                (
+                    row
+                    for row in rows
+                    if canonical_event_key(row) == expected_key
+                    and _same_release_minute(row, release)
+                ),
+                None,
+            )
         if exact is None:
             provider_results = [
                 _model_dump(result)
@@ -495,9 +520,13 @@ class MacroActualLifecycleProviderAdapter:
                 raise TemporaryLifecycleProviderError(
                     "macro_actual_calendar_provider_temporary_failure"
                 )
-            return {
-                "status": "NO_DATA",
-                "reason": "macro_actual_exact_occurrence_not_found",
+            # The calendar feed is allowed to age out a released occurrence.
+            # Its persisted occurrence payload remains the identity anchor; only
+            # an admitted official post-release source may supply the actual.
+            exact = {
+                **payload,
+                "occurrence_id": expected_key,
+                "canonical_event_key": expected_key,
             }
 
         direct = _exact_calendar_actual_datum(
@@ -548,6 +577,10 @@ class MacroActualLifecycleProviderAdapter:
                 payload.get("reference_period")
                 or payload.get("period")
             ),
+            persist_candidate=(
+                str(item.get("resolution_mode") or "")
+                != "prepare_atomic_provider_force"
+            ),
         )
         status = str(resolution.get("status") or "NO_DATA").upper()
         if status == "OFFICIAL_FEED_DELAYED" or resolution.get(
@@ -559,6 +592,19 @@ class MacroActualLifecycleProviderAdapter:
                     resolution.get("error")
                     or "official_macro_actual_feed_delayed"
                 ),
+                "reason_code": resolution.get("reason_code"),
+                "provider": resolution.get("provider"),
+                "source_series": resolution.get("source_series"),
+                "provider_http_outcome": resolution.get(
+                    "provider_http_outcome"
+                ),
+                "provider_call_count": int(
+                    resolution.get("provider_call_count") or 0
+                ),
+                "retryable": True,
+                "provider_request_attempted": True,
+                "provider_request_completed": False,
+                "provider_request_failed": True,
             }
         if status in {"FAILED", "TEMPORARY_ERROR"}:
             return {
@@ -599,6 +645,19 @@ class MacroActualLifecycleProviderAdapter:
             "reason": "official_macro_actual_resolved",
             "datum": datum,
             "missing_fields": missing_fields,
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+            "provider_request_failed": False,
+            "candidate": candidate,
+            "mapping_selected": resolution.get("mapping_selected"),
+            "source_series": resolution.get("source_series"),
+            "provider": resolution.get("provider"),
+            "provider_call_count": int(
+                resolution.get("provider_call_count") or 0
+            ),
+            "candidate_validation": resolution.get(
+                "candidate_validation"
+            ),
         }
 
 
@@ -782,14 +841,27 @@ class DeterministicLifecycleDueResolver:
             "RATE_LIMITED",
             "UNAVAILABLE",
         }:
+            failure_telemetry = {
+                **telemetry,
+                "provider_request_completed": False,
+                "provider_request_failed": provider_request_attempted,
+                **{
+                    key: result.get(key)
+                    for key in (
+                        "reason_code",
+                        "provider",
+                        "source_series",
+                        "provider_http_outcome",
+                        "provider_call_count",
+                        "retryable",
+                    )
+                    if result.get(key) is not None
+                },
+            }
             return self._temporary_failure(
                 item,
                 reason=str(result.get("reason") or status.lower()),
-                telemetry={
-                    **telemetry,
-                    "provider_request_completed": False,
-                    "provider_request_failed": provider_request_attempted,
-                },
+                telemetry=failure_telemetry,
             )
         if status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA", "NOT_CONFIGURED"}:
             return self._exhausted(
@@ -827,6 +899,24 @@ class DeterministicLifecycleDueResolver:
             triggering_event=item.get("triggering_event"),
             refresh_reason="deterministic_provider_resolved",
         )
+        if (
+            entity_type == "macro_actual"
+            and provider_datum.get("actual") not in (None, "")
+        ):
+            # An admitted official release is a completed occurrence, not an
+            # expiring quote. Its historical release timestamp must not make a
+            # newly resolved actual fail the generic TTL freshness gate.
+            lifecycle = replace(
+                lifecycle,
+                freshness_state="FRESH",
+                valid_until=None,
+                next_refresh_at=None,
+                next_retry_at=None,
+                retry_class=None,
+                negative_cache_key=None,
+                negative_cache_expires_at=None,
+                refresh_reason="official_macro_actual_resolved",
+            )
         if lifecycle.freshness_state != "FRESH":
             return self._exhausted(
                 item,
@@ -893,24 +983,59 @@ class DeterministicLifecycleDueResolver:
                 hours=int(self.settings.lifecycle_retry_deadline_hours)
             )
         )
+        terminal = retry_deadline_exhausted
+        payload = (
+            dict(item.get("payload") or {})
+            if isinstance(item.get("payload"), dict)
+            else {}
+        )
+        payload.setdefault("event_at", item.get("event_at"))
+        payload.setdefault("actual", None)
+        lifecycle = compute_datum_lifecycle(
+            str(item.get("entity_type") or "unknown"),
+            str(item.get("entity_key") or ""),
+            payload,
+            settings=self.settings,
+            now=self.clock(),
+            attempt_count=int(item.get("attempt_count") or 0) + 1,
+            no_data=not terminal,
+            fields_attempted=list(item.get("fields_attempted") or []),
+            session_state=item.get("session_state"),
+            triggering_event=item.get("triggering_event"),
+            retry_class="NO_DATA",
+            refresh_reason=reason,
+        )
+        if terminal:
+            lifecycle = replace(
+                lifecycle,
+                freshness_state="EXHAUSTED_NO_DATA",
+                next_refresh_at=None,
+                next_retry_at=None,
+                retry_class="EXHAUSTED_NO_DATA",
+                negative_cache_key=None,
+                negative_cache_expires_at=None,
+                refresh_reason=reason,
+            )
         return {
             "status": status,
             "reason": reason,
+            "lifecycle": lifecycle,
+            "next_retry_at": lifecycle.next_retry_at,
             "ai_eligible": bool(
-                decision["agent_enabled"] and not retry_deadline_exhausted
+                decision["agent_enabled"] and not terminal
             ),
             "agent_status": (
                 "ENABLED" if decision["agent_enabled"] else "DISABLED"
             ),
             "execution_status": (
                 "ELIGIBLE"
-                if decision["agent_enabled"] and not retry_deadline_exhausted
+                if decision["agent_enabled"] and not terminal
                 else "NOT_REQUESTED"
             ),
             "data_outcome": (
-                "NO_DATA" if retry_deadline_exhausted else "PENDING"
+                "NO_DATA" if terminal else "PENDING"
             ),
-            "retry_deadline_exhausted": retry_deadline_exhausted,
+            "retry_deadline_exhausted": terminal,
             "enablement": decision,
             **dict(telemetry or {}),
         }
@@ -1285,9 +1410,13 @@ def _official_actual_datum(
         candidate.get("source_url")
         or candidate.get("canonical_url")
     )
+    distributor = event.get("source") or event.get("provider")
+    distributor_url = event.get("source_url")
     actual_lineage = {
         "source": source,
         "publisher": candidate.get("publisher"),
+        "distributor": distributor,
+        "distributor_url": distributor_url,
         "source_url": source_url,
         "canonical_url": candidate.get("canonical_url"),
         "source_tier": candidate.get("source_tier") or 1,
@@ -1305,9 +1434,15 @@ def _official_actual_datum(
             or candidate.get("period")
         ),
         "retrieved_at": candidate.get("retrieved_at"),
+        "released_at": candidate.get("released_at") or candidate.get("release_timestamp"),
+        "validation_timestamp": candidate.get("validation_timestamp"),
+        "frequency": candidate.get("frequency"),
+        "unit": candidate.get("unit"),
+        "raw_lineage_redacted": candidate.get("raw_lineage_redacted"),
         "validation_status": (
             candidate.get("validation_status") or "accepted"
         ),
+        "source_field": "actual",
     }
     enrichment = (
         dict(event.get("enrichment") or {})
@@ -1315,10 +1450,45 @@ def _official_actual_datum(
         else {}
     )
     field_lineage = dict(enrichment.get("field_lineage") or {})
+    persisted_lineage = (
+        event.get("lineage")
+        if isinstance(event.get("lineage"), dict)
+        else {}
+    )
+    persisted_fields = dict(
+        persisted_lineage.get("field_lineage") or {}
+    )
+    if "forecast" not in field_lineage:
+        scheduled_forecast = (
+            persisted_fields.get("forecast")
+            or persisted_fields.get("consensus")
+        )
+        if isinstance(scheduled_forecast, dict):
+            field_lineage["forecast"] = {
+                **scheduled_forecast,
+                "field_semantics": "forecast",
+            }
     field_lineage["actual"] = actual_lineage
+    if candidate.get("previous") not in (None, ""):
+        field_lineage["previous"] = {
+            **actual_lineage,
+            "field_semantics": "previous",
+            "source_field": "previous",
+            "value": candidate.get("previous"),
+            "reference_period": candidate.get(
+                "previous_reference_period"
+            ),
+            "derivation": "previous_official_series_observation",
+        }
     enrichment.update(
         {
             "actual": value,
+            "forecast": event.get("forecast"),
+            "previous": (
+                candidate.get("previous")
+                if candidate.get("previous") not in (None, "")
+                else event.get("previous")
+            ),
             "source": source,
             "source_url": source_url,
             "field_lineage": field_lineage,
@@ -1330,6 +1500,13 @@ def _official_actual_datum(
         "release_at": release.isoformat(),
         "time_utc": release.isoformat(),
         "actual": value,
+        "previous": (
+            candidate.get("previous")
+            if candidate.get("previous") not in (None, "")
+            else event.get("previous")
+        ),
+        "previous_revised": candidate.get("previous_revised"),
+        "forecast": event.get("forecast"),
         "metric_id": (
             candidate.get("event_metric_id")
             or candidate.get("metric_id")
@@ -1349,11 +1526,45 @@ def _official_actual_datum(
         "published_at": (
             candidate.get("published_at") or release.isoformat()
         ),
+        "released_at": (
+            candidate.get("released_at")
+            or candidate.get("release_timestamp")
+            or release.isoformat()
+        ),
+        "validation_timestamp": (
+            candidate.get("validation_timestamp")
+            or candidate.get("retrieved_at")
+        ),
+        # A newly admitted official actual starts a fresh lifecycle.  Do not
+        # inherit the pre-release occurrence's expired cache/retry horizon.
+        "valid_until": candidate.get("valid_until"),
+        "next_refresh_at": candidate.get("next_refresh_at"),
+        "next_retry_at": None,
+        "frequency": candidate.get("frequency"),
+        "unit": candidate.get("unit"),
         "source": source,
         "source_url": source_url,
+        "distributor": distributor,
+        "distributor_url": distributor_url,
+        "actual_source": source,
+        "actual_source_url": source_url,
         "source_lineage": [actual_lineage],
+        "comparison_lineage": {
+            **dict(event.get("comparison_lineage") or {}),
+            "scheduled_previous": event.get("previous"),
+            "scheduled_previous_lineage": persisted_fields.get(
+                "previous"
+            ),
+            "official_previous": candidate.get("previous"),
+            "official_previous_semantics": (
+                "previous_official_series_observation"
+            ),
+        },
         "acquisition_method": "api_provider",
         "actual_is_official": True,
+        "awaiting_actual": False,
+        "status": "RELEASED",
+        "release_status": "RELEASED",
         "enrichment": enrichment,
     }
 

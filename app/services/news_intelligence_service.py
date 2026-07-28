@@ -263,12 +263,11 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         }
         for reason in decision.reasons
     )
+    # Distribution is provenance, not a URL classification.  An aggregator
+    # hostname (or a tracking parameter naming one) is insufficient evidence
+    # that the provider actually distributed this editorial record.
     distributor = (
-        "Yahoo Finance"
-        if aggregator_url and domain == "finance.yahoo.com"
-        else domain
-        if aggregator_url
-        else article.get("distribution_source") or article.get("distributor")
+        article.get("distribution_source") or article.get("distributor")
     )
     classified.update(
         {
@@ -470,6 +469,17 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     now = now or datetime.now(UTC)
     article = dict(raw)
     article["title"] = clean_text(article.get("title")) or ""
+    article["headline"] = article["title"]
+    raw_content = clean_text(
+        article.get("content")
+        or article.get("body")
+        or article.get("description")
+        or article.get("content_snippet")
+    )
+    article["content"] = raw_content
+    article["content_availability"] = (
+        "AVAILABLE" if raw_content else "SOURCE_NOT_PROVIDED"
+    )
     article["summary"] = _clean_summary(
         article.get("summary")
         or article.get("content_snippet")
@@ -497,7 +507,9 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     article["summary_reliability"] = round(
         max(0.0, min(1.0, article["summary_quality"] * (0.88 if article["summary_is_generated"] else 1.0))), 3
     )
-    article["source_text_available"] = bool(article.get("source_text_available") or article["summary"])
+    article["source_text_available"] = bool(
+        article.get("source_text_available") or raw_content or article["summary"]
+    )
     article["canonical_status"] = "canonical_resolved" if article.get("canonical_url") else "canonical_unresolved" if article.get("aggregator_url") else "canonical_unavailable"
     logger.info("news_metadata_extracted", extra=_log_fields(article))
 
@@ -507,6 +519,27 @@ def normalize_news_article(raw: dict[str, Any], *, now: datetime | None = None) 
     article["accepted"] = article["exclusion_reason"] is None
     article["content_status"] = "invalid_content" if news_content_status(article) == "invalid_content" else "valid"
     article["article_id"] = _stable_hash(article.get("canonical_url") or f"{article.get('original_publisher')}:{_normalized_title(article.get('title'))}")
+    provenance = {
+        "article_id": article["article_id"],
+        "provider": article.get("provider") or article.get("provider_name"),
+        "source": article.get("source"),
+        "publisher": article.get("publisher")
+        or article.get("original_publisher"),
+        "distributor": article.get("distribution_source"),
+        "source_url": article.get("source_url"),
+        "canonical_url": article.get("canonical_url"),
+        "published_at": article.get("published_at"),
+        "retrieved_at": article.get("retrieved_at"),
+        "validation": article.get("validation"),
+        "content_availability": article["content_availability"],
+    }
+    upstream_lineage = (
+        dict(article.get("lineage") or {})
+        if isinstance(article.get("lineage"), dict)
+        else {}
+    )
+    article["provenance"] = {**upstream_lineage, **provenance}
+    article["lineage"] = dict(article["provenance"])
     article["duplicate_group_id"] = _syndication_key(article)
     article["syndication_group"] = article["duplicate_group_id"]
     article["is_duplicate"] = False

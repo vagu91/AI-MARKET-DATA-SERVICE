@@ -118,6 +118,14 @@ OFFICIAL_METRICS: dict[str, OfficialMetricSpec] = {
         "international_trade_balance", "CENSUS", "CENSUS:FTD:TRADE_BALANCE", "level", "SA",
         "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/foreign-trade/",
     ),
+    "new_home_sales": OfficialMetricSpec(
+        "new_home_sales", "FRED", "HSN1F", "level", "SAAR",
+        "monthly", "thousands_annual_rate", 1, "1", "https://fred.stlouisfed.org/series/HSN1F",
+    ),
+    "flash_services_pmi": OfficialMetricSpec(
+        "flash_services_pmi", "SPGLOBAL", "SPGLOBAL:US:FLASH_SERVICES_PMI", "level", "SA",
+        "monthly", "index_points", 1, "0.1", "https://www.pmi.spglobal.com/Public/Home/PressRelease",
+    ),
 }
 
 
@@ -182,6 +190,16 @@ def derive_official_actual(
         "release_vintage": release_vintage,
         "current_level": _decimal_text(current["value"]),
         "comparison_level": _decimal_text(previous["value"]) if previous else None,
+        "previous": (
+            _decimal_text(previous["value"])
+            if previous is not None and spec.transformation == "level"
+            else None
+        ),
+        "previous_reference_period": (
+            previous["period"]
+            if previous is not None and spec.transformation == "level"
+            else None
+        ),
         "calculation_lineage": lineage,
         "warnings": warnings,
     }

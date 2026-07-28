@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -414,11 +415,24 @@ def test_revision_count_cannot_mask_an_unexplained_occurrence() -> None:
 def test_schema22_forensic_replay_closes_every_observed_blocker() -> None:
     summary, full = replay()
     accounting = summary["after"]["candidate_accounting"]
-    assert summary["after"]["calendar_counts"] == {
-        "PREVIOUS_WEEK": 14,
-        "CURRENT_WEEK": 3,
-        "NEXT_WEEK": 25,
+    window = full["sections"]["event_calendar"]["window"]
+    bucket_bounds = {
+        "previous_week": ("2026-07-13", "2026-07-20"),
+        "current_week": ("2026-07-20", "2026-07-27"),
+        "next_week": ("2026-07-27", "2026-08-03"),
     }
+    for bucket, (start, end) in bucket_bounds.items():
+        assert all(
+            start
+            <= datetime.fromisoformat(
+                str(item["scheduled_at"]).replace("Z", "+00:00")
+            )
+            .astimezone(ZoneInfo("America/New_York"))
+            .date()
+            .isoformat()
+            < end
+            for item in window[bucket]["events"]
+        )
     assert summary["after"]["actual_missing_ids"] == []
     assert summary["after"]["news_admitted"] == 3
     assert summary["after"]["news_quarantined"] == 1

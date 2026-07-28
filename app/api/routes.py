@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -8,6 +9,7 @@ from app.api.deps import (
     get_enrichment_orchestrator,
     get_event_service,
     get_event_window_service,
+    get_lifecycle_due_resolver,
     get_macro_service,
     get_nasdaq_data_service,
 )
@@ -55,7 +57,11 @@ from app.infrastructure.persistence.database_maintenance import analyze_database
 from app.infrastructure.persistence.migrations import migrate_database
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.infrastructure.storage_retention import retention_policy_report, storage_health
-from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
+from app.services.temporal_domain_service import (
+    canonical_event_key,
+    exact_occurrence_key,
+    reconcile_calendar_events,
+)
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
@@ -69,12 +75,85 @@ from app.services.market_context_outbox_service import (
 )
 from app.services.research_agent_enablement import safe_research_agent_capabilities
 from app.services.execution_context import ExecutionContext
+from app.services.provider_force_actual_reconciliation_service import (
+    ProviderForceActualReconciliationService,
+)
+from app.services.observability_contract_service import TelemetryRepository
+from app.services.force_generation_lease_service import (
+    ForceGenerationLease,
+)
 from app.services.market_context_sync_service import (
     MarketContextSyncService,
     SyncContractError,
 )
 
 router = APIRouter()
+
+
+def _emit_force_finalization(
+    settings: object,
+    *,
+    plan: dict[str, object],
+    status: str,
+    reason_code: str,
+) -> None:
+    payload = {
+        "occurrence_id": None,
+        "lifecycle_before": None,
+        "eligibility": None,
+        "reclaim_reason": None,
+        "resolver_invoked": None,
+        "provider_attempted": None,
+        "source_series": None,
+        "reconciliation_outcome": None,
+        "generation_id": plan.get("generation_id"),
+        "finalization_status": status,
+        "canonical_write_count": (
+            int(plan.get("occurrence_write_count") or 0)
+            if status == "COMMITTED"
+            else 0
+        ),
+        "lifecycle_write_count": (
+            int(
+                plan.get(
+                    "discovery_lifecycle_write_count"
+                )
+                or 0
+            )
+            if status == "COMMITTED"
+            else 0
+        ),
+        "coverage_write_count": (
+            int(plan.get("coverage_write_count") or 0)
+            if status == "COMMITTED"
+            else 0
+        ),
+        "snapshot_write_count": 1 if status == "COMMITTED" else 0,
+        "outbox_write_count": None,
+        "reason_code": reason_code,
+    }
+    try:
+        TelemetryRepository(settings).emit(
+            "provider_force_generation",
+            identifiers={
+                "generation_id": plan.get("generation_id"),
+            },
+            decision_summary=f"force generation {status.lower()}",
+            stop_reason=reason_code,
+            payload=payload,
+        )
+    except Exception:
+        # Telemetry is explicitly non-canonical and cannot turn a committed or
+        # safely aborted force generation into an HTTP 500.
+        return
+
+
+def _force_plan_has_writes(plan: dict[str, object]) -> bool:
+    tables = plan.get("tables")
+    return bool(
+        isinstance(tables, dict)
+        and any(bool(rows) for rows in tables.values())
+    )
 
 
 @router.get("/health")
@@ -301,6 +380,7 @@ async def market_context_mnq(
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
     deterministic_runtime=Depends(get_deterministic_provider_runtime),
+    lifecycle_due_resolver=Depends(get_lifecycle_due_resolver),
 ) -> dict[str, object]:
     settings = enrichment_orchestrator.settings
     snapshots = MarketContextSnapshotRepository(settings)
@@ -321,18 +401,118 @@ async def market_context_mnq(
         enrichment_orchestrator=enrichment_orchestrator,
     )
     if refresh in {"false", "force"}:
-        contract = await diagnostics.full_model(
-            country="US",
-            days=30,
-            symbol="MNQ",
-            fetch_missing_nasdaq=refresh == "force",
-            refresh=refresh,
+        canonical_generation_plan: dict[str, object] = {}
+        force_lock = (
+            ForceGenerationLease(settings.database_path)
+            if refresh == "force"
+            else None
         )
-        contract = await deterministic_runtime.enrich_market_context(
-            contract,
-            refresh=refresh,
-        )
-        return _materialize_market_context(contract, refresh=refresh, view=view, settings=settings)
+        if force_lock is not None:
+            await asyncio.to_thread(force_lock.acquire)
+        try:
+            contract = await diagnostics.full_model(
+                country="US",
+                days=30,
+                symbol="MNQ",
+                fetch_missing_nasdaq=refresh == "force",
+                refresh=refresh,
+            )
+            canonical_generation_plan = (
+                dict(
+                    getattr(
+                        diagnostics,
+                        "force_generation_plan",
+                        {},
+                    )
+                )
+                if refresh == "force"
+                else {}
+            )
+            contract = await deterministic_runtime.enrich_market_context(
+                contract,
+                refresh=refresh,
+            )
+            actual_plan = None
+            if (
+                refresh == "force"
+                and hasattr(lifecycle_due_resolver, "resolve")
+            ):
+                actual_plan = await asyncio.to_thread(
+                    ProviderForceActualReconciliationService(
+                        settings,
+                        lifecycle_resolver=lifecycle_due_resolver,
+                        generation_id=str(
+                            canonical_generation_plan.get(
+                                "generation_id"
+                            )
+                            or ""
+                        ),
+                        coverage_write_count=int(
+                            canonical_generation_plan.get(
+                                "coverage_write_count"
+                            )
+                            or 0
+                        ),
+                    ).prepare,
+                    contract,
+                )
+                contract = actual_plan["contract"]
+            if (
+                refresh == "force"
+                and not _force_plan_has_writes(
+                    canonical_generation_plan
+                )
+                and not list(
+                    (actual_plan or {}).get("resolved_items") or []
+                )
+                and not list(
+                    (actual_plan or {}).get(
+                        "canonical_reconciliations"
+                    )
+                    or []
+                )
+            ):
+                previous = snapshots.latest("MNQ")
+                if previous is not None:
+                    _emit_force_finalization(
+                        settings,
+                        plan=canonical_generation_plan,
+                        status="NO_OP",
+                        reason_code="FORCE_FIXED_POINT",
+                    )
+                    return (
+                        previous["debug_payload"]
+                        if view == "debug"
+                        else previous["consumer_payload"]
+                    )
+            response = _materialize_market_context(
+                contract,
+                refresh=refresh,
+                view=view,
+                settings=settings,
+                actual_reconciliation_plan=actual_plan,
+                canonical_generation_plan=canonical_generation_plan,
+            )
+            if refresh == "force":
+                _emit_force_finalization(
+                    settings,
+                    plan=canonical_generation_plan,
+                    status="COMMITTED",
+                    reason_code="FORCE_GENERATION_COMMITTED",
+                )
+            return response
+        except Exception as exc:
+            if refresh == "force":
+                _emit_force_finalization(
+                    settings,
+                    plan=canonical_generation_plan,
+                    status="ABORTED",
+                    reason_code=type(exc).__name__,
+                )
+            raise
+        finally:
+            if force_lock is not None:
+                force_lock.release()
     macro, macro_quality = await diagnostics._macro_db_first()
     events_today_data = await event_service.today(country="US")
     now = datetime.now(UTC)
@@ -402,7 +582,7 @@ async def market_context_mnq(
     for event in upcoming:
         facts_repository.upsert_economic_event(
             event,
-            event_key=canonical_event_key(event),
+            event_key=exact_occurrence_key(event),
             valid_until=enrichment_orchestrator.freshness.macro_valid_until(event),
         )
     ranked_consensus = merge_consensus_provider_payloads(investing_payload, xtb_payload)
@@ -521,6 +701,7 @@ async def market_context_mnq_debug(
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
     deterministic_runtime=Depends(get_deterministic_provider_runtime),
+    lifecycle_due_resolver=Depends(get_lifecycle_due_resolver),
 ) -> dict[str, object]:
     return await market_context_mnq(
         refresh=refresh,
@@ -531,6 +712,7 @@ async def market_context_mnq_debug(
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
         deterministic_runtime=deterministic_runtime,
+        lifecycle_due_resolver=lifecycle_due_resolver,
     )
 
 
@@ -544,6 +726,7 @@ async def market_context_mnq_consumer(
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
     enrichment_orchestrator: EnrichmentOrchestrator = Depends(get_enrichment_orchestrator),
     deterministic_runtime=Depends(get_deterministic_provider_runtime),
+    lifecycle_due_resolver=Depends(get_lifecycle_due_resolver),
 ) -> dict[str, object]:
     response.headers["Deprecation"] = "true"
     response.headers["Link"] = (
@@ -558,6 +741,7 @@ async def market_context_mnq_consumer(
         nasdaq_service=nasdaq_service,
         enrichment_orchestrator=enrichment_orchestrator,
         deterministic_runtime=deterministic_runtime,
+        lifecycle_due_resolver=lifecycle_due_resolver,
     )
 
 
@@ -757,6 +941,8 @@ def _materialize_market_context(
     refresh: str,
     view: str,
     settings,
+    actual_reconciliation_plan: dict[str, object] | None = None,
+    canonical_generation_plan: dict[str, object] | None = None,
 ) -> dict[str, object]:
     snapshots = MarketContextSnapshotRepository(settings)
     event_keys = _context_event_keys(contract)
@@ -765,7 +951,11 @@ def _materialize_market_context(
     debug["data_as_of"] = debug.get("generated_at_utc") or debug.get("generated_at")
     debug["ai_enrichment"] = ai_enrichment
     debug["research"] = _research_summary(ResearchRuntimeRepository(settings).latest("MNQ"))
-    debug = harden_market_context(debug, settings=settings)
+    debug = harden_market_context(
+        debug,
+        settings=settings,
+        force_recalculate=actual_reconciliation_plan is not None,
+    )
     stored = snapshots.save_next(
         symbol="MNQ",
         refresh_mode=refresh,
@@ -773,6 +963,18 @@ def _materialize_market_context(
         ai_enrichment=ai_enrichment,
         source_job_id=(ai_enrichment.get("job_ids") or [None])[0],
         job_ids=list(ai_enrichment.get("job_ids") or []),
+        resolved_items=list(
+            (actual_reconciliation_plan or {}).get("resolved_items")
+            or []
+        ),
+        canonical_reconciliations=list(
+            (actual_reconciliation_plan or {}).get(
+                "canonical_reconciliations"
+            )
+            or []
+        ),
+        canonical_generation_plan=canonical_generation_plan,
+        skip_if_unchanged=refresh == "force",
     )
     consumer = stored["consumer_payload"]
     record_final_consumer_events(

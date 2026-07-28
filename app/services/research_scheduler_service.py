@@ -6,7 +6,7 @@ import inspect
 import json
 import logging
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -22,7 +22,10 @@ from app.services.event_calendar_coverage_repository import (
     EventCalendarCoverageRepository,
 )
 from app.services.temporal_domain_service import temporal_event_state
-from app.services.temporal_domain_service import canonical_event_key
+from app.services.temporal_domain_service import (
+    canonical_event_key,
+    exact_occurrence_key,
+)
 from app.services.data_freshness_service import parse_datetime
 from app.services.research_gap_manifest import ResearchGapManifestBuilder
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
@@ -1473,19 +1476,25 @@ class ResearchSchedulerService:
         *,
         schedule_acquire: Callable[..., Any] | None,
         now: datetime,
+        materialize_snapshot: bool = True,
     ) -> dict[str, Any]:
         if schedule_acquire is None:
             return self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=None,
                 now=now,
+                materialize_snapshot=materialize_snapshot,
             )
-        if not self._canonical_schedule_has_due_dates(now=now):
+        if not self._canonical_schedule_has_due_dates(
+            now=now,
+            schedule_acquire=schedule_acquire,
+        ):
             backoff = self._canonical_schedule_backoff(now=now)
             if backoff is not None:
                 return backoff
             return self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=schedule_acquire,
                 now=now,
+                materialize_snapshot=materialize_snapshot,
             )
         lease_owner = f"schedule-catchup-{uuid.uuid4()}"
         lease = self._acquire_schedule_seed_lease(
@@ -1506,6 +1515,7 @@ class ResearchSchedulerService:
             result = self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=schedule_acquire,
                 now=now,
+                materialize_snapshot=materialize_snapshot,
             )
         except BaseException:
             self._complete_schedule_seed_lease(
@@ -1529,6 +1539,7 @@ class ResearchSchedulerService:
         self,
         *,
         now: datetime,
+        schedule_acquire: Callable[..., Any] | None = None,
     ) -> bool:
         timezone = ZoneInfo(
             str(
@@ -1545,16 +1556,50 @@ class ResearchSchedulerService:
             previous_start + timedelta(days=offset)
             for offset in range(21)
         ]
-        return bool(
+        window_start = datetime.combine(
+            previous_start,
+            datetime.min.time(),
+            timezone,
+        ).astimezone(UTC)
+        window_end = datetime.combine(
+            current_start + timedelta(days=14),
+            datetime.min.time(),
+            timezone,
+        ).astimezone(UTC)
+        owner = (
+            getattr(schedule_acquire, "__self__", None)
+            if schedule_acquire is not None
+            else None
+        )
+        target_loader = getattr(owner, "coverage_targets", None)
+        targets = (
+            list(
+                target_loader(
+                    country="US",
+                    start=window_start,
+                    end=window_end,
+                )
+            )
+            if callable(target_loader)
+            else []
+        )
+        if not targets:
+            targets = [
+                {
+                    "provider_name": "economic_calendar_composite",
+                    "query_scope": "country=US",
+                }
+            ]
+        policy_version = self.market_facts.source_policy.policy_version
+        return any(
             self.calendar_coverage.missing_dates(
                 requested_days,
-                provider_name="economic_calendar_composite",
-                query_scope="country=US",
+                provider_name=str(target["provider_name"]),
+                query_scope=str(target["query_scope"]),
                 now=now,
-                policy_version=(
-                    self.market_facts.source_policy.policy_version
-                ),
+                policy_version=policy_version,
             )
+            for target in targets
         )
 
     def _canonical_schedule_backoff(
@@ -1590,6 +1635,7 @@ class ResearchSchedulerService:
         *,
         schedule_acquire: Callable[..., Any] | None,
         now: datetime,
+        materialize_snapshot: bool = True,
     ) -> dict[str, Any]:
         timezone = ZoneInfo(
             str(
@@ -1613,19 +1659,56 @@ class ResearchSchedulerService:
             datetime.min.time(),
             timezone,
         ).astimezone(UTC)
-        provider_name = "economic_calendar_composite"
-        query_scope = "country=US"
         policy_version = self.market_facts.source_policy.policy_version
         requested_days = [
             previous_start + timedelta(days=offset)
             for offset in range((next_end_date - previous_start).days + 1)
         ]
-        missing_days = self.calendar_coverage.missing_dates(
-            requested_days,
-            provider_name=provider_name,
-            query_scope=query_scope,
-            now=now,
-            policy_version=policy_version,
+        owner = (
+            getattr(schedule_acquire, "__self__", None)
+            if schedule_acquire is not None
+            else None
+        )
+        target_loader = getattr(owner, "coverage_targets", None)
+        coverage_targets = (
+            list(
+                target_loader(
+                    country="US",
+                    start=window_start,
+                    end=window_end,
+                )
+            )
+            if callable(target_loader)
+            else []
+        )
+        if not coverage_targets:
+            coverage_targets = [
+                {
+                    "provider_name": "economic_calendar_composite",
+                    "query_scope": "country=US",
+                }
+            ]
+        missing_by_target: dict[tuple[str, str], list[date]] = {}
+        for target in coverage_targets:
+            target_key = (
+                str(target["provider_name"]),
+                str(target["query_scope"]),
+            )
+            missing_by_target[target_key] = (
+                self.calendar_coverage.missing_dates(
+                    requested_days,
+                    provider_name=target_key[0],
+                    query_scope=target_key[1],
+                    now=now,
+                    policy_version=policy_version,
+                )
+            )
+        missing_days = sorted(
+            {
+                day
+                for target_days in missing_by_target.values()
+                for day in target_days
+            }
         )
         coverage = {
             "window_start": window_start.isoformat(),
@@ -1655,18 +1738,22 @@ class ResearchSchedulerService:
                 day.isoformat() for day in missing_days
             ],
             "provider_calls_avoided": len(requested_days) - len(missing_days),
-            "provider_calls_due": len(
-                _contiguous_date_segments(
-                    missing_days,
-                    timezone=timezone,
-                    upper_bound=window_end,
+            "provider_calls_due": sum(
+                len(
+                    _contiguous_date_segments(
+                        target_days,
+                        timezone=timezone,
+                        upper_bound=window_end,
+                    )
                 )
+                for target_days in missing_by_target.values()
             ),
             "provider_calls_executed": 0,
             "canonical_writes": 0,
             "coverage_metadata_writes": 0,
             "snapshot_writes": 0,
             "outbox_writes": 0,
+            "materialization_deferred": not materialize_snapshot,
         }
         if missing_days and schedule_acquire is None:
             coverage["status"] = "UNVERIFIED_EMPTY"
@@ -1677,77 +1764,122 @@ class ResearchSchedulerService:
         provider_successes = 0
         failed_segments: list[tuple[datetime, datetime, str]] = []
         segment_proofs: list[
-            tuple[datetime, datetime, dict[str, Any]]
+            tuple[str, str, datetime, datetime, dict[str, Any]]
         ] = []
-        for segment_start, segment_end in _contiguous_date_segments(
-            missing_days,
-            timezone=timezone,
-            upper_bound=window_end,
+        for (provider_name, query_scope), target_days in (
+            missing_by_target.items()
         ):
-            coverage["provider_calls"] += 1
-            coverage["provider_calls_executed"] += 1
-            try:
-                output = schedule_acquire(
-                    country="US",
-                    start=segment_start,
-                    end=segment_end,
-                    enrich=False,
+            for segment_start, segment_end in _contiguous_date_segments(
+                target_days,
+                timezone=timezone,
+                upper_bound=window_end,
+            ):
+                coverage["provider_calls"] += 1
+                coverage["provider_calls_executed"] += 1
+                call_kwargs: dict[str, Any] = {
+                    "country": "US",
+                    "start": segment_start,
+                    "end": segment_end,
+                    "enrich": False,
+                }
+                if provider_name != "economic_calendar_composite":
+                    call_kwargs["provider_names"] = [provider_name]
+                try:
+                    output = schedule_acquire(**call_kwargs)
+                    if inspect.isawaitable(output):
+                        output = asyncio.run(output)
+                except Exception as exc:
+                    failed_segments.append(
+                        (
+                            segment_start,
+                            segment_end,
+                            type(exc).__name__,
+                        )
+                    )
+                    continue
+                call_owner = (
+                    getattr(schedule_acquire, "__self__", None)
+                    or schedule_acquire
                 )
-                if inspect.isawaitable(output):
-                    output = asyncio.run(output)
-            except Exception as exc:
-                failed_segments.append(
-                    (segment_start, segment_end, type(exc).__name__)
+                provider_proofs = list(
+                    getattr(
+                        call_owner,
+                        "last_provider_coverage_proofs",
+                        [],
+                    )
+                    or []
                 )
-                continue
-            owner = getattr(schedule_acquire, "__self__", None) or schedule_acquire
-            proof = _normalized_coverage_proof(
-                getattr(owner, "last_coverage_proof", None)
-                or getattr(owner, "coverage_proof", None)
-            )
-            segment_proofs.append((segment_start, segment_end, proof))
-            segment_results = list(
-                getattr(owner, "last_provider_results", []) or []
-            )
-            provider_results.extend(segment_results)
-            segment_successes = sum(
-                1
-                for result in segment_results
-                if not list(getattr(result, "errors", []) or [])
-            )
-            if segment_results and segment_successes == 0:
-                failed_segments.append(
+                matching_proof = next(
                     (
+                        item
+                        for item in provider_proofs
+                        if str(item.get("provider_name"))
+                        == provider_name
+                        and str(item.get("query_scope"))
+                        == query_scope
+                    ),
+                    None,
+                )
+                proof = _normalized_coverage_proof(
+                    matching_proof
+                    or getattr(call_owner, "last_coverage_proof", None)
+                    or getattr(call_owner, "coverage_proof", None)
+                )
+                segment_proofs.append(
+                    (
+                        provider_name,
+                        query_scope,
                         segment_start,
                         segment_end,
-                        "all_schedule_providers_failed",
+                        proof,
                     )
                 )
-                continue
-            provider_successes += max(segment_successes, 1)
-            rows.extend(
-                (
-                    item.model_dump(mode="json")
-                    if hasattr(item, "model_dump")
-                    else dict(item)
+                segment_results = list(
+                    getattr(call_owner, "last_provider_results", []) or []
                 )
-                for item in (output or [])
-                if hasattr(item, "model_dump") or isinstance(item, dict)
-            )
+                provider_results.extend(segment_results)
+                segment_successes = sum(
+                    1
+                    for result in segment_results
+                    if not list(getattr(result, "errors", []) or [])
+                )
+                if segment_results and segment_successes == 0:
+                    failed_segments.append(
+                        (
+                            segment_start,
+                            segment_end,
+                            "all_schedule_providers_failed",
+                        )
+                    )
+                    continue
+                provider_successes += max(segment_successes, 1)
+                rows.extend(
+                    (
+                        item.model_dump(mode="json")
+                        if hasattr(item, "model_dump")
+                        else dict(item)
+                    )
+                    for item in (output or [])
+                    if hasattr(item, "model_dump")
+                    or isinstance(item, dict)
+                )
         coverage["provider_result_count"] = len(provider_results)
         coverage["provider_success_count"] = provider_successes
         if missing_days and failed_segments and not rows:
             retry_at = (now + timedelta(minutes=5)).astimezone(UTC)
-            for day in missing_days:
-                day_start, day_end = _local_day_bounds(
-                    day,
-                    timezone,
-                    window_end,
-                )
-                changed = self.calendar_coverage.record_day(
-                    day,
-                    provider_name=provider_name,
-                    query_scope=query_scope,
+            for (provider_name, query_scope), target_days in (
+                missing_by_target.items()
+            ):
+                for day in target_days:
+                    day_start, day_end = _local_day_bounds(
+                        day,
+                        timezone,
+                        window_end,
+                    )
+                    changed = self.calendar_coverage.record_day(
+                        day,
+                        provider_name=provider_name,
+                        query_scope=query_scope,
                     window_start=day_start,
                     window_end=day_end,
                     status="PROVIDER_UNAVAILABLE",
@@ -1757,9 +1889,9 @@ class ResearchSchedulerService:
                     proof={},
                     next_retry_at=retry_at,
                     lineage={"errors": [item[2] for item in failed_segments]},
-                    policy_version=policy_version,
-                )
-                coverage["coverage_metadata_writes"] += int(changed)
+                        policy_version=policy_version,
+                    )
+                    coverage["coverage_metadata_writes"] += int(changed)
             coverage["status"] = "PROVIDER_UNAVAILABLE"
             coverage["reason"] = failed_segments[0][2]
             coverage["next_retry_at"] = retry_at.isoformat()
@@ -1768,9 +1900,23 @@ class ResearchSchedulerService:
             return coverage
 
         temporal_policy = TemporalPolicy(clock=lambda: now)
+        existing_lifecycle_items = self.lifecycle.list_items()
         existing_keys = {
             (str(item["entity_type"]), str(item["entity_key"]))
-            for item in self.lifecycle.list_items()
+            for item in existing_lifecycle_items
+        }
+        existing_occurrence_aliases = {
+            (
+                str(item["entity_type"]),
+                alias,
+            )
+            for item in existing_lifecycle_items
+            if isinstance(item.get("payload"), dict)
+            for alias in {
+                str(item["payload"].get("occurrence_id") or ""),
+                canonical_event_key(item["payload"]),
+            }
+            if alias
         }
         persisted = 0
         unchanged = 0
@@ -1846,14 +1992,20 @@ class ResearchSchedulerService:
                 triggering_event=entity_type,
                 refresh_reason="provider_first_canonical_schedule_catchup",
             )
-            existed = (entity_type, occurrence_key) in existing_keys
+            existed = (
+                (entity_type, occurrence_key) in existing_keys
+                or (entity_type, occurrence_key)
+                in existing_occurrence_aliases
+            )
             actual_present = canonical_payload.get("actual") not in (None, "")
             work_status = (
                 "COMPLETED"
                 if actual_present or not classification.operational
                 else "READY"
             )
-            discovered_occurrence_ids.append(occurrence_key)
+            discovered_occurrence_ids.append(
+                exact_occurrence_key(canonical_payload)
+            )
             discovered_rows.append(canonical_payload)
             if not existed:
                 persisted += 1
@@ -1871,7 +2023,7 @@ class ResearchSchedulerService:
                 ).astimezone(UTC).isoformat(),
             )
             coverage["canonical_writes"] += int(bool(wrote))
-        rows_by_day: dict[str, int] = {}
+        rows_by_provider_day: dict[tuple[str, str], int] = {}
         for payload in discovered_rows:
             release = parse_datetime(
                 payload.get("release_at")
@@ -1880,109 +2032,219 @@ class ResearchSchedulerService:
             )
             if release is not None:
                 local_day = release.astimezone(timezone).date().isoformat()
-                rows_by_day[local_day] = rows_by_day.get(local_day, 0) + 1
-        for day in missing_days:
-            day_start, day_end = _local_day_bounds(
-                day,
-                timezone,
-                window_end,
-            )
-            count = rows_by_day.get(day.isoformat(), 0)
-            day_proof = next(
-                (
-                    proof
-                    for start, end, proof in segment_proofs
-                    if start
-                    <= datetime.combine(
-                        day,
-                        datetime.min.time(),
-                        timezone,
-                    ).astimezone(UTC)
-                    < end
-                ),
-                {},
-            )
-            if day.isoformat() in quarantined_days:
+                source = str(
+                    payload.get("source") or payload.get("provider") or ""
+                )
+                key = (source, local_day)
+                rows_by_provider_day[key] = (
+                    rows_by_provider_day.get(key, 0) + 1
+                )
+                composite_key = ("economic_calendar_composite", local_day)
+                rows_by_provider_day[composite_key] = (
+                    rows_by_provider_day.get(composite_key, 0) + 1
+                )
+        for (provider_name, query_scope), target_days in (
+            missing_by_target.items()
+        ):
+            for day in target_days:
+                day_start, day_end = _local_day_bounds(
+                    day,
+                    timezone,
+                    window_end,
+                )
+                count = rows_by_provider_day.get(
+                    (provider_name, day.isoformat()),
+                    0,
+                )
+                day_proof = next(
+                    (
+                        proof
+                        for (
+                            proof_provider,
+                            proof_scope,
+                            start,
+                            end,
+                            proof,
+                        ) in segment_proofs
+                        if proof_provider == provider_name
+                        and proof_scope == query_scope
+                        and start <= day_start < end
+                    ),
+                    {},
+                )
+                covered_dates = set(
+                    day_proof.get("covered_dates") or []
+                )
+                empty_dates = set(
+                    day_proof.get("authentic_empty_dates") or []
+                )
+                legacy_authentic_empty = bool(
+                    day_proof.get("authentic_empty")
+                )
+                if covered_dates:
+                    day_proof = {
+                        **day_proof,
+                        "scope_match": day.isoformat() in covered_dates,
+                    }
                 day_proof = {
                     **day_proof,
-                    "records_valid": False,
-                    "authentic_empty": False,
+                    "authentic_empty": (
+                        day.isoformat() in empty_dates
+                        or (
+                            day <= local_now.date()
+                            and legacy_authentic_empty
+                        )
+                    ),
                 }
-            positive_proof = _coverage_proof_complete(
-                day_proof,
-                empty=count == 0,
-            )
-            if (
-                day > local_now.date()
-                and count == 0
-                and day.isoformat()
-                not in set(day_proof.get("authentic_empty_dates") or [])
-            ):
-                positive_proof = False
-            status = (
-                "VERIFIED_COMPLETE"
-                if count and positive_proof
-                else "VERIFIED_EMPTY"
-                if not count and positive_proof
-                else "PARTIAL"
-            )
-            next_retry_at = (
-                None
-                if status in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
-                else now + timedelta(hours=2)
-            )
-            changed = self.calendar_coverage.record_day(
-                day,
+                if day.isoformat() in quarantined_days:
+                    day_proof = {
+                        **day_proof,
+                        "records_valid": False,
+                        "authentic_empty": False,
+                    }
+                positive_proof = _coverage_proof_complete(
+                    day_proof,
+                    empty=count == 0,
+                )
+                if (
+                    day > local_now.date()
+                    and count == 0
+                    and day.isoformat() not in empty_dates
+                ):
+                    positive_proof = False
+                status = (
+                    "VERIFIED_COMPLETE"
+                    if count and positive_proof
+                    else "VERIFIED_EMPTY"
+                    if not count and positive_proof
+                    else "PARTIAL"
+                )
+                next_retry_at = (
+                    None
+                    if status
+                    in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
+                    else now + timedelta(hours=2)
+                )
+                changed = self.calendar_coverage.record_day(
+                    day,
+                    provider_name=provider_name,
+                    query_scope=query_scope,
+                    window_start=day_start,
+                    window_end=day_end,
+                    status=status,
+                    record_count=count,
+                    provider_called=True,
+                    scope_verified=bool(
+                        day_proof.get("scope_match")
+                    ),
+                    proof=day_proof,
+                    valid_until=(
+                        now + timedelta(hours=24)
+                        if day >= local_now.date()
+                        else now + timedelta(days=30)
+                    ),
+                    next_revision_check_at=(
+                        now + timedelta(days=7)
+                        if day < local_now.date()
+                        else now + timedelta(hours=2)
+                    ),
+                    next_retry_at=next_retry_at,
+                    lineage={
+                        "provider_result_count": len(provider_results),
+                        "provider_name": provider_name,
+                        "query_scope": query_scope,
+                        "coverage_proof": day_proof,
+                    },
+                    policy_version=policy_version,
+                )
+                coverage["coverage_metadata_writes"] += int(changed)
+        matrices: dict[str, dict[str, Any]] = {}
+        for provider_name, query_scope in missing_by_target:
+            matrices[provider_name] = self.calendar_coverage.matrix(
+                start_date=previous_start,
+                end_date=next_end_date,
                 provider_name=provider_name,
                 query_scope=query_scope,
-                window_start=day_start,
-                window_end=day_end,
-                status=status,
-                record_count=count,
-                provider_called=True,
-                scope_verified=bool(day_proof.get("scope_match")),
-                proof=day_proof,
-                valid_until=(
-                    now + timedelta(hours=24)
-                    if day >= local_now.date()
-                    else now + timedelta(days=30)
-                ),
-                next_revision_check_at=(
-                    now + timedelta(days=7)
-                    if day < local_now.date()
-                    else now + timedelta(hours=2)
-                ),
-                next_retry_at=next_retry_at,
-                lineage={
-                    "provider_result_count": len(provider_results),
-                    "query_scope": query_scope,
-                    "coverage_proof": day_proof,
-                },
+                now=now,
                 policy_version=policy_version,
             )
-            coverage["coverage_metadata_writes"] += int(changed)
-        matrix = self.calendar_coverage.matrix(
-            start_date=previous_start,
-            end_date=next_end_date,
-            provider_name=provider_name,
-            query_scope=query_scope,
-            now=now,
-            policy_version=policy_version,
+        terminal = {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
+        aggregate_by_date: dict[str, dict[str, Any]] = {}
+        authoritative_sources_by_date: dict[str, list[str]] = {}
+        for day in requested_days:
+            day_key = day.isoformat()
+            rows_for_day = [
+                matrix["by_date"].get(
+                    day_key,
+                    {"status": "UNKNOWN"},
+                )
+                for matrix in matrices.values()
+            ]
+            authoritative_sources = sorted(
+                provider
+                for provider, matrix in matrices.items()
+                if matrix["by_date"].get(day_key, {}).get("status")
+                in terminal
+            )
+            authoritative_sources_by_date[day_key] = (
+                authoritative_sources
+            )
+            all_terminal = bool(rows_for_day) and all(
+                row.get("status") in terminal
+                for row in rows_for_day
+            )
+            aggregate_by_date[day_key] = {
+                "status": (
+                    "VERIFIED_EMPTY"
+                    if all_terminal
+                    and all(
+                        row.get("status") == "VERIFIED_EMPTY"
+                        for row in rows_for_day
+                    )
+                    else "VERIFIED_COMPLETE"
+                    if all_terminal
+                    else "PARTIAL"
+                    if any(
+                        row.get("status") != "UNKNOWN"
+                        for row in rows_for_day
+                    )
+                    else "UNKNOWN"
+                )
+            }
+        unknown_days = sorted(
+            day
+            for day, row in aggregate_by_date.items()
+            if row["status"] == "UNKNOWN"
         )
+        partial_days = sorted(
+            day
+            for day, row in aggregate_by_date.items()
+            if row["status"] == "PARTIAL"
+        )
+        matrix = {
+            "status": (
+                "VERIFIED_COMPLETE"
+                if all(
+                    row["status"] in terminal
+                    for row in aggregate_by_date.values()
+                )
+                else "PARTIAL"
+            ),
+            "by_date": aggregate_by_date,
+            "unknown_coverage_days": unknown_days,
+            "partial_coverage_days": partial_days,
+            "by_provider": matrices,
+        }
         coverage["daily_matrix"] = matrix
-        coverage["unknown_coverage_days"] = matrix[
-            "unknown_coverage_days"
-        ]
-        coverage["partial_coverage_days"] = matrix[
-            "partial_coverage_days"
-        ]
+        coverage["unknown_coverage_days"] = unknown_days
+        coverage["partial_coverage_days"] = partial_days
+        coverage["authoritative_sources_by_date"] = (
+            authoritative_sources_by_date
+        )
         coverage["authoritative_dates"] = sorted(
             day
-            for day, proof in matrix["by_date"].items()
-            if proof["status"]
-            in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
-            and proof["provider_called"]
-            and proof["scope_verified"]
+            for day, providers in authoritative_sources_by_date.items()
+            if len(providers) == len(matrices)
         )
         for bucket_name, (first, last) in {
             "PREVIOUS_WEEK": (
@@ -2010,6 +2272,9 @@ class ResearchSchedulerService:
                 if all(status in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"} for status in statuses)
                 else "PARTIAL"
             )
+        provider_discovered_occurrence_ids = sorted(
+            set(discovered_occurrence_ids)
+        )
         canonical_rows = self.market_facts.economic_event_payloads(
             country="US",
             start_date=previous_start.isoformat(),
@@ -2043,8 +2308,31 @@ class ResearchSchedulerService:
                 "discovered_occurrence_ids": sorted(
                     set(discovered_occurrence_ids)
                 ),
+                "provider_discovered_occurrence_ids": (
+                    provider_discovered_occurrence_ids
+                ),
             }
         )
+        if (
+            not missing_days
+            and not discovered_lifecycles
+            and not coverage["canonical_writes"]
+        ):
+            coverage["rematerialized_snapshot_id"] = None
+            coverage["snapshot_writes"] = 0
+            coverage["outbox_writes"] = 0
+            return coverage
+        if not materialize_snapshot:
+            for lifecycle, payload, work_status in discovered_lifecycles:
+                self.lifecycle.upsert(
+                    lifecycle,
+                    payload=payload,
+                    work_status=work_status,
+                )
+            coverage["rematerialized_snapshot_id"] = None
+            coverage["snapshot_writes"] = 0
+            coverage["outbox_writes"] = 0
+            return coverage
         rematerialized = self._rematerialize_schedule_discovery(
             rows=canonical_rows,
             lifecycles=discovered_lifecycles,
@@ -2130,20 +2418,45 @@ class ResearchSchedulerService:
                     else "other_economic_events"
                 )
                 calendar_changed = True
-        discovered_keys = {
-            str(
-                item.get("canonical_event_key")
-                or item.get("occurrence_id")
-                or canonical_event_key(item)
-            )
-            for item in rows
-        }
+        provider_discovered = source_coverage.get(
+            "provider_discovered_occurrence_ids"
+        )
+        discovered_keys = (
+            {
+                str(item)
+                for item in provider_discovered or []
+                if item
+            }
+            if provider_discovered is not None
+            else {
+                str(
+                    item.get("canonical_event_key")
+                    or item.get("occurrence_id")
+                    or canonical_event_key(item)
+                )
+                for item in rows
+            }
+        )
         coverage_start = parse_datetime(source_coverage.get("window_start"))
         coverage_end = parse_datetime(source_coverage.get("window_end"))
         authoritative_dates = {
             str(item)
             for item in source_coverage.get("authoritative_dates") or []
             if item
+        }
+        authoritative_sources_by_date = {
+            str(day): {
+                str(source).strip().casefold()
+                for source in sources or []
+                if source
+            }
+            for day, sources in (
+                source_coverage.get(
+                    "authoritative_sources_by_date",
+                    {},
+                )
+                or {}
+            ).items()
         }
         calendar_timezone = ZoneInfo(
             str(
@@ -2152,9 +2465,18 @@ class ResearchSchedulerService:
             )
         )
         unconfirmed_removals: list[str] = []
+        lifecycle_items = self.lifecycle.list_items()
         lifecycle_keys = {
             (str(item["entity_type"]), str(item["entity_key"]))
-            for item in self.lifecycle.list_items()
+            for item in lifecycle_items
+        }
+        lifecycle_aliases = {
+            (
+                str(item["entity_type"]),
+                exact_occurrence_key(item["payload"]),
+            ): str(item["entity_key"])
+            for item in lifecycle_items
+            if isinstance(item.get("payload"), dict)
         }
         retained_actual_gaps = 0
         if (
@@ -2167,15 +2489,35 @@ class ResearchSchedulerService:
                     or prior.get("time_utc")
                     or prior.get("date")
                 )
+                release_day = (
+                    release_at.astimezone(calendar_timezone)
+                    .date()
+                    .isoformat()
+                    if release_at is not None
+                    else ""
+                )
+                authoritative_sources = (
+                    authoritative_sources_by_date.get(release_day, set())
+                )
+                prior_source = str(
+                    prior.get("source") or prior.get("provider") or ""
+                ).strip().casefold()
+                source_covered = (
+                    not authoritative_sources_by_date
+                    or "economic_calendar_composite"
+                    in authoritative_sources
+                    or (
+                        prior_source
+                        and prior_source in authoritative_sources
+                    )
+                )
                 if (
                     key in discovered_keys
                     or release_at is None
                     or release_at < coverage_start
                     or release_at > coverage_end
-                    or release_at.astimezone(
-                        calendar_timezone
-                    ).date().isoformat()
-                    not in authoritative_dates
+                    or release_day not in authoritative_dates
+                    or not source_covered
                 ):
                     continue
                 annotated = {
@@ -2190,21 +2532,32 @@ class ResearchSchedulerService:
                     },
                 }
                 unconfirmed_removals.append(key)
-                if annotated != prior:
+                annotation_changed = annotated != prior
+                if annotation_changed:
                     existing[key] = annotated
                     calendar_changed = True
                 classification = classify_occurrence_lifecycle(annotated)
-                lifecycle_key = (classification.entity_type, key)
+                lifecycle_entity_key = lifecycle_aliases.get(
+                    (
+                        classification.entity_type,
+                        exact_occurrence_key(annotated),
+                    ),
+                    key,
+                )
+                lifecycle_key = (
+                    classification.entity_type,
+                    lifecycle_entity_key,
+                )
                 if (
                     classification.operational
                     and annotated.get("actual") in (None, "")
-                    and lifecycle_key not in lifecycle_keys
+                    and annotation_changed
                 ):
                     lifecycles.append(
                         (
                             compute_datum_lifecycle(
                                 classification.entity_type,
-                                key,
+                                lifecycle_entity_key,
                                 annotated,
                                 settings=self.settings,
                                 now=now,
@@ -3245,6 +3598,13 @@ def _normalized_coverage_proof(value: Any) -> dict[str, Any]:
         {
             str(item)
             for item in source.get("authentic_empty_dates") or []
+            if item
+        }
+    )
+    proof["covered_dates"] = sorted(
+        {
+            str(item)
+            for item in source.get("covered_dates") or []
             if item
         }
     )

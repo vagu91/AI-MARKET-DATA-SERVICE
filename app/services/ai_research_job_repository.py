@@ -74,9 +74,59 @@ class AIResearchJobRepository:
         specialized_topic: str | None = None,
         child_ordinal: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        if (
+        execution_context = ExecutionContext.from_payload(
+            request_payload.get("execution_context")
+            if isinstance(request_payload, dict)
+            else None
+        )
+        ai_authorized = authorizes_ai(
+            execution_context,
+            environment=self.settings.environment,
+        )
+        provider_authorized = (
             job_type != "RELEASE_ACTUAL_REFRESH"
-            and not is_research_agent_enabled(
+            or authorizes_live_providers(execution_context)
+        )
+        if not ai_authorized or not provider_authorized:
+            reason = (
+                "PROVIDER_NOT_AUTHORIZED"
+                if not provider_authorized
+                else "AI_NOT_AUTHORIZED"
+            )
+            rejected = {
+                **disabled_job_result(
+                    self.settings,
+                    topic=specialized_topic,
+                    profile_id=profile_id,
+                    job_type=job_type,
+                    correlation_id=correlation_id,
+                ),
+                "last_error": reason,
+            }
+            TelemetryRepository(
+                self.settings,
+                clock=self.clock,
+            ).emit(
+                "ai_authorization",
+                identifiers={"correlation_id": correlation_id},
+                decision_summary=(
+                    "persistent research job rejected before enqueue"
+                ),
+                stop_reason=reason,
+                payload={
+                    "status": "REJECTED",
+                    "reason": reason,
+                    "job_type": job_type,
+                    "execution_context": (
+                        execution_context.as_payload()
+                        if execution_context is not None
+                        else None
+                    ),
+                },
+            )
+            return rejected, False
+        if (
+            not is_research_agent_enabled(
                 self.settings,
                 topic=specialized_topic,
                 profile_id=profile_id,
@@ -526,8 +576,6 @@ class AIResearchJobRepository:
         return self.get(str(row["job_id"]))
 
     def _row_agent_enabled(self, row: Any) -> bool:
-        if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH":
-            return True
         return is_research_agent_enabled(
             self.settings,
             topic=row["specialized_topic"],
@@ -544,7 +592,13 @@ class AIResearchJobRepository:
             payload.get("execution_context") if isinstance(payload, dict) else None
         )
         if str(row["job_type"]) == "RELEASE_ACTUAL_REFRESH":
-            return authorizes_live_providers(context)
+            return (
+                authorizes_live_providers(context)
+                and authorizes_ai(
+                    context,
+                    environment=self.settings.environment,
+                )
+            )
         return authorizes_ai(
             context,
             environment=self.settings.environment,

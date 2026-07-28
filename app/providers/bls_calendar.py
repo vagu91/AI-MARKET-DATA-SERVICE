@@ -20,11 +20,31 @@ from app.providers.calendar_utils import (
 )
 
 
+def _covered_dates(
+    start: datetime,
+    end: datetime,
+    months: set[tuple[int, int]],
+) -> list[date]:
+    timezone = ZoneInfo("America/New_York")
+    first = start.astimezone(timezone).date()
+    last = (end.astimezone(timezone) - datetime.resolution).date()
+    return [
+        first + (date.resolution * offset)
+        for offset in range((last - first).days + 1)
+        if (
+            (first + (date.resolution * offset)).year,
+            (first + (date.resolution * offset)).month,
+        )
+        in months
+    ]
+
+
 class BlsReleaseCalendarProvider(BaseProvider):
     source = "BLS Release Calendar"
     provider_type = ProviderType.SCRAPER
     reliability = 0.82
     cache_key = "provider:bls_release_calendar:events:v2"
+    authoritative_calendar_coverage = True
 
     def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
@@ -68,6 +88,21 @@ class BlsReleaseCalendarProvider(BaseProvider):
             ),
             data=events,
         )
+
+    def coverage_dates(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[date]:
+        now = datetime.now(UTC)
+        months = {(now.year, now.month)}
+        months.add(
+            (now.year + 1, 1)
+            if now.month == 12
+            else (now.year, now.month + 1)
+        )
+        return _covered_dates(start, end, months)
 
     def _parse_month(
         self,
