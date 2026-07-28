@@ -166,7 +166,7 @@ Still to be proved live:
 
 Final PR28 offline verification:
 
-- focused blocker regression: 90 passed;
+- focused blocker regression: 89 passed;
 - provider/actual/lifecycle/queue/sync regression: 509 passed;
 - schema migration matrix 1 to 22, 20 to 22, 21 to 22, and 22 to 22:
   4 passed;
