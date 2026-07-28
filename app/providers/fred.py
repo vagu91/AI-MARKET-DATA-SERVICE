@@ -29,12 +29,17 @@ FRED_SERIES = {
     "T10Y3M": "10-Year Treasury Minus 3-Month Treasury",
     "ICSA": "Initial Claims",
     "WALCL": "Federal Reserve Total Assets",
+    "HSN1F": "New One Family Houses Sold: United States",
 }
 FRED_FREQUENCIES = {
     "FEDFUNDS": "monthly",
     "NFCI": "weekly",
     "ICSA": "weekly",
     "WALCL": "weekly",
+    "HSN1F": "monthly",
+}
+FRED_UNITS = {
+    "HSN1F": "thousands_annual_rate",
 }
 
 
@@ -48,7 +53,11 @@ class FredProvider(BaseProvider):
         super().__init__(cache)
         self.settings = settings
 
-    async def fetch(self) -> ProviderResult:
+    async def fetch(
+        self,
+        *,
+        series_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> ProviderResult:
         if not self.settings.fred_enabled:
             raise ProviderDisabled("FRED provider is disabled")
         if not self.settings.fred_api_key:
@@ -60,7 +69,11 @@ class FredProvider(BaseProvider):
             timeout=self.settings.fred_timeout_seconds,
             follow_redirects=False,
         ) as client:
-            for series_id, name in FRED_SERIES.items():
+            selected = tuple(series_ids or FRED_SERIES)
+            for series_id in selected:
+                name = FRED_SERIES.get(series_id)
+                if name is None:
+                    continue
                 response = await client.get(
                     f"{self.settings.fred_base_url}/series/observations",
                     params={
@@ -73,7 +86,12 @@ class FredProvider(BaseProvider):
                 )
                 response.raise_for_status()
                 payload = response.json()
-                item = latest_observation(payload.get("observations", []))
+                observations = [
+                    row
+                    for row in payload.get("observations", [])
+                    if isinstance(row, dict) and row.get("value") not in {None, "", "."}
+                ]
+                item = latest_observation(observations)
                 if not item:
                     continue
                 value = float(item["value"])
@@ -81,7 +99,10 @@ class FredProvider(BaseProvider):
                     "series_id": series_id,
                     "name": name,
                     "value": value,
-                    "units": "index" if series_id in {"VIXCLS", "NFCI"} else "thousands of claims" if series_id == "ICSA" else "percent",
+                    "units": FRED_UNITS.get(
+                        series_id,
+                        "index" if series_id in {"VIXCLS", "NFCI"} else "thousands of claims" if series_id == "ICSA" else "percent",
+                    ),
                     "data_as_of": item.get("date"),
                     "observation_date": item.get("date"),
                     "retrieved_at": datetime.now(UTC).isoformat(),
@@ -95,6 +116,15 @@ class FredProvider(BaseProvider):
                     "trigger_class": "NON_TRIGGERING",
                     "provider_adapter": "FRED_OFFICIAL_API",
                     "official_adapter": True,
+                    "seasonal_adjustment": "SAAR" if series_id == "HSN1F" else None,
+                    "observations": [
+                        {
+                            "period": row.get("date"),
+                            "value": row.get("value"),
+                            "release_vintage": row.get("realtime_start"),
+                        }
+                        for row in observations
+                    ],
                 }
                 observed_at = datetime.fromisoformat(item["date"]).replace(tzinfo=UTC)
                 latest_as_of = max(latest_as_of, observed_at) if latest_as_of else observed_at

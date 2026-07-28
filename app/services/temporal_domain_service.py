@@ -400,6 +400,8 @@ def _complete_provider_actual_candidate(
     if row.get("actual") in (None, ""):
         return None, None
     reasons: list[str] = []
+    if row.get("actual_is_official") is not True:
+        reasons.append("actual_requires_official_source")
     occurrence_id = str(row.get("occurrence_id") or "").strip()
     provider_event_id = str(
         row.get("source_event_id")

@@ -451,9 +451,16 @@ class MacroActualLifecycleProviderAdapter:
                 "reason": "macro_actual_occurrence_outside_lookback",
             }
 
-        expected_key = str(
-            payload.get("canonical_event_key")
-            or canonical_event_key(payload)
+        persisted_occurrence = str(
+            payload.get("occurrence_id") or payload.get("event_id") or ""
+        )
+        expected_key = (
+            persisted_occurrence
+            if persisted_occurrence.casefold().startswith("xtb:")
+            else str(
+                payload.get("canonical_event_key")
+                or canonical_event_key(payload)
+            )
         )
         entity_key = str(item.get("entity_key") or "")
         if entity_key.startswith("event:") and entity_key != expected_key:
@@ -495,9 +502,13 @@ class MacroActualLifecycleProviderAdapter:
                 raise TemporaryLifecycleProviderError(
                     "macro_actual_calendar_provider_temporary_failure"
                 )
-            return {
-                "status": "NO_DATA",
-                "reason": "macro_actual_exact_occurrence_not_found",
+            # The calendar feed is allowed to age out a released occurrence.
+            # Its persisted occurrence payload remains the identity anchor; only
+            # an admitted official post-release source may supply the actual.
+            exact = {
+                **payload,
+                "occurrence_id": expected_key,
+                "canonical_event_key": expected_key,
             }
 
         direct = _exact_calendar_actual_datum(
@@ -599,6 +610,9 @@ class MacroActualLifecycleProviderAdapter:
             "reason": "official_macro_actual_resolved",
             "datum": datum,
             "missing_fields": missing_fields,
+            "provider_request_attempted": True,
+            "provider_request_completed": True,
+            "provider_request_failed": False,
         }
 
 
@@ -1305,6 +1319,11 @@ def _official_actual_datum(
             or candidate.get("period")
         ),
         "retrieved_at": candidate.get("retrieved_at"),
+        "released_at": candidate.get("released_at") or candidate.get("release_timestamp"),
+        "validation_timestamp": candidate.get("validation_timestamp"),
+        "frequency": candidate.get("frequency"),
+        "unit": candidate.get("unit"),
+        "raw_lineage_redacted": candidate.get("raw_lineage_redacted"),
         "validation_status": (
             candidate.get("validation_status") or "accepted"
         ),
@@ -1330,6 +1349,12 @@ def _official_actual_datum(
         "release_at": release.isoformat(),
         "time_utc": release.isoformat(),
         "actual": value,
+        "previous": (
+            candidate.get("previous")
+            if candidate.get("previous") not in (None, "")
+            else event.get("previous")
+        ),
+        "previous_revised": candidate.get("previous_revised"),
         "metric_id": (
             candidate.get("event_metric_id")
             or candidate.get("metric_id")
@@ -1349,6 +1374,17 @@ def _official_actual_datum(
         "published_at": (
             candidate.get("published_at") or release.isoformat()
         ),
+        "released_at": (
+            candidate.get("released_at")
+            or candidate.get("release_timestamp")
+            or release.isoformat()
+        ),
+        "validation_timestamp": (
+            candidate.get("validation_timestamp")
+            or candidate.get("retrieved_at")
+        ),
+        "frequency": candidate.get("frequency"),
+        "unit": candidate.get("unit"),
         "source": source,
         "source_url": source_url,
         "source_lineage": [actual_lineage],

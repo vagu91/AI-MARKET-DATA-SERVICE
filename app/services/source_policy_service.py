@@ -14,6 +14,7 @@ PROTECTED_PROVIDER_DOMAINS = {
     "bls.gov",
     "bea.gov",
     "census.gov",
+    "pmi.spglobal.com",
     "stlouisfed.org",
     "finnhub.io",
     "tradier.com",

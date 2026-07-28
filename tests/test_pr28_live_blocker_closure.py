@@ -74,7 +74,7 @@ def table_count(cfg: Settings, table: str) -> int:
         )
 
 
-def test_live_incomplete_occurrences_are_atomically_promoted_before_snapshot(
+def test_non_official_calendar_actuals_remain_fail_closed_before_snapshot(
     tmp_path: Path,
 ) -> None:
     cfg = settings(tmp_path)
@@ -100,34 +100,29 @@ def test_live_incomplete_occurrences_are_atomically_promoted_before_snapshot(
         for event in reconciled
     }
     expected = {
-        "xtb:146392:2026-07-24": (628.0, 610.0, 618.0, "2026-06"),
-        "xtb:146945:2026-07-24": (53.6, 52.0, 51.2, "2026-07"),
+        "xtb:146392:2026-07-24": (610.0, 580.0),
+        "xtb:146945:2026-07-24": (51.5, 51.2),
     }
     assert set(expected).issubset(by_occurrence)
     for occurrence_id, values in expected.items():
         event = by_occurrence[occurrence_id]
-        actual, forecast, previous, period = values
-        assert (
-            float(event.actual),
-            float(event.forecast),
-            float(event.previous),
-            event.reference_period,
-        ) == (actual, forecast, previous, period)
-        assert (
-            float(event.enrichment.actual),
-            float(event.enrichment.forecast),
-            float(event.enrichment.previous),
-        ) == (actual, forecast, previous)
+        forecast, previous = values
+        assert event.actual is None
+        assert float(event.enrichment.forecast) == forecast
+        assert float(event.enrichment.previous) == previous
         assert (
             temporal_event_state(event, now=NOW)["temporal_status"]
-            == "RELEASED"
+            == "AWAITING_ACTUAL"
         )
         audit = event.enrichment.summary[
             "provider_actual_reconciliation"
         ]
-        assert audit["status"] == "PROMOTED"
+        assert audit["status"] == "REJECTED"
         assert audit["atomic_record"] is True
         assert audit["official_actual"] is False
+        assert "actual_requires_official_source" in audit[
+            "rejected_candidates"
+        ][0]["reasons"]
         assert facts.upsert_economic_event(
             event,
             event_key=exact_occurrence_key(event),
@@ -142,14 +137,11 @@ def test_live_incomplete_occurrences_are_atomically_promoted_before_snapshot(
         )
     }
     for occurrence_id, values in expected.items():
-        actual, forecast, previous, period = values
+        forecast, previous = values
         item = restored[occurrence_id]
-        assert (
-            float(item["actual"]),
-            float(item["forecast"]),
-            float(item["previous"]),
-            item["reference_period"],
-        ) == (actual, forecast, previous, period)
+        assert item["actual"] is None
+        assert float(item["forecast"]) == forecast
+        assert float(item["previous"]) == previous
 
 
 def test_discordant_complete_provider_records_fail_closed_and_are_audited() -> None:
@@ -187,9 +179,13 @@ def test_discordant_complete_provider_records_fail_closed_and_are_audited() -> N
     audit = event.enrichment.summary[
         "provider_actual_reconciliation"
     ]
-    assert audit["status"] == "CONFLICT"
-    assert audit["candidate_count"] == 2
-    assert len(audit["candidate_fingerprints"]) == 2
+    assert audit["status"] == "REJECTED"
+    assert audit["candidate_count"] == 0
+    assert audit["rejected_candidate_count"] == 2
+    assert all(
+        "actual_requires_official_source" in item["reasons"]
+        for item in audit["rejected_candidates"]
+    )
 
 
 def test_provider_only_context_creates_zero_jobs_at_service_and_repository(

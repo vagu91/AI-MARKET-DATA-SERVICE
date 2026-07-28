@@ -27,6 +27,7 @@ from app.providers.event_enrichment import (
 from app.providers.fed_calendar import FederalReserveCalendarProvider
 from app.providers.federal_reserve import FederalReserveRssProvider
 from app.providers.fred import FredProvider
+from app.providers.sp_global_pmi import SpGlobalPmiProvider
 from app.providers.census import CensusProvider
 from app.providers.finnhub import FinnhubProvider
 from app.providers.tradier import TradierProvider
@@ -86,6 +87,7 @@ def build_application_state(
         "bls": BlsProvider(cache, settings),
         "bea": BeaProvider(cache, settings),
         "census": CensusProvider(cache, settings),
+        "spglobal": SpGlobalPmiProvider(cache, settings),
         "finnhub": FinnhubProvider(cache, settings),
         "tradier": TradierProvider(cache, settings),
     }
@@ -162,8 +164,14 @@ def build_application_state(
         settings,
         providers={
             getattr(provider, "source", ""): provider
-            for provider in [*macro_providers, census_provider]
-            if getattr(provider, "source", "") in {"BLS", "BEA", "CENSUS"}
+            for provider in [
+                *macro_providers,
+                census_provider,
+                deterministic_providers["spglobal"],
+            ]
+            if getattr(provider, "source", "") in {
+                "BLS", "BEA", "CENSUS", "FRED", "SPGLOBAL"
+            }
         },
     )
     lifecycle_due_resolver = DeterministicLifecycleDueResolver(

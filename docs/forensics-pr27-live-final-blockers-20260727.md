@@ -347,3 +347,89 @@ Still pending:
   - full-sync: 464,391 bytes,
     SHA-256 `C11AC14D39FED1BF3FAAA17EDD61133C3131E705AC614656FBADD8A6BD0C114F`;
   - both summary and full-sync are byte-identical across the two executions.
+
+## PR 28 follow-up - LIVE_ACTUAL_RECONCILIATION (2026-07-28)
+
+### Evidence and root cause
+
+The isolated live acceptance database and its final artifacts were inspected
+read-only. The forced refresh called the Investing and XTB calendar paths.
+Investing returned HTTP 403. XTB returned 37 current calendar rows, but neither
+24 July occurrence was still present. Historical XTB candidates did contain
+the two actual values, but they were correctly rejected by source policy
+because XTB is not a tier-1 official actual source.
+
+The lifecycle adapter then required the historical occurrence to reappear in a
+one-minute query of the current authoritative calendar before invoking the
+official actual resolver. That requirement made the resolver unreachable for
+an aged-out XTB occurrence. The calendar record was therefore left at
+`AWAITING_ACTUAL`.
+
+### Corrected deterministic path
+
+- `xtb:146392:2026-07-24` is mapped by documented stable event identity to
+  FRED series `HSN1F`. FRED is a tier-1 admitted official redistributor of the
+  Census/HUD New Residential Sales series. The adapter requests observations,
+  validates monthly frequency, SAAR units and exact `2026-06`, and preserves
+  the prior observation separately.
+- `xtb:146945:2026-07-24` is mapped by documented stable event identity to an
+  S&P Global public PMI release adapter. It only accepts HTTPS pages under
+  `pmi.spglobal.com`, parses the named Flash US Services PMI Business Activity
+  Index row, validates exact month/frequency/unit, and records a redacted
+  content SHA-256 plus release URL.
+- `Giugno` and `Luglio` are normalized from a fixed internal month table using
+  the occurrence release date, independently of host locale.
+- An occurrence that has aged out of the current calendar can now retain its
+  persisted XTB occurrence identity while receiving an actual only from the
+  admitted official resolver.
+- Calendar-provider actuals without `actual_is_official=true` now remain
+  fail-closed. The old redacted XTB test payload is explicitly tested as
+  rejected and is not a production source.
+
+No target numeric value is stored in runtime code. Numeric values in tests are
+provider-response fixtures used to verify parsing and semantics only.
+
+### Before/after and unresolved operational proof
+
+| Occurrence | Live before | Deterministic source path | Offline adapter result |
+| --- | --- | --- | --- |
+| `xtb:146392:2026-07-24` | actual null; previous 580; `Giugno`; awaiting | FRED `HSN1F` / Census-HUD lineage | actual 628; previous 618; `2026-06`; official candidate accepted |
+| `xtb:146945:2026-07-24` | actual null; forecast 51.5; previous 51.2; `Luglio`; awaiting | S&P Global public PMI release | parser proves actual 53.6; previous 51.2; `2026-07` when the release page is accessible |
+
+The PMI path remains operationally blocked in the observed environment:
+S&P Global's public PMI endpoint returned HTTP 403, and no credentialed or
+licensed endpoint is configured. The official release publishes actual and
+previous, not the calendar consensus. The requested forecast `52.0` is not
+present in the captured live candidate (`51.5`) and has not been proven by two
+independent admitted consensus sources. The runtime therefore preserves the
+scheduled forecast and does not invent or overwrite it.
+
+Consequently this change is code-correct and fail-closed, but the producer
+blocker must not be declared closed until a controlled live run has:
+
+1. access to the exact S&P Global release through an authorized endpoint;
+2. independent admitted lineage proving the required PMI forecast;
+3. demonstrated atomic canonical/lifecycle/snapshot/outbox materialization and
+   a completely immutable second fixed-point run.
+
+### Verification boundary
+
+Offline targeted tests cover both real occurrence IDs, official parsing,
+stable identity after calendar age-out, Italian month normalization, exact
+period/frequency/unit semantics, access restriction, preservation of
+forecast/previous, and rejection of non-official calendar actuals. No live
+provider, AI backend, operational database, scheduler daemon, delivery,
+trading, or order path was invoked during this correction.
+
+Final verification for this follow-up:
+
+- new focused tests: 7 passed;
+- provider/actual/lifecycle/calendar focused regression: 63 passed;
+- schema-22/migration/semantic focused regression: 106 passed;
+- complete suite: 1,821 passed;
+- Ruff, targeted `py_compile`, `compileall`, and `git diff --check`: passed;
+- two independent schema-22 offline replays were byte-identical:
+  - summary: 3,608 bytes,
+    SHA-256 `D40459950CACCFB03E16D23F499073F32910272D19393CEEA04E2A5982A5BC00`;
+  - full-sync: 464,424 bytes,
+    SHA-256 `54C04FA33E3888708BD38D1B0C5DA01E436985AA5CED813A1086CC5611FA391D`.
