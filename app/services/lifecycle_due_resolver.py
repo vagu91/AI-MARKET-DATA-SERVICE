@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
 
@@ -899,6 +899,24 @@ class DeterministicLifecycleDueResolver:
             triggering_event=item.get("triggering_event"),
             refresh_reason="deterministic_provider_resolved",
         )
+        if (
+            entity_type == "macro_actual"
+            and provider_datum.get("actual") not in (None, "")
+        ):
+            # An admitted official release is a completed occurrence, not an
+            # expiring quote. Its historical release timestamp must not make a
+            # newly resolved actual fail the generic TTL freshness gate.
+            lifecycle = replace(
+                lifecycle,
+                freshness_state="FRESH",
+                valid_until=None,
+                next_refresh_at=None,
+                next_retry_at=None,
+                retry_class=None,
+                negative_cache_key=None,
+                negative_cache_expires_at=None,
+                refresh_reason="official_macro_actual_resolved",
+            )
         if lifecycle.freshness_state != "FRESH":
             return self._exhausted(
                 item,
@@ -965,24 +983,59 @@ class DeterministicLifecycleDueResolver:
                 hours=int(self.settings.lifecycle_retry_deadline_hours)
             )
         )
+        terminal = retry_deadline_exhausted
+        payload = (
+            dict(item.get("payload") or {})
+            if isinstance(item.get("payload"), dict)
+            else {}
+        )
+        payload.setdefault("event_at", item.get("event_at"))
+        payload.setdefault("actual", None)
+        lifecycle = compute_datum_lifecycle(
+            str(item.get("entity_type") or "unknown"),
+            str(item.get("entity_key") or ""),
+            payload,
+            settings=self.settings,
+            now=self.clock(),
+            attempt_count=int(item.get("attempt_count") or 0) + 1,
+            no_data=not terminal,
+            fields_attempted=list(item.get("fields_attempted") or []),
+            session_state=item.get("session_state"),
+            triggering_event=item.get("triggering_event"),
+            retry_class="NO_DATA",
+            refresh_reason=reason,
+        )
+        if terminal:
+            lifecycle = replace(
+                lifecycle,
+                freshness_state="EXHAUSTED_NO_DATA",
+                next_refresh_at=None,
+                next_retry_at=None,
+                retry_class="EXHAUSTED_NO_DATA",
+                negative_cache_key=None,
+                negative_cache_expires_at=None,
+                refresh_reason=reason,
+            )
         return {
             "status": status,
             "reason": reason,
+            "lifecycle": lifecycle,
+            "next_retry_at": lifecycle.next_retry_at,
             "ai_eligible": bool(
-                decision["agent_enabled"] and not retry_deadline_exhausted
+                decision["agent_enabled"] and not terminal
             ),
             "agent_status": (
                 "ENABLED" if decision["agent_enabled"] else "DISABLED"
             ),
             "execution_status": (
                 "ELIGIBLE"
-                if decision["agent_enabled"] and not retry_deadline_exhausted
+                if decision["agent_enabled"] and not terminal
                 else "NOT_REQUESTED"
             ),
             "data_outcome": (
-                "NO_DATA" if retry_deadline_exhausted else "PENDING"
+                "NO_DATA" if terminal else "PENDING"
             ),
-            "retry_deadline_exhausted": retry_deadline_exhausted,
+            "retry_deadline_exhausted": terminal,
             "enablement": decision,
             **dict(telemetry or {}),
         }

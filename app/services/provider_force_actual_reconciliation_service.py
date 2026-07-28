@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Callable
 
@@ -11,7 +12,9 @@ from app.services.deterministic_actual_resolver import (
 from app.services.event_driven_lifecycle_service import (
     DatumLifecycle,
     LifecycleRepository,
+    compute_datum_lifecycle,
 )
+from app.services.observability_contract_service import TelemetryRepository
 from app.services.official_actual_semantics import (
     normalize_reference_period,
 )
@@ -33,11 +36,19 @@ class ProviderForceActualReconciliationService:
         *,
         lifecycle_resolver: Any,
         clock: Callable[[], datetime] | None = None,
+        generation_id: str | None = None,
+        coverage_write_count: int = 0,
     ) -> None:
         self.settings = settings
         self.lifecycle_resolver = lifecycle_resolver
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lifecycle = LifecycleRepository(settings, clock=self.clock)
+        self.telemetry = TelemetryRepository(settings)
+        self.generation_id = generation_id
+        self.coverage_write_count = max(
+            int(coverage_write_count),
+            0,
+        )
 
     def prepare(
         self,
@@ -68,6 +79,7 @@ class ProviderForceActualReconciliationService:
                 if isinstance((existing or {}).get("payload"), dict)
                 else {}
             )
+            lifecycle_before = _lifecycle_before(existing)
             if contract_event.get("actual") not in (None, ""):
                 persisted_audit = existing_payload.get(
                     "actual_resolution"
@@ -119,6 +131,17 @@ class ProviderForceActualReconciliationService:
                 or contract_event.get("time_utc")
             )
             if release is None or release > now:
+                self._emit_decision(
+                    occurrence_id=occurrence_id,
+                    lifecycle_before=lifecycle_before,
+                    eligibility="FUTURE_NOT_DUE",
+                    reclaim_reason="occurrence_not_published",
+                    resolver_invoked=False,
+                    provider_attempted=False,
+                    source_series=mapping["source_series"],
+                    reconciliation_outcome="SKIPPED",
+                    reason_code="OCCURRENCE_NOT_PUBLISHED",
+                )
                 continue
             payload = dict(
                 (existing or {}).get("payload")
@@ -138,7 +161,11 @@ class ProviderForceActualReconciliationService:
                     release_date=release,
                 ),
             }
-            if _negative_cache_active(existing, now=now):
+            eligibility, reclaim_reason = _eligibility(
+                existing,
+                now=now,
+            )
+            if eligibility != "RECLAIMABLE":
                 persisted = payload.get("actual_resolution")
                 if isinstance(persisted, dict):
                     output = _replace_occurrence(
@@ -147,6 +174,17 @@ class ProviderForceActualReconciliationService:
                         event=payload,
                     )
                     audits.append(dict(persisted))
+                self._emit_decision(
+                    occurrence_id=occurrence_id,
+                    lifecycle_before=lifecycle_before,
+                    eligibility=eligibility,
+                    reclaim_reason=reclaim_reason,
+                    resolver_invoked=False,
+                    provider_attempted=False,
+                    source_series=mapping["source_series"],
+                    reconciliation_outcome="SKIPPED",
+                    reason_code=reclaim_reason,
+                )
                 continue
 
             item = {
@@ -181,6 +219,9 @@ class ProviderForceActualReconciliationService:
             )
             audit = {
                 "occurrence_id": occurrence_id,
+                "lifecycle_before": lifecycle_before,
+                "eligibility": eligibility,
+                "reclaim_reason": reclaim_reason,
                 "resolver_invoked": True,
                 "mapping_selected": mapping["metric_id"],
                 "provider_attempted": (
@@ -197,6 +238,9 @@ class ProviderForceActualReconciliationService:
                         if result.get("provider_request_attempted")
                         else 0
                     )
+                ),
+                "provider_request_attempted": bool(
+                    result.get("provider_request_attempted")
                 ),
                 "provider_http_outcome": result.get(
                     "provider_http_outcome"
@@ -230,6 +274,11 @@ class ProviderForceActualReconciliationService:
                 ).isoformat(),
                 "canonical_write_count": 1,
                 "lifecycle_write_count": 1,
+                "coverage_write_count": self.coverage_write_count,
+                "snapshot_write_count": 1,
+                "outbox_write_count": 1,
+                "generation_id": self.generation_id,
+                "finalization_status": "PREPARED",
             }
             if resolved:
                 resolved_enrichment = dict(
@@ -292,14 +341,24 @@ class ProviderForceActualReconciliationService:
                     "actual_resolution": audit,
                     "enrichment": failed_enrichment,
                 }
-                work_status = "BACKOFF"
+                work_status = (
+                    "EXHAUSTED_NO_DATA"
+                    if status == "EXHAUSTED_NO_DATA"
+                    or bool(result.get("retry_deadline_exhausted"))
+                    else "BACKOFF"
+                )
             lifecycle = result.get("lifecycle")
             if isinstance(lifecycle, dict):
                 lifecycle = DatumLifecycle(**lifecycle)
             if not isinstance(lifecycle, DatumLifecycle):
-                raise RuntimeError(
-                    "provider_force_actual_lifecycle_missing:"
-                    f"{occurrence_id}:{status}:{reason_code}"
+                lifecycle = _failure_lifecycle(
+                    self.settings,
+                    occurrence_id=occurrence_id,
+                    payload=datum,
+                    existing=existing,
+                    now=now,
+                    reason_code=reason_code,
+                    terminal=work_status == "EXHAUSTED_NO_DATA",
                 )
             resolved_items.append((lifecycle, datum, work_status))
             canonical_reconciliations.append(
@@ -322,24 +381,26 @@ class ProviderForceActualReconciliationService:
                 event=datum,
             )
             audits.append(audit)
+            self._emit_prepared(audit)
 
-        output["macro_actuals"] = _project_macro_actuals(output)
-        deterministic_domains = dict(
-            output.get("deterministic_domains") or {}
-        )
-        domains = dict(deterministic_domains.get("domains") or {})
-        if output["macro_actuals"].get("status") == "AVAILABLE":
-            domains["macro_actuals"] = {
-                **dict(domains.get("macro_actuals") or {}),
-                "execution_status": "SUCCEEDED",
-                "data_coverage_status": "COMPLETE",
-                "coverage": 1.0,
-                "warnings": [],
-            }
-            deterministic_domains["domains"] = domains
-            output["deterministic_domains"] = deterministic_domains
+        if audits or canonical_reconciliations:
+            output["macro_actuals"] = _project_macro_actuals(output)
+            deterministic_domains = dict(
+                output.get("deterministic_domains") or {}
+            )
+            domains = dict(deterministic_domains.get("domains") or {})
+            if output["macro_actuals"].get("status") == "AVAILABLE":
+                domains["macro_actuals"] = {
+                    **dict(domains.get("macro_actuals") or {}),
+                    "execution_status": "SUCCEEDED",
+                    "data_coverage_status": "COMPLETE",
+                    "coverage": 1.0,
+                    "warnings": [],
+                }
+                deterministic_domains["domains"] = domains
+                output["deterministic_domains"] = deterministic_domains
         data_quality = dict(output.get("data_quality") or {})
-        data_quality["actual_reconciliation"] = {
+        reconciliation_audit = {
             "mode": "PROVIDER_FORCE_DB_FIRST_ATOMIC",
             "occurrences": audits,
             "resolver_invocation_count": sum(
@@ -363,13 +424,73 @@ class ProviderForceActualReconciliationService:
             "ai_job_count": 0,
             "backend_invocation_count": 0,
         }
-        output["data_quality"] = data_quality
+        if audits or canonical_reconciliations:
+            data_quality["actual_reconciliation"] = (
+                reconciliation_audit
+            )
+            output["data_quality"] = data_quality
         return {
             "contract": output,
             "resolved_items": resolved_items,
             "canonical_reconciliations": canonical_reconciliations,
-            "audit": data_quality["actual_reconciliation"],
+            "audit": reconciliation_audit,
         }
+
+    def _emit_prepared(self, audit: dict[str, Any]) -> None:
+        try:
+            self.telemetry.emit(
+                "provider_force_actual_reconciliation",
+                identifiers={
+                    "generation_id": self.generation_id,
+                    "occurrence_id": audit.get("occurrence_id"),
+                },
+                decision_summary=str(
+                    audit.get("reconciliation_outcome")
+                    or "provider force reconciliation prepared"
+                ),
+                stop_reason=str(
+                    audit.get("reason_code") or "PREPARED"
+                ),
+                payload=audit,
+            )
+        except Exception:
+            # Observability must never change provider-force correctness.
+            return
+
+    def _emit_decision(
+        self,
+        *,
+        occurrence_id: str,
+        lifecycle_before: dict[str, Any] | None,
+        eligibility: str,
+        reclaim_reason: str,
+        resolver_invoked: bool,
+        provider_attempted: bool,
+        source_series: str | None,
+        reconciliation_outcome: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        audit = {
+            "occurrence_id": occurrence_id,
+            "lifecycle_before": lifecycle_before,
+            "eligibility": eligibility,
+            "reclaim_reason": reclaim_reason,
+            "resolver_invoked": resolver_invoked,
+            "provider_attempted": provider_attempted,
+            "provider_call_count": 0,
+            "source_series": source_series,
+            "reconciliation_outcome": reconciliation_outcome,
+            "generation_id": self.generation_id,
+            "finalization_status": "NO_OP",
+            "canonical_write_count": 0,
+            "lifecycle_write_count": 0,
+            "coverage_write_count": 0,
+            "snapshot_write_count": 0,
+            "outbox_write_count": 0,
+            "reason_code": reason_code,
+        }
+        self._emit_prepared(audit)
+        return audit
 
 
 def _contract_occurrences(
@@ -438,6 +559,94 @@ def _negative_cache_active(
         str(item.get("freshness_state") or "") == "NO_DATA_BACKOFF"
         and retry_at is not None
         and retry_at > now
+    )
+
+
+def _eligibility(
+    item: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> tuple[str, str]:
+    if not item:
+        return "RECLAIMABLE", "MISSING_LIFECYCLE_INITIALIZATION"
+    freshness = str(
+        item.get("freshness_state") or ""
+    ).upper()
+    work_status = str(item.get("work_status") or "").upper()
+    if (
+        freshness == "EXHAUSTED_NO_DATA"
+        or work_status == "EXHAUSTED_NO_DATA"
+    ):
+        return "EXHAUSTED_NO_DATA", "TERMINAL_NO_DATA"
+    if _negative_cache_active(item, now=now):
+        return "BACKOFF_ACTIVE", "NEXT_RETRY_IN_FUTURE"
+    valid_until = parse_datetime(item.get("valid_until"))
+    next_refresh = parse_datetime(item.get("next_refresh_at"))
+    if (
+        freshness in {"NO_DATA", "NO_DATA_FRESH"}
+        and (
+            (valid_until is not None and valid_until > now)
+            or (next_refresh is not None and next_refresh > now)
+        )
+    ):
+        return "FRESH_NO_DATA", "NO_DATA_STILL_FRESH"
+    return "RECLAIMABLE", "STALE_NO_DATA_RETRY_DUE"
+
+
+def _lifecycle_before(
+    item: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not item:
+        return None
+    return {
+        key: item.get(key)
+        for key in (
+            "freshness_state",
+            "work_status",
+            "attempt_count",
+            "valid_until",
+            "next_refresh_at",
+            "next_retry_at",
+            "negative_cache_expires_at",
+            "refresh_reason",
+        )
+    }
+
+
+def _failure_lifecycle(
+    settings: Settings,
+    *,
+    occurrence_id: str,
+    payload: dict[str, Any],
+    existing: dict[str, Any] | None,
+    now: datetime,
+    reason_code: str,
+    terminal: bool,
+) -> DatumLifecycle:
+    lifecycle = compute_datum_lifecycle(
+        "macro_actual",
+        occurrence_id,
+        payload,
+        settings=settings,
+        now=now,
+        attempt_count=int((existing or {}).get("attempt_count") or 0)
+        + 1,
+        no_data=not terminal,
+        fields_attempted=["actual"],
+        retry_class=(
+            "EXHAUSTED_NO_DATA" if terminal else "PROVIDER_TEMPORARY"
+        ),
+        refresh_reason=reason_code,
+    )
+    if not terminal:
+        return lifecycle
+    return replace(
+        lifecycle,
+        freshness_state="EXHAUSTED_NO_DATA",
+        next_refresh_at=None,
+        next_retry_at=None,
+        negative_cache_key=None,
+        negative_cache_expires_at=None,
     )
 
 

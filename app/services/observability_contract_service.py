@@ -52,6 +52,8 @@ TELEMETRY_EVENTS = frozenset(
         "agent_disabled",
         "startup_catch_up",
         "event_trigger_batch",
+        "provider_force_actual_reconciliation",
+        "provider_force_generation",
     }
 )
 IDENTIFIER_FIELDS = (
@@ -102,7 +104,33 @@ class TelemetryRepository:
             raise ValueError("unsupported_telemetry_event")
         identifiers = dict(identifiers or {})
         redacted = redact_payload(payload or {})
-        if not self.settings.telemetry_trace_detail_enabled:
+        if event_name in {
+            "provider_force_actual_reconciliation",
+            "provider_force_generation",
+        }:
+            redacted = {
+                key: redacted.get(key)
+                for key in (
+                    "occurrence_id",
+                    "lifecycle_before",
+                    "eligibility",
+                    "reclaim_reason",
+                    "resolver_invoked",
+                    "provider_attempted",
+                    "source_series",
+                    "reconciliation_outcome",
+                    "generation_id",
+                    "finalization_status",
+                    "canonical_write_count",
+                    "lifecycle_write_count",
+                    "coverage_write_count",
+                    "snapshot_write_count",
+                    "outbox_write_count",
+                    "reason_code",
+                )
+                if key in redacted
+            }
+        elif not self.settings.telemetry_trace_detail_enabled:
             redacted = {
                 key: redacted.get(key)
                 for key in (

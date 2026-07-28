@@ -1,0 +1,45 @@
+{
+  "fixture_version": "pr28_r3_force_generation_redacted_v1",
+  "redacted": true,
+  "live_evidence": {
+    "route": "GET /market-context/mnq?refresh=force&view=debug",
+    "http_status": 500,
+    "reason_code": "deterministic_provider_result_not_fresh",
+    "before": {
+      "snapshot_revision": 97,
+      "coverage_rows": 8,
+      "outbox_rows": 3,
+      "ai_jobs": 48,
+      "backend_invocations": 41
+    },
+    "after": {
+      "snapshot_revision": 97,
+      "coverage_rows": 71,
+      "outbox_rows": 3,
+      "ai_jobs": 48,
+      "backend_invocations": 41
+    }
+  },
+  "stale_no_data": {
+    "freshness_state": "AWAITING_ACTUAL",
+    "work_status": "SUPERSEDED",
+    "attempt_count": 1,
+    "valid_until_offset_seconds": -60,
+    "next_retry_at": null,
+    "refresh_reason": "macro_actual_exact_occurrence_not_found"
+  },
+  "expected": {
+    "home_occurrence_id": "xtb:146392:2026-07-24",
+    "home_source_series": "HSN1F",
+    "home_actual": 628.0,
+    "home_forecast": 610.0,
+    "home_previous": 618.0,
+    "home_reference_period": "2026-06",
+    "pmi_occurrence_id": "xtb:146945:2026-07-24",
+    "pmi_actual": null,
+    "pmi_forecast": 51.5,
+    "pmi_previous": 51.2,
+    "pmi_reference_period": "2026-07",
+    "pmi_reason_code": "sp_global_public_release_access_restricted"
+  }
+}

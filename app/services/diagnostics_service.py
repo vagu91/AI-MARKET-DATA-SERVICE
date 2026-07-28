@@ -47,6 +47,9 @@ from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
 from app.services.fed_expectations_service import FedExpectationsService
+from app.services.force_generation_staging_service import (
+    ForceGenerationStaging,
+)
 from app.services.risk_context_runtime_service import RiskContextRuntimeService
 from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.social_sentiment_service import SocialSentimentService
@@ -81,6 +84,7 @@ class DiagnosticsService:
         self.positioning_runtime = PositioningRuntimeService(settings)
         self.fed_expectations = FedExpectationsService(settings)
         self.risk_context = RiskContextRuntimeService(settings)
+        self.force_generation_plan: dict[str, Any] = {}
 
     async def e2e_cache_test(
         self,
@@ -133,6 +137,8 @@ class DiagnosticsService:
         now = datetime.now(UTC)
         fetch_missing = refresh != "false"
         force = refresh == "force"
+        staged_force_events: list[Any] = []
+        self.force_generation_plan = {}
         request_context = ExecutionContext.provider_only(
             correlation_id=f"market-context-{uuid.uuid4()}",
             allow_live_providers=fetch_missing,
@@ -148,8 +154,18 @@ class DiagnosticsService:
                 )
             )
         ):
-            force_schedule_coverage = (
-                await self._force_schedule_catch_up(now=now)
+            force_schedule_coverage = await self._force_schedule_catch_up(
+                now=now,
+                stage_for_atomic_finalization=True,
+            )
+            self.force_generation_plan = dict(
+                force_schedule_coverage.pop(
+                    "_canonical_generation_plan",
+                    {},
+                )
+            )
+            staged_force_events = list(
+                force_schedule_coverage.pop("_staged_events", [])
             )
 
         async def load_macro() -> tuple[MacroLatestResponse, dict[str, Any]]:
@@ -190,9 +206,11 @@ class DiagnosticsService:
                     }
                 }
             if force_schedule_coverage:
-                events = self._canonical_three_week_events(
-                    country=country,
-                    now=now,
+                events = staged_force_events or (
+                    self._canonical_three_week_events(
+                        country=country,
+                        now=now,
+                    )
                 )
             else:
                 try:
@@ -464,6 +482,7 @@ class DiagnosticsService:
         *,
         country: str,
         now: datetime,
+        materializer: EconomicEventMaterializationService | None = None,
     ) -> list[Any]:
         """Read the complete previous/current/next local-week DB window."""
 
@@ -487,7 +506,9 @@ class DiagnosticsService:
             datetime.max.time(),
             calendar_timezone,
         )
-        events, _ = self.event_materializer.load_from_history(
+        events, _ = (
+            materializer or self.event_materializer
+        ).load_from_history(
             country=country,
             start=window_start,
             end=window_end,
@@ -499,26 +520,72 @@ class DiagnosticsService:
         self,
         *,
         now: datetime,
+        stage_for_atomic_finalization: bool = False,
     ) -> dict[str, Any]:
-        scheduler = ResearchSchedulerService(self.settings)
-        result: dict[str, Any] = {}
-        deadline = perf_counter() + max(
-            float(self.settings.timeout_events_seconds),
-            5.0,
-        )
-        while perf_counter() < deadline:
-            result = await asyncio.to_thread(
-                scheduler._seed_canonical_schedule_gaps,
-                schedule_acquire=self.event_service.list_events,
-                now=now,
-                materialize_snapshot=False,
+        if not stage_for_atomic_finalization:
+            scheduler = ResearchSchedulerService(self.settings)
+            result: dict[str, Any] = {}
+            deadline = perf_counter() + max(
+                float(self.settings.timeout_events_seconds),
+                5.0,
             )
-            if (
-                result.get("reason")
-                != "schedule_catchup_single_flight_active"
-            ):
-                return result
-            await asyncio.sleep(0.05)
+            while perf_counter() < deadline:
+                result = await asyncio.to_thread(
+                    scheduler._seed_canonical_schedule_gaps,
+                    schedule_acquire=self.event_service.list_events,
+                    now=now,
+                    materialize_snapshot=False,
+                )
+                if (
+                    result.get("reason")
+                    != "schedule_catchup_single_flight_active"
+                ):
+                    return result
+                await asyncio.sleep(0.05)
+            raise TimeoutError(
+                "force_schedule_single_flight_timeout"
+            )
+        with ForceGenerationStaging(self.settings) as staging:
+            scheduler = ResearchSchedulerService(
+                staging.stage_settings
+            )
+            result: dict[str, Any] = {}
+            deadline = perf_counter() + max(
+                float(self.settings.timeout_events_seconds),
+                5.0,
+            )
+            while perf_counter() < deadline:
+                result = await asyncio.to_thread(
+                    scheduler._seed_canonical_schedule_gaps,
+                    schedule_acquire=self.event_service.list_events,
+                    now=now,
+                    materialize_snapshot=False,
+                )
+                if (
+                    result.get("reason")
+                    != "schedule_catchup_single_flight_active"
+                ):
+                    stage_materializer = (
+                        EconomicEventMaterializationService(
+                            staging.stage_settings
+                        )
+                    )
+                    events = self._canonical_three_week_events(
+                        country="US",
+                        now=now,
+                        materializer=stage_materializer,
+                    )
+                    staged_result = {
+                        **result,
+                        "_canonical_generation_plan": (
+                            staging.generation_plan()
+                        ),
+                        "_staged_events": events,
+                    }
+                    del stage_materializer
+                    del scheduler
+                    return staged_result
+                await asyncio.sleep(0.05)
         raise TimeoutError("force_schedule_single_flight_timeout")
 
     def temporal_integrity(self) -> dict[str, Any]:

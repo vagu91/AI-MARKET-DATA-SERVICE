@@ -39,6 +39,9 @@ from app.services.event_calendar_window_service import (
 from app.services.event_occurrence_lifecycle_service import (
     classify_occurrence_lifecycle,
 )
+from app.services.force_generation_staging_service import (
+    publish_force_generation_in_transaction,
+)
 from app.services.observability_contract_service import TelemetryRepository
 from app.services.market_context_sync_service import (
     persist_sync_sections_in_transaction,
@@ -109,6 +112,7 @@ class MarketContextSnapshotRepository:
         ]
         | None = None,
         canonical_reconciliations: list[dict[str, Any]] | None = None,
+        canonical_generation_plan: dict[str, Any] | None = None,
         skip_if_unchanged: bool = False,
         trigger_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -294,6 +298,9 @@ class MarketContextSnapshotRepository:
                 skip_if_unchanged
                 and previous is not None
                 and not canonical_reconciliations
+                and not _generation_plan_has_writes(
+                    canonical_generation_plan
+                )
                 and not resolved_items
                 and resolved_lifecycle is None
             ):
@@ -315,6 +322,35 @@ class MarketContextSnapshotRepository:
                     }
             generated_at = str(debug.get("generated_at_utc") or debug.get("generated_at") or now)
             data_as_of = str(consumer.get("data_as_of") or generated_at)
+            if canonical_generation_plan is not None:
+                generation_audit = dict(debug.get("audit") or {})
+                generation_audit["force_generation"] = {
+                    "generation_id": canonical_generation_plan.get(
+                        "generation_id"
+                    ),
+                    "finalization_status": "COMMITTED",
+                    "coverage_write_count": int(
+                        canonical_generation_plan.get(
+                            "coverage_write_count"
+                        )
+                        or 0
+                    ),
+                    "occurrence_write_count": int(
+                        canonical_generation_plan.get(
+                            "occurrence_write_count"
+                        )
+                        or 0
+                    ),
+                    "discovery_lifecycle_write_count": int(
+                        canonical_generation_plan.get(
+                            "discovery_lifecycle_write_count"
+                        )
+                        or 0
+                    ),
+                    "snapshot_write_count": 1,
+                    "outbox_write_count": 1 if trigger_type else 0,
+                }
+                debug["audit"] = generation_audit
             debug_json = self._json(debug)
             consumer_json = self._json(consumer)
             checksum = hashlib.sha256((debug_json + consumer_json).encode("utf-8")).hexdigest()
@@ -329,6 +365,10 @@ class MarketContextSnapshotRepository:
             )
             if current_revision != revision:
                 raise RuntimeError("snapshot_revision_changed_during_preflight")
+            publish_force_generation_in_transaction(
+                conn,
+                canonical_generation_plan,
+            )
             for reconciliation in canonical_reconciliations or []:
                 persist_actual_reconciliation_in_transaction(
                     conn,
@@ -1411,6 +1451,18 @@ def _trigger_type_for_causes(causes: list[str]) -> str:
             if cause in mapping
         ),
         "market_schedule_change",
+    )
+
+
+def _generation_plan_has_writes(
+    plan: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(plan, dict):
+        return False
+    tables = plan.get("tables")
+    return bool(
+        isinstance(tables, dict)
+        and any(bool(rows) for rows in tables.values())
     )
 
 
