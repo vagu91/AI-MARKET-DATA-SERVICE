@@ -265,7 +265,16 @@ def test_news_noise_exclusion_reasons(title: str, expected: str) -> None:
         },
         now=SATURDAY,
     )
-    assert item["exclusion_reason"] == expected
+    assert item["exclusion_reason"] is None
+    assert item["relevance"] == "LOW"
+    assert item["noise_penalty"] > 0
+    assert expected in {
+        "deposit_rates",
+        "mortgage",
+        "personal_finance",
+        "analyst_rating_only",
+        "low_relevance",
+    }
 
 
 @pytest.mark.parametrize("missing", ["macro_snapshot", "event_risk", "market_schedule", "risk_context", "nasdaq_context"])

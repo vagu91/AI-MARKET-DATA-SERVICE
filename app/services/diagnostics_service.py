@@ -1225,14 +1225,9 @@ def _news_pipeline_status(
             else diagnostics.get("accepted_count") or 0
         )
         exclusions = list(materialized.get("excluded") or [])
-        exclusions.extend(
-            {
-                "article_id": item.get("article_id") or item.get("news_key") or item.get("source_url") or item.get("title"),
-                "reason": "outside_context_date",
-            }
-            for item in materialized.get("historical_articles") or []
-        )
-    materialized_count = len(materialized.get("latest") or [])
+    materialized_count = len(
+        materialized.get("articles") or materialized.get("latest") or []
+    )
     return {
         "fetched_count": len(news_items),
         "validated_count": len(news_items),
@@ -1261,8 +1256,6 @@ def _news_exclusion_reason(item: dict[str, Any]) -> str | None:
         return "missing_url"
     if not item.get("source"):
         return "missing_source"
-    if freshness_label(valid_until=item.get("valid_until")) in {"STALE", "EXPIRED"}:
-        return "expired"
     published = item.get("published_at")
     if published:
         parsed = _parse_dt(published)

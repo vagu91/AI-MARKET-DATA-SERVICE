@@ -691,6 +691,29 @@ def test_changes_notification_and_idempotent_ack_survive_restart(tmp_path: Path)
             }
         )
 
+    save_snapshot(
+        settings,
+        revision=3,
+        payload=debug_payload(
+            news=[
+                record("news-2", "changed"),
+                record("news-3", "new after acknowledged base"),
+            ]
+        ),
+    )
+    delta = service.sections(
+        consumer_id="ai-trader",
+        target_snapshot_revision=3,
+        sections=["news"],
+    )["sections"]["news"]
+    assert delta["incremental"]["mode"] == "RECORD_DELTA"
+    assert delta["incremental"]["base_snapshot_revision"] == 2
+    assert delta["incremental"]["new_count"] == 1
+    assert delta["incremental"]["updated_count"] == 0
+    assert [
+        item["record_id"] for item in delta["context"]["articles"]
+    ] == ["news-3"]
+
 
 def test_calendar_retains_every_event_and_counts_match(tmp_path: Path) -> None:
     settings = cfg(tmp_path)

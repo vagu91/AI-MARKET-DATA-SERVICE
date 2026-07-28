@@ -1,0 +1,72 @@
+{
+  "fixture_version": "lossless-news-forensic-v1",
+  "derived_from": "redacted metadata shapes observed in PR28 R4 sandbox",
+  "contains_credentials": false,
+  "records": [
+    {
+      "provider_record_id": "redacted-reuters-yahoo-1",
+      "title": "Redacted Reuters market update",
+      "summary": "A redacted summary preserves only the metadata shape needed for offline validation.",
+      "source": "Reuters",
+      "original_publisher": "Reuters",
+      "distribution_source": "Yahoo Finance",
+      "source_url": "https://finance.yahoo.com/news/redacted-reuters-1",
+      "published_at": "2026-07-27T13:10:00Z",
+      "retrieved_at": "2026-07-27T13:11:00Z",
+      "valid_from": "2026-07-27T13:10:00Z",
+      "valid_until": "2026-07-28T18:00:00Z",
+      "provider_type": "RSS"
+    },
+    {
+      "provider_record_id": "redacted-reuters-yahoo-2",
+      "title": "Redacted Reuters market update — later dispatch",
+      "summary": "A later redacted dispatch remains a distinct record with a distinct publication timestamp.",
+      "source": "Reuters",
+      "original_publisher": "Reuters",
+      "distribution_source": "Yahoo Finance",
+      "source_url": "https://finance.yahoo.com/news/redacted-reuters-2",
+      "published_at": "2026-07-27T13:40:00Z",
+      "retrieved_at": "2026-07-27T13:41:00Z",
+      "valid_from": "2026-07-27T13:40:00Z",
+      "valid_until": "2026-07-28T18:00:00Z",
+      "provider_type": "RSS"
+    },
+    {
+      "provider_record_id": "redacted-ibd-1",
+      "title": "Redacted IBD mega-cap market report",
+      "summary": "A redacted IBD summary preserves publisher and temporal metadata without protected article text.",
+      "source": "Investor's Business Daily",
+      "original_publisher": "Investor's Business Daily",
+      "source_url": "https://www.investors.com/research/redacted-report",
+      "published_at": "2026-07-27T12:00:00Z",
+      "retrieved_at": "2026-07-27T12:01:00Z",
+      "valid_until": "2026-07-27T18:00:00Z",
+      "provider_type": "RSS"
+    },
+    {
+      "provider_record_id": "redacted-fed-rss-1",
+      "title": "Federal Reserve issues redacted official notice",
+      "summary": "A redacted official notice preserves the source-policy and lineage fields needed by the test.",
+      "source": "Federal Reserve RSS",
+      "original_publisher": "Federal Reserve",
+      "source_url": "https://www.federalreserve.gov/newsevents/pressreleases/redacted.htm",
+      "published_at": "2026-07-26T15:00:00Z",
+      "retrieved_at": "2026-07-26T15:01:00Z",
+      "valid_until": "2026-07-27T15:00:00Z",
+      "provider_type": "RSS"
+    },
+    {
+      "provider_record_id": "redacted-unknown-yahoo-1",
+      "title": "Redacted claim from an unknown originator",
+      "summary": "The distributor is known but the declared originator cannot be verified by the configured policy.",
+      "source": "Unknown Publisher",
+      "original_publisher": "Unknown Publisher",
+      "distribution_source": "Yahoo Finance",
+      "source_url": "https://finance.yahoo.com/news/redacted-unknown-1",
+      "published_at": "2026-07-27T14:00:00Z",
+      "retrieved_at": "2026-07-27T14:01:00Z",
+      "valid_until": "2026-07-28T18:00:00Z",
+      "provider_type": "RSS"
+    }
+  ]
+}

@@ -125,7 +125,6 @@ class MarketNewsRepository:
             "reason_code": payload["source_invalid_reason"],
             "policy_version": policy.policy_version,
         }
-        payload["raw_payload_json"] = encode(article)
         if not source_admitted:
             payload["reliability"] = 0.0
             payload["confidence"] = 0.0
@@ -136,7 +135,23 @@ class MarketNewsRepository:
             topics=topics,
         )
         payload["next_refresh_at"] = article.get("next_refresh_at") or self.freshness.next_refresh_at(payload["valid_until"])
-        payload["lifecycle_status"] = "CURRENT" if (parse_datetime(payload["valid_until"]) or datetime.min.replace(tzinfo=UTC)) > current else "EXPIRED"
+        parsed_valid_until = parse_datetime(payload["valid_until"])
+        payload["lifecycle_status"] = (
+            "CURRENT"
+            if parsed_valid_until and parsed_valid_until > current
+            else "EXPIRED"
+            if parsed_valid_until
+            else "UNCLASSIFIED"
+        )
+        article.update(
+            {
+                "valid_until": payload["valid_until"],
+                "next_refresh_at": payload["next_refresh_at"],
+                "lifecycle_status": payload["lifecycle_status"],
+                "category": payload["category"],
+            }
+        )
+        payload["raw_payload_json"] = encode(article)
         columns = list(payload)
         updates = ", ".join(
             (
@@ -192,7 +207,7 @@ class MarketNewsRepository:
         *,
         symbols: list[str] | None = None,
         days: int = 7,
-        limit: int | None = 200,
+        limit: int | None = None,
         current_only: bool = False,
         include_quarantined: bool = False,
     ) -> list[dict[str, Any]]:
@@ -219,7 +234,13 @@ class MarketNewsRepository:
         now = self.clock()
         for item in items:
             valid_until = parse_datetime(item.get("valid_until"))
-            item["lifecycle_status"] = "CURRENT" if valid_until and valid_until > now else "EXPIRED"
+            item["lifecycle_status"] = (
+                "CURRENT"
+                if valid_until and valid_until > now
+                else "EXPIRED"
+                if valid_until
+                else "UNCLASSIFIED"
+            )
             item["historical"] = item["lifecycle_status"] == "EXPIRED"
         if current_only:
             items = [item for item in items if item["lifecycle_status"] == "CURRENT"]
@@ -228,7 +249,7 @@ class MarketNewsRepository:
             items = [item for item in items if wanted.intersection({symbol.upper() for symbol in item.get("symbols", [])})]
         return items
 
-    def current(self, *, symbols: list[str] | None = None, days: int = 7, limit: int = 200) -> list[dict[str, Any]]:
+    def current(self, *, symbols: list[str] | None = None, days: int = 7, limit: int | None = None) -> list[dict[str, Any]]:
         return self.stored(symbols=symbols, days=days, limit=limit, current_only=True)
 
     def _row(self, row) -> dict[str, Any]:
@@ -249,6 +270,9 @@ class MarketNewsRepository:
                 "independent_source_count", "pipeline_version", "warnings", "content_status",
                 "distribution_source", "distributor", "publisher", "validation", "lineage", "content",
                 "headline", "content_availability", "provenance", "provider", "provider_name",
+                "canonical_news_id", "acquisition_provider", "publisher_status",
+                "distributor_status", "lineage_status", "category_status",
+                "topic_status", "lifecycle",
             ):
                 if data.get(key) in (None, "") and key in data["raw_payload"]:
                     data[key] = data["raw_payload"][key]

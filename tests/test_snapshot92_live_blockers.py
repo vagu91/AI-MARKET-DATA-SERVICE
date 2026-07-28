@@ -802,8 +802,7 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
     rejected = next(
         item
         for item in context["excluded"]
-        if item["title"]
-        == "Unknown publisher claims Nvidia development"
+        if item["lineage"]["original_publisher"] == "Unknown Publisher"
     )
 
     assert ibd["validation"]["status"] == "accepted"
@@ -819,7 +818,10 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         for item in reuters
     )
     assert len({item["published_at"] for item in reuters}) == 2
-    assert rejected["policy_outcome"]["status"] == "rejected"
+    assert rejected["disposition"] == "QUARANTINED"
+    assert rejected["reason"] == (
+        "distribution_source_original_publisher_unverified"
+    )
     policy = SourcePolicyService()
     assert policy.policy_version == "source-policy-v5"
 
@@ -952,7 +954,7 @@ def test_empty_news_cannot_remain_available_or_usable() -> None:
 
     context = section["context"]
     assert context["status"] == "NO_DATA"
-    assert context["reason"] == "NO_DELIVERED_ARTICLES"
+    assert context["reason"] == "TECHNICALLY_INVALID_RECORDS_WITHHELD"
     assert context["accepted_article_count"] == 0
     assert context["delivered_raw_article_count"] == 0
     assert context["usable_for_analysis"] is False

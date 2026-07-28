@@ -316,11 +316,14 @@ def test_news_projection_has_no_sql_top_n_and_explains_rejections(
     assert unknown["source_audit_status"] == "QUARANTINED"
     assert len(context["excluded"]) == 1
     rejected = context["excluded"][0]
-    assert rejected["publisher"] == "Unknown Publisher"
-    assert rejected["distribution_source"] == "Yahoo Finance"
-    assert rejected["policy_outcome"]["status"] == "rejected"
+    assert rejected["lineage"]["original_publisher"] == "Unknown Publisher"
+    assert rejected["lineage"]["distributor"] == "Yahoo Finance"
+    assert rejected["disposition"] == "QUARANTINED"
+    assert rejected["reason"] == (
+        "distribution_source_original_publisher_unverified"
+    )
     assert rejected["reason"]
-    assert rejected["content"] == "Unknown publisher content remains quarantined."
+    assert "content" not in rejected
     equal_timestamp_keys = [
         row["news_key"]
         for row in rows

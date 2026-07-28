@@ -291,9 +291,9 @@ def test_news_contract_is_lossless_and_does_not_infer_distributor() -> None:
     assert first["publisher"] == "Investor's Business Daily"
     assert first["distribution_source"] is None
     assert first["content"] is None
-    assert first["content_availability"] == "SOURCE_NOT_PROVIDED"
+    assert first["content_availability"] == "HEADLINE_ONLY"
     assert first["provenance"]["distributor"] is None
     assert first["lineage"]["article_id"] == first["article_id"]
     assert second["distribution_source"] == "Yahoo Finance"
-    assert second["content_availability"] == "AVAILABLE"
+    assert second["content_availability"] == "FULL_TEXT_AVAILABLE"
     assert second["content"] == "Provider-supplied second-edition body."
