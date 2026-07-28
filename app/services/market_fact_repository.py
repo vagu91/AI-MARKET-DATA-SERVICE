@@ -224,24 +224,70 @@ def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row
             and existing.get(field) not in (None, "")
         ):
             merged[field] = existing[field]
+    existing_period = (
+        existing.get("reference_period") or existing.get("period")
+    )
+    incoming_period = (
+        incoming.get("reference_period") or incoming.get("period")
+    )
+    if (
+        re.fullmatch(r"20\d{2}-\d{2}", str(existing_period or ""))
+        and not re.fullmatch(r"20\d{2}-\d{2}", str(incoming_period or ""))
+    ):
+        merged["reference_period"] = existing_period
+        merged["period"] = existing_period
     existing_enrichment = dict(existing.get("enrichment") or {})
     incoming_enrichment = dict(incoming.get("enrichment") or {})
-    lineage = {
-        **dict(existing_enrichment.get("field_lineage") or {}),
-        **dict(incoming_enrichment.get("field_lineage") or {}),
-    }
+    existing_lineage = dict(
+        existing_enrichment.get("field_lineage") or {}
+    )
+    incoming_lineage = dict(
+        incoming_enrichment.get("field_lineage") or {}
+    )
+    lineage = dict(existing_lineage)
+    for field, value in incoming_lineage.items():
+        prior = existing_lineage.get(field)
+        if isinstance(prior, dict) and isinstance(value, dict):
+            lineage[field] = {**prior, **value}
+        else:
+            lineage[field] = value
     enrichment = {**existing_enrichment, **incoming_enrichment, "field_lineage": lineage}
     for field in ("forecast", "previous", "consensus", "actual"):
         if incoming_enrichment.get(field) in (None, "") and existing_enrichment.get(field) not in (None, ""):
             enrichment[field] = existing_enrichment[field]
+        elif _event_scalar_equal(
+            existing_enrichment.get(field),
+            incoming_enrichment.get(field),
+        ):
+            enrichment[field] = existing_enrichment.get(field)
+    existing_summary = dict(existing_enrichment.get("summary") or {})
+    incoming_summary = dict(incoming_enrichment.get("summary") or {})
+    summary = {**existing_summary, **incoming_summary}
+    # temporal_domain is a projection of persisted canonical columns.  Do not
+    # let an enrichment pass add/remove it and create storage churn.
+    if "temporal_domain" in existing_summary:
+        summary["temporal_domain"] = existing_summary["temporal_domain"]
+    else:
+        summary.pop("temporal_domain", None)
+    if summary:
+        enrichment["summary"] = summary
+    else:
+        enrichment.pop("summary", None)
     merged["enrichment"] = enrichment
+    for field in ("release_at", "time_utc"):
+        if _same_event_instant(existing.get(field), incoming.get(field)):
+            merged[field] = existing.get(field)
     if incoming.get("actual") in (None, "") and row["actual"] not in (None, ""):
         merged["actual"] = row["actual"]
+    elif _event_scalar_equal(existing.get("actual"), incoming.get("actual")):
+        merged["actual"] = existing.get("actual")
     if row["actual_source"]:
         merged["actual_source"] = row["actual_source"]
         merged["actual_source_url"] = row["actual_source_url"]
-        merged["surprise_value"] = row["surprise_value"]
-        merged["surprise_direction"] = row["surprise_direction"]
+        if row["surprise_value"] is not None:
+            merged["surprise_value"] = row["surprise_value"]
+        if row["surprise_direction"] is not None:
+            merged["surprise_direction"] = row["surprise_direction"]
     if row["outcome_json"]:
         merged["outcome"] = decode(row["outcome_json"], {})
     terminal = str(row["temporal_status"] or row["status"] or "").upper()
@@ -256,6 +302,27 @@ def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row
         merged["temporal_audit_status"] = QUARANTINED_STATUS
         merged["temporal_invalid_reason"] = row["temporal_invalid_reason"]
     return merged
+
+
+def _event_scalar_equal(left: Any, right: Any) -> bool:
+    if left in (None, "") or right in (None, ""):
+        return left in (None, "") and right in (None, "")
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError):
+        return left == right
+
+
+def _same_event_instant(left: Any, right: Any) -> bool:
+    if left in (None, "") or right in (None, ""):
+        return left in (None, "") and right in (None, "")
+    left_time = parse_datetime(left)
+    right_time = parse_datetime(right)
+    return (
+        left_time is not None
+        and right_time is not None
+        and left_time == right_time
+    )
 
 
 def _event_record_payload(row: Any) -> dict[str, Any]:
@@ -356,6 +423,223 @@ def _merge_exact_occurrence_payloads(
         merged["occurrence_id"] = key
         selected[key] = merged
     return [selected[key] for key in order]
+
+
+def persist_actual_reconciliation_in_transaction(
+    conn: Any,
+    *,
+    settings: Settings,
+    reconciliation: dict[str, Any],
+    timestamp: str,
+) -> int:
+    """Persist one exact-occurrence resolution in the snapshot transaction."""
+
+    occurrence_id = str(reconciliation.get("occurrence_id") or "")
+    datum = dict(reconciliation.get("datum") or {})
+    candidate = dict(reconciliation.get("candidate") or {})
+    audit = dict(reconciliation.get("audit") or {})
+    resolved = bool(reconciliation.get("resolved"))
+    if not occurrence_id:
+        raise ValueError("actual_reconciliation_occurrence_missing")
+    row = conn.execute(
+        """
+        SELECT * FROM economic_events_history
+        WHERE (
+          event_id=?
+          OR event_key=?
+          OR canonical_event_key=?
+          OR json_extract(raw_payload_json,'$.occurrence_id')=?
+        )
+          AND temporal_audit_status!='QUARANTINED'
+          AND source_audit_status!='QUARANTINED'
+        ORDER BY
+          CASE WHEN event_id=? THEN 0 ELSE 1 END,
+          updated_at DESC,id DESC
+        LIMIT 1
+        """,
+        (
+            occurrence_id,
+            occurrence_id,
+            occurrence_id,
+            occurrence_id,
+            occurrence_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"actual_reconciliation_occurrence_not_found:{occurrence_id}"
+        )
+
+    raw_payload = decode(row["raw_payload_json"], {})
+    raw_payload = _merge_event_payload(raw_payload, datum, row)
+    raw_payload["occurrence_id"] = occurrence_id
+    raw_payload["event_id"] = occurrence_id
+    raw_payload["reference_period"] = datum.get("reference_period")
+    raw_payload["frequency"] = datum.get("frequency")
+    raw_payload["actual_resolution"] = audit
+    enrichment = dict(raw_payload.get("enrichment") or {})
+    field_lineage = dict(
+        enrichment.get("field_lineage")
+        or datum.get("field_lineage")
+        or (datum.get("lineage") or {}).get("field_lineage")
+        or {}
+    )
+    enrichment.update(
+        {
+            "actual": datum.get("actual"),
+            "forecast": datum.get("forecast"),
+            "previous": datum.get("previous"),
+            "field_lineage": field_lineage,
+        }
+    )
+    raw_payload["enrichment"] = enrichment
+    policy_version = str(
+        reconciliation.get("policy_version")
+        or candidate.get("policy_version")
+        or SourcePolicyService(settings.source_policy_path).policy_version
+    )
+    if not resolved:
+        conn.execute(
+            """
+            UPDATE economic_events_history
+            SET period=?,forecast=COALESCE(?,forecast),
+                previous=COALESCE(?,previous),
+                temporal_status='AWAITING_ACTUAL',
+                status='AWAITING_ACTUAL',
+                raw_payload_json=?,updated_at=?
+            WHERE id=?
+            """,
+            (
+                datum.get("reference_period"),
+                datum.get("forecast"),
+                datum.get("previous"),
+                encode(raw_payload),
+                timestamp,
+                row["id"],
+            ),
+        )
+        return 1
+
+    candidate_url = str(
+        candidate.get("canonical_url")
+        or candidate.get("source_url")
+        or ""
+    )
+    source_validation = SourcePolicyService(
+        settings.source_policy_path
+    ).validate_url(
+        candidate_url,
+        allow_test_reserved=settings.environment.lower() == "test",
+    )
+    if not source_validation.accepted:
+        raise ValueError(
+            f"source_invalid:{source_validation.reason_code}"
+        )
+    actual = datum.get("actual")
+    if actual in (None, ""):
+        raise ValueError("official actual candidate has no value")
+    source = str(
+        candidate.get("source") or candidate.get("publisher") or ""
+    )
+    if not source or not candidate_url:
+        raise ValueError(
+            "official actual candidate requires source and URL"
+        )
+    surprise_value, surprise_direction, semantic_compatible, semantic_warnings = (
+        _semantic_surprise(row, raw_payload, candidate)
+    )
+    conn.execute(
+        """
+        UPDATE economic_events_history
+        SET period=?,forecast=COALESCE(?,forecast),
+            previous=COALESCE(?,previous),actual=?,
+            actual_source=?,actual_source_url=?,
+            surprise_value=?,surprise_direction=?,
+            actual_retrieved_at=?,field_lineage_json=?,
+            policy_version=?,temporal_status='RELEASED',
+            status='RELEASED',raw_payload_json=?,updated_at=?,
+            actual_metric_id=?,actual_unit=?,actual_frequency=?,
+            actual_seasonal_adjustment=?,actual_reference_period=?,
+            actual_transformation=?,actual_semantic_compatible=?,
+            semantic_warnings_json=?
+        WHERE id=?
+        """,
+        (
+            datum.get("reference_period"),
+            datum.get("forecast"),
+            datum.get("previous"),
+            str(actual),
+            source,
+            candidate_url,
+            None if surprise_value is None else str(surprise_value),
+            surprise_direction,
+            candidate.get("retrieved_at") or timestamp,
+            encode(field_lineage),
+            policy_version,
+            encode(raw_payload),
+            timestamp,
+            candidate.get("event_metric_id")
+            or candidate.get("metric_id"),
+            candidate.get("unit"),
+            candidate.get("frequency"),
+            candidate.get("seasonal_adjustment"),
+            candidate.get("reference_period")
+            or candidate.get("period"),
+            candidate.get("transformation"),
+            int(semantic_compatible),
+            encode(semantic_warnings),
+            row["id"],
+        ),
+    )
+    fact_payload = {
+        "fact_key": f"{occurrence_id}:official_actual",
+        "fact_type": "official_event_actual",
+        "country": row["country"],
+        "category": row["category"],
+        "event_name": row["name"],
+        "period": datum.get("reference_period"),
+        "unit": candidate.get("unit"),
+        "forecast": datum.get("forecast"),
+        "previous": datum.get("previous"),
+        "consensus": row["consensus"],
+        "actual": str(actual),
+        "source": source,
+        "source_url": candidate_url,
+        "provider_type": "API",
+        "reliability": candidate.get("reliability") or 0,
+        "confidence": candidate.get("confidence") or 0,
+        "retrieved_at": candidate.get("retrieved_at") or timestamp,
+        "release_at": row["release_at"],
+        "status": "active",
+        "raw_payload_json": encode(
+            {**candidate, "actual_resolution": audit}
+        ),
+        "field_lineage_json": encode(field_lineage),
+        "policy_version": policy_version,
+        "source_tier": candidate.get("source_tier"),
+        "source_classification": candidate.get(
+            "source_classification"
+        ),
+        "canonical_url": candidate.get("canonical_url"),
+        "canonical_event_key": occurrence_id,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    columns = [
+        column for column in FACT_COLUMNS if column in fact_payload
+    ]
+    conn.execute(
+        f"INSERT INTO market_facts ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)}) "
+        f"ON CONFLICT(fact_key) DO UPDATE SET "
+        + ", ".join(
+            f"{column}=excluded.{column}"
+            for column in columns
+            if column not in {"fact_key", "created_at"}
+        ),
+        [fact_payload[column] for column in columns],
+    )
+    return 1
 
 
 def connect_market_db(settings: Settings) -> Any:
@@ -736,6 +1020,10 @@ class MarketFactRepository:
                     conn.rollback()
                     return False
                 payload = _merge_event_payload(existing_raw, payload, existing)
+                merged_enrichment = dict(payload.get("enrichment") or {})
+                forecast = merged_enrichment.get("forecast")
+                previous = merged_enrichment.get("previous")
+                consensus = merged_enrichment.get("consensus")
                 if actual in (None, "") and existing["actual"] not in (None, ""):
                     actual = existing["actual"]
                 if str(existing["temporal_status"] or existing["status"] or "").upper() in {
@@ -766,6 +1054,36 @@ class MarketFactRepository:
                 payload["temporal_status"] = QUARANTINED_STATUS
                 payload["temporal_audit_status"] = QUARANTINED_STATUS
                 payload["temporal_invalid_reason"] = invalid_reason
+            if (
+                existing is not None
+                and existing_raw == payload
+                and _event_scalar_equal(existing["actual"], actual)
+                and _event_scalar_equal(existing["forecast"], forecast)
+                and _event_scalar_equal(existing["previous"], previous)
+                and _event_scalar_equal(existing["consensus"], consensus)
+                and str(existing["period"] or "")
+                == str(
+                    payload.get("reference_period")
+                    or payload.get("period")
+                    or ""
+                )
+                and str(
+                    existing["temporal_status"]
+                    or existing["status"]
+                    or ""
+                ).upper()
+                == terminal_status
+                and str(
+                    existing["temporal_audit_status"] or "ACTIVE"
+                ).upper()
+                == audit_status
+                and str(
+                    existing["source_audit_status"] or "ACTIVE"
+                ).upper()
+                == source_audit_status
+            ):
+                conn.rollback()
+                return False
             conn.execute(
                 """
                 INSERT INTO economic_events_history (

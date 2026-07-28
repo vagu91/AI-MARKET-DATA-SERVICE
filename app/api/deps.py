@@ -8,6 +8,9 @@ from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.deterministic_provider_runtime_service import (
     DeterministicProviderRuntimeService,
 )
+from app.services.lifecycle_due_resolver import (
+    DeterministicLifecycleDueResolver,
+)
 
 
 def get_macro_service(request: Request) -> MacroService:
@@ -34,3 +37,9 @@ def get_deterministic_provider_runtime(
     request: Request,
 ) -> DeterministicProviderRuntimeService:
     return request.app.state.deterministic_provider_runtime
+
+
+def get_lifecycle_due_resolver(
+    request: Request,
+) -> DeterministicLifecycleDueResolver:
+    return request.app.state.lifecycle_due_resolver

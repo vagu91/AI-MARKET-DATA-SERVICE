@@ -49,9 +49,16 @@ class FredProvider(BaseProvider):
     reliability = 0.95
     cache_key = "provider:fred:macro_latest"
 
-    def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
+    def __init__(
+        self,
+        cache: ProviderCacheProtocol,
+        settings: Settings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         super().__init__(cache)
         self.settings = settings
+        self.transport = transport
 
     async def fetch(
         self,
@@ -68,6 +75,7 @@ class FredProvider(BaseProvider):
         async with httpx.AsyncClient(
             timeout=self.settings.fred_timeout_seconds,
             follow_redirects=False,
+            transport=self.transport,
         ) as client:
             selected = tuple(series_ids or FRED_SERIES)
             for series_id in selected:

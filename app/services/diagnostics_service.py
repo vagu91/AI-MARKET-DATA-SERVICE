@@ -797,7 +797,16 @@ class DiagnosticsService:
                     "value": None if series.value is None else str(series.value),
                     "unit": series.units,
                     "source": series.source,
-                    "provider_type": series.metadata.provider_type.value,
+                    "provider_type": (
+                        ProviderType.API.value
+                        if (
+                            series.metadata.provider_type
+                            == ProviderType.CACHE
+                            and str(series.source).upper()
+                            in {"FRED", "BLS", "BEA", "CENSUS"}
+                        )
+                        else series.metadata.provider_type.value
+                    ),
                     "reliability": series.metadata.reliability,
                     "confidence": series.metadata.reliability,
                     "retrieved_at": series.metadata.retrieved_at.isoformat(),

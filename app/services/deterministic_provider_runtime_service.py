@@ -523,9 +523,9 @@ def _rates_context(series: dict[str, Any], now: datetime) -> dict[str, Any]:
     return {
         **_section(
             [
-                {"series_id": key, **dict(value)}
-                for key, value in selected.items()
-                if isinstance(value, dict)
+                {"series_id": key, **dict(selected[key])}
+                for key in sorted(selected)
+                if isinstance(selected[key], dict)
             ],
             provider="FRED",
             trigger_class="NON_TRIGGERING",

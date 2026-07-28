@@ -1484,7 +1484,10 @@ class ResearchSchedulerService:
                 now=now,
                 materialize_snapshot=materialize_snapshot,
             )
-        if not self._canonical_schedule_has_due_dates(now=now):
+        if not self._canonical_schedule_has_due_dates(
+            now=now,
+            schedule_acquire=schedule_acquire,
+        ):
             backoff = self._canonical_schedule_backoff(now=now)
             if backoff is not None:
                 return backoff
@@ -1536,6 +1539,7 @@ class ResearchSchedulerService:
         self,
         *,
         now: datetime,
+        schedule_acquire: Callable[..., Any] | None = None,
     ) -> bool:
         timezone = ZoneInfo(
             str(
@@ -1552,16 +1556,50 @@ class ResearchSchedulerService:
             previous_start + timedelta(days=offset)
             for offset in range(21)
         ]
-        return bool(
+        window_start = datetime.combine(
+            previous_start,
+            datetime.min.time(),
+            timezone,
+        ).astimezone(UTC)
+        window_end = datetime.combine(
+            current_start + timedelta(days=14),
+            datetime.min.time(),
+            timezone,
+        ).astimezone(UTC)
+        owner = (
+            getattr(schedule_acquire, "__self__", None)
+            if schedule_acquire is not None
+            else None
+        )
+        target_loader = getattr(owner, "coverage_targets", None)
+        targets = (
+            list(
+                target_loader(
+                    country="US",
+                    start=window_start,
+                    end=window_end,
+                )
+            )
+            if callable(target_loader)
+            else []
+        )
+        if not targets:
+            targets = [
+                {
+                    "provider_name": "economic_calendar_composite",
+                    "query_scope": "country=US",
+                }
+            ]
+        policy_version = self.market_facts.source_policy.policy_version
+        return any(
             self.calendar_coverage.missing_dates(
                 requested_days,
-                provider_name="economic_calendar_composite",
-                query_scope="country=US",
+                provider_name=str(target["provider_name"]),
+                query_scope=str(target["query_scope"]),
                 now=now,
-                policy_version=(
-                    self.market_facts.source_policy.policy_version
-                ),
+                policy_version=policy_version,
             )
+            for target in targets
         )
 
     def _canonical_schedule_backoff(

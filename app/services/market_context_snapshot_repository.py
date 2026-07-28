@@ -25,7 +25,11 @@ from app.services.market_context_outbox_service import (
 from app.services.event_driven_lifecycle_service import (
     DatumLifecycle,
     compute_datum_lifecycle,
+    material_changes,
     persist_lifecycle_in_transaction,
+)
+from app.services.market_fact_repository import (
+    persist_actual_reconciliation_in_transaction,
 )
 from app.services.event_calendar_window_service import (
     build_event_calendar_window,
@@ -104,6 +108,8 @@ class MarketContextSnapshotRepository:
             tuple[DatumLifecycle, dict[str, Any], str]
         ]
         | None = None,
+        canonical_reconciliations: list[dict[str, Any]] | None = None,
+        skip_if_unchanged: bool = False,
         trigger_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Allocate revision and persist both payloads in one SQLite write transaction."""
@@ -284,6 +290,29 @@ class MarketContextSnapshotRepository:
                 allow_test_reserved=self.allow_test_reserved_sources,
             ) or {}
             self._validate_prepared_payloads(debug=debug, consumer=consumer)
+            if (
+                skip_if_unchanged
+                and previous is not None
+                and not canonical_reconciliations
+                and not resolved_items
+                and resolved_lifecycle is None
+            ):
+                previous_consumer = json.loads(
+                    previous["consumer_payload_json"] or "{}"
+                )
+                changed_sections, _ = material_changes(
+                    previous_consumer,
+                    consumer,
+                )
+                if not changed_sections:
+                    return {
+                        "snapshot_id": str(previous["snapshot_id"]),
+                        "debug_payload": previous_debug,
+                        "consumer_payload": previous_consumer,
+                        "created": False,
+                        "snapshot_write_count": 0,
+                        "outbox_write_count": 0,
+                    }
             generated_at = str(debug.get("generated_at_utc") or debug.get("generated_at") or now)
             data_as_of = str(consumer.get("data_as_of") or generated_at)
             debug_json = self._json(debug)
@@ -300,6 +329,13 @@ class MarketContextSnapshotRepository:
             )
             if current_revision != revision:
                 raise RuntimeError("snapshot_revision_changed_during_preflight")
+            for reconciliation in canonical_reconciliations or []:
+                persist_actual_reconciliation_in_transaction(
+                    conn,
+                    settings=self.settings,
+                    reconciliation=reconciliation,
+                    timestamp=now,
+                )
             conn.execute(
                 """
                 INSERT INTO market_context_snapshots(
@@ -369,6 +405,10 @@ class MarketContextSnapshotRepository:
                     changed_sections_override=sync_changed_sections,
                     section_metadata=sync_section_metadata,
                 )
+            # Project the generic read-model lifecycles first.  Exact resolver
+            # outcomes below are authoritative for their occurrence and must
+            # retain provider backoff/freshness semantics.
+            self._persist_projected_lifecycle(conn, debug, timestamp=now)
             if resolved_lifecycle is not None:
                 persist_lifecycle_in_transaction(
                     conn,
@@ -385,7 +425,6 @@ class MarketContextSnapshotRepository:
                     work_status=work_status,
                     timestamp=now,
                 )
-            self._persist_projected_lifecycle(conn, debug, timestamp=now)
             self._persist_components(
                 conn,
                 symbol=symbol,

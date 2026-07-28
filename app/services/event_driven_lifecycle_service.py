@@ -90,6 +90,20 @@ VOLATILE_FINGERPRINT_KEYS = frozenset(
         "heartbeat_at",
         "lease_owner",
         "lease_expires_at",
+        "born_at",
+        "delete_after",
+        "next_refresh",
+        "next_refresh_at",
+        "next_retry_at",
+        "valid_from",
+        "valid_until",
+        "materiality_fingerprint",
+        "consumer_event_bytes",
+        "size_bytes",
+        "next_open",
+        "next_open_at",
+        "next_close",
+        "next_close_at",
     }
 )
 
@@ -426,6 +440,8 @@ def material_changes(
             "metadata",
             "generated_at",
             "generated_at_utc",
+            "data_as_of",
+            "payload_measurement",
         }:
             continue
         old_fingerprint = materiality_fingerprint(previous.get(key))

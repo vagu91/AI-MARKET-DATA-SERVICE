@@ -126,8 +126,9 @@ class ExactOccurrenceActualProviderAdapter:
             else {}
         )
         expected_key = str(
-            payload.get("canonical_event_key")
-            or payload.get("occurrence_id")
+            payload.get("occurrence_id")
+            or payload.get("event_id")
+            or payload.get("canonical_event_key")
             or canonical_event_key(payload)
         )
         expected_release = parse_datetime(
@@ -434,13 +435,20 @@ class MacroActualLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": "macro_actual_occurrence_not_released",
             }
+        atomic_provider_force = (
+            str(item.get("resolution_mode") or "")
+            == "prepare_atomic_provider_force"
+        )
         lookback_start = now - (
             timedelta(
                 days=int(
                     self.settings.event_calendar_catchup_lookback_days
                 )
             )
-            if self.settings.event_calendar_catchup_enabled
+            if (
+                self.settings.event_calendar_catchup_enabled
+                or atomic_provider_force
+            )
             else timedelta(
                 hours=int(self.settings.lifecycle_startup_catchup_hours)
             )
@@ -468,25 +476,35 @@ class MacroActualLifecycleProviderAdapter:
                 "status": "NO_DATA",
                 "reason": "macro_actual_item_identity_mismatch",
             }
-        tolerance = timedelta(minutes=1)
-        output = asyncio.run(
-            self.event_service.list_events(
-                country=str(payload.get("country") or "US"),
-                start=max(lookback_start, release - tolerance),
-                end=min(now, release + tolerance),
-                enrich=False,
+        exact = (
+            {
+                **payload,
+                "occurrence_id": expected_key,
+                "canonical_event_key": expected_key,
+            }
+            if atomic_provider_force
+            else None
+        )
+        if exact is None:
+            tolerance = timedelta(minutes=1)
+            output = asyncio.run(
+                self.event_service.list_events(
+                    country=str(payload.get("country") or "US"),
+                    start=max(lookback_start, release - tolerance),
+                    end=min(now, release + tolerance),
+                    enrich=False,
+                )
             )
-        )
-        rows = [_model_dump(row) for row in output]
-        exact = next(
-            (
-                row
-                for row in rows
-                if canonical_event_key(row) == expected_key
-                and _same_release_minute(row, release)
-            ),
-            None,
-        )
+            rows = [_model_dump(row) for row in output]
+            exact = next(
+                (
+                    row
+                    for row in rows
+                    if canonical_event_key(row) == expected_key
+                    and _same_release_minute(row, release)
+                ),
+                None,
+            )
         if exact is None:
             provider_results = [
                 _model_dump(result)
@@ -559,6 +577,10 @@ class MacroActualLifecycleProviderAdapter:
                 payload.get("reference_period")
                 or payload.get("period")
             ),
+            persist_candidate=(
+                str(item.get("resolution_mode") or "")
+                != "prepare_atomic_provider_force"
+            ),
         )
         status = str(resolution.get("status") or "NO_DATA").upper()
         if status == "OFFICIAL_FEED_DELAYED" or resolution.get(
@@ -570,6 +592,19 @@ class MacroActualLifecycleProviderAdapter:
                     resolution.get("error")
                     or "official_macro_actual_feed_delayed"
                 ),
+                "reason_code": resolution.get("reason_code"),
+                "provider": resolution.get("provider"),
+                "source_series": resolution.get("source_series"),
+                "provider_http_outcome": resolution.get(
+                    "provider_http_outcome"
+                ),
+                "provider_call_count": int(
+                    resolution.get("provider_call_count") or 0
+                ),
+                "retryable": True,
+                "provider_request_attempted": True,
+                "provider_request_completed": False,
+                "provider_request_failed": True,
             }
         if status in {"FAILED", "TEMPORARY_ERROR"}:
             return {
@@ -613,6 +648,16 @@ class MacroActualLifecycleProviderAdapter:
             "provider_request_attempted": True,
             "provider_request_completed": True,
             "provider_request_failed": False,
+            "candidate": candidate,
+            "mapping_selected": resolution.get("mapping_selected"),
+            "source_series": resolution.get("source_series"),
+            "provider": resolution.get("provider"),
+            "provider_call_count": int(
+                resolution.get("provider_call_count") or 0
+            ),
+            "candidate_validation": resolution.get(
+                "candidate_validation"
+            ),
         }
 
 
@@ -796,14 +841,27 @@ class DeterministicLifecycleDueResolver:
             "RATE_LIMITED",
             "UNAVAILABLE",
         }:
+            failure_telemetry = {
+                **telemetry,
+                "provider_request_completed": False,
+                "provider_request_failed": provider_request_attempted,
+                **{
+                    key: result.get(key)
+                    for key in (
+                        "reason_code",
+                        "provider",
+                        "source_series",
+                        "provider_http_outcome",
+                        "provider_call_count",
+                        "retryable",
+                    )
+                    if result.get(key) is not None
+                },
+            }
             return self._temporary_failure(
                 item,
                 reason=str(result.get("reason") or status.lower()),
-                telemetry={
-                    **telemetry,
-                    "provider_request_completed": False,
-                    "provider_request_failed": provider_request_attempted,
-                },
+                telemetry=failure_telemetry,
             )
         if status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA", "NOT_CONFIGURED"}:
             return self._exhausted(
@@ -1299,9 +1357,13 @@ def _official_actual_datum(
         candidate.get("source_url")
         or candidate.get("canonical_url")
     )
+    distributor = event.get("source") or event.get("provider")
+    distributor_url = event.get("source_url")
     actual_lineage = {
         "source": source,
         "publisher": candidate.get("publisher"),
+        "distributor": distributor,
+        "distributor_url": distributor_url,
         "source_url": source_url,
         "canonical_url": candidate.get("canonical_url"),
         "source_tier": candidate.get("source_tier") or 1,
@@ -1327,6 +1389,7 @@ def _official_actual_datum(
         "validation_status": (
             candidate.get("validation_status") or "accepted"
         ),
+        "source_field": "actual",
     }
     enrichment = (
         dict(event.get("enrichment") or {})
@@ -1334,10 +1397,45 @@ def _official_actual_datum(
         else {}
     )
     field_lineage = dict(enrichment.get("field_lineage") or {})
+    persisted_lineage = (
+        event.get("lineage")
+        if isinstance(event.get("lineage"), dict)
+        else {}
+    )
+    persisted_fields = dict(
+        persisted_lineage.get("field_lineage") or {}
+    )
+    if "forecast" not in field_lineage:
+        scheduled_forecast = (
+            persisted_fields.get("forecast")
+            or persisted_fields.get("consensus")
+        )
+        if isinstance(scheduled_forecast, dict):
+            field_lineage["forecast"] = {
+                **scheduled_forecast,
+                "field_semantics": "forecast",
+            }
     field_lineage["actual"] = actual_lineage
+    if candidate.get("previous") not in (None, ""):
+        field_lineage["previous"] = {
+            **actual_lineage,
+            "field_semantics": "previous",
+            "source_field": "previous",
+            "value": candidate.get("previous"),
+            "reference_period": candidate.get(
+                "previous_reference_period"
+            ),
+            "derivation": "previous_official_series_observation",
+        }
     enrichment.update(
         {
             "actual": value,
+            "forecast": event.get("forecast"),
+            "previous": (
+                candidate.get("previous")
+                if candidate.get("previous") not in (None, "")
+                else event.get("previous")
+            ),
             "source": source,
             "source_url": source_url,
             "field_lineage": field_lineage,
@@ -1355,6 +1453,7 @@ def _official_actual_datum(
             else event.get("previous")
         ),
         "previous_revised": candidate.get("previous_revised"),
+        "forecast": event.get("forecast"),
         "metric_id": (
             candidate.get("event_metric_id")
             or candidate.get("metric_id")
@@ -1383,13 +1482,36 @@ def _official_actual_datum(
             candidate.get("validation_timestamp")
             or candidate.get("retrieved_at")
         ),
+        # A newly admitted official actual starts a fresh lifecycle.  Do not
+        # inherit the pre-release occurrence's expired cache/retry horizon.
+        "valid_until": candidate.get("valid_until"),
+        "next_refresh_at": candidate.get("next_refresh_at"),
+        "next_retry_at": None,
         "frequency": candidate.get("frequency"),
         "unit": candidate.get("unit"),
         "source": source,
         "source_url": source_url,
+        "distributor": distributor,
+        "distributor_url": distributor_url,
+        "actual_source": source,
+        "actual_source_url": source_url,
         "source_lineage": [actual_lineage],
+        "comparison_lineage": {
+            **dict(event.get("comparison_lineage") or {}),
+            "scheduled_previous": event.get("previous"),
+            "scheduled_previous_lineage": persisted_fields.get(
+                "previous"
+            ),
+            "official_previous": candidate.get("previous"),
+            "official_previous_semantics": (
+                "previous_official_series_observation"
+            ),
+        },
         "acquisition_method": "api_provider",
         "actual_is_official": True,
+        "awaiting_actual": False,
+        "status": "RELEASED",
+        "release_status": "RELEASED",
         "enrichment": enrichment,
     }
 

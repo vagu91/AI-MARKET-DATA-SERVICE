@@ -433,3 +433,197 @@ Final verification for this follow-up:
     SHA-256 `D40459950CACCFB03E16D23F499073F32910272D19393CEEA04E2A5982A5BC00`;
   - full-sync: 464,424 bytes,
     SHA-256 `54C04FA33E3888708BD38D1B0C5DA01E436985AA5CED813A1086CC5611FA391D`.
+
+## PR 28 R2 follow-up - production route wiring (2026-07-28)
+
+Initial PR head:
+`1e85e47e8b04871f41c7293d0bc6dca67f311407`.
+Base:
+`f32fecb365d91501cb863497a6b2c15d3b128ff7`.
+The final implementation head is the commit containing this addendum on
+`codex/fix-pr27-live-forensic-blockers`; its exact SHA is recorded in PR #28
+and in the final handoff.
+
+### Read-only R2 evidence
+
+The isolated R2 database and three captured artifacts under
+`data/pr28-r2-live-sandbox-20260728-103300` were inspected read-only. SQLite
+was opened with immutable/query-only semantics and passed
+`PRAGMA integrity_check`. The operational database was not opened.
+
+- `actual-diagnostic-summary.json`: 19,937 bytes,
+  SHA-256
+  `7C3B2CE20AB11DC5582737F9322B0B5FC3FB6AB3D2E98FB593431A41DF933088`;
+- `provider-force-debug.json`: 4,815,230 bytes,
+  SHA-256
+  `39502A778EC4BA402CBF20D839A291AF8CE271F7D32BD502C6A109023B0AC966`;
+- `full-sync-exact.json`: 3,832,706 bytes,
+  SHA-256
+  `DBDF8A8FCA00435956F23391218EE09B32F0C1E3D12BE6321D41DCC487BA92E2`.
+
+The full-sync had 17 sections, snapshot 98, and contract checksum
+`e2cae8e6939b60db3905b5625ca163718d818c29634689caf9864fbed95a7b80`.
+The calendar contained 56 delivered plus 15 exact duplicates across the 71
+provider/scope/date candidates, with zero omission. Snapshot 97 advanced to
+98 and outbox 3 advanced to 4, while AI jobs stayed at 48, backend
+invocations stayed at 41, and the queue stayed empty. Both target
+occurrences remained `actual_missing`; localized `Giugno`/`Luglio` and the
+stale scheduled values were still visible.
+
+### Exact root cause and call graph
+
+The official actual resolver was instantiated by
+`build_application_state`, and the lifecycle resolver owned it. It was not,
+however, a dependency of the force route.
+
+Before:
+
+```text
+GET /market-context/mnq?refresh=force
+  -> construct DiagnosticsService inside the route
+  -> DiagnosticsService.full_model
+     -> calendar/provider reconciliation
+     -> scheduler coverage preflight (snapshot materialization disabled)
+  -> DeterministicProviderRuntimeService.enrich_market_context
+  -> harden_market_context
+  -> MarketContextSnapshotRepository.save_next
+     -> snapshot/outbox
+```
+
+The `MacroActualLifecycleProviderAdapter` and
+`DeterministicActualResolver` existed only behind the lifecycle resolver used
+by startup/background catch-up. The route did not pass that resolver to its
+orchestrator, did not give it the two `actual_missing_ids`, and therefore
+never selected FRED `HSN1F` or attempted S&P Global. Normalization and the
+PMI reason code lived in the unreachable branch and could not reach the
+canonical row or full-sync.
+
+After:
+
+```text
+GET /market-context/mnq?refresh=force
+  -> FastAPI dependency graph supplies the production lifecycle resolver
+  -> DiagnosticsService.full_model
+  -> DeterministicProviderRuntimeService.enrich_market_context
+  -> ProviderForceActualReconciliationService.prepare
+     -> DB-first exact-occurrence gap detection
+     -> official mapping
+     -> production lifecycle resolver
+        -> MacroActualLifecycleProviderAdapter
+           -> DeterministicActualResolver
+              -> FRED HSN1F / S&P Global adapter
+     -> validate and prepare canonical + lifecycle mutations
+     -> project losslessly into event calendar and macro actuals
+  -> harden_market_context
+  -> MarketContextSnapshotRepository.save_next
+     -> one BEGIN IMMEDIATE transaction
+        -> canonical exact-occurrence reconciliation
+        -> lifecycle outcome
+        -> snapshot
+        -> outbox
+```
+
+The scheduler now checks the actual provider/scope coverage targets before
+acquiring its lease, so an already-covered fixed point cannot mutate
+`provider_state`. The stable provider occurrence ID has precedence over a
+derived canonical alias, preventing a replay or richer projection from
+renaming `xtb:146392:2026-07-24` or `xtb:146945:2026-07-24`.
+
+Earlier tests passed because they manually constructed an adapter/resolver
+pair or replaced `DiagnosticsService`; neither path exercised the dependency
+graph built by `app.main` and used by the HTTP route.
+
+### Provider results and provenance
+
+For `xtb:146392:2026-07-24`, the route-level controlled HTTP response contains
+FRED observations 628 and 618 for `HSN1F`. Runtime code contains the mapping
+and semantic constraints, not those numeric values. The resolver validates
+monthly frequency, SAAR/thousands unit, observation month `2026-06`, and
+source policy. The materialized occurrence retains the XTB identity and
+distributor, while the official actual lineage identifies FRED/Census-HUD,
+`HSN1F`, source URL, retrieval/release/reference timestamps, unit, frequency,
+validation status, and occurrence mapping. Forecast retains separate XTB
+lineage. Previous 618 has separate official lineage with
+`derivation=previous_official_series_observation` and
+`source_field=previous`; it is not relabelled as forecast or as the stale XTB
+previous.
+
+For `xtb:146945:2026-07-24`, the route really reaches the S&P Global HTTP
+boundary. A controlled HTTP 403 produces no candidate and no invented actual.
+The occurrence remains `AWAITING_ACTUAL`, normalizes to `2026-07`, preserves
+forecast 51.5 and previous 51.2 with XTB lineage, and carries structured
+`actual_resolution` telemetry in debug and full-sync:
+
+- resolver invoked and mapping selected;
+- provider `SPGLOBAL`, HTTP outcome `HTTP_403`;
+- stable reason
+  `sp_global_public_release_access_restricted`;
+- retryable, actual still missing, attempted timestamp;
+- provider/candidate/reconciliation/persistence and write accounting.
+
+No alternative deterministic source admitted by the current source policy was
+found for this PMI release. The unavailable provider therefore remains
+fail-closed.
+
+### Production-graph and atomicity proof
+
+`tests/test_pr28_route_provider_force_wiring.py` starts the real `app.main`
+lifespan and calls the production `build_application_state`. It replaces only
+the FRED and S&P HTTP transports and rejects all other network at the boundary.
+It calls the actual route and then `/market-context/mnq/sync/full`.
+
+The test proves FRED invocation and `HSN1F` selection, 628/610/618,
+`2026-06`, unchanged XTB occurrence identity, separate field lineage, one real
+S&P 403, fail-closed PMI, `2026-07`, reason propagation, 17 full-sync sections,
+zero AI jobs, and zero backend invocations.
+
+Test-only SQLite triggers audit `INSERT`, `UPDATE`, and `DELETE` on snapshots,
+outbox, canonical history, lifecycle, candidates, coverage, provider state, AI
+jobs, and backend invocations. The first force creates exactly one snapshot
+and at most one outbox. On the second force, the audit table is empty: zero
+canonical, lifecycle, coverage, provider-state, retry, snapshot, outbox, AI,
+and backend writes. The S&P negative cache prevents a second HTTP call.
+
+The canonical event repository now performs lossless deep lineage merge and
+suppresses semantically identical numeric/time rewrites. A poorer provider
+projection cannot delete richer verified lineage, and a derived temporal
+projection cannot create database churn.
+
+### Final offline verification
+
+- route/actual/live-blocker/sync focused suite: 56 passed;
+- extended provider/actual/lifecycle/scheduler/coverage/snapshot/sync suite:
+  217 passed;
+- schema migration matrix 1 to 22, 20 to 22, 21 to 22, and 22 to 22:
+  4 passed;
+- complete suite: 1,822 passed;
+- Ruff, `py_compile`, `compileall`, and `git diff --check`: passed;
+- two independent schema-22 replays are byte-identical:
+  - summary: 3,609 bytes,
+    SHA-256
+    `AABC0E264C3571EFAC74975A602C479CE0588E8B8EA9B78DAE55EBCAD0E1A1D9`;
+  - full-sync: 465,269 bytes, 17 sections,
+    SHA-256
+    `EFBC4A28E61ADC5A955D414E9E00A88D9855A1FB63BF4A828AD4A783068E4A67`;
+  - `actual_missing` is zero in the offline replay;
+  - provider calls, resolver evaluations, canonical/lifecycle/coverage/
+    provider-state/retry/snapshot/outbox writes are all zero at its fixed
+    point;
+  - live provider calls, AI jobs, and backend invocations are zero.
+
+### Remaining live validation and safety boundary
+
+The historical R2 artifacts prove the defect, not this correction. PR #28
+must remain non-mergeable operationally until a new isolated live
+provider-force run demonstrates:
+
+1. FRED `HSN1F` is reached by the real deployed route and the 628/610/618
+   record is committed under the unchanged XTB occurrence;
+2. the deployed S&P endpoint outcome is delivered with the structured reason
+   and no invented value;
+3. one force creates at most one snapshot/outbox and the second fixed-point
+   force performs no unintended write.
+
+During this correction `.env` was neither read nor modified. The operational
+database, Uvicorn, live providers, AI/OpenAI/Codex backends, browser research,
+AI Trader, delivery, trading, and order paths were not invoked.

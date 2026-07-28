@@ -207,4 +207,5 @@ def build_application_state(
         "research_scheduler": research_scheduler,
         "market_context_sync_refresh_worker": market_context_sync_refresh_worker,
         "lifecycle_due_resolver": lifecycle_due_resolver,
+        "official_actual_resolver": official_actual_resolver,
     }
