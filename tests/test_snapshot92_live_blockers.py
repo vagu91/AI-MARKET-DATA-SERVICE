@@ -799,10 +799,10 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         by_title["US expands Nvidia chip export controls"],
         by_title["US expands Nvidia chip export controls — update"],
     ]
-    rejected = next(
+    degraded = next(
         item
-        for item in context["excluded"]
-        if item["lineage"]["original_publisher"] == "Unknown Publisher"
+        for item in context["latest"]
+        if item["original_publisher"] == "Unknown Publisher"
     )
 
     assert ibd["validation"]["status"] == "accepted"
@@ -818,10 +818,8 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         for item in reuters
     )
     assert len({item["published_at"] for item in reuters}) == 2
-    assert rejected["disposition"] == "QUARANTINED"
-    assert rejected["reason"] == (
-        "distribution_source_original_publisher_unverified"
-    )
+    assert degraded["source_verification_status"] == "UNKNOWN"
+    assert degraded["analysis_usability"] == "DEGRADED"
     policy = SourcePolicyService()
     assert policy.policy_version == "source-policy-v5"
 
@@ -833,22 +831,22 @@ def test_news_policy_and_sync_are_lossless_and_count_coherent() -> None:
         }
     )["news"]
     delivered = news["context"]["articles"]
-    assert len(delivered) == 3
+    assert len(delivered) == 4
     assert {item["original_publisher"] for item in delivered} == {
         "Investor's Business Daily",
         "Reuters",
+        "Unknown Publisher",
     }
-    assert news["context"]["accepted_article_count"] == 3
-    assert news["context"]["delivered_raw_article_count"] == 3
+    assert news["context"]["accepted_article_count"] == 4
+    assert news["context"]["delivered_raw_article_count"] == 4
     assert news["context"]["historical_article_count"] == 0
-    assert news["context"]["diagnostics"]["excluded_count"] == 1
-    assert news["context"]["rejected_article_count"] == 1
+    assert news["context"]["diagnostics"]["excluded_count"] == 0
+    assert news["context"]["rejected_article_count"] == 0
     assert news["context"]["usable_for_analysis"] is True
-    assert news["context"]["status"] == "PARTIAL"
-    assert news["digest"]["status"] == "PARTIAL"
-    assert news["digest"]["accepted_article_count"] == 3
-    assert len(news["context"]["excluded"]) == 1
-    assert news["context"]["excluded"][0]["reason"]
+    assert news["context"]["status"] == "DEGRADED"
+    assert news["digest"]["status"] == "DEGRADED"
+    assert news["digest"]["accepted_article_count"] == 4
+    assert news["context"]["excluded"] == []
 
 
 def test_multi_megabyte_news_reconciliation_does_not_cap_or_deduplicate() -> None:
@@ -953,13 +951,15 @@ def test_empty_news_cannot_remain_available_or_usable() -> None:
     )
 
     context = section["context"]
-    assert context["status"] == "NO_DATA"
-    assert context["reason"] == "TECHNICALLY_INVALID_RECORDS_WITHHELD"
+    assert context["status"] == "UNAVAILABLE"
+    assert context["reason"] == "UNEXPLAINED_NEWS_LOSS"
     assert context["accepted_article_count"] == 0
     assert context["delivered_raw_article_count"] == 0
     assert context["usable_for_analysis"] is False
     assert context["rejected_article_count"] == 4
-    assert section["digest"]["status"] == "NO_DATA_AVAILABLE"
+    assert context["diagnostics"]["unexplained_loss_count"] == 4
+    assert context["diagnostics"]["accounting_balanced"] is False
+    assert section["digest"]["status"] == "UNAVAILABLE"
     assert section["digest"]["accepted_article_count"] == 0
 
 

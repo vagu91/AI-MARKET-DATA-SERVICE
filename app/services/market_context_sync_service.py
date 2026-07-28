@@ -60,7 +60,7 @@ UNAVAILABLE_STATUSES = frozenset(
     }
 )
 DEGRADED_STATUSES = frozenset(
-    {"PARTIAL", "LAST_KNOWN_GOOD", "STALE", "EXPIRED", "DUE"}
+    {"DEGRADED", "PARTIAL", "LAST_KNOWN_GOOD", "STALE", "EXPIRED", "DUE"}
 )
 ACTIVE_WORK_STATUSES = frozenset({"PENDING", "RUNNING", "WAITING_BACKOFF"})
 MAX_CONTROL_PAYLOAD_BYTES = 262_144
@@ -516,8 +516,15 @@ def reconcile_delivered_section(
     context["historical_context_available"] = bool(historical)
     diagnostics = dict(context.get("diagnostics") or {})
     diagnostics["accepted_count"] = len(delivered)
-    diagnostics["accepted_for_delivery"] = len(delivered)
-    diagnostics["delivered"] = len(delivered)
+    diagnostics["delivered_logical_articles"] = len(delivered)
+    diagnostics["delivered"] = int(
+        diagnostics.get("delivered")
+        or sum(
+            int(item.get("source_record_count") or 1)
+            for item in delivered
+        )
+    )
+    diagnostics["accepted_for_delivery"] = diagnostics["delivered"]
     candidate_count = max(
         int(context.get("candidate_article_count") or 0),
         int(diagnostics.get("raw_article_count") or 0),
@@ -526,17 +533,16 @@ def reconcile_delivered_section(
     diagnostics["raw_article_count"] = candidate_count
     diagnostics["excluded_count"] = int(diagnostics.get("excluded_count") or 0)
     explicitly_accounted = (
-        len(delivered)
+        int(diagnostics.get("delivered") or 0)
         + int(diagnostics.get("quarantined") or 0)
+        + int(diagnostics.get("withheld") or 0)
         + int(diagnostics.get("technically_invalid") or 0)
         + int(diagnostics.get("outside_scope") or 0)
     )
     unexplained_legacy_loss = max(candidate_count - explicitly_accounted, 0)
     if unexplained_legacy_loss:
-        diagnostics["technically_invalid"] = (
-            int(diagnostics.get("technically_invalid") or 0)
-            + unexplained_legacy_loss
-        )
+        diagnostics["unexplained_loss_count"] = unexplained_legacy_loss
+        diagnostics["accounting_balanced"] = False
         reasons = dict(diagnostics.get("exclusion_breakdown") or {})
         reasons["unaccounted_legacy_projection"] = (
             int(reasons.get("unaccounted_legacy_projection") or 0)
@@ -560,32 +566,51 @@ def reconcile_delivered_section(
         int(diagnostics.get("quarantined") or 0),
     )
     technical_invalid = int(diagnostics.get("technically_invalid") or 0)
-    if quarantine_count or technical_invalid:
+    degraded_records = any(
+        item.get("analysis_usability") == "DEGRADED"
+        or str(item.get("source_verification_status") or "").upper()
+        == "UNKNOWN"
+        for item in delivered
+    )
+    if delivered and (
+        quarantine_count
+        or technical_invalid
+        or int(diagnostics.get("withheld") or 0)
+        or degraded_records
+    ):
+        context["status"] = "DEGRADED"
+        context["reason"] = "VALID_NEWS_DELIVERED_WITH_QUALITY_WARNINGS"
+    elif quarantine_count or technical_invalid:
         context["status"] = (
-            "PARTIAL"
-            if delivered
-            else "QUARANTINED"
-            if quarantine_count
-            else "NO_DATA"
+            "QUARANTINED"
         )
         context["reason"] = (
             "SOURCE_VALIDATION_WITHHELD_RECORDS"
             if quarantine_count
             else "TECHNICALLY_INVALID_RECORDS_WITHHELD"
         )
-    elif not delivered and context.get("search_completed") is not True:
-        context["status"] = "PROVIDER_UNAVAILABLE"
+    elif not delivered and (
+        unexplained_legacy_loss
+        or context.get("search_completed") is not True
+    ):
+        context["status"] = "UNAVAILABLE"
+        context["reason"] = (
+            "UNEXPLAINED_NEWS_LOSS"
+            if unexplained_legacy_loss
+            else "NEWS_MATERIALIZATION_NOT_COMPLETED"
+        )
     elif not delivered and str(
         context.get("historical_coverage_status") or ""
     ).upper() == "UNVERIFIED_EMPTY":
-        context["status"] = "PARTIAL"
+        context["status"] = "UNAVAILABLE"
         context["reason"] = "HISTORICAL_COVERAGE_UNVERIFIED"
     elif delivered:
         context["status"] = "AVAILABLE"
         context.pop("reason", None)
     else:
         context["status"] = "NO_DATA"
-        context["reason"] = "NO_DELIVERED_ARTICLES"
+        context["authentic_empty"] = True
+        context["reason"] = "AUTHENTIC_EMPTY_NEWS_WINDOW"
     context["usable_for_analysis"] = bool(delivered)
     delivered_article_ids = {
         str(item.get("article_id"))
@@ -622,13 +647,19 @@ def reconcile_delivered_section(
     digest.update(
         {
             "status": (
-                "AVAILABLE"
-                if delivered and not quarantine_count and not technical_invalid
-                else "PARTIAL"
+                "DEGRADED"
+                if delivered
+                and (
+                    quarantine_count
+                    or technical_invalid
+                    or int(diagnostics.get("withheld") or 0)
+                    or degraded_records
+                )
+                else "AVAILABLE"
                 if delivered
                 else "QUARANTINED"
-                if quarantine_count
-                else "NO_DATA_AVAILABLE"
+                if quarantine_count or technical_invalid
+                else str(context.get("status") or "UNAVAILABLE")
             ),
             "candidate_article_count": candidate_count,
             "accepted_article_count": len(delivered),
@@ -650,6 +681,11 @@ def news_record_delta(
     *,
     base_snapshot_revision: int,
     target_snapshot_revision: int,
+    consumer_id: str | None = None,
+    base_acknowledged_delivery_id: str | None = None,
+    base_ack_checksum: str | None = None,
+    base_section_revision: int | None = None,
+    target_section_revision: int | None = None,
 ) -> dict[str, Any]:
     """Produce a lossless record delta; absence alone never confirms removal."""
 
@@ -739,6 +775,11 @@ def news_record_delta(
         "mode": "RECORD_DELTA",
         "base_snapshot_revision": int(base_snapshot_revision),
         "target_snapshot_revision": int(target_snapshot_revision),
+        "consumer_id": consumer_id,
+        "base_acknowledged_delivery_id": base_acknowledged_delivery_id,
+        "base_ack_checksum": base_ack_checksum,
+        "base_section_revision": base_section_revision,
+        "target_section_revision": target_section_revision,
         "new_count": len(new_records),
         "updated_count": len(updated_records),
         "lifecycle_change_count": len(lifecycle_changes),
@@ -1125,11 +1166,48 @@ class MarketContextSyncService:
             base_row,
             include_lineage=include_lineage,
         )
+        acknowledged_delivery_id = str(
+            state.get("last_delivery_acknowledged") or ""
+        )
+        with connect_sqlite(self.settings.database_path) as conn:
+            acknowledged_row = conn.execute(
+                """
+                SELECT outbox.payload_hash
+                FROM market_context_delivery_acks ack
+                JOIN market_context_outbox outbox
+                  ON outbox.event_id=ack.delivery_id
+                WHERE ack.consumer_id=? AND ack.delivery_id=?
+                  AND ack.snapshot_revision=?
+                """,
+                (
+                    consumer_id,
+                    acknowledged_delivery_id,
+                    base_revision,
+                ),
+            ).fetchone()
+        if acknowledged_row is None:
+            return {
+                **target,
+                "incremental": {
+                    "mode": "FULL_SECTION",
+                    "reason": "ACK_AUDIT_BINDING_NOT_AVAILABLE",
+                    "base_snapshot_revision": base_revision,
+                    "target_snapshot_revision": target_snapshot_revision,
+                    "requires_full_resync": True,
+                },
+            }
         return news_record_delta(
             base,
             target,
             base_snapshot_revision=base_revision,
             target_snapshot_revision=target_snapshot_revision,
+            consumer_id=consumer_id,
+            base_acknowledged_delivery_id=acknowledged_delivery_id,
+            base_ack_checksum=str(acknowledged_row["payload_hash"]),
+            base_section_revision=int(base_row["section_revision"]),
+            target_section_revision=int(
+                (target.get("sync") or {}).get("section_revision") or 0
+            ),
         )
 
     def sections_request(
@@ -1967,6 +2045,7 @@ class MarketContextSyncService:
                 "snapshot_revision",
                 "status",
                 "section_revisions",
+                "checksum",
                 "acknowledged_at",
             },
         )
@@ -1981,6 +2060,7 @@ class MarketContextSyncService:
         )
         status = str(payload.get("status") or "").strip().upper()
         acknowledged_at = str(payload.get("acknowledged_at") or "").strip()
+        checksum = str(payload.get("checksum") or "").strip().lower()
         section_revisions = payload.get("section_revisions")
         if status != "PERSISTED":
             raise SyncContractError("ack_status_must_be_persisted", 422)
@@ -1989,6 +2069,8 @@ class MarketContextSyncService:
             raise SyncContractError("acknowledged_at_invalid", 422)
         if not isinstance(section_revisions, dict) or not section_revisions:
             raise SyncContractError("section_revisions_required", 422)
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise SyncContractError("ack_checksum_invalid", 422)
         revision = parse_positive_int(
             payload.get("snapshot_revision"),
             field="snapshot_revision",
@@ -2011,6 +2093,7 @@ class MarketContextSyncService:
                     "snapshot_revision": revision,
                     "status": status,
                     "section_revisions": normalized_revisions,
+                    "checksum": checksum,
                     "acknowledged_at": acknowledged_at,
                 }
             ).encode("utf-8")
@@ -2027,6 +2110,9 @@ class MarketContextSyncService:
             if int(delivery["snapshot_revision"]) != revision:
                 conn.rollback()
                 raise SyncContractError("ack_snapshot_revision_mismatch", 409)
+            if str(delivery["payload_hash"]).strip().lower() != checksum:
+                conn.rollback()
+                raise SyncContractError("ack_checksum_mismatch", 409)
             created_datetime = parse_datetime(str(delivery["created_at"]))
             if (
                 created_datetime is None
@@ -2097,6 +2183,7 @@ class MarketContextSyncService:
                     "idempotent_replay": True,
                     "delivery_id": delivery_id,
                     "snapshot_revision": revision,
+                    "checksum": checksum,
                     "superseded_delivery": bool(
                         target["superseded_by_delivery_id"]
                     ),
@@ -2229,6 +2316,7 @@ class MarketContextSyncService:
             "idempotent_replay": False,
             "delivery_id": delivery_id,
             "snapshot_revision": revision,
+            "checksum": checksum,
             "superseded_delivery": superseded,
         }
 
@@ -2866,7 +2954,7 @@ def producer_availability_classification(
     freshness = str(metadata.get("freshness") or "UNKNOWN").upper()
     if status == "QUARANTINED" or freshness == "QUARANTINED":
         return "QUARANTINED_AT_PRODUCER"
-    if status == "PARTIAL":
+    if status in {"DEGRADED", "PARTIAL"}:
         return "PARTIAL_AT_PRODUCER"
     if status in UNAVAILABLE_STATUSES:
         return "UNAVAILABLE_AT_PRODUCER"
@@ -2985,12 +3073,24 @@ def section_status(
         technically_invalid = int(
             diagnostics.get("technically_invalid") or 0
         )
-        if delivered and (quarantined or technically_invalid):
-            return "PARTIAL", "NEWS_SCOPE_PARTIALLY_WITHHELD"
+        withheld = int(diagnostics.get("withheld") or 0)
+        degraded = any(
+            item.get("analysis_usability") == "DEGRADED"
+            or str(item.get("source_verification_status") or "").upper()
+            == "UNKNOWN"
+            for item in delivered
+            if isinstance(item, dict)
+        )
+        if delivered and (
+            quarantined or technically_invalid or withheld or degraded
+        ):
+            return "DEGRADED", "VALID_NEWS_WITH_QUALITY_WARNINGS"
         if delivered:
             return "AVAILABLE", None
-        if quarantined:
-            return "QUARANTINED", "NO_USABLE_NEWS_AFTER_POLICY"
+        if quarantined or technically_invalid:
+            return "QUARANTINED", "ALL_NEWS_CONCRETELY_BLOCKED"
+        if context.get("authentic_empty") is True:
+            return "NO_DATA", "AUTHENTIC_EMPTY_NEWS_WINDOW"
         return "UNAVAILABLE", "NO_USABLE_NEWS_IN_DECLARED_SCOPE"
     quarantine = _quarantine_disclosure(payload)
     material_payload = _without_disclosures(payload)
@@ -3222,6 +3322,8 @@ def delivery_readiness(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "status": (
                 "AVAILABLE"
                 if not missing_required and not degraded_required
+                else "DEGRADED"
+                if analysis == "news_analysis" and usable_required
                 else "PARTIAL"
                 if usable_required
                 else "UNAVAILABLE"
@@ -3322,6 +3424,8 @@ def notification_envelope(row: Any) -> dict[str, Any]:
             else max(int(row["snapshot_revision"]) - 1, 0)
         ),
         "target_revision": int(row["snapshot_revision"]),
+        "checksum": str(row["payload_hash"]),
+        "checksum_scope": "OUTBOX_MATERIAL_PAYLOAD",
         "changed_sections": changed_sections,
         "triggers": triggers,
         "manifest_url": (

@@ -274,7 +274,7 @@ def test_market_closed_without_current_news_is_expected_not_critical():
 
     data = report(market_context=context)
 
-    assert check(data, "NEWS_LATEST_NOT_EMPTY")["status"] == "PASS"
+    assert check(data, "NEWS_DELIVERY_NOT_EMPTY")["status"] == "PASS"
     assert check(data, "NEWS_COLD_START_COMPLETE")["status"] == "PASS"
     assert check(data, "NEWS_MARKET_CLOSED_NO_FRESH_EXPECTED")["status"] == "INFO"
 
@@ -285,7 +285,7 @@ def test_available_news_status_without_articles_is_critical():
 
     data = report(market_context=context)
 
-    assert check(data, "NEWS_LATEST_NOT_EMPTY")["status"] == "FAIL"
+    assert check(data, "NEWS_DELIVERY_NOT_EMPTY")["status"] == "FAIL"
 
 
 def test_provider_warning_detail_present_and_fallback_warning_is_not_critical():

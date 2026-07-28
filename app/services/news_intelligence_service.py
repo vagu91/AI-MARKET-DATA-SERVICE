@@ -16,8 +16,10 @@ from app.services.source_policy_service import SourcePolicyService
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_VERSION = "lossless_news_intelligence_v2"
+PIPELINE_VERSION = "lossless_news_intelligence_v3"
+NEWS_CONTRACT_VERSION = "lossless_news_sync_v3"
 ENTITY_MAP_VERSION = "mnq_entities_v1"
+DEFAULT_CURRENT_WINDOW_HOURS = 24
 
 ENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "AAPL": ("apple", "apple inc", "aapl"),
@@ -85,8 +87,9 @@ DIAGNOSTIC_KEYS = (
     "excluded_missing_timestamp_count", "duplicate_count", "syndicated_duplicate_count", "cluster_count",
     "confirmed_cluster_count", "official_source_count", "high_reliability_source_count",
     "raw_fetched", "persisted", "active_current", "historical", "lifecycle_unclassified",
-    "accepted_for_delivery", "delivered", "quarantined", "withheld",
-    "technically_invalid", "outside_scope", "publisher_verified", "publisher_unknown",
+    "accepted_for_delivery", "delivered", "delivered_logical_articles",
+    "quarantined", "withheld", "technically_invalid", "technically_rejected",
+    "outside_scope", "publisher_verified", "publisher_unknown",
     "summary_only", "headline_only", "full_text_available",
 )
 
@@ -186,7 +189,10 @@ def canonicalize_url(value: Any) -> str | None:
 def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
     title = str(article.get("title") or "")
     source = str(article.get("source") or "").strip()
-    source_url = canonicalize_url(article.get("source_url") or article.get("url"))
+    raw_source_url = str(
+        article.get("source_url") or article.get("url") or ""
+    ).strip()
+    source_url = canonicalize_url(raw_source_url)
     canonical_url = canonicalize_url(article.get("canonical_url"))
     url = canonical_url or source_url
     domain = (urlparse(url).netloc.lower().removeprefix("www.") if url else "")
@@ -240,9 +246,11 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
     is_primary = classification in {"official_source", "primary_market_source"}
     classified = {
         "source": display_source,
-        "original_publisher": display_source,
+        "original_publisher": original or None,
+        "_source_is_declared_publisher": bool(original or source),
         "source_classification": classification,
         "source_url": source_url,
+        "_raw_source_url": raw_source_url or None,
         "canonical_url": canonical_url or (None if aggregator_url else source_url),
         "aggregator_url": aggregator_url,
         "is_official_source": is_official,
@@ -261,7 +269,11 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         "source_is_official_redistributor": False,
         "source_reliability_base": SOURCE_BASE_RELIABILITY[classification],
     }
-    policy_candidate = {**article, **classified}
+    policy_candidate = {
+        **article,
+        **classified,
+        "_raw_source_url": raw_source_url or None,
+    }
     policy_service = SourcePolicyService()
     decision = policy_service.validate(
         policy_candidate,
@@ -281,19 +293,35 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
     # hostname (or a tracking parameter naming one) is insufficient evidence
     # that the provider actually distributed this editorial record.
     distributor = lineage.get("distributor")
+    source_verification_status = str(
+        lineage.get("source_verification_status") or "UNKNOWN"
+    )
+    quality_warnings = []
+    if source_verification_status == "UNKNOWN":
+        quality_warnings.append("SOURCE_VERIFICATION_UNKNOWN")
+    if lineage.get("publisher_status") == "UNKNOWN":
+        quality_warnings.append("ORIGINAL_PUBLISHER_UNKNOWN")
+    elif lineage.get("publisher_status") == "DECLARED_UNVERIFIED":
+        quality_warnings.append("ORIGINAL_PUBLISHER_UNVERIFIED")
+    if lineage.get("distributor_status") == "DECLARED_UNVERIFIED":
+        quality_warnings.append("DISTRIBUTOR_UNVERIFIED")
     classified.update(
         {
             "publisher": display_source,
-            "original_publisher": lineage.get("original_publisher") or display_source,
+            "original_publisher": lineage.get("original_publisher"),
+            "original_publisher_status": lineage.get(
+                "original_publisher_status"
+            ),
             "distribution_source": distributor,
             "distributor": distributor,
             "acquisition_provider": lineage.get("acquisition_provider"),
             "publisher_status": lineage.get("publisher_status"),
             "distributor_status": lineage.get("distributor_status"),
             "lineage_status": lineage.get("lineage_status"),
+            "source_verification_status": source_verification_status,
             "distribution_url": aggregator_url,
             "source_policy_version": decision.policy_version,
-            "news_lineage_model_version": "news-lineage-v2",
+            "news_lineage_model_version": "news-lineage-v3",
             "source_policy_reliability": decision.reliability,
             "confirmation": {
                 "confirmed": False,
@@ -305,6 +333,9 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
                 "status": (
                     "accepted"
                     if decision.accepted
+                    and source_verification_status == "VERIFIED"
+                    else "accepted_degraded"
+                    if decision.accepted
                     else "unverified"
                     if reserved_fixture_source
                     else "rejected"
@@ -315,6 +346,7 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
                 "policy_version": decision.policy_version,
                 "domain": decision.domain,
             },
+            "source_quality_warning_codes": quality_warnings,
         }
     )
     return classified
@@ -497,6 +529,8 @@ def normalize_news_article(
     source_content = (
         article.get("content")
         if article.get("content") is not None
+        else article.get("full_content")
+        if article.get("full_content") is not None
         else article.get("body")
     )
     raw_content = source_content if isinstance(source_content, str) else None
@@ -504,6 +538,7 @@ def normalize_news_article(
         article.get("content_snippet") or article.get("description")
     )
     article["content"] = raw_content
+    article["full_content"] = raw_content
     article["content_snippet"] = content_snippet
     article["summary"] = _clean_summary(
         article.get("summary")
@@ -511,6 +546,17 @@ def normalize_news_article(
         or raw_content
     )
     article["retrieved_at"] = _iso_datetime(article.get("retrieved_at")) or now.replace(microsecond=0).isoformat()
+    article["first_seen_at"] = (
+        _iso_datetime(article.get("first_seen_at") or article.get("created_at"))
+        or article["retrieved_at"]
+    )
+    article["last_seen_at"] = (
+        _iso_datetime(article.get("last_seen_at") or article.get("updated_at"))
+        or article["retrieved_at"]
+    )
+    article["updated_at"] = (
+        _iso_datetime(article.get("updated_at")) or article["last_seen_at"]
+    )
     article.update(_recover_timestamp(article, now=now))
     article["provider_type"] = str(article.get("provider_type") or "RSS").split(".")[-1]
     logger.info("news_article_received", extra=_log_fields(article))
@@ -551,25 +597,47 @@ def normalize_news_article(
     )
     article["content_status"] = _delivery_content_status(article)
     article["content_availability"] = article["content_status"]
+    article["content_availability_status"] = article["content_status"]
     article["canonical_status"] = "canonical_resolved" if article.get("canonical_url") else "canonical_unresolved" if article.get("aggregator_url") else "canonical_unavailable"
     logger.info("news_metadata_extracted", extra=_log_fields(article))
 
     article.update(_score_article(article, now=now))
     logger.info("news_article_relevance_scored", extra=_log_fields(article))
     valid_until = parse_datetime(article.get("valid_until"))
-    lifecycle_status = (
-        "CURRENT"
-        if valid_until and valid_until > now
-        else "EXPIRED"
-        if valid_until
-        else "UNCLASSIFIED"
-    )
+    published_at = parse_datetime(article.get("published_at"))
+    declared_lifecycle = str(
+        article.get("lifecycle_status")
+        or (
+            (article.get("lifecycle") or {}).get("status")
+            if isinstance(article.get("lifecycle"), dict)
+            else ""
+        )
+        or ""
+    ).upper()
+    if valid_until:
+        lifecycle_status = "CURRENT" if valid_until > now else "EXPIRED"
+        lifecycle_derivation = "VALID_UNTIL"
+    elif declared_lifecycle in {"CURRENT", "EXPIRED"}:
+        lifecycle_status = declared_lifecycle
+        lifecycle_derivation = "DECLARED_CANONICAL"
+    elif published_at:
+        lifecycle_status = (
+            "CURRENT"
+            if published_at + timedelta(hours=DEFAULT_CURRENT_WINDOW_HOURS)
+            > now
+            else "EXPIRED"
+        )
+        lifecycle_derivation = "PUBLISHED_AT_DEFAULT_WINDOW"
+    else:
+        lifecycle_status = "UNCLASSIFIED"
+        lifecycle_derivation = "INSUFFICIENT_TIMESTAMP"
     article["lifecycle_status"] = lifecycle_status
     article["historical"] = lifecycle_status == "EXPIRED"
     article["lifecycle"] = {
         "status": lifecycle_status,
         "valid_from": article.get("valid_from") or article.get("published_at"),
         "valid_until": article.get("valid_until"),
+        "derivation": lifecycle_derivation,
     }
     article["exclusion_reason"] = _exclusion_reason(
         article,
@@ -591,6 +659,21 @@ def normalize_news_article(
         )
     )
     article["article_id"] = article["canonical_news_id"]
+    article["raw_source_identity"] = {
+        key: article.get(key)
+        for key in (
+            "news_key",
+            "provider_record_id",
+            "occurrence_id",
+            "record_id",
+            "source",
+            "source_url",
+            "canonical_url",
+            "aggregator_url",
+            "published_at",
+        )
+        if article.get(key) not in (None, "")
+    }
     provenance = {
         "article_id": article["article_id"],
         "provider": article.get("acquisition_provider"),
@@ -605,8 +688,15 @@ def normalize_news_article(
         "validation": article.get("validation"),
         "content_availability": article["content_availability"],
         "publisher_status": article.get("publisher_status"),
+        "original_publisher_status": article.get(
+            "original_publisher_status"
+        ),
         "distributor_status": article.get("distributor_status"),
         "lineage_status": article.get("lineage_status"),
+        "source_verification_status": article.get(
+            "source_verification_status"
+        ),
+        "raw_source_identity": article["raw_source_identity"],
     }
     upstream_lineage = (
         dict(article.get("lineage") or {})
@@ -622,6 +712,13 @@ def normalize_news_article(
     article["independent_source_count"] = 1
     article["pipeline_version"] = PIPELINE_VERSION
     article["warnings"] = _article_warnings(article)
+    article["warning_codes"] = list(article["warnings"])
+    article["reason_codes"] = list(article["warnings"])
+    article["analysis_usability"] = (
+        "DEGRADED"
+        if article["warnings"]
+        else "AVAILABLE"
+    )
     logger.info("news_article_accepted" if article["accepted"] else "news_article_rejected", extra=_log_fields(article))
     return article
 
@@ -632,6 +729,7 @@ def build_news_context(
     limit: int | None = None,
     now: datetime | None = None,
     scope_days: int = 30,
+    authentic_empty: bool = False,
 ) -> dict[str, Any]:
     del limit
     now = now or datetime.now(UTC)
@@ -644,9 +742,9 @@ def build_news_context(
         )
         for item in news_items
     ]
-    accepted = [item for item in normalized if item["accepted"]]
+    accepted_records = [item for item in normalized if item["accepted"]]
     excluded = [_compact_exclusion(item) for item in normalized if not item["accepted"]]
-    delivered, duplicates = _deduplicate_articles(accepted)
+    delivered, duplicates = _deduplicate_articles(accepted_records)
     clusters = _build_clusters(delivered)
     cluster_by_article = {article_id: cluster["cluster_id"] for cluster in clusters for article_id in cluster["article_ids"]}
     for item in delivered:
@@ -666,20 +764,38 @@ def build_news_context(
     by_symbol = _group_items(delivered, "symbols")
     official = [item for item in delivered if item.get("is_official_source")]
     market = [item for item in delivered if not item.get("is_official_source")]
-    diagnostics = _diagnostics(normalized, delivered, excluded, duplicates, clusters)
+    diagnostics = _diagnostics(
+        normalized,
+        accepted_records,
+        delivered,
+        excluded,
+        duplicates,
+        clusters,
+    )
     quality = _news_quality(normalized, delivered, excluded, clusters)
-    delivery_blockers = int(diagnostics.get("quarantined") or 0) + int(
-        diagnostics.get("technically_invalid") or 0
+    degraded_delivery = any(
+        item.get("analysis_usability") == "DEGRADED"
+        for item in delivered
+    )
+    concrete_blockers = (
+        int(diagnostics.get("quarantined") or 0)
+        + int(diagnostics.get("withheld") or 0)
+        + int(diagnostics.get("technically_rejected") or 0)
     )
     context = {
         "status": (
-            "PARTIAL"
-            if delivered and delivery_blockers
+            "DEGRADED"
+            if delivered and (degraded_delivery or concrete_blockers)
             else "AVAILABLE"
             if delivered
+            else "NO_DATA"
+            if authentic_empty and not normalized
+            else "QUARANTINED"
+            if concrete_blockers
             else "UNAVAILABLE"
         ),
         "pipeline_version": PIPELINE_VERSION,
+        "contract_version": NEWS_CONTRACT_VERSION,
         "scope": {
             "type": "PUBLISHED_AT_WINDOW",
             "start": scope_start.replace(microsecond=0).isoformat(),
@@ -696,7 +812,27 @@ def build_news_context(
         "official_sources": official,
         "market_sources": market,
         "excluded": excluded,
-        "withheld_records": excluded,
+        "non_delivered_records": excluded,
+        "quarantined_records": [
+            item
+            for item in excluded
+            if item.get("disposition") == "QUARANTINED"
+        ],
+        "withheld_records": [
+            item
+            for item in excluded
+            if item.get("disposition") == "WITHHELD"
+        ],
+        "technically_rejected_records": [
+            item
+            for item in excluded
+            if item.get("disposition") == "TECHNICALLY_REJECTED"
+        ],
+        "outside_scope_records": [
+            item
+            for item in excluded
+            if item.get("disposition") == "OUTSIDE_SCOPE"
+        ],
         "duplicates": [_compact_duplicate(item) for item in duplicates],
         "clusters": clusters,
         "diagnostics": diagnostics,
@@ -706,8 +842,10 @@ def build_news_context(
         "canonical_url_coverage_pct": quality["canonical_url_coverage_pct"],
         "candidate_article_count": len(normalized),
         "accepted_article_count": len(delivered),
+        "delivered_record_count": diagnostics["delivered"],
         "current_article_count": len(latest),
         "historical_article_count": len(historical),
+        "authentic_empty": bool(authentic_empty and not normalized),
         "usable_for_analysis": bool(delivered),
     }
     context["digest"] = build_news_digest(context, generated_at=now)
@@ -740,15 +878,20 @@ def build_news_digest(
     confidence = round(min(0.98, reliability * 0.55 + float(quality.get("news_quality_score") or 0) * 0.3 + confirmation_ratio * 0.15), 3) if latest else 0.0
     return {
         "status": (
-            "PARTIAL"
+            "DEGRADED"
             if latest
             and (
                 int(diagnostics.get("quarantined") or 0)
-                or int(diagnostics.get("technically_invalid") or 0)
+                or int(diagnostics.get("withheld") or 0)
+                or int(diagnostics.get("technically_rejected") or 0)
+                or any(
+                    item.get("analysis_usability") == "DEGRADED"
+                    for item in latest
+                )
             )
             else "AVAILABLE"
             if latest
-            else "UNAVAILABLE"
+            else str(news_context.get("status") or "UNAVAILABLE")
         ),
         "pipeline_version": PIPELINE_VERSION,
         "generated_at_utc": (generated_at or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -902,10 +1045,11 @@ def _exclusion_reason(
         )
     if news_content_status(article) == "invalid_content":
         return "technically_invalid_content"
-    if not (article.get("source_url") or article.get("canonical_url")):
-        return "technically_invalid_url"
-    if not article.get("original_publisher"):
-        return "publisher_unknown"
+    if (
+        not (article.get("source_url") or article.get("canonical_url"))
+        and not _has_delivery_identity(article)
+    ):
+        return "technically_invalid_identity"
     published = parse_datetime(article.get("published_at"))
     if published and published > now + timedelta(minutes=5):
         return "technically_invalid_timestamp"
@@ -916,61 +1060,117 @@ def _exclusion_reason(
     return None
 
 
+def _has_delivery_identity(article: dict[str, Any]) -> bool:
+    return any(
+        article.get(key) not in (None, "")
+        for key in (
+            "news_key",
+            "provider_record_id",
+            "occurrence_id",
+            "article_id",
+            "record_id",
+        )
+    )
+
+
 def _deduplicate_articles(articles: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Classify exact acquisition retries without removing any canonical record."""
+    """Consolidate only byte-equivalent occurrences while retaining every lineage."""
 
     groups: dict[str, list[dict[str, Any]]] = {}
     for article in articles:
-        technical_identity = {
-            "provider": article.get("provider") or article.get("source"),
-            "provider_record_id": (
-                article.get("provider_record_id")
+        exact_occurrence = {
+            "original_publisher": _normalized_text(
+                article.get("original_publisher")
+            ).strip(),
+            "identity_guard": (
+                None
+                if article.get("source_verification_status") == "VERIFIED"
+                else article.get("provider_record_id")
+                or article.get("occurrence_id")
+                or article.get("news_key")
+                or article.get("canonical_url")
+                or article.get("source_url")
                 or article.get("article_id")
             ),
-            "occurrence": article.get("occurrence_id"),
-            "version": article.get("version") or 1,
-            "canonical_url": article.get("canonical_url"),
-            "source_url": article.get("source_url"),
-            "aggregator_url": article.get("aggregator_url"),
             "published_at": article.get("published_at"),
-            "title": article.get("title"),
+            "title": _normalized_title(article.get("title")),
             "summary": article.get("summary"),
+            "full_content": article.get("full_content"),
         }
         group_id = _stable_hash(
-            "technical_retry:"
+            "exact_editorial_occurrence:"
             + json.dumps(
-                technical_identity,
+                exact_occurrence,
                 sort_keys=True,
+                ensure_ascii=False,
                 separators=(",", ":"),
                 default=str,
             )
         )
         groups.setdefault(group_id, []).append(article)
-        article["duplicate_group_id"] = group_id
-        article["syndication_group"] = group_id
+
     delivered: list[dict[str, Any]] = []
     duplicates: list[dict[str, Any]] = []
-    for group_id, items in groups.items():
+    for group_id in sorted(groups):
+        items = groups[group_id]
         items.sort(
             key=lambda item: (
-                item.get("retrieved_at") or "",
-                item.get("article_id") or "",
+                json.dumps(
+                    _source_occurrence(item),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ),
                 material_news_fingerprint(item),
             )
         )
         representative = items[0]
-        representative["independent_source_count"] = 1
+        occurrences = [_source_occurrence(item) for item in items]
+        representative["duplicate_group_id"] = group_id
+        representative["syndication_group"] = group_id
+        representative["source_occurrences"] = occurrences
+        representative["distribution_lineage"] = occurrences
+        representative["source_record_count"] = len(items)
+        representative["independent_source_count"] = len(
+            {
+                json.dumps(
+                    {
+                        "acquisition_provider": item.get(
+                            "acquisition_provider"
+                        ),
+                        "distribution_source": item.get(
+                            "distribution_source"
+                        ),
+                        "source_url": item.get("source_url"),
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                for item in items
+            }
+        )
         representative["duplicate_occurrence_index"] = 0
         delivered.append(representative)
         for index, duplicate in enumerate(items[1:], start=1):
+            same_acquisition_identity = (
+                _source_occurrence(duplicate)
+                == _source_occurrence(representative)
+            )
+            duplicate["duplicate_group_id"] = group_id
+            duplicate["syndication_group"] = group_id
             duplicate["is_duplicate"] = True
             duplicate["duplicate_of"] = representative["article_id"]
             duplicate["duplicate_occurrence_index"] = index
-            duplicate["duplicate_classification"] = "TECHNICAL_ACQUISITION_RETRY"
+            duplicate["duplicate_classification"] = (
+                "TECHNICAL_ACQUISITION_RETRY"
+                if same_acquisition_identity
+                else "EXACT_SYNDICATION"
+            )
             duplicates.append(duplicate)
-            delivered.append(duplicate)
             logger.info(
-                "news_article_technical_duplicate_classified",
+                "news_article_exact_occurrence_consolidated",
                 extra=_log_fields(duplicate),
             )
     return delivered, duplicates
@@ -1030,61 +1230,105 @@ def _build_clusters(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _diagnostics(
     normalized: list[dict[str, Any]],
-    accepted: list[dict[str, Any]],
+    accepted_records: list[dict[str, Any]],
+    delivered_articles: list[dict[str, Any]],
     excluded: list[dict[str, Any]],
     duplicates: list[dict[str, Any]],
     clusters: list[dict[str, Any]],
 ) -> dict[str, Any]:
     reasons = Counter(str(item.get("reason") or "unknown") for item in excluded)
-    outside_scope = reasons["outside_declared_scope"]
-    quarantined_reasons = {
-        reason
-        for reason in reasons
-        if (
-            "source" in reason
-            or "publisher" in reason
-            or "lineage" in reason
-            or "policy" in reason
-            or reason in {"unknown_source", "forbidden_domain"}
-        )
-    }
-    technical_reasons = {
-        reason
-        for reason in reasons
-        if reason.startswith("technically_invalid")
-    }
-    quarantined = sum(reasons[reason] for reason in quarantined_reasons)
-    technically_invalid = sum(reasons[reason] for reason in technical_reasons)
-    in_scope_raw = len(normalized) - outside_scope
-    accounted = len(accepted) + quarantined + technically_invalid
+    disposition_counts = Counter(
+        str(item.get("disposition") or "WITHHELD")
+        for item in excluded
+    )
+    outside_scope = disposition_counts["OUTSIDE_SCOPE"]
+    quarantined = disposition_counts["QUARANTINED"]
+    withheld = disposition_counts["WITHHELD"]
+    technically_rejected = disposition_counts["TECHNICALLY_REJECTED"]
+    raw_acquired = len(normalized)
+    persisted_valid = raw_acquired - technically_rejected
+    persisted_valid_in_scope = persisted_valid - outside_scope
+    delivered_source_records = sum(
+        int(item.get("source_record_count") or 1)
+        for item in delivered_articles
+    )
+    current_delivered = sum(
+        int(item.get("source_record_count") or 1)
+        for item in delivered_articles
+        if item.get("lifecycle_status") == "CURRENT"
+    )
+    historical_delivered = sum(
+        int(item.get("source_record_count") or 1)
+        for item in delivered_articles
+        if item.get("lifecycle_status") == "EXPIRED"
+    )
+    non_delivered = [
+        {
+            "record_id": item.get("canonical_news_id")
+            or item.get("record_fingerprint"),
+            "reason_code": item.get("reason"),
+            "disposition": item.get("disposition"),
+        }
+        for item in excluded
+    ]
+    publisher_breakdown = Counter(
+        str(item.get("source_verification_status") or "UNKNOWN")
+        for item in accepted_records
+    )
+    content_breakdown = Counter(
+        str(item.get("content_availability") or "CONTENT_UNAVAILABLE")
+        for item in accepted_records
+    )
+    provider_breakdown = Counter(
+        str(item.get("acquisition_provider") or "UNKNOWN")
+        for item in accepted_records
+    )
+    distributor_breakdown = Counter(
+        str(item.get("distribution_source") or "DIRECT_OR_UNKNOWN")
+        for item in accepted_records
+    )
+    original_publisher_breakdown = Counter(
+        str(item.get("original_publisher") or "UNKNOWN")
+        for item in accepted_records
+    )
     values = {key: 0 for key in DIAGNOSTIC_KEYS}
     values.update({
         "raw_article_count": len(normalized),
         "metadata_complete_count": sum(bool(item.get("published_at") and item.get("summary") and item.get("canonical_url")) for item in normalized),
         "published_at_found_count": sum(bool(item.get("published_at")) for item in normalized),
         "summary_found_count": sum(bool(item.get("summary")) for item in normalized),
-        "accepted_count": len(accepted),
+        "accepted_count": len(delivered_articles),
         "excluded_count": len(excluded),
         "excluded_personal_finance_count": sum(reasons[name] for name in ("personal_finance", "mortgage", "deposit_rates")),
         "excluded_low_relevance_count": reasons["low_relevance"] + reasons["irrelevant_company"] + reasons["analyst_rating_only"],
         "excluded_missing_timestamp_count": reasons["missing_timestamp"],
         "duplicate_count": len(duplicates),
-        "syndicated_duplicate_count": sum(1 for item in duplicates if item.get("aggregator_url")),
+        "syndicated_duplicate_count": sum(
+            item.get("duplicate_classification") == "EXACT_SYNDICATION"
+            for item in duplicates
+        ),
         "cluster_count": len(clusters),
         "confirmed_cluster_count": sum(bool(cluster.get("confirmed")) for cluster in clusters),
-        "official_source_count": len({item.get("original_publisher") for item in accepted if item.get("is_official_source")}),
-        "high_reliability_source_count": len({item.get("original_publisher") for item in accepted if float(item.get("reliability") or 0) >= 0.8}),
+        "official_source_count": len({item.get("original_publisher") for item in accepted_records if item.get("is_official_source")}),
+        "high_reliability_source_count": len({item.get("original_publisher") for item in accepted_records if float(item.get("reliability") or 0) >= 0.8}),
         "exclusion_breakdown": dict(sorted(reasons.items())),
-        "raw_fetched": len(normalized),
-        "persisted": len(normalized),
-        "active_current": sum(item.get("lifecycle_status") == "CURRENT" for item in accepted),
-        "historical": sum(item.get("lifecycle_status") == "EXPIRED" for item in accepted),
-        "lifecycle_unclassified": sum(item.get("lifecycle_status") == "UNCLASSIFIED" for item in accepted),
-        "accepted_for_delivery": len(accepted),
-        "delivered": len(accepted),
+        "raw_fetched": raw_acquired,
+        "raw_acquired": raw_acquired,
+        "persisted": persisted_valid,
+        "persisted_valid": persisted_valid,
+        "persisted_valid_in_scope": persisted_valid_in_scope,
+        "active_current": current_delivered,
+        "current_delivered": current_delivered,
+        "historical": historical_delivered,
+        "historical_delivered": historical_delivered,
+        "lifecycle_unclassified": sum(item.get("lifecycle_status") == "UNCLASSIFIED" for item in accepted_records),
+        "accepted_for_delivery": delivered_source_records,
+        "delivered": delivered_source_records,
+        "delivered_logical_articles": len(delivered_articles),
         "quarantined": quarantined,
-        "withheld": len(excluded),
-        "technically_invalid": technically_invalid,
+        "withheld": withheld,
+        "technically_invalid": technically_rejected,
+        "technically_rejected": technically_rejected,
         "outside_scope": outside_scope,
         "publisher_verified": sum(item.get("publisher_status") == "VERIFIED" for item in normalized),
         "publisher_unknown": sum(item.get("publisher_status") != "VERIFIED" for item in normalized),
@@ -1092,15 +1336,58 @@ def _diagnostics(
             item.get("publisher_status") == "DECLARED_UNVERIFIED"
             for item in normalized
         ),
-        "summary_only": sum(item.get("content_status") == "SUMMARY_ONLY" for item in accepted),
-        "headline_only": sum(item.get("content_status") == "HEADLINE_ONLY" for item in accepted),
-        "full_text_available": sum(item.get("content_status") == "FULL_TEXT_AVAILABLE" for item in accepted),
-        "in_scope_raw": in_scope_raw,
-        "accounted_in_scope": accounted,
-        "accounting_balanced": in_scope_raw == accounted,
+        "summary_only": sum(item.get("content_status") == "SUMMARY_ONLY" for item in accepted_records),
+        "headline_only": sum(item.get("content_status") == "HEADLINE_ONLY" for item in accepted_records),
+        "full_text_available": sum(item.get("content_status") == "FULL_TEXT_AVAILABLE" for item in accepted_records),
+        "content_unavailable": sum(item.get("content_status") == "CONTENT_UNAVAILABLE" for item in accepted_records),
+        "in_scope_raw": persisted_valid_in_scope,
+        "accounted_in_scope": delivered_source_records + quarantined + withheld,
+        "accounting_balanced": (
+            raw_acquired == persisted_valid + technically_rejected
+            and persisted_valid_in_scope
+            == delivered_source_records + quarantined + withheld
+            and delivered_source_records
+            == current_delivered + historical_delivered
+        ),
+        "accounting_equations": {
+            "raw_acquired": (
+                f"{raw_acquired} = {persisted_valid} persisted_valid + "
+                f"{technically_rejected} technically_rejected"
+            ),
+            "persisted_valid_in_scope": (
+                f"{persisted_valid_in_scope} = "
+                f"{delivered_source_records} delivered + "
+                f"{quarantined} quarantined_with_concrete_reason + "
+                f"{withheld} withheld_with_concrete_reason"
+            ),
+            "delivered": (
+                f"{delivered_source_records} = "
+                f"{current_delivered} current_delivered + "
+                f"{historical_delivered} historical_delivered"
+            ),
+        },
         "accounting_equation": (
-            "in_scope_raw = delivered + quarantined + technically_invalid; "
-            "raw_fetched = in_scope_raw + outside_scope"
+            "raw_acquired = persisted_valid + technically_rejected; "
+            "persisted_valid_in_scope = delivered + "
+            "quarantined_with_concrete_reason + "
+            "withheld_with_concrete_reason; "
+            "delivered = current_delivered + historical_delivered"
+        ),
+        "non_delivered_records": non_delivered,
+        "publisher_verification_breakdown": dict(
+            sorted(publisher_breakdown.items())
+        ),
+        "content_availability_breakdown": dict(
+            sorted(content_breakdown.items())
+        ),
+        "acquisition_provider_breakdown": dict(
+            sorted(provider_breakdown.items())
+        ),
+        "distribution_source_breakdown": dict(
+            sorted(distributor_breakdown.items())
+        ),
+        "original_publisher_breakdown": dict(
+            sorted(original_publisher_breakdown.items())
         ),
         "revision": None,
         "snapshot_id": None,
@@ -1216,6 +1503,34 @@ def _syndication_key(article: dict[str, Any]) -> str:
     return _stable_hash(f"syndication:{publisher}:{_normalized_title(article.get('title'))}")
 
 
+def _source_occurrence(article: dict[str, Any]) -> dict[str, Any]:
+    """Return attribution-only metadata without duplicating editorial content."""
+
+    return {
+        "canonical_news_id": article.get("canonical_news_id"),
+        "provider_record_id": article.get("provider_record_id"),
+        "occurrence_id": article.get("occurrence_id"),
+        "acquisition_provider": article.get("acquisition_provider"),
+        "distribution_source": article.get("distribution_source"),
+        "distributor_status": article.get("distributor_status"),
+        "original_publisher": article.get("original_publisher"),
+        "original_publisher_status": article.get(
+            "original_publisher_status"
+        ),
+        "source_verification_status": article.get(
+            "source_verification_status"
+        ),
+        "source_url": article.get("source_url"),
+        "canonical_url": article.get("canonical_url"),
+        "aggregator_url": article.get("aggregator_url"),
+        "retrieved_at": article.get("retrieved_at"),
+        "first_seen_at": article.get("first_seen_at"),
+        "last_seen_at": article.get("last_seen_at"),
+        "raw_source_identity": article.get("raw_source_identity"),
+        "warning_codes": article.get("warning_codes") or [],
+    }
+
+
 def _compact_exclusion(article: dict[str, Any]) -> dict[str, Any]:
     validation = (
         dict(article.get("validation") or {})
@@ -1223,12 +1538,20 @@ def _compact_exclusion(article: dict[str, Any]) -> dict[str, Any]:
         else {}
     )
     reason = str(article.get("exclusion_reason") or "unknown")
+    normalized_reason = reason.lower()
     disposition = (
         "OUTSIDE_SCOPE"
         if reason == "outside_declared_scope"
-        else "TECHNICALLY_INVALID"
+        else "TECHNICALLY_REJECTED"
         if reason.startswith("technically_invalid")
         else "QUARANTINED"
+        if (
+            "source" in normalized_reason
+            or "lineage" in normalized_reason
+            or "policy" in normalized_reason
+            or reason == "forbidden_domain"
+        )
+        else "WITHHELD"
     )
     return {
         "record_fingerprint": material_news_fingerprint(article),
@@ -1247,7 +1570,11 @@ def _compact_exclusion(article: dict[str, Any]) -> dict[str, Any]:
             "acquisition_provider": article.get("acquisition_provider"),
             "lineage_status": article.get("lineage_status"),
         },
-        "withheld_status": "WITHHELD_FROM_USABLE_NEWS",
+        "withheld_status": (
+            "WITHHELD_FROM_USABLE_NEWS"
+            if disposition in {"QUARANTINED", "WITHHELD"}
+            else disposition
+        ),
     }
 
 
@@ -1261,7 +1588,8 @@ def _compact_duplicate(article: dict[str, Any]) -> dict[str, Any]:
         "duplicate_occurrence_index": article.get("duplicate_occurrence_index"),
         "duplicate_classification": article.get("duplicate_classification"),
         "syndication_group": article.get("syndication_group"),
-        "disposition": "DELIVERED_NONDESTRUCTIVE",
+        "source_occurrence": _source_occurrence(article),
+        "disposition": "CONSOLIDATED_WITH_LINEAGE",
     }
 
 
@@ -1282,16 +1610,45 @@ def _group_items(items: list[dict[str, Any]], field: str) -> dict[str, list[dict
 
 
 def _article_warnings(article: dict[str, Any]) -> list[str]:
-    warnings = list(article.get("warnings") or [])
+    warnings = [
+        *list(article.get("warnings") or []),
+        *list(article.get("source_quality_warning_codes") or []),
+    ]
     for condition, warning in (
         (not article.get("published_at"), "published_at_missing"),
         (not article.get("summary"), "summary_missing"),
         (not article.get("summary"), "summary_source_unavailable"),
         (not article.get("canonical_url"), "canonical_unresolved"),
+        (
+            article.get("content_status") == "HEADLINE_ONLY",
+            "CONTENT_HEADLINE_ONLY",
+        ),
+        (
+            article.get("content_status") == "SUMMARY_ONLY",
+            "CONTENT_SUMMARY_ONLY",
+        ),
+        (
+            article.get("content_status") == "CONTENT_UNAVAILABLE",
+            "CONTENT_UNAVAILABLE",
+        ),
+        (
+            article.get("topic_status") == "AMBIGUOUS",
+            "TOPIC_AMBIGUOUS",
+        ),
+        (
+            article.get("category_status") == "UNCLASSIFIED",
+            "CATEGORY_UNCLASSIFIED",
+        ),
+        (article.get("relevance") == "LOW", "RELEVANCE_LOW"),
+        (
+            (article.get("lifecycle") or {}).get("derivation")
+            == "PUBLISHED_AT_DEFAULT_WINDOW",
+            "LIFECYCLE_DERIVED_FROM_PUBLISHED_AT",
+        ),
     ):
         if condition and warning not in warnings:
             warnings.append(warning)
-    return warnings
+    return sorted(set(str(item) for item in warnings if str(item).strip()))
 
 
 def _personal_finance_reason(text: str) -> str | None:
@@ -1432,13 +1789,17 @@ def material_news_fingerprint(article: dict[str, Any]) -> str:
             "title",
             "summary",
             "content",
+            "full_content",
             "content_snippet",
             "source_url",
             "canonical_url",
             "aggregator_url",
             "original_publisher",
+            "original_publisher_status",
             "distributor",
+            "distribution_source",
             "acquisition_provider",
+            "source_verification_status",
             "published_at",
             "valid_from",
             "valid_until",
@@ -1453,6 +1814,10 @@ def material_news_fingerprint(article: dict[str, Any]) -> str:
             "lineage",
             "provenance",
             "content_status",
+            "content_availability_status",
+            "analysis_usability",
+            "warning_codes",
+            "source_occurrences",
         )
     }
     return hashlib.sha256(

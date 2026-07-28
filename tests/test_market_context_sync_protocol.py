@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -628,7 +629,7 @@ def test_changes_notification_and_idempotent_ack_survive_restart(tmp_path: Path)
                 "mcs-sync-1",
                 NOW.isoformat(),
                 "delivery-idempotency",
-                "payload-hash",
+                _delivery_checksum(delivery_id),
                 json.dumps(
                     [
                         {
@@ -670,6 +671,7 @@ def test_changes_notification_and_idempotent_ack_survive_restart(tmp_path: Path)
         "snapshot_revision": 2,
         "status": "PERSISTED",
         "section_revisions": section_revisions,
+        "checksum": notification["checksum"],
         "acknowledged_at": NOW.isoformat(),
     }
     first = service.acknowledge(ack_payload)
@@ -1289,7 +1291,7 @@ def _insert_delivery(
                 "[]",
                 created_at,
                 f"idempotency-{delivery_id}",
-                f"hash-{delivery_id}",
+                _delivery_checksum(delivery_id),
                 max(revision - 1, 0),
             ),
         )
@@ -1325,6 +1327,7 @@ def test_ack_rejects_wrong_consumer_partial_and_bad_clock(
             name: manifest["sections"][name]["section_revision"]
             for name in ("news", "vix")
         },
+        "checksum": _delivery_checksum("ack-adversarial"),
         "acknowledged_at": created.isoformat(),
     }
     with pytest.raises(SyncContractError, match="ack_consumer_not_notified"):
@@ -1333,6 +1336,8 @@ def test_ack_rejects_wrong_consumer_partial_and_bad_clock(
         service.acknowledge(
             {**valid, "section_revisions": {"news": 1}}
         )
+    with pytest.raises(SyncContractError, match="ack_checksum_mismatch"):
+        service.acknowledge({**valid, "checksum": "0" * 64})
     with pytest.raises(SyncContractError, match="ack_precedes_delivery"):
         service.acknowledge(
             {
@@ -1382,6 +1387,7 @@ def test_ack_is_concurrent_idempotent_and_transactional(
                 "section_revision"
             ]
         },
+        "checksum": _delivery_checksum("ack-concurrent"),
         "acknowledged_at": created.isoformat(),
     }
     with connect_sqlite(settings.database_path) as conn:
@@ -1510,6 +1516,7 @@ def test_late_superseded_ack_does_not_regress_consumer_inventory(
             "snapshot_revision": 2,
             "status": "PERSISTED",
             "section_revisions": {"news": new_revision},
+            "checksum": _delivery_checksum("delivery-new"),
             "acknowledged_at": created.isoformat(),
         }
     )
@@ -1520,6 +1527,7 @@ def test_late_superseded_ack_does_not_regress_consumer_inventory(
             "snapshot_revision": 1,
             "status": "PERSISTED",
             "section_revisions": {"news": old_revision},
+            "checksum": _delivery_checksum("delivery-old"),
             "acknowledged_at": created.isoformat(),
         }
     )
@@ -1530,3 +1538,5 @@ def test_late_superseded_ack_does_not_regress_consumer_inventory(
     assert state["last_snapshot_revision_acknowledged"] == 2
     assert state["section_revisions"]["news"] == new_revision
     assert state["pending_delivery_count"] == 0
+def _delivery_checksum(delivery_id: str) -> str:
+    return hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()

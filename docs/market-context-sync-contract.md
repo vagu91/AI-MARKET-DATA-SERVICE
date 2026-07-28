@@ -93,8 +93,11 @@ GET /market-context/mnq/sync/manifest
 
 The response identifies the current immutable snapshot, independently reports
 Nasdaq cash and MNQ/Globex session state, and exposes all section metadata.
-`QUARANTINED`, `UNAVAILABLE`, `NO_DATA`, `PARTIAL` and `BACKOFF` are producer
-truth; they are never converted into consumer-missing state.
+`AVAILABLE`, `DEGRADED`, `QUARANTINED`, `UNAVAILABLE`, `NO_DATA`, `PARTIAL`
+and `BACKOFF` are producer truth; they are never converted into
+consumer-missing state. For news specifically, `DEGRADED` means valid records
+were delivered with explicit source/content/classification uncertainty;
+`NO_DATA` requires affirmative `authentic_empty` evidence.
 
 A normal weekend or maintenance closure remains reportable when the official
 holiday-override source times out. Cash and MNQ remain separate and expose
@@ -140,9 +143,10 @@ Deterministic results:
 `MISSING_AT_CONSUMER` means the producer has a usable section that AI Trader
 does not have. Producer truth is classified exactly as
 `UNAVAILABLE_AT_PRODUCER`, `STALE_AT_PRODUCER`,
-`PARTIAL_AT_PRODUCER` or `QUARANTINED_AT_PRODUCER`; the response includes the
-real status, freshness and reason. None of these classifications is a request
-to fetch an empty replacement.
+`PARTIAL_AT_PRODUCER` (including delivered `DEGRADED` news) or
+`QUARANTINED_AT_PRODUCER`; the response includes the real status, freshness
+and reason. None of these classifications is a request to fetch an empty
+replacement.
 
 ## Full snapshot
 
@@ -156,9 +160,11 @@ per-section fingerprints, `context_fingerprint`, exact UTF-8
 from the sections actually delivered. Empty sections remain present with
 status and reason.
 
-Rejected, invalid and quarantined source records are not returned as usable
-records. Their content is withheld and only an aggregate
-`producer_disclosures.quarantine` count and reason-code list is exposed.
+Only records with a concrete, deterministic reason are withheld: corrupt or
+unparseable material, unrecoverable timestamps, dangerous URLs/content,
+certain source-policy contradictions, insufficient collision-safe identity,
+or records outside the requested temporal scope. Quarantine disclosures carry
+safe fingerprints, reason codes and lineage without exposing unsafe material.
 Secrets, credentialed URLs and local filesystem paths are redacted before
 section persistence.
 
@@ -166,12 +172,29 @@ Market-news admission uses versioned `source-policy-v5`, independently from
 official macro/actual policy. Trusted editorial publishers may be delivered
 from one source with explicit reliability and
 `confirmation.confirmed=false`. `investors.com` is an admitted editorial
-publisher. `finance.yahoo.com` is distribution-only: it is admitted only when
-the preserved original publisher is in its narrow publisher rule (currently
-Reuters), and Yahoo-only or unknown-origin content remains quarantined.
-Original publisher, distribution source/URL, canonical/source URL, timestamps,
-available original summary/content, validation and cluster lineage remain in
-the raw article.
+publisher. `finance.yahoo.com` is distribution-only and never promotes Yahoo,
+the acquisition provider, or an unknown label into a verified editorial
+publisher. A safe, temporally valid Yahoo-distributed record whose original
+publisher is unknown is still delivered with
+`source_verification_status=UNKNOWN`, `analysis_usability=DEGRADED` and
+explicit warning codes. UNKNOWN is not INVALID.
+
+Every canonical news record keeps acquisition provider, distribution source,
+original publisher and its status, source verification, headline, summary,
+real full content when present, content availability, canonical URL, publish/
+update/first-seen/last-seen timestamps, lifecycle, category, topics,
+relevance, validation, lineage, raw source identity and reason/warning codes.
+Missing publisher, headline-only or summary-only content, LOW relevance,
+UNCLASSIFIED category, ambiguous topic and an in-window historical lifecycle
+are quality metadata, never destructive filters.
+
+`articles` is the complete canonical in-scope inventory. `latest`,
+`historical_articles`, `directly_relevant`, `supporting`, clusters and digest
+are derived views and cannot replace or truncate it. Similar stories and
+temporal updates remain distinct. Only the exact same editorial occurrence
+(publisher, timestamp, title and content) can be consolidated; all acquisition
+and distribution occurrences remain in `source_occurrences` and
+`distribution_lineage`.
 
 After withholding, `accepted_article_count`,
 `delivered_raw_article_count`, `historical_article_count`, rejected count,
@@ -179,6 +202,26 @@ digest status, context status and `usable_for_analysis` are recomputed from the
 same delivered set. A digest cannot be `AVAILABLE` when zero articles are
 delivered. Clusters are supplemental views and never replace admitted raw
 records.
+
+News diagnostics must balance all three equations and list the exact record id,
+disposition and reason code for every non-delivered record:
+
+```text
+raw_acquired
+= persisted_valid + technically_rejected
+
+persisted_valid_in_scope
+= delivered + quarantined_with_concrete_reason
+  + withheld_with_concrete_reason
+
+delivered
+= current_delivered + historical_delivered
+```
+
+News readiness is `AVAILABLE` for verified usable delivery, `DEGRADED` for
+usable delivery with explicit uncertainty, `NO_DATA` only with authentic-empty
+proof, `UNAVAILABLE` for acquisition/materialization failure, and
+`QUARANTINED` only when every candidate has a concrete blocking reason.
 
 `checksum_scope=CANONICAL_DELIVERY_WITHOUT_MEASUREMENT_FIELDS` means the
 checksum is computed from canonical JSON after omitting only `checksum` and
@@ -206,6 +249,14 @@ POST /market-context/mnq/sync/sections
 All returned sections belong to revision 92. If revision 92 is unavailable,
 the producer returns `status=RESYNC_REQUIRED` and
 `requires_full_resync=true`; it never substitutes the latest revision.
+
+For news, a record delta is allowed only when the consumer's persisted ACK can
+be joined to the exact delivery, snapshot revision and payload checksum. The
+delta carries consumer id, acknowledged base delivery/checksum and base/target
+section revisions. It contains only new records, material content/publisher/
+timestamp corrections and lifecycle changes. Absence alone is disclosed as
+unconfirmed and never deletes a record. Without an auditable ACK binding the
+producer sends a full section resync.
 
 ## Delta manifest
 
@@ -288,6 +339,8 @@ snapshot:
   "symbol": "MNQ",
   "base_revision": 91,
   "target_revision": 92,
+  "checksum": "outbox-payload-sha256",
+  "checksum_scope": "OUTBOX_MATERIAL_PAYLOAD",
   "changed_sections": ["news", "vix"],
   "triggers": [
     {
@@ -329,6 +382,7 @@ ACK request:
   "delivery_id": "outbox-id",
   "snapshot_revision": 92,
   "status": "PERSISTED",
+  "checksum": "outbox-payload-sha256",
   "section_revisions": {
     "news": 29,
     "vix": 44
@@ -338,12 +392,14 @@ ACK request:
 ```
 
 The producer accepts an ACK only for the consumer-specific target that was
-actually notified. It validates delivery existence, snapshot revision, clock
-ordering and the exact changed-section set: partial `PERSISTED` claims and
-impossible section revisions are HTTP 409. Identical replay is idempotent;
-conflicting replay is HTTP 409. A late ACK for a superseded delivery is retained
-without regressing the consumer's latest acknowledged snapshot or section
-inventory. ACK and consumer-specific delivery state survive restart.
+actually notified. It validates delivery existence, consumer id, snapshot
+revision, exact 64-hex payload checksum, clock ordering and the exact
+changed-section revision set: wrong-consumer, wrong-revision, wrong-checksum,
+partial `PERSISTED` claims and impossible section revisions are rejected.
+Identical replay is idempotent; conflicting replay is HTTP 409. A late ACK for
+a superseded delivery is retained without regressing the consumer's latest
+acknowledged snapshot or section inventory. ACK and consumer-specific delivery
+state survive restart.
 `PERSISTED` means only that AI Trader declares an atomic local save. It does not
 mean Senior Analyst has run, approved or interpreted the data.
 

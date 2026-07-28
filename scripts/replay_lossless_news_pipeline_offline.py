@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 if __package__ in {None, ""}:
@@ -33,9 +35,23 @@ def replay(
     database_hash_before = _sha256_file(database_path)
     captured = json.loads(captured_full_sync_path.read_text(encoding="utf-8"))
     reference = parse_datetime(captured.get("generated_at")) or datetime.now(UTC)
-    rows = _read_news(database_path)
-    first = _materialize(captured, rows, reference=reference)
-    second = _materialize(captured, rows, reference=reference)
+    with TemporaryDirectory(prefix="lossless-news-replay-") as directory:
+        sandbox_one = Path(directory) / "sandbox-one.sqlite"
+        sandbox_two = Path(directory) / "sandbox-two.sqlite"
+        shutil.copy2(database_path, sandbox_one)
+        shutil.copy2(database_path, sandbox_two)
+        rows = _read_news(sandbox_one)
+        second_rows = _read_news(sandbox_two)
+        first_sandbox_hash_before = _sha256_file(sandbox_one)
+        second_sandbox_hash_before = _sha256_file(sandbox_two)
+        first = _materialize(captured, rows, reference=reference)
+        second = _materialize(captured, second_rows, reference=reference)
+        first_sandbox_hash_after = _sha256_file(sandbox_one)
+        second_sandbox_hash_after = _sha256_file(sandbox_two)
+        if first_sandbox_hash_before != first_sandbox_hash_after:
+            raise AssertionError("first_read_only_sandbox_database_changed")
+        if second_sandbox_hash_before != second_sandbox_hash_after:
+            raise AssertionError("second_read_only_sandbox_database_changed")
     first_bytes = canonical_json(first).encode("utf-8")
     second_bytes = canonical_json(second).encode("utf-8")
     if first_bytes != second_bytes:
@@ -66,12 +82,22 @@ def replay(
         },
         "after": {
             "raw_fetched": diagnostics["raw_fetched"],
+            "raw_acquired": diagnostics["raw_acquired"],
+            "persisted_valid": diagnostics["persisted_valid"],
+            "persisted_valid_in_scope": diagnostics[
+                "persisted_valid_in_scope"
+            ],
             "delivered": diagnostics["delivered"],
+            "delivered_logical_articles": diagnostics[
+                "delivered_logical_articles"
+            ],
             "active_current": diagnostics["active_current"],
             "historical": diagnostics["historical"],
             "lifecycle_unclassified": diagnostics["lifecycle_unclassified"],
             "quarantined": diagnostics["quarantined"],
+            "withheld": diagnostics["withheld"],
             "technically_invalid": diagnostics["technically_invalid"],
+            "technically_rejected": diagnostics["technically_rejected"],
             "outside_scope": diagnostics["outside_scope"],
             "publisher_verified": diagnostics["publisher_verified"],
             "publisher_unknown": diagnostics["publisher_unknown"],
@@ -84,6 +110,25 @@ def replay(
                 for item in news.get("articles") or []
             ),
             "accounting_balanced": diagnostics["accounting_balanced"],
+            "accounting_equations": diagnostics["accounting_equations"],
+            "non_delivered_records": diagnostics[
+                "non_delivered_records"
+            ],
+            "publisher_verification_breakdown": diagnostics[
+                "publisher_verification_breakdown"
+            ],
+            "content_availability_breakdown": diagnostics[
+                "content_availability_breakdown"
+            ],
+            "acquisition_provider_breakdown": diagnostics[
+                "acquisition_provider_breakdown"
+            ],
+            "distribution_source_breakdown": diagnostics[
+                "distribution_source_breakdown"
+            ],
+            "original_publisher_breakdown": diagnostics[
+                "original_publisher_breakdown"
+            ],
             "news_analysis": (
                 first["readiness"]["analysis_readiness"]["news_analysis"][
                     "status"
@@ -117,6 +162,12 @@ def replay(
             "sha256_after": database_hash_after,
             "unchanged": database_hash_before == database_hash_after,
             "access": "SQLITE_MODE_RO_QUERY_ONLY",
+            "independent_sandbox_count": 2,
+            "sandbox_hashes_unchanged": (
+                first_sandbox_hash_before == first_sandbox_hash_after
+                and second_sandbox_hash_before
+                == second_sandbox_hash_after
+            ),
         },
     }
     return summary, first
@@ -166,7 +217,7 @@ def _materialize(
     }
     quarantined = [
         item
-        for item in context.get("withheld_records") or []
+        for item in context.get("quarantined_records") or []
         if item.get("disposition") == "QUARANTINED"
     ]
     if quarantined:
@@ -195,7 +246,11 @@ def _materialize(
         "record_count": len(news["context"].get("articles") or []),
         "status": status,
         "reason": reason,
-        "freshness": "CURRENT" if status in {"AVAILABLE", "PARTIAL"} else status,
+        "freshness": (
+            "CURRENT"
+            if status in {"AVAILABLE", "DEGRADED", "PARTIAL"}
+            else status
+        ),
     }
     full["sections"]["news"] = news
     if isinstance(full.get("manifest"), dict):

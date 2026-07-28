@@ -248,12 +248,20 @@ class SourcePolicyService:
     def news_lineage(self, candidate: dict[str, Any]) -> dict[str, Any]:
         """Return explicit, audit-safe publisher/distributor/provider lineage states."""
 
-        url = candidate.get("canonical_url") or candidate.get("source_url")
+        url = (
+            candidate.get("canonical_url")
+            or candidate.get("source_url")
+            or candidate.get("_raw_source_url")
+        )
         distribution_rule = self.rule_for(url, candidate.get("publisher"))
         publisher = str(
             candidate.get("original_publisher")
             or candidate.get("publisher")
-            or candidate.get("source")
+            or (
+                candidate.get("source")
+                if candidate.get("_source_is_declared_publisher", True)
+                else ""
+            )
             or ""
         ).strip()
         distributor = str(
@@ -298,6 +306,13 @@ class SourcePolicyService:
                 )
             )
         )
+        if (
+            distributor
+            and _normalize_publisher(distributor) == publisher_normalized
+            and distribution_rule
+            and distribution_rule.get("distribution_only") is not True
+        ):
+            distributor = ""
         publisher_status = (
             "VERIFIED"
             if (
@@ -332,16 +347,29 @@ class SourcePolicyService:
                 )
                 or (
                     distribution_rule.get("distribution_only") is not True
+                    and bool(publisher)
                     and not direct_publisher_matches
                 )
             )
+        )
+        source_verification_status = (
+            "POLICY_VIOLATION"
+            if contradiction
+            else "VERIFIED"
+            if publisher_status == "VERIFIED"
+            and distributor_status in {"VERIFIED", "NOT_APPLICABLE"}
+            else "UNKNOWN"
         )
         return {
             "original_publisher": publisher or None,
             "publisher_status": (
                 "CONTRADICTORY" if contradiction else publisher_status
             ),
+            "original_publisher_status": (
+                "CONTRADICTORY" if contradiction else publisher_status
+            ),
             "distributor": distributor or None,
+            "distribution_source": distributor or None,
             "distributor_status": distributor_status,
             "acquisition_provider": acquisition_provider or None,
             "lineage_status": (
@@ -352,6 +380,7 @@ class SourcePolicyService:
                 and distributor_status in {"VERIFIED", "NOT_APPLICABLE"}
                 else publisher_status
             ),
+            "source_verification_status": source_verification_status,
         }
 
     def validate(
@@ -361,11 +390,30 @@ class SourcePolicyService:
         field_semantics: str,
         numerical: bool = False,
     ) -> SourceDecision:
-        url = candidate.get("canonical_url") or candidate.get("source_url")
+        semantics = field_semantics.lower()
+        url = (
+            candidate.get("canonical_url")
+            or candidate.get("source_url")
+            or candidate.get("_raw_source_url")
+        )
         publisher = candidate.get("publisher") or candidate.get("source")
         url_validation = self.validate_url(url)
         domain = url_validation.domain
         if not url_validation.accepted:
+            if (
+                semantics in {"news", "current_news"}
+                and url_validation.reason_code
+                == "SOURCE_URL_MISSING_OR_MALFORMED"
+                and not str(url or "").strip()
+                and _has_stable_news_identity(candidate)
+            ):
+                return self._decision(
+                    True,
+                    "",
+                    5,
+                    "UNKNOWN",
+                    0.0,
+                )
             return self._decision(
                 False,
                 domain,
@@ -379,39 +427,22 @@ class SourcePolicyService:
             return self._decision(False, domain, 5, "FORBIDDEN", 0.0, "forbidden_domain")
         rule = self.rule_for(url, publisher)
         if rule is None:
+            if semantics in {"news", "current_news"}:
+                return self._decision(
+                    True,
+                    domain,
+                    5,
+                    "UNKNOWN",
+                    0.0,
+                )
             if field_semantics in {"sentiment", "exploratory_context"}:
                 return self._decision(True, domain, 5, "SECONDARY_CONTEXT", 0.35)
             return self._decision(False, domain, 5, "UNKNOWN", 0.0, "unknown_source")
-        semantics = field_semantics.lower()
         reasons: list[str] = []
         if rule.get("distribution_only") is True:
-            allowed_publishers = {
-                _normalize_publisher(item)
-                for item in rule.get("allowed_publishers") or []
-                if str(item).strip()
-            }
-            host_publishers = {
-                _normalize_publisher(item)
-                for item in rule.get("host_publishers") or []
-                if str(item).strip()
-            }
-            original_publisher = str(
-                candidate.get("original_publisher")
-                or candidate.get("publisher")
-                or ""
-            ).strip()
-            normalized_publisher = _normalize_publisher(original_publisher)
             lineage = self.news_lineage(candidate)
             if lineage["lineage_status"] == "CONTRADICTORY":
                 reasons.append("distribution_lineage_contradictory")
-            elif not original_publisher:
-                reasons.append("distribution_source_original_publisher_unknown")
-            elif (
-                normalized_publisher not in allowed_publishers
-                and normalized_publisher not in host_publishers
-                and self.rule_for_publisher(original_publisher) is None
-            ):
-                reasons.append("distribution_source_original_publisher_unverified")
         elif semantics in {"news", "current_news"}:
             lineage = self.news_lineage(candidate)
             if lineage["lineage_status"] == "CONTRADICTORY":
@@ -712,6 +743,19 @@ def _domain_matches(host: str, allowed_domain: str) -> bool:
     host = str(host or "").lower().rstrip(".")
     allowed = str(allowed_domain or "").lower().strip().rstrip(".")
     return bool(host and allowed and (host == allowed or host.endswith(f".{allowed}")))
+
+
+def _has_stable_news_identity(candidate: dict[str, Any]) -> bool:
+    return any(
+        candidate.get(key) not in (None, "")
+        for key in (
+            "news_key",
+            "provider_record_id",
+            "occurrence_id",
+            "article_id",
+            "record_id",
+        )
+    )
 
 
 def _normalize_publisher(value: Any) -> str:

@@ -1,7 +1,13 @@
 {
-  "fixture_version": "lossless-news-forensic-v1",
+  "fixture_version": "lossless-news-forensic-v2",
   "derived_from": "redacted metadata shapes observed in PR28 R4 sandbox",
   "contains_credentials": false,
+  "contract_expectations": {
+    "unknown_is_invalid": false,
+    "unknown_is_delivered_degraded": true,
+    "semantic_deduplication": false,
+    "exact_syndication_preserves_all_lineage": true
+  },
   "records": [
     {
       "provider_record_id": "redacted-reuters-yahoo-1",

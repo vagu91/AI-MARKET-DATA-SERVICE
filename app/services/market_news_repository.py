@@ -16,7 +16,10 @@ from app.services.market_fact_repository import (
     encode,
     init_market_db,
 )
-from app.services.news_intelligence_service import normalize_news_article
+from app.services.news_intelligence_service import (
+    DEFAULT_CURRENT_WINDOW_HOURS,
+    normalize_news_article,
+)
 from app.services.source_policy_service import (
     SourcePolicyService,
     SourceUrlValidation,
@@ -47,8 +50,18 @@ class MarketNewsRepository:
                 warnings.append("invalid_content")
             article["warnings"] = warnings
         source_url = str(article.get("source_url") or article.get("url") or "")
-        if not source_url:
-            raise ValueError("news source_url is required")
+        identity_only = not source_url and any(
+            article.get(key) not in (None, "")
+            for key in (
+                "news_key",
+                "provider_record_id",
+                "occurrence_id",
+                "article_id",
+                "record_id",
+            )
+        )
+        if not source_url and not identity_only:
+            raise ValueError("news source identity is required")
         current = self.clock()
         timestamp = current.replace(microsecond=0).isoformat()
         published_at = parse_datetime(article.get("published_at"))
@@ -72,12 +85,16 @@ class MarketNewsRepository:
                 }
             )
         )
-        source_admitted = source_validation.accepted and (
-            policy.accepted or reserved_fixture_source
-        )
+        source_admitted = policy.accepted and (
+            source_validation.accepted or identity_only
+        ) or reserved_fixture_source
         topics = list(article.get("topics") or [])
+        source_identity_seed = source_url or (
+            f"identity:{article.get('acquisition_provider') or article.get('provider_type') or 'UNKNOWN'}:"
+            f"{article.get('provider_record_id') or article.get('occurrence_id') or article.get('article_id') or article.get('record_id')}"
+        )
         payload = {
-            "news_key": article.get("news_key") or self.keys.news_key(title=str(article.get("title") or ""), source_url=source_url),
+            "news_key": article.get("news_key") or self.keys.news_key(title=str(article.get("title") or ""), source_url=source_identity_seed),
             "title": article.get("title") or "",
             "summary": article.get("summary"),
             "content_snippet": article.get("content_snippet"),
@@ -99,7 +116,7 @@ class MarketNewsRepository:
             "raw_payload_json": encode(article),
             "created_at": article.get("created_at") or timestamp,
             "updated_at": timestamp,
-            "canonical_url": article.get("canonical_url") or source_url,
+            "canonical_url": article.get("canonical_url") or source_url or None,
             "aggregator_url": article.get("aggregator_url"),
             "original_publisher": article.get("original_publisher") or article.get("publisher") or article.get("source"),
             "source_tier": article.get("source_tier") or policy.tier,
@@ -110,14 +127,21 @@ class MarketNewsRepository:
                 else "QUARANTINED"
             ),
             "source_invalid_reason": (
-                source_validation.reason_code
+                (
+                    source_validation.reason_code
+                    if not source_validation.accepted and not identity_only
+                    else None
+                )
                 or (",".join(policy.reasons) if not policy.accepted else None)
             ),
         }
         article["validation"] = {
             "status": (
                 "accepted"
-                if source_validation.accepted and policy.accepted
+                if source_admitted
+                and article.get("source_verification_status") == "VERIFIED"
+                else "accepted_degraded"
+                if source_admitted
                 else "unverified"
                 if reserved_fixture_source
                 else "rejected"
@@ -234,11 +258,22 @@ class MarketNewsRepository:
         now = self.clock()
         for item in items:
             valid_until = parse_datetime(item.get("valid_until"))
+            published_at = parse_datetime(item.get("published_at"))
+            declared = str(item.get("lifecycle_status") or "").upper()
             item["lifecycle_status"] = (
                 "CURRENT"
                 if valid_until and valid_until > now
                 else "EXPIRED"
                 if valid_until
+                else declared
+                if declared in {"CURRENT", "EXPIRED"}
+                else "CURRENT"
+                if published_at
+                and published_at
+                + timedelta(hours=DEFAULT_CURRENT_WINDOW_HOURS)
+                > now
+                else "EXPIRED"
+                if published_at
                 else "UNCLASSIFIED"
             )
             item["historical"] = item["lifecycle_status"] == "EXPIRED"
@@ -254,6 +289,7 @@ class MarketNewsRepository:
 
     def _row(self, row) -> dict[str, Any]:
         data = dict(row)
+        persistence_updated_at = data.get("updated_at")
         data["symbols"] = decode(data.pop("symbols_json", None), [])
         data["topics"] = decode(data.pop("topics_json", None), [])
         data["raw_payload"] = decode(data.pop("raw_payload_json", None), None)
@@ -270,10 +306,18 @@ class MarketNewsRepository:
                 "independent_source_count", "pipeline_version", "warnings", "content_status",
                 "distribution_source", "distributor", "publisher", "validation", "lineage", "content",
                 "headline", "content_availability", "provenance", "provider", "provider_name",
+                "content_availability_status",
                 "canonical_news_id", "acquisition_provider", "publisher_status",
+                "original_publisher_status", "source_verification_status",
                 "distributor_status", "lineage_status", "category_status",
-                "topic_status", "lifecycle",
+                "topic_status", "lifecycle", "full_content", "first_seen_at",
+                "last_seen_at", "analysis_usability", "warning_codes",
+                "reason_codes", "raw_source_identity", "source_occurrences",
+                "distribution_lineage",
             ):
                 if data.get(key) in (None, "") and key in data["raw_payload"]:
                     data[key] = data["raw_payload"][key]
+            if data["raw_payload"].get("updated_at") not in (None, ""):
+                data["persistence_updated_at"] = persistence_updated_at
+                data["updated_at"] = data["raw_payload"]["updated_at"]
         return data

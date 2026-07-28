@@ -149,10 +149,12 @@ deduplicate across sources or truncate records while saving.
 
 ## ACK
 
-Send `status=PERSISTED`, the exact delivery id, target snapshot revision and
-exactly the changed-section revision inventory named by that delivery. Use the
-coordinator timestamp, never a time before notification creation or more than
-five minutes in the future.
+Send `status=PERSISTED`, the exact consumer id, delivery id, target snapshot
+revision, notification payload checksum and exactly the changed-section
+revision inventory named by that delivery. Use the coordinator timestamp,
+never a time before notification creation or more than five minutes in the
+future. A wrong consumer, revision, checksum or section set is a contract
+conflict and must not be retried with invented values.
 Retry the identical ACK on timeout. Treat HTTP 409 as a contract conflict that
 requires diagnosis; do not manufacture another ACK payload.
 

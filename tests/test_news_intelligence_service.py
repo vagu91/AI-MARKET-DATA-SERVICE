@@ -230,29 +230,37 @@ def _dedupe_fixture() -> list[dict]:
     ]
 
 
-def test_equal_url_is_classified_without_destructive_deduplication():
+def test_equal_url_is_consolidated_without_losing_acquisition_lineage():
     context = build_news_context(_dedupe_fixture(), now=NOW)
-    assert len(context["latest"]) == 2
+    assert len(context["latest"]) == 1
+    assert context["diagnostics"]["delivered"] == 2
     assert context["diagnostics"]["duplicate_count"] == 1
-    assert context["duplicates"][0]["disposition"] == "DELIVERED_NONDESTRUCTIVE"
+    assert (
+        context["duplicates"][0]["disposition"]
+        == "CONSOLIDATED_WITH_LINEAGE"
+    )
 
 
-def test_equal_normalized_title_and_publisher_remain_distinct_records():
+def test_exact_syndication_is_one_logical_article_with_two_lineages():
     rows = [article("Nvidia faces export controls", url="https://one.test/a"), article("NVIDIA faces export controls!", url="https://two.test/a")]
     context = build_news_context(rows, now=NOW)
-    assert context["diagnostics"]["duplicate_count"] == 0
-    assert len(context["latest"]) == 2
+    assert context["diagnostics"]["duplicate_count"] == 1
+    assert context["diagnostics"]["delivered"] == 2
+    assert len(context["latest"]) == 1
+    assert len(context["latest"][0]["source_occurrences"]) == 2
 
 
-def test_reuters_through_two_aggregators_preserves_both_records():
+def test_reuters_through_two_aggregators_preserves_both_lineages():
     rows = [
         article("Nvidia faces export controls", source="Reuters", url="https://finance.yahoo.com/news/a"),
         article("Nvidia faces export controls", source="Reuters", url="https://msn.com/news/a"),
     ]
     context = build_news_context(rows, now=NOW)
-    assert context["diagnostics"]["duplicate_count"] == 0
-    assert len(context["latest"]) == 2
-    assert context["latest"][0]["independent_source_count"] == 1
+    assert context["diagnostics"]["duplicate_count"] == 1
+    assert context["diagnostics"]["delivered"] == 2
+    assert len(context["latest"]) == 1
+    assert context["latest"][0]["independent_source_count"] == 2
+    assert len(context["latest"][0]["source_occurrences"]) == 2
 
 
 def test_independent_sources_on_same_fact_remain_articles():

@@ -1252,10 +1252,17 @@ def _news_pipeline_status(
 def _news_exclusion_reason(item: dict[str, Any]) -> str | None:
     if news_content_status(item) == "invalid_content":
         return "invalid_content"
-    if not (item.get("source_url") or item.get("url")):
-        return "missing_url"
-    if not item.get("source"):
-        return "missing_source"
+    if not (item.get("source_url") or item.get("url")) and not any(
+        item.get(key) not in (None, "")
+        for key in (
+            "news_key",
+            "provider_record_id",
+            "occurrence_id",
+            "article_id",
+            "record_id",
+        )
+    ):
+        return "missing_source_identity"
     published = item.get("published_at")
     if published:
         parsed = _parse_dt(published)
