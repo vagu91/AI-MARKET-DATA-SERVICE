@@ -1,13 +1,15 @@
-# PR28 R3 force-generation forensic closure
+# PR28 force-generation forensic closure and R4 LIVE acceptance
 
-Status: **LIVE RERUN REQUIRED / DO NOT MERGE**
+Status: **R4 LIVE PRODUCER PATH ACCEPTED**
 
 This correction is limited to the two R3 blockers:
 `STALE_NO_DATA_NOT_RECLAIMED` and
 `COVERAGE_WRITE_ESCAPES_FAILED_FORCE_TRANSACTION`. The R3 sandbox and HTTP
 artifact were inspected read-only. No operational database, live provider, AI
 backend, browser, delivery, trading, order, migration, Uvicorn process or
-`.env` file was used.
+`.env` file was used while implementing or verifying the correction offline.
+The later controlled R4 acceptance artifacts record the authorized live
+provider validation described below.
 
 ## Read-only R3 evidence
 
@@ -114,7 +116,7 @@ regression: **110 passed**. Schema-22 and migration-focused verification:
 **44 passed**. The final complete repository suite passes with **1,828 passed**.
 Ruff, `py_compile`, `compileall` and `git diff --check` pass.
 
-## Offline replay and residual risk
+## Offline replay
 
 Two independent offline replay executions are byte-identical:
 
@@ -127,8 +129,89 @@ The replay reports zero provider-live, AI/backend, browser, delivery,
 operational-database and trading side effects, plus a byte-identical,
 write-free fixed point.
 
-Residual risk is operational: the controlled test proves the production graph
-and failure boundaries, but it does not prove the corrected code against the
-next real provider responses or deployment topology. PR28 must remain draft
-and unmerged until a new isolated live rerun confirms the corrected stale
-reclaim, S&P degraded outcome, atomic generation and second-run fixed point.
+## R4 controlled LIVE acceptance
+
+The R4 sandbox and the final acceptance artifacts were inspected read-only:
+
+- `data/pr28-r4-live-sandbox-20260728-151525`;
+- `data/pr28-r4-live-sandbox-20260728-151525/r4-live-rerun-20260728T135518Z`;
+- `data/pr28-r4-live-sandbox-20260728-151525/final-readonly-acceptance-20260728T140151Z`.
+
+The acceptance result is `PASS`, with zero recorded errors.
+
+### Provider-force reconciliation
+
+The stale `NO_DATA` lifecycle for
+`xtb:146392:2026-07-24` was classified `RECLAIMABLE` with reason
+`STALE_NO_DATA_RETRY_DUE`. FRED was invoked exactly once and returned
+successfully through official series `HSN1F`. The published occurrence
+preserves its XTB identity and contains:
+
+- actual 628;
+- forecast 610;
+- previous 618;
+- reference period `2026-06`;
+- lifecycle/release status `PUBLISHED`;
+- official actual publisher `FRED` and adapter `FRED_OFFICIAL_API`.
+
+For `xtb:146945:2026-07-24`, S&P Global returned HTTP 403. The producer
+returned HTTP 200 with typed degraded state rather than inventing data:
+
+- actual remains null;
+- forecast remains 51.5;
+- previous remains 51.2;
+- reference period remains `2026-07`;
+- resolution status is `PROVIDER_UNAVAILABLE`;
+- reason code is `sp_global_public_release_access_restricted`;
+- the result is retryable and fail-closed.
+
+### Atomic publication and accounting
+
+Exactly one canonical finalization was observed:
+
+- snapshot revision/count: 97 to 98;
+- outbox: 3 to 4;
+- coverage rows: 8 to 71, representing 21 distinct dates;
+- AI jobs: unchanged at 48;
+- backend invocations: unchanged at 41;
+- SQLite integrity: `ok`;
+- persistence outcome: `ATOMIC_COMMIT_WITH_SNAPSHOT`.
+
+The operational database remained unchanged. The failed-force atomicity guard
+passed, the queue was empty and no partial canonical generation was exposed.
+
+### Read-only full-sync acceptance
+
+Two independent reads of snapshot revision 98 produced byte-identical,
+checksum-verified full-sync payloads:
+
+- 17 sections;
+- 3,633,738 bytes;
+- SHA-256
+  `CAFDAA4E60E86988F1E8BB4DAC90AE3E87680791CECFB241B22C489C14272549`;
+- no 90 KB ceiling, truncation or lossful payload reduction;
+- zero database writes caused by either read.
+
+Readiness remains explicit and must not be presented as complete:
+
+- trading context: `PARTIAL`;
+- macro analysis: `PARTIAL`;
+- event-risk analysis: `PARTIAL`;
+- news analysis: `UNAVAILABLE`;
+- market schedule: `PARTIAL`.
+
+### Final safety gate and residual limitations
+
+At final verification, port 8053 was free, process 4892 was not running, the
+operational database SHA-256 remained
+`69514FAC4DC680BF5C0AC7FE278C76FDBB656625374A40201A3C10CA4669FA83`,
+and the intentional untracked consumer artifact remained
+`BCED28DECDF98D65AF9843C3CF3FF23DAB0A164C721B8BEF9B3E0D7697699DD4`.
+The PR28 merge gate is therefore open.
+
+Both R3 software blockers are closed and the PR28 producer path is validated
+LIVE. This does not make the whole system production-ready. S&P Global public
+release access remains externally restricted by HTTP 403, and news analysis
+is unavailable in the accepted snapshot; both limitations remain visible as
+degradation. Consumer integration with AI Trader and a real shadow
+end-to-end run remain the next step.
