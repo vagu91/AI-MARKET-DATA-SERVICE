@@ -17,7 +17,7 @@ from app.services.economic_event_materialization_service import EconomicEventMat
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.provider_observation_repository import ProviderObservationRepository
 from app.services.ai_research_job_service import AIResearchJobService
-from app.services.temporal_domain_service import canonical_event_key
+from app.services.temporal_domain_service import exact_occurrence_key
 from app.services.execution_context import ExecutionContext
 
 
@@ -91,7 +91,7 @@ class EnrichmentOrchestrator:
                 metrics["events_checked"] += 1
                 self.facts.upsert_economic_event(
                     event,
-                    event_key=canonical_event_key(event),
+                    event_key=exact_occurrence_key(event),
                     valid_until=self.freshness.macro_valid_until(event),
                 )
                 if not self._should_enrich(event):

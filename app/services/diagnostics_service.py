@@ -511,6 +511,7 @@ class DiagnosticsService:
                 scheduler._seed_canonical_schedule_gaps,
                 schedule_acquire=self.event_service.list_events,
                 now=now,
+                materialize_snapshot=False,
             )
             if (
                 result.get("reason")

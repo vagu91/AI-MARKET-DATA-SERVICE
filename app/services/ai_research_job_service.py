@@ -157,7 +157,7 @@ class AIResearchJobService:
                 job_type,
                 execution_context=execution_context,
                 correlation_id=correlation,
-                ai_required=job_type != "RELEASE_ACTUAL_REFRESH",
+                ai_required=True,
             ):
                 continue
             pending = ["actual"] if job_type == "RELEASE_ACTUAL_REFRESH" else ["outcome", "transcript_url"]
@@ -222,7 +222,7 @@ class AIResearchJobService:
     ) -> tuple[dict[str, Any], bool]:
         self._validate_job_type(job_type)
         profile = profile_for_job(job_type)
-        ai_required = job_type != "RELEASE_ACTUAL_REFRESH"
+        ai_required = True
         if not self._authorize(
             job_type,
             execution_context=execution_context,

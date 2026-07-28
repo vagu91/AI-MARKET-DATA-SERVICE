@@ -5,6 +5,174 @@ Date: 2026-07-27
 Base: `f32fecb365d91501cb863497a6b2c15d3b128ff7`
 Evidence: `data/pr27-live-acceptance-20260727T161552Z`
 
+## PR28 isolated live acceptance addendum
+
+Evidence:
+`data/pr28-live-sandbox-20260727-194238/acceptance-20260727T174803Z`.
+The five JSON artifacts were parsed in full, including duplicate-key checks.
+The exact full-sync is 3,935,493 bytes and has file SHA-256
+`DA41C09AF03B72B72A6C853E14B7C9EE9756B3B2FC9D7D79C0677D43FB10D164`.
+Its pretty rendering is semantically identical. The sandbox database, WAL,
+and SHM were copied to a temporary directory before read-only SQLite
+inspection. The operational database was not opened or modified.
+
+The PR28 live run confirms that the coverage, news, and sync corrections below
+remain valid:
+
+- 71 provider/scope/date ledger rows across all 21 dates, with 53
+  `VERIFIED_EMPTY`, 8 `PARTIAL`, 10 `VERIFIED_COMPLETE`, no logical duplicate,
+  and no terminal-proof violation;
+- five admitted news records with explicit provenance and content
+  availability, while two quarantined records remain withheld;
+- 17-section `FULL_SNAPSHOT`, byte-identical repeated reads, checksum
+  verification, and candidate equation
+  67 = 53 delivered + 0 quarantined + 14 exact duplicates.
+
+The same run exposed three additional blockers.
+
+### PR28 blocker 1 - provider actual reconciliation
+
+The correct actual candidates 628.0 and 53.6 exist in
+`event_value_candidates` inside the isolated sandbox. They came from complete
+post-release XTB records and retain stable occurrence IDs, retrieval time,
+reference-period evidence, and field lineage:
+
+- `current` maps to actual;
+- `forecast` maps to consensus/forecast;
+- `previous` maps to previous.
+
+They were rejected only for use as *official* actuals, which is correct:
+XTB is a distributor, not the originating statistical publisher. They were
+therefore never read by `accepted_official_actual`. No accepted canonical or
+lifecycle row contained the complete records. The expected Flash Services PMI
+forecast 52.0 is also absent from the captured live database and JSON
+artifacts; the captured incomplete provider candidate contains 51.5. The 52.0
+value is present only in the redacted canonical acceptance fixture and must be
+revalidated against a fresh provider response in the next isolated live run.
+
+The synchronous force path called `reconcile_calendar_events`, whose prior
+contract deliberately set every aggregator actual to null. It merged only
+forecast/consensus/previous, preserved non-empty stale values on conflict, and
+did not normalize a localized reference period already present in history.
+The deterministic official resolver was not called in this HTTP path. Instead,
+`EnrichmentOrchestrator` unconditionally called
+`enqueue_temporal_refreshes`; `RELEASE_ACTUAL_REFRESH` treated a provider-only
+context as sufficient authority and deferred the missing actual to the
+persistent AI job table.
+
+Correction:
+
+- a complete provider row is validated synchronously before snapshot
+  materialization using stable occurrence identity, post-release retrieval,
+  numeric field checks, verified forecast/consensus semantics, explicit field
+  lineage, provenance, and canonical monthly/quarterly reference period;
+- actual, forecast, consensus, previous, occurrence ID, and reference period
+  are promoted as one atomic record, never field-swapped or partially merged;
+- the lineage and audit explicitly say `official_actual=false`;
+- identical duplicate observations collapse by deterministic fingerprint;
+- discordant complete records do not promote an actual and remain auditably
+  `CONFLICT`;
+- production code contains no event-specific numeric constants. The values
+  exist only in redacted fixtures/tests.
+
+Offline fixture
+`tests/fixtures/pr28_live_actual_reconciliation_redacted.json` starts with the
+two exact incomplete occurrences and supplies complete post-release provider
+records. It proves:
+
+- 628.0 / 610.0 / 618.0 / 2026-06;
+- 53.6 / 52.0 / 51.2 / 2026-07;
+- `RELEASED`, with no residual `AWAITING_ACTUAL`;
+- exact read-back under the original occurrence IDs.
+
+### PR28 blocker 2 - unauthorized persistent jobs
+
+The live route created 15 `RELEASE_ACTUAL_REFRESH` rows (48 to 63) while the
+worker, researcher, fallback, and enrichment AI flags were disabled.
+`research_backend_invocations` correctly stayed at 41, but execution-time
+suppression was too late: queue state had already been mutated.
+
+Root cause:
+
+- temporal release refresh used `ai_required=false`;
+- the repository exempted `RELEASE_ACTUAL_REFRESH` from centralized agent
+  enablement;
+- repository enqueue did not validate the execution context before `INSERT`;
+- acquisition/recovery checks could reject a row later, but could not undo the
+  unauthorized queue mutation.
+
+Correction:
+
+- every persistent research job, including release refresh, requires explicit
+  persisted AI authority before enqueue;
+- release refresh additionally requires live-provider authority;
+- centralized research-agent enablement now applies to release refresh too;
+- repository enqueue fails closed before any row is written;
+- acquisition, retry, recovery, and startup retain the same authorization and
+  enablement gates;
+- the safe provider-only context is retained in redacted authorization
+  telemetry for verification.
+
+The integrated route regression passes the provider-only context through the
+force orchestration and verifies zero `ai_research_jobs`, zero
+`research_runs`, zero active/running jobs, and zero backend invocations.
+
+### PR28 blocker 3 - coalesced materialization
+
+The one live request produced revisions 98 and 99 because
+`DiagnosticsService._force_schedule_catch_up` invoked scheduler discovery,
+which immediately called `_rematerialize_schedule_discovery` for revision 98
+and its outbox event. The route then unconditionally called
+`_materialize_market_context`, creating revision 99. This was scheduler
+preflight plus route finalization, not a necessary two-generation contract.
+
+Correction:
+
+- schedule discovery accepts an explicit `materialize_snapshot` policy;
+- ordinary background scheduler calls retain the existing default;
+- diagnostics force preflight passes `materialize_snapshot=false`;
+- canonical coverage and lifecycle state are committed during preflight, but
+  no intermediate snapshot or outbox row is exposed;
+- the consolidated route result is materialized once, allowing the final
+  snapshot comparison to emit at most one corresponding outbox event.
+
+The fixed-point regression retains 21 dates and proves zero due provider calls,
+resolver evaluations, AI jobs, canonical writes, lifecycle writes, coverage
+writes, snapshot writes, outbox writes, provider-state mutations, and retry
+writes on the subsequent pass.
+
+### PR28 verification boundary
+
+Proved offline:
+
+- complete provider-record promotion and exact database read-back;
+- fail-closed conflict audit;
+- provider-only pre-enqueue rejection in both service and repository;
+- route-to-orchestrator context propagation;
+- deferred scheduler preflight and one route finalization;
+- 21-date fixed point;
+- coverage, news, market-schedule, readiness, and full-sync regressions;
+- two independent 17-section full-sync replays are byte-identical at 464,424
+  bytes with SHA-256
+  `54C04FA33E3888708BD38D1B0C5DA01E436985AA5CED813A1086CC5611FA391D`.
+
+Still to be proved live:
+
+- a new isolated provider-force returns the complete current provider records,
+  including the canonical 52.0 Flash Services PMI forecast;
+- one request advances the snapshot revision by at most one and emits at most
+  one corresponding outbox event;
+- queue, active/running counts, and backend invocation count remain unchanged.
+
+Final PR28 offline verification:
+
+- focused blocker regression: 90 passed;
+- provider/actual/lifecycle/queue/sync regression: 509 passed;
+- schema migration matrix 1 to 22, 20 to 22, 21 to 22, and 22 to 22:
+  4 passed;
+- complete suite: 1,814 passed;
+- Ruff, `py_compile`, `compileall`, and `git diff --check`: passed.
+
 ## Safety and evidence integrity
 
 The operational service was stopped and port 8053 was free. The operational

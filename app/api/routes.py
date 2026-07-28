@@ -55,7 +55,11 @@ from app.infrastructure.persistence.database_maintenance import analyze_database
 from app.infrastructure.persistence.migrations import migrate_database
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
 from app.infrastructure.storage_retention import retention_policy_report, storage_health
-from app.services.temporal_domain_service import canonical_event_key, reconcile_calendar_events
+from app.services.temporal_domain_service import (
+    canonical_event_key,
+    exact_occurrence_key,
+    reconcile_calendar_events,
+)
 from app.services.ai_research_job_repository import AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
@@ -402,7 +406,7 @@ async def market_context_mnq(
     for event in upcoming:
         facts_repository.upsert_economic_event(
             event,
-            event_key=canonical_event_key(event),
+            event_key=exact_occurrence_key(event),
             valid_until=enrichment_orchestrator.freshness.macro_valid_until(event),
         )
     ranked_consensus = merge_consensus_provider_payloads(investing_payload, xtb_payload)

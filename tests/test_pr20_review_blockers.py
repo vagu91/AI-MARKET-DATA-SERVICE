@@ -202,10 +202,7 @@ def test_job_service_public_methods_fail_closed_for_invalid_context(
     assert table_count(settings, "research_runs") == 0
     assert table_count(settings, "research_backend_invocations") == 0
     if method == "enqueue_temporal_refreshes":
-        assert "PROVIDER_SUPPRESSED" in latest_authorization(
-            settings,
-            event_name="resolver_evaluation",
-        )
+        assert "AI_SUPPRESSED" in latest_authorization(settings)
     else:
         assert "AI_SUPPRESSED" in latest_authorization(settings)
 

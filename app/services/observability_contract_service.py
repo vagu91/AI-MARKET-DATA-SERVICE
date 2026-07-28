@@ -113,6 +113,7 @@ class TelemetryRepository:
                     "output_tokens",
                     "cached_tokens",
                     "cost_status",
+                    "execution_context",
                 )
                 if key in redacted
             }

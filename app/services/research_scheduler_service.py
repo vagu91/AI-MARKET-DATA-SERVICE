@@ -1476,11 +1476,13 @@ class ResearchSchedulerService:
         *,
         schedule_acquire: Callable[..., Any] | None,
         now: datetime,
+        materialize_snapshot: bool = True,
     ) -> dict[str, Any]:
         if schedule_acquire is None:
             return self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=None,
                 now=now,
+                materialize_snapshot=materialize_snapshot,
             )
         if not self._canonical_schedule_has_due_dates(now=now):
             backoff = self._canonical_schedule_backoff(now=now)
@@ -1489,6 +1491,7 @@ class ResearchSchedulerService:
             return self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=schedule_acquire,
                 now=now,
+                materialize_snapshot=materialize_snapshot,
             )
         lease_owner = f"schedule-catchup-{uuid.uuid4()}"
         lease = self._acquire_schedule_seed_lease(
@@ -1509,6 +1512,7 @@ class ResearchSchedulerService:
             result = self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=schedule_acquire,
                 now=now,
+                materialize_snapshot=materialize_snapshot,
             )
         except BaseException:
             self._complete_schedule_seed_lease(
@@ -1593,6 +1597,7 @@ class ResearchSchedulerService:
         *,
         schedule_acquire: Callable[..., Any] | None,
         now: datetime,
+        materialize_snapshot: bool = True,
     ) -> dict[str, Any]:
         timezone = ZoneInfo(
             str(
@@ -1710,6 +1715,7 @@ class ResearchSchedulerService:
             "coverage_metadata_writes": 0,
             "snapshot_writes": 0,
             "outbox_writes": 0,
+            "materialization_deferred": not materialize_snapshot,
         }
         if missing_days and schedule_acquire is None:
             coverage["status"] = "UNVERIFIED_EMPTY"
@@ -2274,6 +2280,17 @@ class ResearchSchedulerService:
             and not discovered_lifecycles
             and not coverage["canonical_writes"]
         ):
+            coverage["rematerialized_snapshot_id"] = None
+            coverage["snapshot_writes"] = 0
+            coverage["outbox_writes"] = 0
+            return coverage
+        if not materialize_snapshot:
+            for lifecycle, payload, work_status in discovered_lifecycles:
+                self.lifecycle.upsert(
+                    lifecycle,
+                    payload=payload,
+                    work_status=work_status,
+                )
             coverage["rematerialized_snapshot_id"] = None
             coverage["snapshot_writes"] = 0
             coverage["outbox_writes"] = 0
