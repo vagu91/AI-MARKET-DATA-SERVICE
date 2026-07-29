@@ -209,6 +209,10 @@ class NewsProvider(BaseProvider):
                     "provider_failure_count": sum(
                         batch.get("status") == "FAILED" for batch in batches
                     ),
+                    "provider_temporarily_unavailable_count": sum(
+                        batch.get("status") == "TEMPORARILY_UNAVAILABLE"
+                        for batch in batches
+                    ),
                 }
             )
             result.data["data_quality"] = quality
@@ -515,6 +519,10 @@ class NewsProvider(BaseProvider):
             item.get("reason_code") == "EXACT_TECHNICAL_DUPLICATE"
             for item in persistence_results
         )
+        aggregate_accounting = _aggregate_provider_accounting(accounts)
+        accounting_valid = (
+            accounting_valid and aggregate_accounting["valid"]
+        )
         if not self.market_news_repository:
             persistence_status = "NOT_CONFIGURED"
         elif failed and deliverable:
@@ -525,7 +533,10 @@ class NewsProvider(BaseProvider):
             persistence_status = "COMPLETE"
 
         provider_degraded = any(
-            account.get("status") in {"FAILED", "PARTIAL"} for account in accounts
+            account.get("status")
+            in {"FAILED", "PARTIAL", "TEMPORARILY_UNAVAILABLE"}
+            or account.get("metadata_enrichment_status") == "PARTIAL"
+            for account in accounts
         )
         readiness = (
             "UNAVAILABLE"
@@ -560,6 +571,7 @@ class NewsProvider(BaseProvider):
                 "exact_technical_duplicate_count": duplicates,
                 "persistence_results": persistence_results,
                 "provider_accounting_valid": accounting_valid,
+                "provider_accounting_aggregate": aggregate_accounting,
                 "provider_accounting": accounts,
                 "readiness": readiness,
                 "final_data_available": bool(deliverable),
@@ -736,6 +748,7 @@ class NewsProvider(BaseProvider):
                 retry_count=max(attempts - 1, 0),
             )
         except Exception as exc:
+            temporarily_unavailable = _gdelt_retryable(exc)
             return _failed_provider_batch(
                 provider=provider,
                 provider_type=ProviderType.API,
@@ -744,6 +757,16 @@ class NewsProvider(BaseProvider):
                 error=exc,
                 calls=max(attempts, 1),
                 retry_count=max(attempts - 1, 0),
+                status=(
+                    "TEMPORARILY_UNAVAILABLE"
+                    if temporarily_unavailable
+                    else "FAILED"
+                ),
+                reason_code=_provider_failure_reason_code(
+                    provider,
+                    exc,
+                    retry_exhausted=temporarily_unavailable,
+                ),
             )
 
     def _rss_tasks(
@@ -894,8 +917,6 @@ class NewsProvider(BaseProvider):
                     error_message = _redact_provider_error(
                         str(exc) or type(exc).__name__
                     )
-                    batch["status"] = "PARTIAL"
-                    batch["coverage_status"] = "PARTIAL"
                     batch["metadata_enrichment_status"] = "PARTIAL"
                     batch.setdefault("warnings", []).append(
                         f"{provider} metadata_enrichment_failed: {error_message}"
@@ -907,6 +928,8 @@ class NewsProvider(BaseProvider):
                             "reason_code": (
                                 exc.reason_code
                                 if isinstance(exc, MetadataRedirectError)
+                                else "METADATA_ENRICHMENT_TIMEOUT"
+                                if isinstance(exc, httpx.TimeoutException)
                                 else "METADATA_ENRICHMENT_FAILED"
                             ),
                             "error_type": type(exc).__name__,
@@ -1820,6 +1843,7 @@ def _provider_batch(
         "pages": 1,
         "retry_count": retry_count,
         "metadata_enrichment_calls": 0,
+        "metadata_enrichment_required": False,
         "metadata_enrichment_status": "NOT_REQUIRED",
         "metadata_enrichment_results": [],
         "per_provider_limit": limit,
@@ -1856,23 +1880,35 @@ def _failed_provider_batch(
     error: Exception,
     calls: int = 1,
     retry_count: int = 0,
+    status: str = "FAILED",
+    reason_code: str | None = None,
 ) -> dict[str, Any]:
     message = _redact_provider_error(str(error) or type(error).__name__)
+    reason_code = reason_code or _provider_failure_reason_code(
+        provider,
+        error,
+        retry_exhausted=retry_count > 0,
+    )
     return {
         "provider": provider,
         "provider_type": provider_type.value,
-        "status": "FAILED",
+        "status": status,
+        "availability_status": status,
         "coverage_status": "FAILED",
+        "reason_code": reason_code,
+        "temporary": status == "TEMPORARILY_UNAVAILABLE",
         "reliability": reliability,
         "calls": calls,
         "pages": 0,
         "retry_count": retry_count,
         "metadata_enrichment_calls": 0,
+        "metadata_enrichment_required": False,
         "metadata_enrichment_status": "NOT_REQUIRED",
         "metadata_enrichment_results": [],
         "per_provider_limit": limit,
         "pagination_supported": False,
         "pagination_complete": False,
+        "coverage_reason": reason_code,
         "raw_capture_status": "NOT_ACQUIRED",
         "raw_capture": [],
         "raw_record_ids": [],
@@ -1890,6 +1926,133 @@ def _failed_provider_batch(
         ],
         "_articles": [],
     }
+
+
+def _aggregate_provider_accounting(
+    accounts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    raw_list = [
+        str(record_id)
+        for account in accounts
+        for record_id in account.get("raw_record_ids") or []
+    ]
+    raw_ids = set(raw_list)
+    parsed_ids = {
+        str(record_id)
+        for account in accounts
+        for record_id in account.get("parsed_record_ids") or []
+    }
+    persisted_ids = {
+        str(record_id)
+        for account in accounts
+        for record_id in account.get("persisted_record_ids") or []
+    }
+    technical_rejected_ids = {
+        str(item.get("record_id"))
+        for account in accounts
+        for item in account.get("technical_rejections") or []
+        if item.get("record_id")
+    }
+    persistence_rejected_ids = {
+        str(item.get("record_id"))
+        for account in accounts
+        for item in account.get("persistence_rejections") or []
+        if item.get("record_id")
+    }
+    outside_ids = {
+        str(item.get("record_id"))
+        for account in accounts
+        for item in account.get("explicit_out_of_scope") or []
+        if item.get("record_id")
+    }
+    duplicate_ids = {
+        str(item.get("record_id"))
+        for account in accounts
+        for item in account.get("exact_technical_duplicates") or []
+        if item.get("record_id")
+    }
+    raw_partitions = (parsed_ids, technical_rejected_ids)
+    parsed_partitions = (
+        persisted_ids,
+        persistence_rejected_ids,
+        outside_ids,
+        duplicate_ids,
+    )
+    raw_disjoint = all(
+        left.isdisjoint(right)
+        for index, left in enumerate(raw_partitions)
+        for right in raw_partitions[index + 1 :]
+    )
+    parsed_disjoint = all(
+        left.isdisjoint(right)
+        for index, left in enumerate(parsed_partitions)
+        for right in parsed_partitions[index + 1 :]
+    )
+    cross_provider_identity_collisions = sorted(
+        record_id
+        for record_id, count in Counter(raw_list).items()
+        if count > 1
+    )
+    raw_accounted = set().union(*raw_partitions)
+    parsed_accounted = set().union(*parsed_partitions)
+    return {
+        "valid": (
+            bool(accounts)
+            and raw_disjoint
+            and parsed_disjoint
+            and not cross_provider_identity_collisions
+            and raw_ids == raw_accounted
+            and parsed_ids == parsed_accounted
+        ),
+        "raw_count": len(raw_ids),
+        "parsed_count": len(parsed_ids),
+        "persisted_count": len(persisted_ids),
+        "technically_rejected_count": len(technical_rejected_ids),
+        "persistence_rejected_count": len(persistence_rejected_ids),
+        "explicit_out_of_scope_count": len(outside_ids),
+        "exact_technical_duplicate_count": len(duplicate_ids),
+        "raw_identity_equation_valid": raw_ids == raw_accounted,
+        "parsed_identity_equation_valid": parsed_ids == parsed_accounted,
+        "raw_partitions_disjoint": raw_disjoint,
+        "parsed_partitions_disjoint": parsed_disjoint,
+        "cross_provider_identity_collision_ids": (
+            cross_provider_identity_collisions
+        ),
+        "unaccounted_raw_ids": sorted(raw_ids - raw_accounted),
+        "unexpected_raw_partition_ids": sorted(raw_accounted - raw_ids),
+        "parsed_but_not_accounted_ids": sorted(
+            parsed_ids - parsed_accounted
+        ),
+        "accounted_without_parsed_identity_ids": sorted(
+            parsed_accounted - parsed_ids
+        ),
+    }
+
+
+def _provider_failure_reason_code(
+    provider: str,
+    error: Exception,
+    *,
+    retry_exhausted: bool,
+) -> str:
+    prefix = re.sub(r"[^A-Z0-9]+", "_", provider.upper()).strip("_")
+    if isinstance(error, httpx.ConnectTimeout):
+        suffix = "CONNECT_TIMEOUT"
+    elif isinstance(error, httpx.TimeoutException):
+        suffix = "TIMEOUT"
+    elif isinstance(error, httpx.HTTPStatusError):
+        suffix = f"HTTP_{error.response.status_code}"
+    elif isinstance(error, httpx.NetworkError):
+        suffix = "NETWORK_ERROR"
+    else:
+        suffix = re.sub(
+            r"[^A-Z0-9]+",
+            "_",
+            type(error).__name__.upper(),
+        ).strip("_")
+    if retry_exhausted:
+        suffix = f"{suffix}_RETRY_EXHAUSTED"
+    return f"{prefix}_{suffix}"
 
 
 def _redact_provider_error(message: str) -> str:

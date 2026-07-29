@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
@@ -27,12 +28,13 @@ from app.providers.news_provider import (
 from app.infrastructure.persistence.provider_cache_repository import (
     ProviderCacheRepository,
 )
+from app.services.market_session_service import build_session_aware_schedule
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_PATH = REPO_ROOT / "docs" / "baselines" / "news-pipeline-v1.json"
 GOLDEN_PATH = REPO_ROOT / "tests" / "fixtures" / "news-pipeline-golden-v1.json"
-BASELINE_SHA256 = "F4268DD55094918D49E7CA64C5364424BF899DB87E7A9CB94C1E7AB8E15FBE1D"
+BASELINE_SHA256 = "7142794B166F011B21C242E08B8559B12DF6F1BF5997F734C7DFDB42B2670886"
 
 
 def _baseline() -> dict:
@@ -97,6 +99,49 @@ def test_baseline_provider_lineage_contract_matches_runtime() -> None:
     assert providers["Yahoo Finance RSS"]["distributor"] == "Yahoo Finance"
     assert providers["Google News RSS"]["publisher_fallback"] is None
     assert providers["Google News RSS"]["distributor"] == "Google News"
+
+
+def test_baseline_has_required_primary_group_and_optional_accessories() -> None:
+    baseline = _baseline()
+    providers = {
+        item["provider"]: item for item in baseline["providers"]
+    }
+    availability = baseline["availability"]
+    assert availability["optional_providers"] == [
+        "Alpha Vantage NEWS_SENTIMENT",
+        "GDELT Doc API",
+    ]
+    group = availability["required_provider_groups"][0]
+    assert group["group"] == "primary_news_feeds"
+    assert group["minimum_usable_providers"] == 1
+    assert group["minimum_persisted_records"] == 1
+    assert set(group["providers"]) == {
+        "Federal Reserve RSS",
+        "BLS RSS",
+        "BEA RSS",
+        "Yahoo Finance RSS",
+        "MarketWatch RSS",
+        "Google News RSS",
+    }
+    assert all(
+        providers[name]["availability_role"] == "PRIMARY_GROUP_MEMBER"
+        for name in group["providers"]
+    )
+    assert providers["GDELT Doc API"]["availability_role"] == (
+        "OPTIONAL_ACCESSORY"
+    )
+    assert providers["Yahoo Finance RSS"]["metadata_enrichment"] == {
+        "required": False,
+        "failure_preserves_original_record": True,
+        "failure_degrades_enrichment_only": True,
+    }
+    assert availability["not_all_sources_are_optional"] is True
+    assert baseline["accounting"][
+        "provider_and_aggregate_equations_required"
+    ] is True
+    assert baseline["accounting"][
+        "cross_provider_raw_identity_collisions_forbidden"
+    ] is True
 
 
 def test_no_post_fetch_record_slicing_or_named_limit_rejection() -> None:
@@ -366,6 +411,76 @@ async def test_gdelt_timeout_retry_policy_is_bounded_and_accounted(
     assert batch["retry_count"] == 2
     assert batch["status"] == "COMPLETE"
     assert batch["raw_capture"] == []
+
+
+@pytest.mark.asyncio
+async def test_gdelt_retry_exhaustion_is_temporary_and_never_complete(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        database_path=tmp_path / "market.sqlite",
+        alpha_vantage_api_key="",
+        news_rss_enabled=False,
+        gdelt_doc_api_url="https://gdelt.test/api",
+        news_gdelt_max_attempts=3,
+        news_gdelt_retry_backoff_seconds=0,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+    )
+    async with httpx.AsyncClient() as client:
+        with respx.mock(
+            assert_all_called=True,
+            assert_all_mocked=True,
+        ) as router:
+            route = router.get("https://gdelt.test/api").mock(
+                side_effect=httpx.ConnectTimeout("offline timeout")
+            )
+            batch = await provider._fetch_gdelt(
+                client=client,
+                symbols=["QQQ"],
+                query="QQQ Nasdaq",
+                limit=25,
+                recency_days=30,
+            )
+    assert route.call_count == 3
+    assert batch["calls"] == 3
+    assert batch["retry_count"] == 2
+    assert batch["status"] == "TEMPORARILY_UNAVAILABLE"
+    assert batch["availability_status"] == "TEMPORARILY_UNAVAILABLE"
+    assert batch["coverage_status"] == "FAILED"
+    assert batch["pagination_complete"] is False
+    assert batch["temporary"] is True
+    assert batch["reason_code"] == (
+        "GDELT_DOC_API_CONNECT_TIMEOUT_RETRY_EXHAUSTED"
+    )
+    assert batch["raw_record_ids"] == []
+
+
+def test_cme_crosscheck_unavailable_is_partial_not_quarantined_offline() -> None:
+    contract = _baseline()["related_contract_checks"]
+    assert contract["official_cme_crosscheck"] == (
+        "OPTIONAL_AUTHORITATIVE_VERIFICATION"
+    )
+    schedule = build_session_aware_schedule(
+        {
+            "cme_calendar": {
+                "status": "timeout",
+                "official_document_discovered": False,
+                "official_schedule_parsed": False,
+            }
+        },
+        now=datetime(2026, 7, 27, 9, 40, tzinfo=UTC),
+    )
+    assert schedule["status"] == "PARTIAL"
+    assert schedule["validation"]["status"] == "partial"
+    assert schedule["mnq_session"]["session_state"] == "GLOBEX_OPEN"
+    assert schedule["mnq_session"]["calendar_crosscheck_status"] == "timeout"
+    assert schedule["quarantined_holidays"] == []
+    assert schedule["validation"]["status"] != "quarantined"
 
 
 def test_temporary_stage_scripts_are_not_part_of_permanent_harness() -> None:

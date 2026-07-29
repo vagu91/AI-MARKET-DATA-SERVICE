@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
-import sqlite3
+import shutil
 import sys
 import time
 from typing import Any, Iterator
@@ -25,7 +25,7 @@ from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import (
     ProviderCacheRepository,
 )
-from app.providers.news_provider import NewsProvider
+from app.providers.news_provider import NewsProvider, _aggregate_provider_accounting
 from app.services.market_news_repository import MarketNewsRepository
 
 
@@ -313,7 +313,11 @@ async def controlled_live(
     sandbox_root = output_root / "sandbox"
     sandbox_root.mkdir(parents=True, exist_ok=True)
     sandbox = sandbox_root / "market_data_service.sqlite"
-    _create_consistent_sandbox(operational, sandbox)
+    sandbox_preflight = _create_consistent_sandbox(
+        operational,
+        sandbox,
+        expected_source_state=before,
+    )
 
     guard = (
         repo_root
@@ -374,34 +378,35 @@ async def controlled_live(
 
     payload = result.model_dump(mode="json")
     network = audit.verify()
-    accounts = payload.get("data", {}).get("provider_accounting", [])
-    accounting_pass = bool(accounts) and all(
-        account.get("accounting_valid") is True for account in accounts
-    )
-    coverage_pass = bool(accounts) and all(
-        account.get("coverage_status") != "FAILED" for account in accounts
-    )
     after = _database_state(operational)
-    operational_unchanged = before == after
+    database_invariants = _database_invariants(before, after)
+    acceptance = _evaluate_controlled_live_acceptance(
+        baseline=baseline,
+        payload=payload,
+        network=network,
+        database_invariants=database_invariants,
+    )
     report = {
         "mode": "CONTROLLED_LIVE",
+        "result": acceptance["status"],
         "baseline": baseline["contract_id"],
         "baseline_sha256": baseline_sha,
         "guard_path": str(guard),
         "guard_consumed": True,
+        "sandbox_preflight": sandbox_preflight,
         "operational_database_before": before,
         "operational_database_after": after,
-        "operational_database_unchanged": operational_unchanged,
-        "provider_accounting_valid": accounting_pass,
-        "coverage_has_no_failed_source": coverage_pass,
+        "operational_database_unchanged": database_invariants["pass"],
+        "database_invariants": database_invariants,
+        "provider_accounting_valid": acceptance["accounting_valid"],
+        "coverage_has_no_blocking_failure": acceptance[
+            "coverage_has_no_blocking_failure"
+        ],
+        "provider_availability": acceptance["provider_availability"],
+        "acceptance": acceptance,
         "network": network,
         "response": payload,
-        "pass": (
-            accounting_pass
-            and coverage_pass
-            and network["pass"]
-            and operational_unchanged
-        ),
+        "pass": acceptance["pass"],
     }
     _write_json(output_root / "controlled-live-validation.json", report)
     findings = _secret_scan(output_root)
@@ -438,16 +443,377 @@ def _database_state(main: Path) -> list[dict[str, Any]]:
     return output
 
 
-def _create_consistent_sandbox(source: Path, target: Path) -> None:
-    if target.exists():
+def _database_invariants(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+) -> dict[str, Any]:
+    before_by_role = {
+        str(item["role"]): item for item in before if item.get("role")
+    }
+    after_by_role = {
+        str(item["role"]): item for item in after if item.get("role")
+    }
+    roles_unchanged = (
+        bool(before_by_role)
+        and set(before_by_role) == set(after_by_role)
+        and "MAIN" in before_by_role
+    )
+    changed_content_roles = sorted(
+        role
+        for role in set(before_by_role) | set(after_by_role)
+        if role not in before_by_role
+        or role not in after_by_role
+        or before_by_role[role].get("bytes")
+        != after_by_role[role].get("bytes")
+        or before_by_role[role].get("sha256")
+        != after_by_role[role].get("sha256")
+    )
+    changed_metadata_roles = sorted(
+        role
+        for role in set(before_by_role) | set(after_by_role)
+        if role not in before_by_role
+        or role not in after_by_role
+        or before_by_role[role].get("last_write_ns")
+        != after_by_role[role].get("last_write_ns")
+    )
+    content_unchanged = roles_unchanged and not changed_content_roles
+    metadata_unchanged = roles_unchanged and not changed_metadata_roles
+    semantic_database_unchanged = content_unchanged
+    metadata_only_shm_timestamp_change = (
+        content_unchanged
+        and changed_metadata_roles == ["SHM"]
+    )
+    if content_unchanged and metadata_unchanged:
+        classification = "UNCHANGED"
+    elif metadata_only_shm_timestamp_change:
+        classification = "METADATA_ONLY_SHM_TIMESTAMP_CHANGE"
+    elif content_unchanged:
+        classification = "UNEXPECTED_METADATA_CHANGE"
+    else:
+        classification = "CONTENT_CHANGED"
+    return {
+        "classification": classification,
+        "content_unchanged": content_unchanged,
+        "metadata_unchanged": metadata_unchanged,
+        "semantic_database_unchanged": semantic_database_unchanged,
+        "metadata_only_shm_timestamp_change": (
+            metadata_only_shm_timestamp_change
+        ),
+        "changed_content_roles": changed_content_roles,
+        "changed_metadata_roles": changed_metadata_roles,
+        "pass": (
+            semantic_database_unchanged
+            and (
+                metadata_unchanged
+                or metadata_only_shm_timestamp_change
+            )
+        ),
+    }
+
+
+def _create_consistent_sandbox(
+    source: Path,
+    target: Path,
+    *,
+    expected_source_state: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    target_paths = [
+        target,
+        Path(str(target) + "-wal"),
+        Path(str(target) + "-shm"),
+    ]
+    if any(path.exists() for path in target_paths):
         raise RuntimeError("SANDBOX_DATABASE_ALREADY_EXISTS")
     target.parent.mkdir(parents=True, exist_ok=True)
-    source_uri = f"{source.resolve().as_uri()}?mode=ro"
-    with (
-        sqlite3.connect(source_uri, uri=True) as source_connection,
-        sqlite3.connect(target) as target_connection,
+    expected = expected_source_state or _database_state(source)
+    expected_by_role = {
+        str(item["role"]): item for item in expected if item.get("role")
+    }
+    if "MAIN" not in expected_by_role:
+        raise RuntimeError("OPERATIONAL_DATABASE_MAIN_NOT_FOUND")
+    for role, suffix in (("MAIN", ""), ("WAL", "-wal"), ("SHM", "-shm")):
+        if role not in expected_by_role:
+            continue
+        source_component = Path(str(source) + suffix)
+        target_component = Path(str(target) + suffix)
+        shutil.copy2(source_component, target_component)
+
+    source_after = _database_state(source)
+    source_invariants = _database_invariants(expected, source_after)
+    if source_invariants["classification"] != "UNCHANGED":
+        raise RuntimeError(
+            "OPERATIONAL_DATABASE_CHANGED_DURING_SANDBOX_COPY "
+            f"classification={source_invariants['classification']}"
+        )
+    sandbox_state = _database_state(target)
+    sandbox_invariants = _database_invariants(expected, sandbox_state)
+    if not sandbox_invariants["content_unchanged"]:
+        raise RuntimeError("SANDBOX_DATABASE_BUNDLE_COPY_MISMATCH")
+    return {
+        "method": "FILESYSTEM_BUNDLE_COPY_WITHOUT_SQLITE_SOURCE_OPEN",
+        "operational_sqlite_opened": False,
+        "source_invariants": source_invariants,
+        "sandbox_content_matches_source": True,
+    }
+
+
+def _evaluate_controlled_live_acceptance(
+    *,
+    baseline: dict[str, Any],
+    payload: dict[str, Any],
+    network: dict[str, Any],
+    database_invariants: dict[str, Any],
+) -> dict[str, Any]:
+    data = payload.get("data") or {}
+    quality = data.get("data_quality") or {}
+    accounts = list(data.get("provider_accounting") or [])
+    account_by_provider = {
+        str(account.get("provider")): account
+        for account in accounts
+        if account.get("provider")
+    }
+    provider_policies = {
+        str(item["provider"]): item
+        for item in baseline.get("providers") or []
+    }
+    availability = baseline.get("availability") or {}
+    optional_providers = set(availability.get("optional_providers") or [])
+    required_groups = list(
+        availability.get("required_provider_groups") or []
+    )
+
+    hard_failures: list[dict[str, Any]] = []
+    degraded_reasons: list[dict[str, Any]] = []
+    unknown_providers = sorted(
+        set(account_by_provider) - set(provider_policies)
+    )
+    if unknown_providers:
+        hard_failures.append(
+            {
+                "reason_code": "PROVIDER_WITHOUT_BASELINE_POLICY",
+                "providers": unknown_providers,
+            }
+        )
+    if not network.get("pass"):
+        hard_failures.append(
+            {"reason_code": "NETWORK_INSTRUMENTATION_FAILED"}
+        )
+    accounting_valid = bool(accounts) and all(
+        account.get("accounting_valid") is True for account in accounts
+    )
+    aggregate_accounting = _aggregate_provider_accounting(accounts)
+    accounting_valid = accounting_valid and aggregate_accounting["valid"]
+    if not accounting_valid:
+        hard_failures.append(
+            {"reason_code": "PROVIDER_ACCOUNTING_INVALID"}
+        )
+
+    falsely_complete: list[str] = []
+    unreasoned_unavailable: list[str] = []
+    non_temporary_optional_failures: list[str] = []
+    for provider, account in account_by_provider.items():
+        status = str(account.get("status") or "UNKNOWN")
+        coverage_status = str(
+            account.get("coverage_status") or "UNKNOWN"
+        )
+        error_text = " ".join(
+            [
+                str(account.get("reason_code") or ""),
+                *[str(item) for item in account.get("errors") or []],
+            ]
+        ).upper()
+        if status == "COMPLETE" and (
+            coverage_status != "COMPLETE"
+            or account.get("pagination_complete") is False
+            or bool(account.get("errors"))
+        ):
+            falsely_complete.append(provider)
+        if status in {"FAILED", "TEMPORARILY_UNAVAILABLE"}:
+            if not error_text.strip():
+                unreasoned_unavailable.append(provider)
+            temporary = (
+                status == "TEMPORARILY_UNAVAILABLE"
+                or account.get("temporary") is True
+                or "TIMEOUT" in error_text
+                or "TEMPORAR" in error_text
+            )
+            if provider in optional_providers and not temporary:
+                non_temporary_optional_failures.append(provider)
+        if status != "COMPLETE" or coverage_status != "COMPLETE":
+            degraded_reasons.append(
+                {
+                    "reason_code": "PROVIDER_COVERAGE_DEGRADED",
+                    "provider": provider,
+                    "status": status,
+                    "coverage_status": coverage_status,
+                }
+            )
+        if account.get("metadata_enrichment_status") == "PARTIAL":
+            degraded_reasons.append(
+                {
+                    "reason_code": "OPTIONAL_METADATA_ENRICHMENT_PARTIAL",
+                    "provider": provider,
+                }
+            )
+    if falsely_complete:
+        hard_failures.append(
+            {
+                "reason_code": "FAILED_OR_PARTIAL_SOURCE_DECLARED_COMPLETE",
+                "providers": sorted(falsely_complete),
+            }
+        )
+    if unreasoned_unavailable:
+        hard_failures.append(
+            {
+                "reason_code": "UNAVAILABLE_PROVIDER_WITHOUT_REASON",
+                "providers": sorted(unreasoned_unavailable),
+            }
+        )
+    if non_temporary_optional_failures:
+        hard_failures.append(
+            {
+                "reason_code": "OPTIONAL_PROVIDER_NON_TEMPORARY_FAILURE",
+                "providers": sorted(non_temporary_optional_failures),
+            }
+        )
+
+    group_results: list[dict[str, Any]] = []
+    for group in required_groups:
+        members = set(group.get("providers") or [])
+        usable = sorted(
+            provider
+            for provider in members
+            if provider in account_by_provider
+            and account_by_provider[provider].get("accounting_valid") is True
+            and account_by_provider[provider].get("status")
+            in {"COMPLETE", "PARTIAL"}
+            and account_by_provider[provider].get("coverage_status")
+            in {"COMPLETE", "PARTIAL"}
+        )
+        persisted_count = sum(
+            int(
+                account_by_provider[provider].get("persisted_count")
+                or len(
+                    account_by_provider[provider].get(
+                        "persisted_record_ids"
+                    )
+                    or []
+                )
+            )
+            for provider in usable
+        )
+        group_pass = (
+            len(usable)
+            >= int(group.get("minimum_usable_providers") or 1)
+            and persisted_count
+            >= int(group.get("minimum_persisted_records") or 1)
+        )
+        group_result = {
+            "group": group.get("group"),
+            "members": sorted(members),
+            "usable_providers": usable,
+            "persisted_count": persisted_count,
+            "pass": group_pass,
+        }
+        group_results.append(group_result)
+        if not group_pass:
+            hard_failures.append(
+                {
+                    "reason_code": "REQUIRED_PROVIDER_GROUP_UNAVAILABLE",
+                    "group": group.get("group"),
+                }
+            )
+
+    response_articles = list(data.get("articles") or [])
+    response_ids = {
+        str(article.get("raw_record_id"))
+        for article in response_articles
+        if article.get("raw_record_id")
+    }
+    response_missing_identity_count = sum(
+        not article.get("raw_record_id")
+        for article in response_articles
+    )
+    persisted_ids = {
+        str(record_id)
+        for account in accounts
+        for record_id in account.get("persisted_record_ids") or []
+    }
+    response_without_persisted_identity = sorted(
+        response_ids - persisted_ids
+    )
+    if response_missing_identity_count:
+        hard_failures.append(
+            {
+                "reason_code": "RESPONSE_ARTICLE_WITHOUT_RAW_IDENTITY",
+                "count": response_missing_identity_count,
+            }
+        )
+    if response_without_persisted_identity:
+        hard_failures.append(
+            {
+                "reason_code": "RESPONSE_ARTICLE_WITHOUT_PERSISTED_IDENTITY",
+                "record_ids": response_without_persisted_identity,
+            }
+        )
+    if (
+        not quality.get("final_data_available")
+        or not response_articles
     ):
-        source_connection.backup(target_connection)
+        hard_failures.append(
+            {"reason_code": "NO_USABLE_NEWS_PAYLOAD"}
+        )
+    if not database_invariants.get("pass"):
+        hard_failures.append(
+            {
+                "reason_code": "OPERATIONAL_DATABASE_INVARIANT_FAILED",
+                "classification": database_invariants.get(
+                    "classification"
+                ),
+            }
+        )
+    elif database_invariants.get(
+        "metadata_only_shm_timestamp_change"
+    ):
+        degraded_reasons.append(
+            {
+                "reason_code": "SHM_TIMESTAMP_METADATA_ONLY_CHANGE",
+            }
+        )
+
+    if hard_failures:
+        status = "FAIL"
+    elif degraded_reasons:
+        status = "PASS_DEGRADED"
+    else:
+        status = "PASS"
+    return {
+        "status": status,
+        "pass": status in {"PASS", "PASS_DEGRADED"},
+        "usable": status in {"PASS", "PASS_DEGRADED"},
+        "accounting_valid": accounting_valid,
+        "aggregate_accounting": aggregate_accounting,
+        "coverage_has_no_blocking_failure": not any(
+            item["reason_code"]
+            in {
+                "REQUIRED_PROVIDER_GROUP_UNAVAILABLE",
+                "FAILED_OR_PARTIAL_SOURCE_DECLARED_COMPLETE",
+                "UNAVAILABLE_PROVIDER_WITHOUT_REASON",
+                "OPTIONAL_PROVIDER_NON_TEMPORARY_FAILURE",
+            }
+            for item in hard_failures
+        ),
+        "provider_availability": {
+            "required_groups": group_results,
+            "optional_providers": sorted(optional_providers),
+        },
+        "response_article_count": len(response_articles),
+        "response_without_persisted_identity_ids": (
+            response_without_persisted_identity
+        ),
+        "hard_failures": hard_failures,
+        "degraded_reasons": degraded_reasons,
+    }
 
 
 def _canonical_url(value: str) -> str:
@@ -508,7 +874,7 @@ def main() -> int:
         )
     )
     print(
-        "CONTROLLED_LIVE_NEWS_PIPELINE_PASS "
+        f"CONTROLLED_LIVE_NEWS_PIPELINE_{report['result']} "
         f"network_calls={report['network']['network_call_count']}"
     )
     return 0

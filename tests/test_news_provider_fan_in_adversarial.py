@@ -74,6 +74,17 @@ def _rss(provider: str, record_id: str) -> str:
     </item></channel></rss>"""
 
 
+def _yahoo_rss(record_id: str, article_url: str) -> str:
+    published = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return f"""<rss><channel><item>
+      <guid>{record_id}</guid>
+      <title>Reuters reports a material Nasdaq update</title>
+      <link>{article_url}</link>
+      <pubDate>{published}</pubDate>
+      <source>Reuters</source>
+    </item></channel></rss>"""
+
+
 def _assert_exact_provider_accounting(account: dict) -> None:
     raw = set(account["raw_record_ids"])
     captured = {
@@ -265,6 +276,84 @@ async def test_one_provider_failure_does_not_block_other_providers(tmp_path) -> 
     assert len(result.data["articles"]) == 6
     assert result.data["data_quality"]["provider_failure_count"] == 1
     assert result.data["data_quality"]["readiness"] == "DEGRADED"
+
+
+@pytest.mark.asyncio
+async def test_gdelt_timeout_preserves_all_six_primary_feed_records(
+    tmp_path,
+) -> None:
+    repository = RecordingNewsRepository()
+    settings = _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        news_gdelt_max_attempts=3,
+        news_gdelt_retry_backoff_seconds=0,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+        market_news_repository=repository,
+    )
+    rss_urls = {
+        "https://fed.test/rss": ("Federal Reserve RSS", "fed-timeout-1"),
+        "https://bls.test/rss": ("BLS RSS", "bls-timeout-1"),
+        "https://bea.test/rss": ("BEA RSS", "bea-timeout-1"),
+        "https://yahoo.test/rss": ("Yahoo Finance RSS", "yahoo-timeout-1"),
+        "https://marketwatch.test/rss": (
+            "MarketWatch RSS",
+            "marketwatch-timeout-1",
+        ),
+        "https://google.test/rss": ("Google News RSS", "google-timeout-1"),
+    }
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        gdelt = router.get("https://gdelt.test/api").mock(
+            side_effect=httpx.ConnectTimeout("offline fixture timeout")
+        )
+        for url, (name, record_id) in rss_urls.items():
+            router.get(url).mock(
+                return_value=httpx.Response(200, text=_rss(name, record_id))
+            )
+        result = await provider.fetch_for_symbols(
+            ["QQQ"],
+            limit=25,
+            recency_days=14,
+        )
+
+    accounts = {
+        account["provider"]: account
+        for account in result.data["provider_accounting"]
+    }
+    gdelt_account = accounts["GDELT Doc API"]
+    assert gdelt.call_count == 3
+    assert gdelt_account["status"] == "TEMPORARILY_UNAVAILABLE"
+    assert gdelt_account["coverage_status"] == "FAILED"
+    assert gdelt_account["reason_code"] == (
+        "GDELT_DOC_API_CONNECT_TIMEOUT_RETRY_EXHAUSTED"
+    )
+    assert gdelt_account["accounting_valid"] is True
+    assert len(repository.stored) == 6
+    assert len(result.data["articles"]) == 6
+    assert {
+        article["acquisition_provider"]
+        for article in result.data["articles"]
+    } == {name for name, _ in rss_urls.values()}
+    assert result.data["data_quality"][
+        "provider_temporarily_unavailable_count"
+    ] == 1
+    assert result.data["data_quality"]["provider_failure_count"] == 0
+    assert result.data["data_quality"]["provider_accounting_valid"] is True
+    assert result.data["data_quality"]["readiness"] == "DEGRADED"
+    aggregate = result.data["data_quality"][
+        "provider_accounting_aggregate"
+    ]
+    assert aggregate["valid"] is True
+    assert aggregate["raw_count"] == 6
+    assert aggregate["persisted_count"] == 6
+    assert aggregate["technically_rejected_count"] == 0
+    assert aggregate["explicit_out_of_scope_count"] == 0
+    assert aggregate["cross_provider_identity_collision_ids"] == []
+    for name, _ in rss_urls.values():
+        _assert_exact_provider_accounting(accounts[name])
 
 
 def test_url_less_rss_guid_is_deliverable_with_explicit_statuses() -> None:
@@ -780,7 +869,7 @@ async def test_metadata_enrichment_call_is_accounted_and_can_move_record_outside
 
 
 @pytest.mark.asyncio
-async def test_metadata_enrichment_failure_is_provider_partial_not_silent(
+async def test_metadata_enrichment_failure_does_not_replace_main_coverage(
     tmp_path,
 ) -> None:
     repository = RecordingNewsRepository()
@@ -826,6 +915,8 @@ async def test_metadata_enrichment_failure_is_provider_partial_not_silent(
     assert len(result.data["articles"]) == 1
     assert account["status"] == "PARTIAL"
     assert account["coverage_status"] == "PARTIAL"
+    assert account["coverage_reason"] == "PROVIDER_PAGE_LIMIT_REACHED"
+    assert account["metadata_enrichment_required"] is False
     assert account["metadata_enrichment_status"] == "PARTIAL"
     assert account["metadata_enrichment_calls"] == 1
     assert (
@@ -833,6 +924,158 @@ async def test_metadata_enrichment_failure_is_provider_partial_not_silent(
         == "METADATA_ENRICHMENT_FAILED"
     )
     assert result.data["data_quality"]["readiness"] == "DEGRADED"
+    _assert_exact_provider_accounting(account)
+
+
+def _yahoo_only_settings(tmp_path) -> Settings:
+    return _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        news_gdelt_enabled=False,
+        federal_reserve_rss_url="",
+        bls_rss_url="",
+        bea_rss_url="",
+        marketwatch_rss_url="",
+        google_news_rss_url="",
+        news_metadata_enrichment_limit_per_provider=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_yahoo_rss_200_and_allowlisted_307_delivers_record(
+    tmp_path,
+) -> None:
+    repository = RecordingNewsRepository()
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        _yahoo_only_settings(tmp_path),
+        market_news_repository=repository,
+    )
+    original = "https://finance.yahoo.com/technology/articles/rss-307.html"
+    redirected = "https://finance.yahoo.com/news/rss-307.html"
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        router.get("https://yahoo.test/rss").mock(
+            return_value=httpx.Response(
+                200,
+                text=_yahoo_rss("yahoo-main-307", original),
+            )
+        )
+        router.get(original).mock(
+            return_value=httpx.Response(
+                307,
+                headers={"Location": redirected},
+            )
+        )
+        router.get(redirected).mock(
+            return_value=httpx.Response(
+                200,
+                text=(
+                    '<html><head><meta name="description" '
+                    'content="Preserved metadata summary."></head></html>'
+                ),
+            )
+        )
+        result = await provider.fetch_for_symbols(
+            ["QQQ"],
+            limit=25,
+            recency_days=14,
+        )
+
+    account = result.data["provider_accounting"][0]
+    assert len(repository.stored) == 1
+    assert len(result.data["articles"]) == 1
+    assert result.data["articles"][0]["source_url"] == original
+    assert account["status"] == "COMPLETE"
+    assert account["coverage_status"] == "COMPLETE"
+    assert account["metadata_enrichment_status"] == "COMPLETE"
+    assert account["metadata_enrichment_required"] is False
+    _assert_exact_provider_accounting(account)
+
+
+@pytest.mark.asyncio
+async def test_yahoo_rss_200_and_enrichment_timeout_delivers_original(
+    tmp_path,
+) -> None:
+    repository = RecordingNewsRepository()
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        _yahoo_only_settings(tmp_path),
+        market_news_repository=repository,
+    )
+    original = "https://finance.yahoo.com/technology/articles/rss-timeout.html"
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        router.get("https://yahoo.test/rss").mock(
+            return_value=httpx.Response(
+                200,
+                text=_yahoo_rss("yahoo-main-timeout", original),
+            )
+        )
+        router.get(original).mock(
+            side_effect=httpx.ConnectTimeout("offline metadata timeout")
+        )
+        result = await provider.fetch_for_symbols(
+            ["QQQ"],
+            limit=25,
+            recency_days=14,
+        )
+
+    account = result.data["provider_accounting"][0]
+    assert len(repository.stored) == 1
+    assert len(result.data["articles"]) == 1
+    assert result.data["articles"][0]["source_url"] == original
+    assert account["status"] == "COMPLETE"
+    assert account["coverage_status"] == "COMPLETE"
+    assert account["metadata_enrichment_status"] == "PARTIAL"
+    assert account["metadata_enrichment_results"][0]["reason_code"] == (
+        "METADATA_ENRICHMENT_TIMEOUT"
+    )
+    assert result.data["data_quality"]["readiness"] == "DEGRADED"
+    _assert_exact_provider_accounting(account)
+
+
+@pytest.mark.asyncio
+async def test_yahoo_nonallowlisted_307_is_not_called_and_original_is_delivered(
+    tmp_path,
+) -> None:
+    repository = RecordingNewsRepository()
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        _yahoo_only_settings(tmp_path),
+        market_news_repository=repository,
+    )
+    original = "https://finance.yahoo.com/technology/articles/rss-blocked.html"
+    blocked = "https://example.com/not-allowlisted"
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        feed_route = router.get("https://yahoo.test/rss").mock(
+            return_value=httpx.Response(
+                200,
+                text=_yahoo_rss("yahoo-main-blocked", original),
+            )
+        )
+        metadata_route = router.get(original).mock(
+            return_value=httpx.Response(
+                307,
+                headers={"Location": blocked},
+            )
+        )
+        result = await provider.fetch_for_symbols(
+            ["QQQ"],
+            limit=25,
+            recency_days=14,
+        )
+
+    account = result.data["provider_accounting"][0]
+    assert feed_route.call_count == 1
+    assert metadata_route.call_count == 1
+    assert len(repository.stored) == 1
+    assert len(result.data["articles"]) == 1
+    assert result.data["articles"][0]["source_url"] == original
+    assert account["status"] == "COMPLETE"
+    assert account["coverage_status"] == "COMPLETE"
+    assert account["metadata_enrichment_status"] == "PARTIAL"
+    assert account["metadata_enrichment_results"][0]["reason_code"] == (
+        "METADATA_REDIRECT_NOT_ALLOWLISTED"
+    )
     _assert_exact_provider_accounting(account)
 
 
