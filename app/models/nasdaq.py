@@ -319,7 +319,8 @@ class NewsArticle(BaseModel):
     title: str
     source: str
     published_at: datetime | None = None
-    url: str
+    editorial_updated_at: datetime | None = None
+    url: str | None = None
     summary: str | None = None
     content_snippet: str | None = None
     source_url: str | None = None
@@ -351,6 +352,22 @@ class NewsArticle(BaseModel):
     exclusion_reason: str | None = None
     accepted: bool = True
     article_id: str | None = None
+    canonical_news_id: str | None = None
+    provider_record_id: str | None = None
+    raw_record_id: str | None = None
+    occurrence_id: str | None = None
+    editorial_occurrence_id: str | None = None
+    technical_acquisition_id: str | None = None
+    acquisition_provider: str | None = None
+    distribution_source: str | None = None
+    distributor: str | None = None
+    canonical_url_status: str | None = None
+    source_identity_status: str | None = None
+    content_availability_status: str | None = None
+    raw_source_identity: dict[str, Any] = Field(default_factory=dict)
+    source_occurrences: list[dict[str, Any]] = Field(default_factory=list)
+    distribution_lineage: list[dict[str, Any]] = Field(default_factory=list)
+    persistence: dict[str, Any] = Field(default_factory=dict)
     duplicate_group_id: str | None = None
     duplicate_of: str | None = None
     syndication_group: str | None = None
@@ -360,7 +377,25 @@ class NewsArticle(BaseModel):
 
 
 class NewsQuality(DataQuality):
-    pass
+    fan_in: bool = False
+    global_limit_applied: bool = False
+    requested_limit_semantics: str | None = None
+    raw_acquired_count: int = 0
+    raw_article_count: int = 0
+    accepted_count: int = 0
+    excluded_count: int = 0
+    provider_success_count: int = 0
+    provider_failure_count: int = 0
+    provider_accounting_valid: bool = False
+    persistence_status: str | None = None
+    persistence_attempted_count: int = 0
+    persisted_count: int = 0
+    persistence_failed_count: int = 0
+    exact_technical_duplicate_count: int = 0
+    persistence_results: list[dict[str, Any]] = Field(default_factory=list)
+    exclusion_breakdown: dict[str, int] = Field(default_factory=dict)
+    readiness: str | None = None
+    provider_accounting: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class NewsResponse(BaseModel):

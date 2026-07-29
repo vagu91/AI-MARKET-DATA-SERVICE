@@ -60,7 +60,7 @@ UNAVAILABLE_STATUSES = frozenset(
     }
 )
 DEGRADED_STATUSES = frozenset(
-    {"PARTIAL", "LAST_KNOWN_GOOD", "STALE", "EXPIRED", "DUE"}
+    {"DEGRADED", "PARTIAL", "LAST_KNOWN_GOOD", "STALE", "EXPIRED", "DUE"}
 )
 ACTIVE_WORK_STATUSES = frozenset({"PENDING", "RUNNING", "WAITING_BACKOFF"})
 MAX_CONTROL_PAYLOAD_BYTES = 262_144
@@ -197,7 +197,7 @@ def persist_sync_sections_in_transaction(
             ).fetchone()[0]
             section_revision = int(maximum or 0) + 1
             changed.append(section_name)
-        status, reason = section_status(payload)
+        status, reason = section_status(payload, section_name=section_name)
         section_data_as_of = _find_temporal_value(
             payload,
             (
@@ -463,28 +463,40 @@ def reconcile_delivered_section(
         if isinstance(output.get("context"), dict)
         else {}
     )
-    current = _unique_records(
-        [
-            *list(context.get("articles") or []),
-            *list(context.get("latest") or []),
-        ],
-        identity_keys=("article_id", "news_key", "canonical_url", "source_url"),
-    )
-    historical = _unique_records(
-        list(context.get("historical_articles") or []),
-        identity_keys=("article_id", "news_key", "canonical_url", "source_url"),
-    )
-    current_ids = {
-        _record_identity(item) for item in current
-    }
+    canonical_articles = [
+        item
+        for item in context.get("articles") or []
+        if isinstance(item, dict)
+    ]
+    if canonical_articles:
+        delivered = list(canonical_articles)
+    else:
+        delivered = _unique_records(
+            [
+                *list(context.get("latest") or []),
+                *list(context.get("historical_articles") or []),
+            ],
+            identity_keys=(
+                "article_id",
+                "news_key",
+                "canonical_url",
+                "source_url",
+            ),
+        )
+    current = [
+        item
+        for item in delivered
+        if str(item.get("lifecycle_status") or "").upper() != "EXPIRED"
+        and item.get("historical") is not True
+    ]
     historical = [
         item
-        for item in historical
-        if _record_identity(item) not in current_ids
+        for item in delivered
+        if str(item.get("lifecycle_status") or "").upper() == "EXPIRED"
+        or item.get("historical") is True
     ]
-    delivered = [*current, *historical]
     delivered_ids = {_record_identity(item) for item in delivered}
-    context["articles"] = current
+    context["articles"] = delivered
     context["latest"] = current
     context["historical_articles"] = historical
     context["directly_relevant"] = [
@@ -503,47 +515,102 @@ def reconcile_delivered_section(
     context["historical_article_count"] = len(historical)
     context["historical_context_available"] = bool(historical)
     diagnostics = dict(context.get("diagnostics") or {})
-    diagnostics["content_filter_accepted_count"] = int(
-        diagnostics.get("accepted_count") or 0
-    )
     diagnostics["accepted_count"] = len(delivered)
+    diagnostics["delivered_logical_articles"] = len(delivered)
+    diagnostics["delivered"] = int(
+        diagnostics.get("delivered")
+        or sum(
+            int(item.get("source_record_count") or 1)
+            for item in delivered
+        )
+    )
+    diagnostics["accepted_for_delivery"] = diagnostics["delivered"]
     candidate_count = max(
         int(context.get("candidate_article_count") or 0),
         int(diagnostics.get("raw_article_count") or 0),
         len(delivered),
     )
     diagnostics["raw_article_count"] = candidate_count
+    diagnostics["excluded_count"] = int(diagnostics.get("excluded_count") or 0)
+    explicitly_accounted = (
+        int(diagnostics.get("delivered") or 0)
+        + int(diagnostics.get("quarantined") or 0)
+        + int(diagnostics.get("withheld") or 0)
+        + int(diagnostics.get("technically_invalid") or 0)
+        + int(diagnostics.get("outside_scope") or 0)
+    )
+    unexplained_legacy_loss = max(candidate_count - explicitly_accounted, 0)
+    if unexplained_legacy_loss:
+        diagnostics["unexplained_loss_count"] = unexplained_legacy_loss
+        diagnostics["accounting_balanced"] = False
+        reasons = dict(diagnostics.get("exclusion_breakdown") or {})
+        reasons["unaccounted_legacy_projection"] = (
+            int(reasons.get("unaccounted_legacy_projection") or 0)
+            + unexplained_legacy_loss
+        )
+        diagnostics["exclusion_breakdown"] = reasons
     diagnostics["excluded_count"] = max(
-        int(diagnostics.get("excluded_count") or 0),
+        diagnostics["excluded_count"],
         candidate_count - len(delivered),
     )
     context["candidate_article_count"] = candidate_count
     context["rejected_article_count"] = diagnostics["excluded_count"]
     context["diagnostics"] = diagnostics
-    quarantine = (
+    quarantine_disclosure = (
         (output.get("producer_disclosures") or {}).get("quarantine")
         if isinstance(output.get("producer_disclosures"), dict)
         else {}
     ) or {}
-    if quarantine.get("record_count"):
-        context["status"] = "PARTIAL" if delivered else "QUARANTINED"
-        context["reason"] = "SOURCE_VALIDATION_WITHHELD_RECORDS"
-    elif not delivered and context.get("search_completed") is not True:
-        context["status"] = "PROVIDER_UNAVAILABLE"
+    quarantine_count = max(
+        int(quarantine_disclosure.get("record_count") or 0),
+        int(diagnostics.get("quarantined") or 0),
+    )
+    technical_invalid = int(diagnostics.get("technically_invalid") or 0)
+    degraded_records = any(
+        item.get("analysis_usability") == "DEGRADED"
+        or str(item.get("source_verification_status") or "").upper()
+        == "UNKNOWN"
+        for item in delivered
+    )
+    if delivered and (
+        quarantine_count
+        or technical_invalid
+        or int(diagnostics.get("withheld") or 0)
+        or degraded_records
+    ):
+        context["status"] = "DEGRADED"
+        context["reason"] = "VALID_NEWS_DELIVERED_WITH_QUALITY_WARNINGS"
+    elif quarantine_count or technical_invalid:
+        context["status"] = (
+            "QUARANTINED"
+        )
+        context["reason"] = (
+            "SOURCE_VALIDATION_WITHHELD_RECORDS"
+            if quarantine_count
+            else "TECHNICALLY_INVALID_RECORDS_WITHHELD"
+        )
+    elif not delivered and (
+        unexplained_legacy_loss
+        or context.get("search_completed") is not True
+    ):
+        context["status"] = "UNAVAILABLE"
+        context["reason"] = (
+            "UNEXPLAINED_NEWS_LOSS"
+            if unexplained_legacy_loss
+            else "NEWS_MATERIALIZATION_NOT_COMPLETED"
+        )
     elif not delivered and str(
         context.get("historical_coverage_status") or ""
     ).upper() == "UNVERIFIED_EMPTY":
-        context["status"] = "PARTIAL"
+        context["status"] = "UNAVAILABLE"
         context["reason"] = "HISTORICAL_COVERAGE_UNVERIFIED"
-    elif delivered and diagnostics["excluded_count"]:
-        context["status"] = "PARTIAL"
-        context["reason"] = "SOURCE_POLICY_EXCLUDED_RECORDS"
     elif delivered:
         context["status"] = "AVAILABLE"
         context.pop("reason", None)
     else:
         context["status"] = "NO_DATA"
-        context["reason"] = "NO_DELIVERED_ARTICLES"
+        context["authentic_empty"] = True
+        context["reason"] = "AUTHENTIC_EMPTY_NEWS_WINDOW"
     context["usable_for_analysis"] = bool(delivered)
     delivered_article_ids = {
         str(item.get("article_id"))
@@ -580,26 +647,25 @@ def reconcile_delivered_section(
     digest.update(
         {
             "status": (
-                "AVAILABLE"
-                if (
-                    delivered
-                    and not quarantine.get("record_count")
-                    and not diagnostics["excluded_count"]
+                "DEGRADED"
+                if delivered
+                and (
+                    quarantine_count
+                    or technical_invalid
+                    or int(diagnostics.get("withheld") or 0)
+                    or degraded_records
                 )
-                else "PARTIAL"
+                else "AVAILABLE"
                 if delivered
                 else "QUARANTINED"
-                if quarantine.get("record_count")
-                else "NO_DATA_AVAILABLE"
+                if quarantine_count or technical_invalid
+                else str(context.get("status") or "UNAVAILABLE")
             ),
             "candidate_article_count": candidate_count,
             "accepted_article_count": len(delivered),
             "delivered_article_count": len(delivered),
             "historical_article_count": len(historical),
-            "excluded_article_count": max(
-                int(digest.get("excluded_article_count") or 0),
-                candidate_count - len(delivered),
-            ),
+            "excluded_article_count": diagnostics["excluded_count"],
             "cluster_count": len(context["clusters"]),
         }
     )
@@ -607,6 +673,176 @@ def reconcile_delivered_section(
     context["digest"] = dict(digest)
     output["context"] = context
     return output
+
+
+def news_record_delta(
+    base: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    base_snapshot_revision: int,
+    target_snapshot_revision: int,
+    consumer_id: str | None = None,
+    base_acknowledged_delivery_id: str | None = None,
+    base_ack_checksum: str | None = None,
+    base_section_revision: int | None = None,
+    target_section_revision: int | None = None,
+) -> dict[str, Any]:
+    """Produce a lossless record delta; absence alone never confirms removal."""
+
+    base_context = (
+        base.get("context")
+        if isinstance(base.get("context"), dict)
+        else {}
+    )
+    target_context = (
+        target.get("context")
+        if isinstance(target.get("context"), dict)
+        else {}
+    )
+    base_records = [
+        item
+        for item in base_context.get("articles") or []
+        if isinstance(item, dict)
+    ]
+    target_records = [
+        item
+        for item in target_context.get("articles") or []
+        if isinstance(item, dict)
+    ]
+    base_by_key = {_news_delta_key(item): item for item in base_records}
+    target_by_key = {_news_delta_key(item): item for item in target_records}
+    new_records: list[dict[str, Any]] = []
+    updated_records: list[dict[str, Any]] = []
+    lifecycle_changes: list[dict[str, Any]] = []
+    unchanged_count = 0
+    for key in sorted(target_by_key):
+        current = target_by_key[key]
+        previous = base_by_key.get(key)
+        if previous is None:
+            new_records.append(current)
+            continue
+        lifecycle_changed = _news_lifecycle_projection(previous) != (
+            _news_lifecycle_projection(current)
+        )
+        material_changed = material_fingerprint(
+            _news_without_lifecycle(previous)
+        ) != material_fingerprint(_news_without_lifecycle(current))
+        if material_changed:
+            updated_records.append(current)
+        elif lifecycle_changed:
+            lifecycle_changes.append(current)
+        else:
+            unchanged_count += 1
+    explicit_removals = [
+        item
+        for item in target_context.get("confirmed_removals") or []
+        if isinstance(item, dict)
+        and str(item.get("removal_status") or "").upper() == "CONFIRMED"
+    ]
+    absent_keys = set(base_by_key) - set(target_by_key)
+    delta_records = [
+        *new_records,
+        *updated_records,
+        *lifecycle_changes,
+    ]
+    delta_records.sort(key=_news_delta_key)
+    delta_keys = {_news_delta_key(item) for item in delta_records}
+    delta_context = dict(target_context)
+    delta_context["articles"] = delta_records
+    delta_context["latest"] = [
+        item
+        for item in delta_records
+        if str(item.get("lifecycle_status") or "").upper() != "EXPIRED"
+        and item.get("historical") is not True
+    ]
+    delta_context["historical_articles"] = [
+        item
+        for item in delta_records
+        if str(item.get("lifecycle_status") or "").upper() == "EXPIRED"
+        or item.get("historical") is True
+    ]
+    for key in ("directly_relevant", "supporting"):
+        delta_context[key] = [
+            item
+            for item in target_context.get(key) or []
+            if isinstance(item, dict) and _news_delta_key(item) in delta_keys
+        ]
+    delta_context["delivered_delta_count"] = len(delta_records)
+    output = dict(target)
+    output["context"] = delta_context
+    output["latest"] = list(delta_context["latest"])
+    output["incremental"] = {
+        "mode": "RECORD_DELTA",
+        "base_snapshot_revision": int(base_snapshot_revision),
+        "target_snapshot_revision": int(target_snapshot_revision),
+        "consumer_id": consumer_id,
+        "base_acknowledged_delivery_id": base_acknowledged_delivery_id,
+        "base_ack_checksum": base_ack_checksum,
+        "base_section_revision": base_section_revision,
+        "target_section_revision": target_section_revision,
+        "new_count": len(new_records),
+        "updated_count": len(updated_records),
+        "lifecycle_change_count": len(lifecycle_changes),
+        "confirmed_removal_count": len(explicit_removals),
+        "unchanged_count": unchanged_count,
+        "absence_not_confirmed_count": len(absent_keys),
+        "confirmed_removals": explicit_removals,
+        "requires_full_resync": False,
+    }
+    return output
+
+
+def _news_delta_key(item: dict[str, Any]) -> str:
+    stable_id = (
+        item.get("canonical_news_id")
+        or item.get("news_key")
+        or item.get("article_id")
+        or item.get("provider_record_id")
+        or item.get("record_id")
+        or material_fingerprint(
+            {
+                "source_url": item.get("source_url"),
+                "publisher": item.get("original_publisher"),
+                "published_at": item.get("published_at"),
+                "title": item.get("title") or item.get("headline"),
+            }
+        )
+    )
+    return canonical_json(
+        {
+            "stable_id": stable_id,
+            "provider": item.get("acquisition_provider")
+            or item.get("provider"),
+            "duplicate_occurrence_index": item.get(
+                "duplicate_occurrence_index"
+            ),
+        }
+    )
+
+
+def _news_lifecycle_projection(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lifecycle_status": item.get("lifecycle_status"),
+        "historical": item.get("historical"),
+        "valid_from": item.get("valid_from"),
+        "valid_until": item.get("valid_until"),
+        "lifecycle": item.get("lifecycle"),
+    }
+
+
+def _news_without_lifecycle(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in item.items()
+        if key
+        not in {
+            "lifecycle_status",
+            "historical",
+            "valid_from",
+            "valid_until",
+            "lifecycle",
+        }
+    }
 
 
 def _unique_records(
@@ -847,6 +1083,14 @@ class MarketContextSyncService:
             )
             for name in normalized
         }
+        if "news" in delivered:
+            delivered["news"] = self._news_delivery_for_consumer(
+                consumer_id=consumer_id,
+                target_snapshot_revision=int(snapshot["revision"]),
+                target=delivered["news"],
+                include_lineage=include_lineage,
+                symbol=symbol,
+            )
         response = {
             "contract": CONTRACT,
             "schema_version": SCHEMA_VERSION,
@@ -860,6 +1104,110 @@ class MarketContextSyncService:
             "payload_size_bytes": 0,
         }
         return finalize_delivery(response)
+
+    def _news_delivery_for_consumer(
+        self,
+        *,
+        consumer_id: str,
+        target_snapshot_revision: int,
+        target: dict[str, Any],
+        include_lineage: bool,
+        symbol: str,
+    ) -> dict[str, Any]:
+        state = self.consumer_state(consumer_id)
+        acknowledged = state.get("last_snapshot_revision_acknowledged")
+        if (
+            acknowledged is None
+            or not state.get("last_delivery_acknowledged")
+            or state.get("gap_detected")
+            or state.get("resync_required")
+        ):
+            return {
+                **target,
+                "incremental": {
+                    "mode": "FULL_SECTION",
+                    "reason": "VALID_ACK_BASE_NOT_AVAILABLE",
+                    "target_snapshot_revision": target_snapshot_revision,
+                },
+            }
+        base_revision = int(acknowledged)
+        if base_revision > target_snapshot_revision:
+            return {
+                **target,
+                "incremental": {
+                    "mode": "FULL_SECTION",
+                    "reason": "ACK_BASE_NEWER_THAN_TARGET",
+                    "base_snapshot_revision": base_revision,
+                    "target_snapshot_revision": target_snapshot_revision,
+                    "requires_full_resync": True,
+                },
+            }
+        try:
+            _, base_rows = self._snapshot_and_sections(
+                symbol=symbol,
+                snapshot_revision=base_revision,
+            )
+        except SyncContractError:
+            return {
+                **target,
+                "incremental": {
+                    "mode": "FULL_SECTION",
+                    "reason": "ACK_BASE_SNAPSHOT_NOT_AVAILABLE",
+                    "base_snapshot_revision": base_revision,
+                    "target_snapshot_revision": target_snapshot_revision,
+                    "requires_full_resync": True,
+                },
+            }
+        base_row = next(
+            row for row in base_rows if str(row["section_name"]) == "news"
+        )
+        base = self._delivery_section(
+            base_row,
+            include_lineage=include_lineage,
+        )
+        acknowledged_delivery_id = str(
+            state.get("last_delivery_acknowledged") or ""
+        )
+        with connect_sqlite(self.settings.database_path) as conn:
+            acknowledged_row = conn.execute(
+                """
+                SELECT outbox.payload_hash
+                FROM market_context_delivery_acks ack
+                JOIN market_context_outbox outbox
+                  ON outbox.event_id=ack.delivery_id
+                WHERE ack.consumer_id=? AND ack.delivery_id=?
+                  AND ack.snapshot_revision=?
+                """,
+                (
+                    consumer_id,
+                    acknowledged_delivery_id,
+                    base_revision,
+                ),
+            ).fetchone()
+        if acknowledged_row is None:
+            return {
+                **target,
+                "incremental": {
+                    "mode": "FULL_SECTION",
+                    "reason": "ACK_AUDIT_BINDING_NOT_AVAILABLE",
+                    "base_snapshot_revision": base_revision,
+                    "target_snapshot_revision": target_snapshot_revision,
+                    "requires_full_resync": True,
+                },
+            }
+        return news_record_delta(
+            base,
+            target,
+            base_snapshot_revision=base_revision,
+            target_snapshot_revision=target_snapshot_revision,
+            consumer_id=consumer_id,
+            base_acknowledged_delivery_id=acknowledged_delivery_id,
+            base_ack_checksum=str(acknowledged_row["payload_hash"]),
+            base_section_revision=int(base_row["section_revision"]),
+            target_section_revision=int(
+                (target.get("sync") or {}).get("section_revision") or 0
+            ),
+        )
 
     def sections_request(
         self,
@@ -1696,6 +2044,7 @@ class MarketContextSyncService:
                 "snapshot_revision",
                 "status",
                 "section_revisions",
+                "checksum",
                 "acknowledged_at",
             },
         )
@@ -1710,6 +2059,7 @@ class MarketContextSyncService:
         )
         status = str(payload.get("status") or "").strip().upper()
         acknowledged_at = str(payload.get("acknowledged_at") or "").strip()
+        checksum = str(payload.get("checksum") or "").strip().lower()
         section_revisions = payload.get("section_revisions")
         if status != "PERSISTED":
             raise SyncContractError("ack_status_must_be_persisted", 422)
@@ -1718,6 +2068,8 @@ class MarketContextSyncService:
             raise SyncContractError("acknowledged_at_invalid", 422)
         if not isinstance(section_revisions, dict) or not section_revisions:
             raise SyncContractError("section_revisions_required", 422)
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise SyncContractError("ack_checksum_invalid", 422)
         revision = parse_positive_int(
             payload.get("snapshot_revision"),
             field="snapshot_revision",
@@ -1740,6 +2092,7 @@ class MarketContextSyncService:
                     "snapshot_revision": revision,
                     "status": status,
                     "section_revisions": normalized_revisions,
+                    "checksum": checksum,
                     "acknowledged_at": acknowledged_at,
                 }
             ).encode("utf-8")
@@ -1756,6 +2109,9 @@ class MarketContextSyncService:
             if int(delivery["snapshot_revision"]) != revision:
                 conn.rollback()
                 raise SyncContractError("ack_snapshot_revision_mismatch", 409)
+            if str(delivery["payload_hash"]).strip().lower() != checksum:
+                conn.rollback()
+                raise SyncContractError("ack_checksum_mismatch", 409)
             created_datetime = parse_datetime(str(delivery["created_at"]))
             if (
                 created_datetime is None
@@ -1826,6 +2182,7 @@ class MarketContextSyncService:
                     "idempotent_replay": True,
                     "delivery_id": delivery_id,
                     "snapshot_revision": revision,
+                    "checksum": checksum,
                     "superseded_delivery": bool(
                         target["superseded_by_delivery_id"]
                     ),
@@ -1958,6 +2315,7 @@ class MarketContextSyncService:
             "idempotent_replay": False,
             "delivery_id": delivery_id,
             "snapshot_revision": revision,
+            "checksum": checksum,
             "superseded_delivery": superseded,
         }
 
@@ -2337,6 +2695,21 @@ class MarketContextSyncService:
         else:
             delivered = {"records": payload}
         delivered["sync"] = cls._section_metadata(row)
+        if (
+            str(row["section_name"]) == "news"
+            and isinstance(delivered.get("context"), dict)
+        ):
+            context = dict(delivered["context"])
+            diagnostics = dict(context.get("diagnostics") or {})
+            diagnostics.update(
+                {
+                    "revision": int(row["snapshot_revision"]),
+                    "snapshot_id": str(row["snapshot_id"]),
+                    "correlation_id": str(row["snapshot_id"]),
+                }
+            )
+            context["diagnostics"] = diagnostics
+            delivered["context"] = context
         if include_lineage:
             delivered["sync"]["lineage"] = {
                 "snapshot_id": str(row["snapshot_id"]),
@@ -2545,34 +2918,7 @@ def _material_value(value: Any, *, field_name: str | None = None) -> Any:
             and any(item.get(key) not in (None, "") for key in ORDER_INSENSITIVE_ID_KEYS)
             for item in normalized
         ):
-            ordered = sorted(normalized, key=canonical_json)
-            deduplicated: list[Any] = []
-            seen: set[str] = set()
-            for item in ordered:
-                technical_identity = canonical_json(
-                    {
-                        "provider": item.get("provider"),
-                        "source": item.get("source"),
-                        "identifier": next(
-                            (
-                                [key, item[key]]
-                                for key in ORDER_INSENSITIVE_ID_KEYS
-                                if item.get(key) not in (None, "")
-                            ),
-                            None,
-                        ),
-                        "occurrence_id": item.get("occurrence_id")
-                        or item.get("related_occurrence_id"),
-                        "version": item.get("version"),
-                        "technical_fingerprint": item.get("technical_fingerprint")
-                        or item.get("fingerprint")
-                        or canonical_json(item),
-                    }
-                )
-                if technical_identity not in seen:
-                    seen.add(technical_identity)
-                    deduplicated.append(item)
-            return deduplicated
+            return sorted(normalized, key=canonical_json)
         return normalized
     if isinstance(value, datetime):
         return {"__datetime_utc__": _iso(_aware(value))}
@@ -2607,7 +2953,7 @@ def producer_availability_classification(
     freshness = str(metadata.get("freshness") or "UNKNOWN").upper()
     if status == "QUARANTINED" or freshness == "QUARANTINED":
         return "QUARANTINED_AT_PRODUCER"
-    if status == "PARTIAL":
+    if status in {"DEGRADED", "PARTIAL"}:
         return "PARTIAL_AT_PRODUCER"
     if status in UNAVAILABLE_STATUSES:
         return "UNAVAILABLE_AT_PRODUCER"
@@ -2705,7 +3051,46 @@ def record_count_for(value: Any) -> int:
     return 1 if _has_material_data(value) else 0
 
 
-def section_status(payload: Any) -> tuple[str, str | None]:
+def section_status(
+    payload: Any,
+    *,
+    section_name: str | None = None,
+) -> tuple[str, str | None]:
+    if section_name == "news" and isinstance(payload, dict):
+        context = (
+            payload.get("context")
+            if isinstance(payload.get("context"), dict)
+            else {}
+        )
+        delivered = list(context.get("articles") or [])
+        diagnostics = (
+            context.get("diagnostics")
+            if isinstance(context.get("diagnostics"), dict)
+            else {}
+        )
+        quarantined = int(diagnostics.get("quarantined") or 0)
+        technically_invalid = int(
+            diagnostics.get("technically_invalid") or 0
+        )
+        withheld = int(diagnostics.get("withheld") or 0)
+        degraded = any(
+            item.get("analysis_usability") == "DEGRADED"
+            or str(item.get("source_verification_status") or "").upper()
+            == "UNKNOWN"
+            for item in delivered
+            if isinstance(item, dict)
+        )
+        if delivered and (
+            quarantined or technically_invalid or withheld or degraded
+        ):
+            return "DEGRADED", "VALID_NEWS_WITH_QUALITY_WARNINGS"
+        if delivered:
+            return "AVAILABLE", None
+        if quarantined or technically_invalid:
+            return "QUARANTINED", "ALL_NEWS_CONCRETELY_BLOCKED"
+        if context.get("authentic_empty") is True:
+            return "NO_DATA", "AUTHENTIC_EMPTY_NEWS_WINDOW"
+        return "UNAVAILABLE", "NO_USABLE_NEWS_IN_DECLARED_SCOPE"
     quarantine = _quarantine_disclosure(payload)
     material_payload = _without_disclosures(payload)
     if not _has_material_data(material_payload):
@@ -2936,6 +3321,8 @@ def delivery_readiness(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "status": (
                 "AVAILABLE"
                 if not missing_required and not degraded_required
+                else "DEGRADED"
+                if analysis == "news_analysis" and usable_required
                 else "PARTIAL"
                 if usable_required
                 else "UNAVAILABLE"
@@ -3036,6 +3423,8 @@ def notification_envelope(row: Any) -> dict[str, Any]:
             else max(int(row["snapshot_revision"]) - 1, 0)
         ),
         "target_revision": int(row["snapshot_revision"]),
+        "checksum": str(row["payload_hash"]),
+        "checksum_scope": "OUTBOX_MATERIAL_PAYLOAD",
         "changed_sections": changed_sections,
         "triggers": triggers,
         "manifest_url": (

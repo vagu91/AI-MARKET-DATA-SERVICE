@@ -33,6 +33,7 @@ QUALITY_VERSION = "available_data_quality_v3"
 HARDENING_VERSION = "market_context_hardening_v4"
 NEWS_STATUSES = {
     "AVAILABLE",
+    "DEGRADED",
     "PARTIAL",
     "NO_RELEVANT_NEWS",
     "MARKET_CLOSED_NO_FRESH_NEWS",
@@ -169,11 +170,20 @@ def apply_news_semantics(
     now = _aware(now or datetime.now(UTC))
     output = dict(context)
     pipeline = dict(pipeline or {})
-    articles = _deduplicate_articles(
-        [
-            *(output.get("latest") or output.get("articles") or []),
-            *(output.get("historical_articles") or []),
-        ]
+    canonical_articles = [
+        item
+        for item in output.get("articles") or []
+        if isinstance(item, dict)
+    ]
+    articles = (
+        canonical_articles
+        if canonical_articles
+        else _deduplicate_articles(
+            [
+                *(output.get("latest") or []),
+                *(output.get("historical_articles") or []),
+            ]
+        )
     )
     diagnostics = dict(output.get("diagnostics") or {})
     candidate_count = int(
@@ -203,37 +213,46 @@ def apply_news_semantics(
     session_status = str(market_schedule.get("market_session_status") or "unknown").lower()
     closed = is_market_closed(session_status)
     coverage = _news_lookback(settings, session_status)
-    cutoff = now - timedelta(hours=coverage)
     context_date = str(market_schedule.get("context_date") or now.astimezone(NEW_YORK).date().isoformat())
-    context_day = _date(context_date) or now.astimezone(NEW_YORK).date()
-    current_week_start = context_day - timedelta(days=context_day.weekday())
-    historical_start = current_week_start - timedelta(days=7)
-    current_articles: list[dict[str, Any]] = []
-    historical_articles: list[dict[str, Any]] = []
-    filtered_out = 0
-    for article in articles:
-        published = parse_datetime(article.get("published_at"))
-        if published is None:
-            filtered_out += 1
-            continue
-        published_local_date = _aware(published).astimezone(NEW_YORK).date()
-        if published_local_date == context_day:
-            if _aware(published) < cutoff:
-                filtered_out += 1
-                continue
-            current_articles.append(article)
-            continue
-        if historical_start <= published_local_date < context_day:
-            historical_articles.append(article)
-            continue
-        filtered_out += 1
-    articles = current_articles
+    articles = [
+        _project_legacy_news_article(
+            article,
+            context_date=context_date,
+        )
+        for article in articles
+    ]
+    current_articles = [
+        article
+        for article in articles
+        if str(article.get("lifecycle_status") or "").upper()
+        != "EXPIRED"
+        and article.get("historical") is not True
+    ]
+    historical_articles = [
+        article
+        for article in articles
+        if str(article.get("lifecycle_status") or "").upper()
+        == "EXPIRED"
+        or article.get("historical") is True
+    ]
     accepted_count = len(articles)
-    rejected_count = min(candidate_count, pipeline_rejected_count + filtered_out)
+    rejected_count = min(candidate_count, pipeline_rejected_count)
     pipeline_error = bool(output.get("pipeline_error") or explicit_errors)
     configured = output.get("configured", True) is not False
+    degraded_delivery = any(
+        article.get("analysis_usability") == "DEGRADED"
+        for article in articles
+    )
     if articles:
-        status = "LAST_KNOWN_GOOD" if output.get("last_known_good_used") else "AVAILABLE" if not explicit_errors else "PARTIAL"
+        status = (
+            "LAST_KNOWN_GOOD"
+            if output.get("last_known_good_used")
+            else "DEGRADED"
+            if degraded_delivery
+            or explicit_errors
+            or str(output.get("status") or "").upper() == "DEGRADED"
+            else "AVAILABLE"
+        )
         reason = None
     elif not configured:
         status = "NOT_CONFIGURED"
@@ -252,7 +271,7 @@ def apply_news_semantics(
         reason = "no_articles_passed_relevance_and_recency_filters"
     search_completed = status not in {"PROVIDER_UNAVAILABLE", "PIPELINE_ERROR", "NOT_CONFIGURED"}
     latest_published = max(
-        (parse_datetime(item.get("published_at")) for item in articles if parse_datetime(item.get("published_at"))),
+        (parse_datetime(item.get("published_at")) for item in current_articles if parse_datetime(item.get("published_at"))),
         default=None,
     )
     lkg_age = (
@@ -277,12 +296,15 @@ def apply_news_semantics(
             "candidate_article_count": candidate_count,
             "accepted_article_count": accepted_count,
             "delivered_raw_article_count": (
-                len(articles) + len(historical_articles)
+                sum(
+                    int(item.get("source_record_count") or 1)
+                    for item in articles
+                )
             ),
             "rejected_article_count": rejected_count,
             "reason": reason,
             "articles": articles,
-            "latest": articles,
+            "latest": current_articles,
             "historical_articles": historical_articles,
             "historical_article_count": len(historical_articles),
             "historical_context_available": bool(historical_articles),
@@ -292,7 +314,7 @@ def apply_news_semantics(
                 provider_failure_count=provider_failure_count,
             ),
             "confidence": float((output.get("digest") or {}).get("confidence") or output.get("confidence") or 0.0),
-            "last_known_good_used": bool(output.get("last_known_good_used") and articles),
+            "last_known_good_used": bool(output.get("last_known_good_used") and current_articles),
             "last_known_good_age_hours": lkg_age,
             "last_known_good_original_published_at": (
                 latest_published.isoformat() if output.get("last_known_good_used") and latest_published else output.get("last_known_good_original_published_at")
@@ -477,6 +499,8 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
         degrading.append("news_provider_unavailable")
     if news.get("status") == "PIPELINE_ERROR":
         degrading.append("news_pipeline_error")
+    if news.get("status") == "DEGRADED":
+        degrading.append("news_delivery_degraded")
     if section_status["rates_expectations"] not in {"AVAILABLE", "LAST_KNOWN_GOOD"}:
         degrading.append("rates_expectations_unavailable")
 
@@ -497,6 +521,7 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
         status = "READY"
     full_acceptable = {
         "AVAILABLE",
+        "DEGRADED",
         "NO_DATA_EXPECTED",
         "NO_RELEVANT_DATA",
         "NO_RELEVANT_MARKETS",
@@ -511,7 +536,7 @@ def evaluate_readiness(full: dict[str, Any], *, settings: Settings) -> dict[str,
         "ready_for_rates_analysis": section_status["rates_expectations"] in {"AVAILABLE", "LAST_KNOWN_GOOD"},
         "ready_for_risk_context_analysis": section_status["risk_context"] == "AVAILABLE",
         "ready_for_nasdaq_context_analysis": section_status["nasdaq_context"] == "AVAILABLE",
-        "ready_for_news_analysis": news.get("status") in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"},
+        "ready_for_news_analysis": news.get("status") in {"AVAILABLE", "DEGRADED", "PARTIAL", "LAST_KNOWN_GOOD"},
         "ready_for_sentiment_analysis": section_status["sentiment"] in {"AVAILABLE", "LAST_KNOWN_GOOD"},
         "ready_for_trading_context": trading_ready,
         "ready_for_full_analysis": full_ready,
@@ -549,7 +574,7 @@ def build_consumer_quality(full: dict[str, Any], *, session_status: str) -> dict
     available_scores = [macro, event, risk, nasdaq, schedule]
     if _optional_status(full.get("rates_expectations") or {}) == "AVAILABLE":
         available_scores.append(rates)
-    if news_context.get("status") in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"}:
+    if news_context.get("status") in {"AVAILABLE", "DEGRADED", "PARTIAL", "LAST_KNOWN_GOOD"}:
         available_scores.append(news)
     if _optional_status(sentiment_context) == "AVAILABLE":
         available_scores.append(sentiment)
@@ -1564,40 +1589,74 @@ def _deduplicate_articles(articles: list[Any]) -> list[dict[str, Any]]:
     for raw in articles:
         if not isinstance(raw, dict):
             continue
-        stable_id = raw.get("article_id") or raw.get("news_key")
-        key = (
-            json.dumps(
-                {
-                    "provider": raw.get("provider"),
-                    "source": raw.get("source"),
-                    "stable_id": stable_id,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-            if stable_id not in (None, "")
-            else json.dumps(
-                {
-                    "provider": raw.get("provider"),
-                    "source": raw.get("source"),
-                    "source_url": raw.get("source_url"),
-                    "canonical_url": raw.get("canonical_url"),
-                    "published_at": raw.get("published_at"),
-                    "headline": raw.get("headline") or raw.get("title"),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
+        key = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
         )
         if key in seen:
             continue
         seen.add(key)
-        output.append(raw)
+        output.append(dict(raw))
     return output
+
+
+def _project_legacy_news_article(
+    raw: dict[str, Any],
+    *,
+    context_date: str,
+) -> dict[str, Any]:
+    article = dict(raw)
+    warnings = [
+        str(item)
+        for item in article.get("warning_codes") or []
+        if str(item)
+    ]
+    lifecycle_status = str(article.get("lifecycle_status") or "").upper()
+    if lifecycle_status not in {"CURRENT", "EXPIRED"}:
+        published_at = parse_datetime(article.get("published_at"))
+        published_date = (
+            _aware(published_at).astimezone(NEW_YORK).date().isoformat()
+            if published_at
+            else None
+        )
+        lifecycle_status = (
+            "CURRENT"
+            if published_date == context_date
+            else "EXPIRED"
+            if published_date
+            else "UNKNOWN"
+        )
+        warnings.append("LIFECYCLE_DERIVED_FROM_PUBLISHED_AT")
+        article["lifecycle_derivation"] = "published_at_context_date"
+    article["lifecycle_status"] = lifecycle_status
+    article["historical"] = lifecycle_status == "EXPIRED"
+
+    verification_status = str(
+        article.get("source_verification_status") or ""
+    ).upper()
+    if not verification_status:
+        verification_status = "UNKNOWN"
+        warnings.append("SOURCE_VERIFICATION_UNKNOWN")
+    article["source_verification_status"] = verification_status
+    if not article.get("original_publisher_status"):
+        article["original_publisher_status"] = (
+            "VERIFIED"
+            if verification_status == "VERIFIED"
+            else "UNKNOWN"
+        )
+    if (
+        verification_status != "VERIFIED"
+        or lifecycle_status == "UNKNOWN"
+        or warnings
+    ):
+        article["analysis_usability"] = "DEGRADED"
+    else:
+        article.setdefault("analysis_usability", "FULL")
+    article["warning_codes"] = list(dict.fromkeys(warnings))
+    return article
 
 
 def _issuer_event_id(issuer: str, event_date: str) -> str:

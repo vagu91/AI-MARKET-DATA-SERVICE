@@ -321,7 +321,9 @@ class NasdaqDataService:
         _set_provider_runtime(quality_data, result.metadata.provider_type)
         return NewsResponse(
             retrieved_at=result.metadata.retrieved_at,
-            articles=data.get("articles", [])[:limit],
+            # ``limit`` is a per-provider acquisition bound. Applying it again
+            # here would silently drop valid fan-in records from later sources.
+            articles=data.get("articles", []),
             data_quality=NewsQuality.model_validate(quality_data),
         )
 

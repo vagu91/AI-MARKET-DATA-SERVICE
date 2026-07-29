@@ -295,7 +295,7 @@ def test_news_projection_has_no_sql_top_n_and_explains_rejections(
         {
             "title": "Unknown publisher claims Nvidia development",
             "summary": "A material claim with unverifiable originator.",
-            "content": "Unknown publisher content remains quarantined.",
+            "content": "Unknown publisher content remains degraded.",
             "source": "Yahoo Finance",
             "publisher": "Unknown Publisher",
             "distribution_source": "Yahoo Finance",
@@ -312,15 +312,16 @@ def test_news_projection_has_no_sql_top_n_and_explains_rejections(
     context = build_news_context(rows, now=NOW)
 
     assert len(rows) == 117
-    assert len(context["latest"]) == 116
-    assert unknown["source_audit_status"] == "QUARANTINED"
-    assert len(context["excluded"]) == 1
-    rejected = context["excluded"][0]
-    assert rejected["publisher"] == "Unknown Publisher"
-    assert rejected["distribution_source"] == "Yahoo Finance"
-    assert rejected["policy_outcome"]["status"] == "rejected"
-    assert rejected["reason"]
-    assert rejected["content"] == "Unknown publisher content remains quarantined."
+    assert len(context["latest"]) == 117
+    assert unknown["source_audit_status"] == "ACTIVE"
+    assert context["excluded"] == []
+    degraded = next(
+        item
+        for item in context["latest"]
+        if item["original_publisher"] == "Unknown Publisher"
+    )
+    assert degraded["source_verification_status"] == "UNKNOWN"
+    assert degraded["analysis_usability"] == "DEGRADED"
     equal_timestamp_keys = [
         row["news_key"]
         for row in rows
@@ -434,8 +435,8 @@ def test_schema22_forensic_replay_closes_every_observed_blocker() -> None:
             for item in window[bucket]["events"]
         )
     assert summary["after"]["actual_missing_ids"] == []
-    assert summary["after"]["news_admitted"] == 3
-    assert summary["after"]["news_quarantined"] == 1
+    assert summary["after"]["news_admitted"] == 4
+    assert summary["after"]["news_quarantined"] == 0
     assert summary["after"]["market_schedule"] == "PARTIAL"
     assert summary["after"]["ledger_dates"] == 21
     assert accounting["source_candidate_count"] == (

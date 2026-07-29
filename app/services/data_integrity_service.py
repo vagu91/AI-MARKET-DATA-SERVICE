@@ -143,16 +143,23 @@ def news_content_status(item: dict[str, Any]) -> str:
     title = clean_text(item.get("title"))
     text = str(title or "").strip()
     upper = text.upper()
+    alternative_content = clean_text(
+        item.get("content")
+        or item.get("full_content")
+        or item.get("content_snippet")
+        or item.get("summary")
+        or item.get("description")
+    )
     if not text:
-        return "invalid_content"
+        return "valid" if alternative_content else "invalid_content"
     if upper in {"META_TITLE_QUOTE", "TITLE_QUOTE", "N/A", "NULL", "NONE"}:
-        return "invalid_content"
+        return "valid" if alternative_content else "invalid_content"
     if "META_TITLE_QUOTE" in upper:
-        return "invalid_content"
+        return "valid" if alternative_content else "invalid_content"
     if upper.endswith("_TITLE_QUOTE") or upper.endswith("_QUOTE"):
-        return "invalid_content"
+        return "valid" if alternative_content else "invalid_content"
     if "_" in text and upper == text and not any(ch.isalpha() and ch.islower() for ch in text):
-        return "invalid_content"
+        return "valid" if alternative_content else "invalid_content"
     if any(token in text for token in ("Ã", "â", "\ufffd")):
         return "invalid_content"
     return "valid"

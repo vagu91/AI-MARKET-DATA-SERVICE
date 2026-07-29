@@ -404,7 +404,7 @@ def test_raw_news_and_historical_records_are_delivered_with_lineage(
     )
     consumer_news = _news(context, {}, {})
 
-    assert len(consumer_news["articles"]) == 1
+    assert len(consumer_news["articles"]) == 3
     assert len(consumer_news["historical_articles"]) == 2
     assert consumer_news["historical_article_count"] == 2
     assert consumer_news["historical_context_available"] is True
@@ -412,10 +412,7 @@ def test_raw_news_and_historical_records_are_delivered_with_lineage(
         consumer_news["historical_coverage_status"]
         == "VERIFIED_COMPLETE"
     )
-    delivered = [
-        *consumer_news["articles"],
-        *consumer_news["historical_articles"],
-    ]
+    delivered = consumer_news["articles"]
     assert all(item["headline"].startswith("Original headline") for item in delivered)
     assert all(item["lineage"] for item in delivered)
 

@@ -135,7 +135,7 @@ def test_nasdaq_context_materialized_from_db_facts():
     assert context["earnings"]["upcoming"][0]["symbol"] == "NVDA"
 
 
-def test_news_context_dedupes_and_groups_articles():
+def test_news_context_preserves_distinct_acquisitions_and_groups_articles():
     news = build_news_context(
         [
             {
@@ -154,7 +154,7 @@ def test_news_context_dedupes_and_groups_articles():
         ]
     )
 
-    assert len(news["latest"]) == 1
+    assert len(news["latest"]) == 2
     assert news["by_topic"]["fed"][0]["source_url"] == "https://news.test/1"
     assert news["by_symbol"]["QQQ"][0]["title"] == "Fed policy and Nasdaq story"
 

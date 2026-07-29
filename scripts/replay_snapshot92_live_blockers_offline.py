@@ -331,7 +331,11 @@ def replay_artifacts() -> tuple[dict[str, Any], dict[str, Any]]:
                 "quarantined_count": quarantined_news,
                 "runtime_metrics": news_metrics,
                 "admitted_articles": admitted_proof,
-                "unknown_publisher_via_yahoo_admitted": False,
+                "unknown_publisher_via_yahoo_admitted": any(
+                    item.get("original_publisher") == "Unknown Publisher"
+                    and item.get("source_verification_status") == "UNKNOWN"
+                    for item in admitted_news
+                ),
                 "temporal_distinct_reuters_delivered": (
                     len(
                         {

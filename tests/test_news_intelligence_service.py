@@ -60,17 +60,17 @@ def article(
         (article("Treasury 10Y yield rises after bond selloff"), {"yields"}, None, set()),
         (article("Treasury auction draws weak demand and lifts government debt yields"), {"yields"}, None, set()),
         (article("Fed repricing drives Treasury yields higher after FOMC comments"), {"yields", "fed"}, None, set()),
-        (article("Best CD rates today", source="Yahoo Personal Finance"), set(), "deposit_rates", set()),
-        (article("Top high-yield savings rates this week", source="Yahoo Personal Finance"), set(), "deposit_rates", set()),
-        (article("Mortgage rates and refinancing offers today", source="Yahoo Personal Finance"), set(), "mortgage", set()),
-        (article("How to choose a HELOC", source="Yahoo Personal Finance"), set(), "personal_finance", set()),
+        (article("Best CD rates today", source="Yahoo Personal Finance"), set(), None, set()),
+        (article("Top high-yield savings rates this week", source="Yahoo Personal Finance"), set(), None, set()),
+        (article("Mortgage rates and refinancing offers today", source="Yahoo Personal Finance"), set(), None, set()),
+        (article("How to choose a HELOC", source="Yahoo Personal Finance"), set(), None, set()),
         (article("Apple dividend yield reaches a five-year high"), {"mega-cap"}, None, {"yields"}),
-        (article("Analyst reiterates Nvidia price target"), {"mega-cap"}, "analyst_rating_only", {"yields"}),
+        (article("Analyst reiterates Nvidia price target"), {"mega-cap"}, None, {"yields"}),
         (article("BLS CPI release shows inflation cooling", source="BLS", url="https://www.bls.gov/news.release/cpi.htm"), {"inflation", "macro"}, None, set()),
         (article("Apple earnings margins pressured by fuel costs"), {"earnings", "mega-cap"}, None, {"inflation"}),
         (article("Apple reports earnings and raises guidance"), {"earnings", "mega-cap"}, None, set()),
         (article("Nvidia faces new China export controls on AI chips"), {"semiconductors", "mega-cap", "geopolitics"}, None, set()),
-        (article("Tiny mining company opens a local office"), set(), "ambiguous_topic", set()),
+        (article("Tiny mining company opens a local office"), set(), None, set()),
     ],
 )
 def test_topic_classification_matrix(raw, topics, excluded, absent):
@@ -84,7 +84,8 @@ def test_federal_reserve_enforcement_action_is_not_policy_news():
     normalized = normalize_news_article(article("Federal Reserve Board issues enforcement action with a small community bank"), now=NOW)
     assert "fed" not in normalized["topics"]
     assert "macro" not in normalized["topics"]
-    assert normalized["exclusion_reason"] == "ambiguous_topic"
+    assert normalized["exclusion_reason"] is None
+    assert normalized["topic_status"] == "AMBIGUOUS"
 
 
 @pytest.mark.parametrize(
@@ -209,10 +210,10 @@ def test_entity_symbol_extraction_matrix(title, symbols):
         (article("BLS CPI release shows inflation cooling", source="BLS", url="https://www.bls.gov/news.release/cpi.htm"), 0.75, None),
         (article("Federal Reserve issues FOMC policy decision", source="Federal Reserve", url="https://www.federalreserve.gov/newsevents/pressreleases/test.htm"), 0.75, None),
         (article("Nvidia faces new China export controls on AI chips"), 0.75, None),
-        (article("Best CD rates today", source="Yahoo Personal Finance"), 0.0, "deposit_rates"),
-        (article("Mortgage refinancing offers", source="Yahoo Personal Finance"), 0.0, "mortgage"),
-        (article("Analyst reiterates Nvidia price target"), 0.0, "analyst_rating_only"),
-        (article("Apple earnings update", summary=None, published_at=None), 0.0, "irrelevant_company"),
+        (article("Best CD rates today", source="Yahoo Personal Finance"), 0.0, None),
+        (article("Mortgage refinancing offers", source="Yahoo Personal Finance"), 0.0, None),
+        (article("Analyst reiterates Nvidia price target"), 0.0, None),
+        (article("Apple earnings update", summary=None, published_at=None), 0.0, None),
         (article("Major US bank failure raises systemic risk concerns"), 0.52, None),
     ],
 )
@@ -229,28 +230,36 @@ def _dedupe_fixture() -> list[dict]:
     ]
 
 
-def test_equal_url_is_deduplicated():
+def test_equal_url_is_consolidated_without_losing_acquisition_lineage():
     context = build_news_context(_dedupe_fixture(), now=NOW)
     assert len(context["latest"]) == 1
+    assert context["diagnostics"]["delivered"] == 2
     assert context["diagnostics"]["duplicate_count"] == 1
+    assert (
+        context["duplicates"][0]["disposition"]
+        == "CONSOLIDATED_WITH_LINEAGE"
+    )
 
 
-def test_equal_normalized_title_and_publisher_remain_distinct_records():
+def test_different_canonical_urls_are_not_assumed_to_be_exact_syndication():
     rows = [article("Nvidia faces export controls", url="https://one.test/a"), article("NVIDIA faces export controls!", url="https://two.test/a")]
     context = build_news_context(rows, now=NOW)
     assert context["diagnostics"]["duplicate_count"] == 0
+    assert context["diagnostics"]["delivered"] == 2
     assert len(context["latest"]) == 2
 
 
-def test_reuters_through_two_aggregators_preserves_both_records():
+def test_reuters_through_two_aggregators_preserves_both_lineages():
     rows = [
         article("Nvidia faces export controls", source="Reuters", url="https://finance.yahoo.com/news/a"),
         article("Nvidia faces export controls", source="Reuters", url="https://msn.com/news/a"),
     ]
     context = build_news_context(rows, now=NOW)
-    assert context["diagnostics"]["duplicate_count"] == 0
-    assert len(context["latest"]) == 2
-    assert context["latest"][0]["independent_source_count"] == 1
+    assert context["diagnostics"]["duplicate_count"] == 1
+    assert context["diagnostics"]["delivered"] == 2
+    assert len(context["latest"]) == 1
+    assert context["latest"][0]["independent_source_count"] == 2
+    assert len(context["latest"][0]["source_occurrences"]) == 2
 
 
 def test_independent_sources_on_same_fact_remain_articles():
@@ -276,9 +285,10 @@ def test_different_events_for_same_company_form_different_clusters():
     assert len(context["clusters"]) == 2
 
 
-def test_personal_finance_does_not_create_operational_cluster():
+def test_personal_finance_is_preserved_as_low_relevance_context():
     context = build_news_context([article("Best CD rates today", source="Yahoo Personal Finance")], now=NOW)
-    assert context["clusters"] == []
+    assert len(context["articles"]) == 1
+    assert context["articles"][0]["relevance"] == "LOW"
 
 
 def test_confirmed_cluster_requires_independent_publishers():
@@ -312,11 +322,10 @@ def test_correct_personal_finance_exclusions_do_not_count_as_harmful_noise():
     assert context["quality"]["noise_rejection_count"] == 0
 
 
-def test_ambiguous_noise_reduces_quality():
-    clean = build_news_context([article("Apple reports earnings")], now=NOW)["quality"]
-    noisy = build_news_context([article("Apple reports earnings"), article("Unrelated local business story")], now=NOW)["quality"]
-    assert noisy["noise_rejection_count"] == 1
-    assert noisy["news_quality_score"] < clean["news_quality_score"]
+def test_ambiguous_topic_is_metadata_not_a_quality_rejection():
+    context = build_news_context([article("Unrelated local business story")], now=NOW)
+    assert context["quality"]["noise_rejection_count"] == 0
+    assert context["articles"][0]["topic_status"] == "AMBIGUOUS"
 
 
 def test_official_source_increases_digest_reliability():
@@ -344,14 +353,14 @@ def test_force_persists_digest(tmp_path):
         refresh_mode="force",
     )
     assert metrics["persisted_count"] == 1
-    assert context["digest"]["accepted_article_count"] == 2
+    assert context["digest"]["accepted_article_count"] == 3
 
 
 def test_new_connection_reads_digest(tmp_path):
     settings = cfg(tmp_path)
     runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
     fact = MarketFactRepository(settings).get_fact(NEWS_SNAPSHOT_KEY)
-    assert fact["raw_payload"]["news_digest"]["accepted_article_count"] == 2
+    assert fact["raw_payload"]["news_digest"]["accepted_article_count"] == 3
 
 
 def test_new_runtime_instance_materializes_digest(tmp_path):
@@ -384,11 +393,12 @@ def test_clusters_survive_persistence(tmp_path):
     assert cached["clusters"]
 
 
-def test_excluded_breakdown_survives_persistence(tmp_path):
+def test_lossless_acceptance_survives_persistence(tmp_path):
     settings = cfg(tmp_path)
     runtime(settings).materialize(_runtime_rows(), refresh_mode="force")
     cached, _ = runtime(settings).materialize([], refresh_mode="false")
-    assert cached["diagnostics"]["exclusion_breakdown"]["deposit_rates"] == 1
+    assert cached["diagnostics"]["excluded_count"] == 0
+    assert cached["diagnostics"]["accepted_count"] == 3
 
 
 def test_legacy_news_rows_remain_readable():
@@ -464,9 +474,9 @@ def test_contract_preserves_legacy_latest_key():
     assert "by_topic" in context
 
 
-def test_noise_is_absent_from_operational_latest():
+def test_low_relevance_is_present_in_canonical_articles():
     context = build_news_context(_runtime_rows(), now=NOW)
-    assert all("CD rates" not in item["title"] for item in context["latest"])
+    assert any("CD rates" in item["title"] for item in context["articles"])
 
 
 def test_diagnostics_are_available():

@@ -9,7 +9,7 @@ from app.services.bls_required_series import (
     bls_required_series_status_from_facts,
     required_macro_saved_but_missing_from_snapshot,
 )
-from app.services.data_integrity_service import freshness_label, news_content_status
+from app.services.data_integrity_service import news_content_status
 from app.services.market_context_builder import build_news_context
 from app.services.market_fact_repository import MarketFactRepository, connect_market_db
 from app.services.market_news_repository import MarketNewsRepository
@@ -282,12 +282,17 @@ def _macro_pipeline_status(settings: Settings) -> dict[str, Any]:
 def _news_exclusion_reason(item: dict[str, Any]) -> str | None:
     if news_content_status(item) == "invalid_content":
         return "invalid_content"
-    if not (item.get("source_url") or item.get("url")):
-        return "missing_url"
-    if not item.get("source"):
-        return "missing_source"
-    if freshness_label(valid_until=item.get("valid_until")) in {"STALE", "EXPIRED"}:
-        return "expired"
+    if not (item.get("source_url") or item.get("url")) and not any(
+        item.get(key) not in (None, "")
+        for key in (
+            "news_key",
+            "provider_record_id",
+            "occurrence_id",
+            "article_id",
+            "record_id",
+        )
+    ):
+        return "missing_source_identity"
     published = item.get("published_at")
     if published:
         try:

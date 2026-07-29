@@ -230,6 +230,160 @@ class SourcePolicyService:
             }
         return None
 
+    def rule_for_publisher(self, publisher: str | None) -> dict[str, Any] | None:
+        """Resolve an editorial publisher without treating a distributor as its origin."""
+
+        normalized = _normalize_publisher(publisher)
+        if not normalized:
+            return None
+        matches = [
+            rule
+            for rule in self.policy["rules"]
+            if rule.get("distribution_only") is not True
+            and normalized in _publisher_aliases(rule.get("publisher"))
+            and bool(rule.get("news"))
+        ]
+        return min(matches, key=lambda item: int(item["tier"])) if matches else None
+
+    def news_lineage(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        """Return explicit, audit-safe publisher/distributor/provider lineage states."""
+
+        url = (
+            candidate.get("canonical_url")
+            or candidate.get("source_url")
+            or candidate.get("_raw_source_url")
+        )
+        distribution_rule = self.rule_for(url, candidate.get("publisher"))
+        publisher = str(
+            candidate.get("original_publisher")
+            or candidate.get("publisher")
+            or (
+                candidate.get("source")
+                if candidate.get("_source_is_declared_publisher", True)
+                else ""
+            )
+            or ""
+        ).strip()
+        distributor = str(
+            candidate.get("distribution_source")
+            or candidate.get("distributor")
+            or (
+                _distribution_publisher(distribution_rule.get("publisher"))
+                if distribution_rule
+                and distribution_rule.get("distribution_only") is True
+                else ""
+            )
+            or ""
+        ).strip()
+        acquisition_provider = str(
+            candidate.get("acquisition_provider")
+            or candidate.get("provider")
+            or candidate.get("provider_name")
+            or candidate.get("provider_type")
+            or ""
+        ).strip()
+        publisher_rule = self.rule_for_publisher(publisher)
+        host_publishers = {
+            _normalize_publisher(item)
+            for item in (
+                distribution_rule.get("host_publishers")
+                if distribution_rule
+                and distribution_rule.get("distribution_only") is True
+                else []
+            )
+            or []
+        }
+        publisher_normalized = _normalize_publisher(publisher)
+        direct_publisher_matches = bool(
+            distribution_rule
+            and distribution_rule.get("distribution_only") is not True
+            and (
+                publisher_normalized
+                in _publisher_aliases(distribution_rule.get("publisher"))
+                or (
+                    distribution_rule.get("issuer_official") is True
+                    and publisher_normalized
+                    in _publisher_aliases(distribution_rule.get("issuer"))
+                )
+            )
+        )
+        if (
+            distributor
+            and _normalize_publisher(distributor) == publisher_normalized
+            and distribution_rule
+            and distribution_rule.get("distribution_only") is not True
+        ):
+            distributor = ""
+        publisher_status = (
+            "VERIFIED"
+            if (
+                publisher_rule is not None
+                or publisher_normalized in host_publishers
+                or direct_publisher_matches
+            )
+            else "DECLARED_UNVERIFIED"
+            if publisher
+            else "UNKNOWN"
+        )
+        distributor_status = (
+            "VERIFIED"
+            if distribution_rule
+            and distribution_rule.get("distribution_only") is True
+            else "NOT_APPLICABLE"
+            if not distributor
+            else "DECLARED_UNVERIFIED"
+        )
+        contradiction = bool(
+            distribution_rule
+            and (
+                (
+                    distribution_rule.get("distribution_only") is True
+                    and distributor
+                    and _normalize_publisher(distributor)
+                    not in _publisher_aliases(
+                        _distribution_publisher(
+                            distribution_rule.get("publisher")
+                        )
+                    )
+                )
+                or (
+                    distribution_rule.get("distribution_only") is not True
+                    and bool(publisher)
+                    and not direct_publisher_matches
+                )
+            )
+        )
+        source_verification_status = (
+            "POLICY_VIOLATION"
+            if contradiction
+            else "VERIFIED"
+            if publisher_status == "VERIFIED"
+            and distributor_status in {"VERIFIED", "NOT_APPLICABLE"}
+            else "UNKNOWN"
+        )
+        return {
+            "original_publisher": publisher or None,
+            "publisher_status": (
+                "CONTRADICTORY" if contradiction else publisher_status
+            ),
+            "original_publisher_status": (
+                "CONTRADICTORY" if contradiction else publisher_status
+            ),
+            "distributor": distributor or None,
+            "distribution_source": distributor or None,
+            "distributor_status": distributor_status,
+            "acquisition_provider": acquisition_provider or None,
+            "lineage_status": (
+                "CONTRADICTORY"
+                if contradiction
+                else "VERIFIED"
+                if publisher_status == "VERIFIED"
+                and distributor_status in {"VERIFIED", "NOT_APPLICABLE"}
+                else publisher_status
+            ),
+            "source_verification_status": source_verification_status,
+        }
+
     def validate(
         self,
         candidate: dict[str, Any],
@@ -237,11 +391,30 @@ class SourcePolicyService:
         field_semantics: str,
         numerical: bool = False,
     ) -> SourceDecision:
-        url = candidate.get("canonical_url") or candidate.get("source_url")
+        semantics = field_semantics.lower()
+        url = (
+            candidate.get("canonical_url")
+            or candidate.get("source_url")
+            or candidate.get("_raw_source_url")
+        )
         publisher = candidate.get("publisher") or candidate.get("source")
         url_validation = self.validate_url(url)
         domain = url_validation.domain
         if not url_validation.accepted:
+            if (
+                semantics in {"news", "current_news"}
+                and url_validation.reason_code
+                == "SOURCE_URL_MISSING_OR_MALFORMED"
+                and not str(url or "").strip()
+                and _has_stable_news_identity(candidate)
+            ):
+                return self._decision(
+                    True,
+                    "",
+                    5,
+                    "UNKNOWN",
+                    0.0,
+                )
             return self._decision(
                 False,
                 domain,
@@ -255,24 +428,26 @@ class SourcePolicyService:
             return self._decision(False, domain, 5, "FORBIDDEN", 0.0, "forbidden_domain")
         rule = self.rule_for(url, publisher)
         if rule is None:
+            if semantics in {"news", "current_news"}:
+                return self._decision(
+                    True,
+                    domain,
+                    5,
+                    "UNKNOWN",
+                    0.0,
+                )
             if field_semantics in {"sentiment", "exploratory_context"}:
                 return self._decision(True, domain, 5, "SECONDARY_CONTEXT", 0.35)
             return self._decision(False, domain, 5, "UNKNOWN", 0.0, "unknown_source")
-        semantics = field_semantics.lower()
         reasons: list[str] = []
         if rule.get("distribution_only") is True:
-            allowed_publishers = {
-                str(item).strip().casefold()
-                for item in rule.get("allowed_publishers") or []
-                if str(item).strip()
-            }
-            original_publisher = str(
-                candidate.get("original_publisher")
-                or candidate.get("publisher")
-                or ""
-            ).strip()
-            if original_publisher.casefold() not in allowed_publishers:
-                reasons.append("distribution_source_original_publisher_not_allowed")
+            lineage = self.news_lineage(candidate)
+            if lineage["lineage_status"] == "CONTRADICTORY":
+                reasons.append("distribution_lineage_contradictory")
+        elif semantics in {"news", "current_news"}:
+            lineage = self.news_lineage(candidate)
+            if lineage["lineage_status"] == "CONTRADICTORY":
+                reasons.append("source_lineage_publisher_contradictory")
         if semantics in {"actual", "official_actual"} and not bool(rule["official_actual"]):
             reasons.append("actual_requires_official_source")
         if semantics in {"actual", "official_actual"} and int(rule["tier"]) != 1:
@@ -569,6 +744,64 @@ def _domain_matches(host: str, allowed_domain: str) -> bool:
     host = str(host or "").lower().rstrip(".")
     allowed = str(allowed_domain or "").lower().strip().rstrip(".")
     return bool(host and allowed and (host == allowed or host.endswith(f".{allowed}")))
+
+
+def _has_stable_news_identity(candidate: dict[str, Any]) -> bool:
+    return any(
+        candidate.get(key) not in (None, "")
+        for key in (
+            "news_key",
+            "provider_record_id",
+            "occurrence_id",
+            "article_id",
+            "record_id",
+        )
+    )
+
+
+def _normalize_publisher(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+    if text.startswith("u s "):
+        text = text[4:]
+    aliases = {
+        "ap": "associated press",
+        "ap news": "associated press",
+        "bls": "bureau of labor statistics",
+        "bls rss": "bureau of labor statistics",
+        "bea": "bureau of economic analysis",
+        "bea rss": "bureau of economic analysis",
+        "bureau labor statistics": "bureau of labor statistics",
+        "bureau economic analysis": "bureau of economic analysis",
+        "ibd": "investors business daily",
+        "investor s business daily": "investors business daily",
+        "federal reserve rss": "federal reserve",
+        "board of governors of the federal reserve system": "federal reserve",
+        "department of the treasury": "treasury",
+        "us treasury": "treasury",
+        "securities and exchange commission": "sec",
+        "commodity futures trading commission": "cftc",
+        "energy information administration": "energy information administration",
+        "eia": "energy information administration",
+        "census": "census bureau",
+        "sp global": "s p global market intelligence",
+        "sp global pmi": "s p global market intelligence",
+        "yahoo": "yahoo finance",
+        "the wall street journal": "wall street journal",
+    }
+    return aliases.get(text, text)
+
+
+def _publisher_aliases(value: Any) -> set[str]:
+    normalized = _normalize_publisher(value)
+    aliases = {normalized} if normalized else set()
+    if normalized.endswith(" distribution"):
+        aliases.add(normalized.removesuffix(" distribution").strip())
+    return aliases
+
+
+def _distribution_publisher(value: Any) -> str:
+    text = str(value or "").strip()
+    return re.sub(r"\s+distribution$", "", text, flags=re.IGNORECASE).strip()
 
 
 def _is_source_url_field(key: str) -> bool:

@@ -77,7 +77,7 @@ class NewsIntelligenceRuntimeService:
                 "retrieved_at": now,
                 "valid_until": valid_until,
                 "next_refresh_at": valid_until,
-                "status": "active" if context.get("latest") else "no_data_available",
+                "status": "active" if context.get("articles") else "no_data_available",
                 "raw_payload_json": payload,
                 "warnings_json": (context.get("digest") or {}).get("warnings") or [],
                 "errors_json": [],
@@ -97,11 +97,18 @@ def _with_runtime(context: dict[str, Any], *, refresh_mode: str, cache_status: s
     output = dict(context)
     if cache_status in {"expired", "stale", "stale_acceptable"} and output.get("latest"):
         output["last_known_good_used"] = True
-        output["historical_articles"] = list(output.get("latest") or [])
+        historical = [
+            *list(output.get("historical_articles") or []),
+            *[
+                {**item, "lifecycle_status": "EXPIRED", "historical": True}
+                for item in output.get("latest") or []
+            ],
+        ]
+        output["historical_articles"] = historical
+        output["articles"] = historical
         output["latest"] = []
-        output["articles"] = []
         output["current_drivers"] = []
-        output["usable_for_analysis"] = False
+        output["usable_for_analysis"] = bool(historical)
         output["status"] = "STALE_LAST_KNOWN_GOOD"
         output["freshness"] = "STALE"
         warnings = list(output.get("warnings") or [])
@@ -130,7 +137,9 @@ def _runtime_metrics(context: dict[str, Any], *, cache_status: str, persisted: i
         "cache_used": cache_status in {"hit", "expired", "legacy_db_materialized"},
         "persisted_count": persisted,
         "read_back_count": read_back,
-        "materialized_count": len(context.get("latest") or []),
+        "materialized_count": len(
+            context.get("articles") or context.get("latest") or []
+        ),
         "AI_called": False,
     }
 
@@ -139,6 +148,35 @@ def _runtime_log(context: dict[str, Any], *, cache_status: str) -> dict[str, Any
     diagnostics = context.get("diagnostics") or {}
     return {
         "cache_status": cache_status,
+        **{
+            key: diagnostics.get(key)
+            for key in (
+                "raw_fetched",
+                "persisted",
+                "active_current",
+                "historical",
+                "lifecycle_unclassified",
+                "accepted_for_delivery",
+                "delivered",
+                "delivered_logical_articles",
+                "quarantined",
+                "withheld",
+                "technically_rejected",
+                "outside_scope",
+                "publisher_verified",
+                "publisher_unknown",
+                "summary_only",
+                "headline_only",
+                "full_text_available",
+                "exclusion_breakdown",
+                "accounting_equations",
+                "publisher_verification_breakdown",
+                "content_availability_breakdown",
+                "revision",
+                "snapshot_id",
+                "correlation_id",
+            )
+        },
         "accepted_count": diagnostics.get("accepted_count"),
         "excluded_count": diagnostics.get("excluded_count"),
         "cluster_count": diagnostics.get("cluster_count"),

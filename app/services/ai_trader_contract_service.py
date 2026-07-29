@@ -486,7 +486,7 @@ def _legacy_news_digest(digest: dict[str, Any]) -> dict[str, Any]:
     semantic = str(output.get("status") or "")
     if semantic:
         output["semantic_status"] = semantic
-        output["status"] = "available" if semantic in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"} else "no_data_available"
+        output["status"] = "available" if semantic in {"AVAILABLE", "DEGRADED", "PARTIAL", "LAST_KNOWN_GOOD"} else "no_data_available"
     return output
 
 

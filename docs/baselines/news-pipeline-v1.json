@@ -1,0 +1,274 @@
+{
+  "contract_id": "news-pipeline-v1",
+  "schema_version": 1,
+  "status": "IMMUTABLE_VERSIONED_BASELINE",
+  "change_control": {
+    "baseline_changes_require_explicit_file_diff": true,
+    "baseline_changes_require_regression_test_changes": true,
+    "silent_runtime_override_forbidden": true
+  },
+  "providers": [
+    {
+      "provider": "Alpha Vantage NEWS_SENTIMENT",
+      "transport": "API",
+      "endpoint": "https://www.alphavantage.co/query",
+      "enabled_when": "API_KEY_PRESENT",
+      "availability_role": "OPTIONAL_ACCESSORY",
+      "publisher_source": "provider_record.source",
+      "distributor": "Alpha Vantage",
+      "acquisition_provider": "Alpha Vantage NEWS_SENTIMENT"
+    },
+    {
+      "provider": "GDELT Doc API",
+      "transport": "API",
+      "endpoint": "https://api.gdeltproject.org/api/v2/doc/doc",
+      "enabled_when": "news_gdelt_enabled",
+      "availability_role": "OPTIONAL_ACCESSORY",
+      "publisher_source": "provider_record.domain_or_source",
+      "distributor": null,
+      "acquisition_provider": "GDELT Doc API"
+    },
+    {
+      "provider": "Federal Reserve RSS",
+      "transport": "RSS",
+      "endpoint": "https://www.federalreserve.gov/feeds/press_all.xml",
+      "availability_role": "PRIMARY_GROUP_MEMBER",
+      "publisher_fallback": "Federal Reserve",
+      "distributor": null,
+      "acquisition_provider": "Federal Reserve RSS"
+    },
+    {
+      "provider": "BLS RSS",
+      "transport": "RSS",
+      "endpoint": "https://www.bls.gov/feed/bls_latest.rss",
+      "availability_role": "PRIMARY_GROUP_MEMBER",
+      "publisher_fallback": "U.S. Bureau of Labor Statistics",
+      "distributor": null,
+      "acquisition_provider": "BLS RSS"
+    },
+    {
+      "provider": "BEA RSS",
+      "transport": "RSS",
+      "endpoint": "https://apps.bea.gov/rss/rss.xml",
+      "availability_role": "PRIMARY_GROUP_MEMBER",
+      "publisher_fallback": "U.S. Bureau of Economic Analysis",
+      "distributor": null,
+      "acquisition_provider": "BEA RSS"
+    },
+    {
+      "provider": "Yahoo Finance RSS",
+      "transport": "RSS",
+      "endpoint": "https://finance.yahoo.com/rss/topstories",
+      "availability_role": "PRIMARY_GROUP_MEMBER",
+      "publisher_fallback": null,
+      "distributor": "Yahoo Finance",
+      "acquisition_provider": "Yahoo Finance RSS",
+      "metadata_enrichment": {
+        "required": false,
+        "failure_preserves_original_record": true,
+        "failure_degrades_enrichment_only": true
+      }
+    },
+    {
+      "provider": "MarketWatch RSS",
+      "transport": "RSS",
+      "endpoint": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+      "availability_role": "PRIMARY_GROUP_MEMBER",
+      "publisher_fallback": "MarketWatch",
+      "distributor": null,
+      "acquisition_provider": "MarketWatch RSS"
+    },
+    {
+      "provider": "Google News RSS",
+      "transport": "RSS",
+      "endpoint": "https://news.google.com/rss/search",
+      "availability_role": "PRIMARY_GROUP_MEMBER",
+      "publisher_fallback": null,
+      "distributor": "Google News",
+      "acquisition_provider": "Google News RSS"
+    }
+  ],
+  "availability": {
+    "acceptance_states": {
+      "PASS": "all hard invariants and required provider groups pass without degraded coverage",
+      "PASS_DEGRADED": "all hard invariants pass and the payload is usable, while optional or partial coverage is explicitly disclosed",
+      "FAIL": "network/accounting/database integrity fails, a source is falsely complete, or no required provider group remains usable"
+    },
+    "optional_providers": [
+      "Alpha Vantage NEWS_SENTIMENT",
+      "GDELT Doc API"
+    ],
+    "required_provider_groups": [
+      {
+        "group": "primary_news_feeds",
+        "providers": [
+          "Federal Reserve RSS",
+          "BLS RSS",
+          "BEA RSS",
+          "Yahoo Finance RSS",
+          "MarketWatch RSS",
+          "Google News RSS"
+        ],
+        "minimum_usable_providers": 1,
+        "minimum_persisted_records": 1
+      }
+    ],
+    "temporarily_unavailable_optional_provider": {
+      "provider_status": "TEMPORARILY_UNAVAILABLE",
+      "coverage_status": "FAILED",
+      "reason_code_required": true,
+      "aggregate_result_when_required_group_is_usable": "PASS_DEGRADED"
+    },
+    "all_primary_sources_unavailable": "FAIL",
+    "not_all_sources_are_optional": true
+  },
+  "identity_and_lineage": {
+    "publisher_distributor_acquisition_provider_are_distinct": true,
+    "url_less_records_supported_with_native_or_stable_identity": true,
+    "deduplicate_by_url_only": false,
+    "deduplicate_by_title_only": false,
+    "exact_technical_duplicate_requires_full_occurrence_identity": true,
+    "temporal_updates_remain_distinct": true,
+    "unknown_publisher_is_not_silently_dropped": true
+  },
+  "raw_capture": {
+    "required": true,
+    "must_happen_before_semantic_parsing": true,
+    "required_fields": [
+      "record_id",
+      "provider",
+      "sequence_index",
+      "captured_before_parsing",
+      "payload_sha256",
+      "payload_size_bytes",
+      "raw_payload"
+    ],
+    "all_captured_ids_must_match_parser_input_ids": true
+  },
+  "losslessness": {
+    "post_fetch_cap": false,
+    "post_fetch_top_n": false,
+    "post_fetch_slicing": false,
+    "byte_cap": false,
+    "lossy_summary": false,
+    "semantic_deduplication": false,
+    "rss_process_every_valid_received_item": true,
+    "configurable_limits_control_requests_or_provider_page_size_only": true
+  },
+  "accounting": {
+    "raw_equation": "raw_acquired_ids = parsed_ids UNION technically_rejected_ids",
+    "parsed_equation": "parsed_ids = persisted_ids UNION persistence_rejected_ids UNION explicit_outside_scope_ids UNION exact_technical_duplicate_ids",
+    "delivery_equation": "persisted_valid_in_scope_ids = delivered_ids UNION quarantined_ids UNION withheld_ids",
+    "all_partitions_disjoint": true,
+    "provider_and_aggregate_equations_required": true,
+    "cross_provider_raw_identity_collisions_forbidden": true,
+    "every_non_delivered_record_requires_identity_and_reason_code": true,
+    "persisted_identity_requires_raw_lineage": true,
+    "response_identity_requires_persisted_identity": true
+  },
+  "coverage": {
+    "COMPLETE": "request window completed, all received records accounted, and no unresolved cursor or provider failure exists",
+    "PARTIAL": "some valid coverage exists but pagination, timeout, retry exhaustion, redirect, or another explicit gap remains",
+    "FAILED": "the source request or parse produced no trustworthy covered result",
+    "failed_source_must_not_be_complete": true,
+    "full_page_without_exhaustion_proof_is_partial": true,
+    "partial_requires_reason_and_cursor_or_explicit_unknown_remainder": true
+  },
+  "network": {
+    "methods": [
+      "GET"
+    ],
+    "fail_closed": true,
+    "all_transports_must_be_observed": true,
+    "gdelt": {
+      "timeout_seconds": 8.0,
+      "max_attempts": 3,
+      "backoff_seconds": 0.25,
+      "retry_statuses": [
+        429,
+        500,
+        502,
+        503,
+        504
+      ],
+      "retry_exceptions": [
+        "TimeoutException",
+        "NetworkError"
+      ],
+      "pagination": {
+        "provider_page_limit": 250,
+        "cursor_parameter": "startrecord",
+        "full_page_without_next_fetch": "PARTIAL"
+      }
+    },
+    "rss": {
+      "redirects": "DISABLED_FOR_FEED_ENDPOINTS",
+      "pagination": "ENTIRE_RECEIVED_DOCUMENT"
+    },
+    "metadata_redirects": {
+      "max_hops": 5,
+      "default_policy": "HTTPS_SAME_HOST_ONLY",
+      "yahoo_allowed_hosts": [
+        "finance.yahoo.com"
+      ],
+      "missing_location": "PARTIAL",
+      "non_allowlisted_target": "PARTIAL"
+    }
+  },
+  "persistence_and_delivery": {
+    "provider_network_outside_sqlite_transactions": true,
+    "canonical_write_is_atomic": true,
+    "snapshot_and_outbox_are_atomic": true,
+    "fixed_point": {
+      "canonical_writes": 0,
+      "lifecycle_writes": 0,
+      "snapshot_writes": 0,
+      "outbox_writes": 0,
+      "revision_increments": 0,
+      "provider_state_mutations_not_due": 0
+    },
+    "database_operational_files_unchanged_by_validation": true,
+    "database_validation": {
+      "operational_sqlite_open_forbidden": true,
+      "sandbox_method": "FILESYSTEM_BUNDLE_COPY_WITH_STABLE_CONTENT_CHECK",
+      "content_unchanged_requires_same_roles_hashes_and_sizes": true,
+      "metadata_unchanged_requires_same_timestamps": true,
+      "semantic_database_unchanged_requires_content_unchanged": true,
+      "content_or_size_change": "FAIL",
+      "shm_timestamp_only_with_identical_content": "PASS_DEGRADED",
+      "other_metadata_only_change": "FAIL"
+    },
+    "ack": {
+      "required_binding_fields": [
+        "consumer_id",
+        "snapshot_revision",
+        "section_revisions",
+        "checksum"
+      ],
+      "wrong_consumer_rejected": true,
+      "wrong_revision_rejected": true,
+      "wrong_checksum_rejected": true,
+      "retry_idempotent": true,
+    "missing_ack_never_discards_data": true
+      }
+  },
+  "related_contract_checks": {
+    "cme_crosscheck_scope": "CONTRACT_TEST_ONLY_NOT_NEWS_PIPELINE",
+    "mnq_base_state_engine": "DETERMINISTIC_LOCAL_WEEKLY_RULE",
+    "official_cme_crosscheck": "OPTIONAL_AUTHORITATIVE_VERIFICATION",
+    "crosscheck_unavailable_status": "PARTIAL",
+    "crosscheck_unavailable_quarantine": false,
+    "network_required_for_contract_test": false
+  },
+  "verification": {
+    "powershell_entrypoint": "scripts/verify-news-pipeline.ps1",
+    "offline_mode": "Offline",
+    "controlled_live_mode": "ControlledLive",
+    "golden_fixture": "tests/fixtures/news-pipeline-golden-v1.json",
+    "forbidden_temporary_script_patterns": [
+      "stage2-v[0-9]+",
+      "controlled-live-news-validation-stage"
+    ],
+    "legacy_evidence_allowed_below_data_through_version": 7
+  }
+}

@@ -136,18 +136,19 @@ def test_news_productive_path_reaches_full_sync_without_destructive_dedup(
         clock=lambda: now,
     ).materialize(admitted, refresh_mode="force", limit=20)
 
-    assert [row["source_audit_status"] for row in writes].count("ACTIVE") == 3
-    assert [row["source_audit_status"] for row in writes].count("QUARANTINED") == 1
-    assert len(admitted) == 3
+    assert [row["source_audit_status"] for row in writes].count("ACTIVE") == 4
+    assert [row["source_audit_status"] for row in writes].count("QUARANTINED") == 0
+    assert len(admitted) == 4
     assert metrics["persisted_count"] == 1
     assert metrics["read_back_count"] == 1
-    assert len({item["article_id"] for item in admitted}) == 3
+    assert len({item["article_id"] for item in admitted}) == 4
     assert {
         item["title"] for item in admitted
     } == {
         "Nvidia earnings outlook lifts semiconductor shares",
         "US expands Nvidia chip export controls",
         "US expands Nvidia chip export controls — update",
+        "Unknown publisher claims Nvidia development",
     }
     reuters = [
         item for item in admitted
@@ -185,7 +186,7 @@ def test_news_productive_path_reaches_full_sync_without_destructive_dedup(
     assert "redacted-nvidia-outlook" in encoded
     assert "redacted-reuters-nvidia-131000000" in encoded
     assert "redacted-reuters-nvidia-134000000" in encoded
-    assert "redacted-unknown-publisher" not in encoded
+    assert "redacted-unknown-publisher" in encoded
     assert "Yahoo Finance" in encoded
     assert "Investor's Business Daily" in encoded
 
@@ -234,10 +235,11 @@ def test_materialized_three_week_replay_and_authentic_full_sync() -> None:
     assert encoded == repeated
     assert b'"actual":628.0' in encoded
     assert b'"actual":53.6' in encoded
-    assert summary["news"]["admitted_count"] == 3
-    assert summary["news"]["quarantined_count"] == 1
+    assert summary["news"]["admitted_count"] == 4
+    assert summary["news"]["quarantined_count"] == 0
     assert all(
         item["present_in_full_sync"]
         for item in summary["news"]["admitted_articles"]
     )
     assert summary["news"]["temporal_distinct_reuters_delivered"] is True
+    assert summary["news"]["unknown_publisher_via_yahoo_admitted"] is True

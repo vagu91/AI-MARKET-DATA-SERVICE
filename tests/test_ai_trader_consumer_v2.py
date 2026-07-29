@@ -159,8 +159,8 @@ def test_cash_and_mnq_session_matrix_for_weekend_and_monday(day: int, hour: int)
         ("open", {"provider_failure_count": 2}, "PROVIDER_UNAVAILABLE"),
         ("open", {"errors": ["boom"]}, "PIPELINE_ERROR"),
         ("open", {"configured": False}, "NOT_CONFIGURED"),
-        ("open", {"latest": [{"article_id": "a", "published_at": "2026-07-11T11:00:00Z"}]}, "AVAILABLE"),
-        ("open", {"latest": [{"article_id": "a", "published_at": "2026-07-11T11:00:00Z"}], "errors": ["partial"]}, "PARTIAL"),
+        ("open", {"latest": [{"article_id": "a", "published_at": "2026-07-11T11:00:00Z"}]}, "DEGRADED"),
+        ("open", {"latest": [{"article_id": "a", "published_at": "2026-07-11T11:00:00Z"}], "errors": ["partial"]}, "DEGRADED"),
     ],
 )
 def test_news_semantic_status_matrix(session: str, payload: dict, expected: str) -> None:
@@ -265,7 +265,16 @@ def test_news_noise_exclusion_reasons(title: str, expected: str) -> None:
         },
         now=SATURDAY,
     )
-    assert item["exclusion_reason"] == expected
+    assert item["exclusion_reason"] is None
+    assert item["relevance"] == "LOW"
+    assert item["noise_penalty"] > 0
+    assert expected in {
+        "deposit_rates",
+        "mortgage",
+        "personal_finance",
+        "analyst_rating_only",
+        "low_relevance",
+    }
 
 
 @pytest.mark.parametrize("missing", ["macro_snapshot", "event_risk", "market_schedule", "risk_context", "nasdaq_context"])
@@ -659,7 +668,7 @@ def test_previous_context_date_only_is_market_closed_without_fresh_news() -> Non
         settings=Settings(_env_file=None),
         now=SATURDAY,
     )
-    assert result["status"] == "MARKET_CLOSED_NO_FRESH_NEWS"
+    assert result["status"] == "DEGRADED"
     assert result["latest"] == []
     assert result["historical_article_count"] == 1
 

@@ -251,7 +251,17 @@ def _build_checks(
     news_context = market_context.get("news_context") or {}
     news_status = str(news_context.get("status") or "").upper()
     no_fresh_news_expected = news_status == "MARKET_CLOSED_NO_FRESH_NEWS"
-    news_claims_available = news_status in {"AVAILABLE", "PARTIAL", "LAST_KNOWN_GOOD"}
+    news_claims_available = news_status in {
+        "AVAILABLE",
+        "DEGRADED",
+        "PARTIAL",
+        "LAST_KNOWN_GOOD",
+    }
+    delivered_news_count = len(
+        news_context.get("articles")
+        or news_context.get("latest")
+        or []
+    )
     runtime_io = (market_context.get("metadata") or {}).get("runtime_io") or {}
     bls_status = _bls_status_from_macro_pipeline(macro_pipeline)
     bls_actual = {"missing": bls_status["missing"], "invalid": bls_status["invalid"]}
@@ -279,7 +289,7 @@ def _build_checks(
     add("RELEASE_QUEUE_RETRY_CONFIGURED", "CRITICAL", not release["retry_seconds"], "Release retry schedule must be configured.", release["retry_seconds"], DEFAULT_RETRY_SECONDS)
     add("RELEASE_QUEUE_MAX_ATTEMPTS_VALID", "CRITICAL", int(release.get("max_attempts") or 0) <= 0, "Max release refresh attempts must be positive.", release.get("max_attempts"), ">0")
 
-    add("NEWS_LATEST_NOT_EMPTY", "CRITICAL", news_claims_available and model_counts["latest_news"] == 0, "News status AVAILABLE/PARTIAL/LAST_KNOWN_GOOD requires current articles.", model_counts["latest_news"], ">0 when status claims availability")
+    add("NEWS_DELIVERY_NOT_EMPTY", "CRITICAL", news_claims_available and delivered_news_count == 0, "News status AVAILABLE/DEGRADED/PARTIAL/LAST_KNOWN_GOOD requires at least one delivered current or historical article.", delivered_news_count, ">0 when status claims availability")
     add("NEWS_MARKET_CLOSED_NO_FRESH_EXPECTED", "INFO", no_fresh_news_expected, "No current-date news is expected for the closed market session.", news_status, "MARKET_CLOSED_NO_FRESH_NEWS")
     add("NEWS_EXPIRED_NOT_IN_LATEST", "CRITICAL", news["expired_in_latest_count"] > 0, "Expired news must not appear in latest.", news["expired_in_latest_count"], 0)
     add("NEWS_PLACEHOLDER_EMPTY", "CRITICAL", news["placeholder_news_count"] > 0, "Placeholder news titles must not appear in latest.", news["placeholder_news_count"], 0)

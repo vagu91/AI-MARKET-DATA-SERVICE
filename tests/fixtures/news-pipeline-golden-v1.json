@@ -1,0 +1,76 @@
+{
+  "fixture_id": "news-pipeline-golden-v1",
+  "reference_time_utc": "2026-07-29T12:00:00Z",
+  "symbols": [
+    "QQQ",
+    "NVDA"
+  ],
+  "alpha_vantage": {
+    "feed": [
+      {
+        "id": "alpha-golden-1",
+        "title": "Nvidia publishes a material semiconductor update",
+        "url": "https://www.nvidia.com/en-us/news/golden-1",
+        "time_published": "20260729T110000",
+        "source": "NVIDIA",
+        "summary": "The company published a complete attributable update.",
+        "ticker_sentiment": [
+          {
+            "ticker": "NVDA"
+          }
+        ]
+      },
+      {
+        "id": "alpha-golden-url-less",
+        "title": "URL-less provider-native market update",
+        "url": "",
+        "time_published": "20260729T111500",
+        "source": "Fixture Wire",
+        "summary": "Native identity and content preserve this URL-less record.",
+        "ticker_sentiment": [
+          {
+            "ticker": "QQQ"
+          }
+        ]
+      }
+    ]
+  },
+  "gdelt": {
+    "articles": [
+      {
+        "id": "gdelt-golden-1",
+        "title": "First Reuters update on a Nasdaq policy event",
+        "url": "https://www.reuters.com/world/us/golden-policy-event",
+        "domain": "reuters.com",
+        "seendate": "20260729T100000Z",
+        "updated_at": "20260729T100000Z",
+        "description": "The first attributable update contains complete context."
+      },
+      {
+        "id": "gdelt-golden-2",
+        "title": "Second Reuters update on a Nasdaq policy event",
+        "url": "https://www.reuters.com/world/us/golden-policy-event",
+        "domain": "reuters.com",
+        "seendate": "20260729T103000Z",
+        "updated_at": "20260729T103000Z",
+        "description": "The later update contains materially distinct temporal context."
+      }
+    ]
+  },
+  "rss": {
+    "BLS RSS": "<rss><channel><item><guid>bls-golden-1</guid><title>BLS publishes official labor statistics</title><link>https://www.bls.gov/news.release/golden.htm</link><pubDate>Wed, 29 Jul 2026 09:00:00 GMT</pubDate><description>Official BLS release content is preserved.</description></item><item><guid>bls-golden-url-less</guid><title>BLS URL-less official revision</title><pubDate>Wed, 29 Jul 2026 09:30:00 GMT</pubDate><description>Official provider-native identity remains sufficient without a URL.</description></item></channel></rss>",
+    "BEA RSS": "<rss><channel><item><guid>bea-golden-1</guid><title>BEA publishes official economic accounts</title><link>https://www.bea.gov/news/golden</link><pubDate>Wed, 29 Jul 2026 08:30:00 GMT</pubDate><description>Official BEA release content is preserved.</description></item></channel></rss>",
+    "Yahoo Finance RSS": "<rss><channel><item><guid>yahoo-golden-1</guid><title>Publisher attribution preserved through Yahoo</title><link>https://finance.yahoo.com/news/golden-publisher-update</link><pubDate>Wed, 29 Jul 2026 10:15:00 GMT</pubDate><source>Reuters</source><description>Yahoo distributes a record whose publisher remains Reuters.</description></item><item><guid>yahoo-golden-unknown</guid><title>Unknown publisher remains explicitly represented</title><link>https://finance.yahoo.com/news/golden-unknown-update</link><pubDate>Wed, 29 Jul 2026 10:20:00 GMT</pubDate><description>Useful content is retained with unknown publisher lineage.</description></item></channel></rss>",
+    "MarketWatch RSS": "<rss><channel><item><guid>marketwatch-golden-1</guid><title>MarketWatch direct feed record</title><link>https://www.marketwatch.com/story/golden-direct-record</link><pubDate>Wed, 29 Jul 2026 10:45:00 GMT</pubDate><description>Direct feed content uses the verified publisher fallback.</description></item></channel></rss>"
+  },
+  "expected": {
+    "raw_record_count": 10,
+    "parsed_record_count": 10,
+    "technically_rejected_count": 0,
+    "outside_scope_count": 0,
+    "url_less_count": 2,
+    "temporal_reuters_occurrence_count": 2,
+    "publisher_distributor_distinct_for_yahoo": true,
+    "marketwatch_publisher": "MarketWatch"
+  }
+}
