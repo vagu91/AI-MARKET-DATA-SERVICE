@@ -76,6 +76,10 @@ def _rss(provider: str, record_id: str) -> str:
 
 def _assert_exact_provider_accounting(account: dict) -> None:
     raw = set(account["raw_record_ids"])
+    captured = {
+        item["record_id"] for item in account["raw_capture"]
+    }
+    parsed = set(account["parsed_record_ids"])
     persisted = set(account["persisted_record_ids"])
     rejected = {
         item["record_id"] for item in account["technical_rejections"]
@@ -83,10 +87,38 @@ def _assert_exact_provider_accounting(account: dict) -> None:
     outside = {
         item["record_id"] for item in account["explicit_out_of_scope"]
     }
-    assert raw == persisted | rejected | outside
-    assert persisted.isdisjoint(rejected)
-    assert persisted.isdisjoint(outside)
-    assert rejected.isdisjoint(outside)
+    persistence_rejected = {
+        item["record_id"] for item in account["persistence_rejections"]
+    }
+    duplicates = {
+        item["record_id"]
+        for item in account["exact_technical_duplicates"]
+    }
+    assert captured == raw
+    assert raw == parsed | rejected
+    assert parsed.isdisjoint(rejected)
+    assert parsed == persisted | persistence_rejected | outside | duplicates
+    parsed_partitions = (
+        persisted,
+        persistence_rejected,
+        outside,
+        duplicates,
+    )
+    assert all(
+        left.isdisjoint(right)
+        for index, left in enumerate(parsed_partitions)
+        for right in parsed_partitions[index + 1 :]
+    )
+    for partition in (
+        account["technical_rejections"],
+        account["persistence_rejections"],
+        account["explicit_out_of_scope"],
+        account["exact_technical_duplicates"],
+    ):
+        assert all(item.get("record_id") for item in partition)
+        assert all(item.get("reason_code") for item in partition)
+    assert account["partition_entries_missing_identity_or_reason"] == []
+    assert account["raw_capture_contract_violations"] == []
     assert account["accounting_valid"] is True
 
 
@@ -802,6 +834,96 @@ async def test_metadata_enrichment_failure_is_provider_partial_not_silent(
     )
     assert result.data["data_quality"]["readiness"] == "DEGRADED"
     _assert_exact_provider_accounting(account)
+
+
+@pytest.mark.asyncio
+async def test_yahoo_metadata_307_follows_only_allowlisted_exact_lineage(
+    tmp_path,
+) -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.redirects: list[dict] = []
+
+        def register_metadata_redirect(self, **payload) -> None:
+            self.redirects.append(payload)
+
+    observer = Observer()
+    settings = _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        news_gdelt_enabled=False,
+        news_rss_enabled=False,
+        news_metadata_enrichment_limit_per_provider=1,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+        network_observer=observer,
+    )
+    original = "https://finance.yahoo.com/technology/articles/fixture.html"
+    redirected = "https://finance.yahoo.com/news/fixture.html"
+    article = {
+        "acquisition_provider": "Yahoo Finance RSS",
+        "source_url": original,
+        "raw_record_id": "raw:yahoo-307",
+        "published_at": None,
+        "summary": "Preserved provider summary.",
+    }
+    batch = {
+        "provider": "Yahoo Finance RSS",
+        "calls": 1,
+        "status": "COMPLETE",
+        "coverage_status": "COMPLETE",
+        "metadata_enrichment_calls": 0,
+        "metadata_enrichment_status": "NOT_REQUIRED",
+        "metadata_enrichment_results": [],
+        "warnings": [],
+    }
+
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        router.get(original).mock(
+            return_value=httpx.Response(
+                307,
+                headers={"Location": redirected},
+            )
+        )
+        router.get(redirected).mock(
+            return_value=httpx.Response(
+                200,
+                text=(
+                    '<html><head><meta property="article:published_time" '
+                    'content="2026-07-29T12:00:00Z"></head></html>'
+                ),
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            enriched = await provider._enrich_missing_metadata(
+                client,
+                [article],
+                batches=[batch],
+            )
+
+    assert enriched[0]["published_at"] == "2026-07-29T12:00:00+00:00"
+    assert batch["calls"] == 2
+    assert batch["metadata_enrichment_calls"] == 1
+    assert batch["metadata_enrichment_status"] == "COMPLETE"
+    assert batch["metadata_enrichment_results"] == [
+        {
+            "record_id": "raw:yahoo-307",
+            "status": "COMPLETE",
+            "reason_code": None,
+            "redirect_count": 1,
+            "final_url": redirected,
+        }
+    ]
+    assert observer.redirects == [
+        {
+            "provider": "Yahoo Finance RSS",
+            "record_id": "raw:yahoo-307",
+            "original_url": original,
+            "redirect_url": redirected,
+        }
+    ]
 
 
 def _occurrence(**overrides) -> dict:

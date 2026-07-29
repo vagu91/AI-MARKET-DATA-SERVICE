@@ -1237,6 +1237,24 @@ class Settings(BaseSettings):
         le=250,
         validation_alias="AI_MARKET_NEWS_GDELT_LIMIT",
     )
+    news_gdelt_timeout_seconds: float = Field(
+        default=8.0,
+        gt=0,
+        le=60,
+        validation_alias="AI_MARKET_NEWS_GDELT_TIMEOUT_SECONDS",
+    )
+    news_gdelt_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        validation_alias="AI_MARKET_NEWS_GDELT_MAX_ATTEMPTS",
+    )
+    news_gdelt_retry_backoff_seconds: float = Field(
+        default=0.25,
+        ge=0,
+        le=10,
+        validation_alias="AI_MARKET_NEWS_GDELT_RETRY_BACKOFF_SECONDS",
+    )
     news_rss_limit_per_feed: int = Field(
         default=250,
         ge=1,
@@ -1255,8 +1273,8 @@ class Settings(BaseSettings):
     federal_reserve_rss_url: str = Field(
         default="https://www.federalreserve.gov/feeds/press_all.xml"
     )
-    bls_rss_url: str = Field(default="https://www.bls.gov/feed/news_release.rss")
-    bea_rss_url: str = Field(default="https://www.bea.gov/news/rss.xml")
+    bls_rss_url: str = Field(default="https://www.bls.gov/feed/bls_latest.rss")
+    bea_rss_url: str = Field(default="https://apps.bea.gov/rss/rss.xml")
     dailyfx_calendar_url: str = "https://www.dailyfx.com/economic-calendar"
     forex_factory_calendar_url: str = "https://www.forexfactory.com/calendar"
     investing_calendar_url: str = "https://www.investing.com/economic-calendar/"

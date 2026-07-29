@@ -7,6 +7,7 @@ import html
 import json
 import re
 from typing import Any
+from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -47,6 +48,14 @@ DIRECT_RSS_PUBLISHERS = {
     "MarketWatch RSS": "MarketWatch",
 }
 
+YAHOO_METADATA_REDIRECT_HOSTS = {"finance.yahoo.com"}
+
+
+class MetadataRedirectError(RuntimeError):
+    def __init__(self, reason_code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason_code = reason_code
+
 
 class NewsProvider(BaseProvider):
     source = "Market News"
@@ -59,10 +68,12 @@ class NewsProvider(BaseProvider):
         cache: ProviderCacheProtocol,
         settings: Settings,
         market_news_repository: MarketNewsRepository | None = None,
+        network_observer: Any | None = None,
     ) -> None:
         super().__init__(cache)
         self.settings = settings
         self.market_news_repository = market_news_repository
+        self.network_observer = network_observer
 
     async def fetch(self) -> ProviderResult:
         symbols = ["NVDA", "AAPL", "MSFT", "QQQ"]
@@ -113,6 +124,8 @@ class NewsProvider(BaseProvider):
                     )
                 )
             batches = list(await asyncio.gather(*tasks)) if tasks else []
+            if self.network_observer is not None:
+                self.network_observer.register_provider_batches(batches)
             articles = [
                 article
                 for batch in batches
@@ -240,14 +253,15 @@ class NewsProvider(BaseProvider):
                     "lineage": article.get("raw_source_identity"),
                 }
                 if account is not None:
-                    account.setdefault("technical_rejections", []).append(
+                    account.setdefault("persistence_rejections", []).append(
                         rejection
                     )
                 persistence_results.append(
                     {
                         **rejection,
                         "provider": provider,
-                        "result": "TECHNICALLY_REJECTED",
+                        "result": "PERSISTENCE_REJECTED",
+                        "error_type": "NormalizationRejected",
                     }
                 )
                 continue
@@ -263,14 +277,14 @@ class NewsProvider(BaseProvider):
                     "lineage": article.get("raw_source_identity"),
                 }
                 if account is not None:
-                    account.setdefault("technical_rejections", []).append(
+                    account.setdefault("exact_technical_duplicates", []).append(
                         rejection
                     )
                 persistence_results.append(
                     {
                         **rejection,
                         "provider": provider,
-                        "result": "TECHNICALLY_REJECTED",
+                        "result": "EXACT_TECHNICAL_DUPLICATE",
                     }
                 )
                 continue
@@ -301,7 +315,7 @@ class NewsProvider(BaseProvider):
                     "retryable": retryable,
                 }
                 if account is not None:
-                    account.setdefault("technical_rejections", []).append(
+                    account.setdefault("persistence_rejections", []).append(
                         rejection
                     )
                 persistence_results.append(
@@ -340,10 +354,26 @@ class NewsProvider(BaseProvider):
         accounting_valid = True
         for account in accounts:
             raw_ids = set(account.get("raw_record_ids") or [])
+            raw_capture_ids = {
+                str(item.get("record_id"))
+                for item in account.get("raw_capture") or []
+                if item.get("record_id")
+            }
+            parsed_ids = set(account.get("parsed_record_ids") or [])
             persisted_ids = set(account.get("persisted_record_ids") or [])
             rejected_ids = {
                 str(item.get("record_id"))
                 for item in account.get("technical_rejections") or []
+                if item.get("record_id")
+            }
+            persistence_rejected_ids = {
+                str(item.get("record_id"))
+                for item in account.get("persistence_rejections") or []
+                if item.get("record_id")
+            }
+            duplicate_ids = {
+                str(item.get("record_id"))
+                for item in account.get("exact_technical_duplicates") or []
                 if item.get("record_id")
             }
             outside_ids = {
@@ -351,21 +381,88 @@ class NewsProvider(BaseProvider):
                 for item in account.get("explicit_out_of_scope") or []
                 if item.get("record_id")
             }
-            partitions = (persisted_ids, rejected_ids, outside_ids)
-            disjoint = all(
+            raw_partitions = (parsed_ids, rejected_ids)
+            raw_disjoint = all(
                 not left.intersection(right)
-                for index, left in enumerate(partitions)
-                for right in partitions[index + 1 :]
+                for index, left in enumerate(raw_partitions)
+                for right in raw_partitions[index + 1 :]
             )
-            accounted_ids = set().union(*partitions)
+            parsed_partitions = (
+                persisted_ids,
+                persistence_rejected_ids,
+                outside_ids,
+                duplicate_ids,
+            )
+            parsed_disjoint = all(
+                not left.intersection(right)
+                for index, left in enumerate(parsed_partitions)
+                for right in parsed_partitions[index + 1 :]
+            )
+            raw_accounted_ids = set().union(*raw_partitions)
+            parsed_accounted_ids = set().union(*parsed_partitions)
             account["persisted_count"] = len(persisted_ids)
             account["technically_rejected_count"] = len(rejected_ids)
             account["explicit_out_of_scope_count"] = len(outside_ids)
-            account["unaccounted_record_ids"] = sorted(raw_ids - accounted_ids)
-            account["unexpected_accounted_record_ids"] = sorted(
-                accounted_ids - raw_ids
+            account["persistence_rejected_count"] = len(
+                persistence_rejected_ids
             )
-            account["accounting_disjoint"] = disjoint
+            account["exact_technical_duplicate_count"] = len(duplicate_ids)
+            account["unaccounted_record_ids"] = sorted(
+                raw_ids - raw_accounted_ids
+            )
+            account["unexpected_accounted_record_ids"] = sorted(
+                raw_accounted_ids - raw_ids
+            )
+            account["parsed_but_not_accounted_ids"] = sorted(
+                parsed_ids - parsed_accounted_ids
+            )
+            account["accounted_without_parsed_identity_ids"] = sorted(
+                parsed_accounted_ids - parsed_ids
+            )
+            account["persisted_without_raw_lineage_ids"] = sorted(
+                persisted_ids - raw_ids
+            )
+            account["raw_capture_missing_ids"] = sorted(
+                raw_ids - raw_capture_ids
+            )
+            account["raw_capture_unexpected_ids"] = sorted(
+                raw_capture_ids - raw_ids
+            )
+            reasoned_partitions = (
+                account.get("technical_rejections") or [],
+                account.get("persistence_rejections") or [],
+                account.get("explicit_out_of_scope") or [],
+                account.get("exact_technical_duplicates") or [],
+            )
+            account["partition_entries_missing_identity_or_reason"] = [
+                {
+                    "partition_index": partition_index,
+                    "entry_index": entry_index,
+                }
+                for partition_index, partition in enumerate(
+                    reasoned_partitions
+                )
+                for entry_index, item in enumerate(partition)
+                if not item.get("record_id") or not item.get("reason_code")
+            ]
+            account["raw_capture_contract_violations"] = [
+                str(item.get("record_id") or f"capture:{index}")
+                for index, item in enumerate(account.get("raw_capture") or [])
+                if not item.get("record_id")
+                or item.get("captured_before_parsing") is not True
+                or not item.get("payload_sha256")
+                or item.get("payload_size_bytes") is None
+                or "raw_payload" not in item
+            ]
+            account["accounting_disjoint"] = (
+                raw_disjoint and parsed_disjoint
+            )
+            account["raw_identity_equation_valid"] = (
+                raw_ids == raw_accounted_ids
+            )
+            account["parsed_identity_equation_valid"] = (
+                parsed_ids == parsed_accounted_ids
+            )
             provider_persistence_results = [
                 item
                 for item in persistence_results
@@ -389,9 +486,18 @@ class NewsProvider(BaseProvider):
                 else "COMPLETE"
             )
             account["accounting_valid"] = (
-                disjoint
+                raw_disjoint
+                and parsed_disjoint
+                and raw_ids == raw_capture_ids
                 and not account["unaccounted_record_ids"]
                 and not account["unexpected_accounted_record_ids"]
+                and not account["parsed_but_not_accounted_ids"]
+                and not account["accounted_without_parsed_identity_ids"]
+                and not account["persisted_without_raw_lineage_ids"]
+                and not account[
+                    "partition_entries_missing_identity_or_reason"
+                ]
+                and not account["raw_capture_contract_violations"]
             )
             accounting_valid = accounting_valid and bool(
                 account["accounting_valid"]
@@ -496,6 +602,10 @@ class NewsProvider(BaseProvider):
             response.raise_for_status()
             payload = response.json()
             ensure_alpha_payload_ok(payload)
+            raw_capture = _capture_raw_records(
+                provider,
+                list(payload.get("feed") or []),
+            )
             articles, rejected, outside, raw_ids = (
                 parse_alpha_vantage_news_with_accounting(
                     payload,
@@ -514,6 +624,7 @@ class NewsProvider(BaseProvider):
                 reliability=0.74,
                 limit=limit,
                 raw_record_ids=raw_ids,
+                raw_capture=raw_capture,
                 articles=articles,
                 technical_rejections=rejected,
                 explicit_out_of_scope=[*outside, *recency_outside],
@@ -546,21 +657,44 @@ class NewsProvider(BaseProvider):
         recency_days: int,
     ) -> dict[str, Any]:
         provider = "GDELT Doc API"
+        attempts = 0
         try:
-            response = await client.get(
-                self.settings.gdelt_doc_api_url,
-                params={
-                    "query": query,
-                    "mode": "artlist",
-                    "format": "json",
-                    "maxrecords": limit,
-                    "sort": "datedesc",
-                },
-                headers=REQUEST_HEADERS,
-                timeout=min(float(self.settings.http_timeout_seconds), 3.0),
-            )
-            response.raise_for_status()
+            while True:
+                attempts += 1
+                try:
+                    response = await client.get(
+                        self.settings.gdelt_doc_api_url,
+                        params={
+                            "query": query,
+                            "mode": "artlist",
+                            "format": "json",
+                            "maxrecords": limit,
+                            "sort": "datedesc",
+                        },
+                        headers=REQUEST_HEADERS,
+                        timeout=min(
+                            float(self.settings.http_timeout_seconds),
+                            float(self.settings.news_gdelt_timeout_seconds),
+                        ),
+                    )
+                    response.raise_for_status()
+                    break
+                except Exception as exc:
+                    retryable = _gdelt_retryable(exc)
+                    if (
+                        not retryable
+                        or attempts >= self.settings.news_gdelt_max_attempts
+                    ):
+                        raise
+                    await asyncio.sleep(
+                        self.settings.news_gdelt_retry_backoff_seconds
+                        * (2 ** (attempts - 1))
+                    )
             payload = response.json()
+            raw_capture = _capture_raw_records(
+                provider,
+                list(payload.get("articles") or []),
+            )
             articles, rejected, outside, raw_ids = (
                 parse_gdelt_articles_with_accounting(
                     payload,
@@ -579,6 +713,7 @@ class NewsProvider(BaseProvider):
                 reliability=0.66,
                 limit=limit,
                 raw_record_ids=raw_ids,
+                raw_capture=raw_capture,
                 articles=articles,
                 technical_rejections=rejected,
                 explicit_out_of_scope=[*outside, *recency_outside],
@@ -597,6 +732,8 @@ class NewsProvider(BaseProvider):
                 records_not_acquired=(
                     "UNKNOWN" if len(raw_ids) >= limit else 0
                 ),
+                calls=attempts,
+                retry_count=max(attempts - 1, 0),
             )
         except Exception as exc:
             return _failed_provider_batch(
@@ -605,6 +742,8 @@ class NewsProvider(BaseProvider):
                 reliability=0.66,
                 limit=limit,
                 error=exc,
+                calls=max(attempts, 1),
+                retry_count=max(attempts - 1, 0),
             )
 
     def _rss_tasks(
@@ -703,12 +842,51 @@ class NewsProvider(BaseProvider):
                     int(batch.get("metadata_enrichment_calls") or 0) + 1
                 )
             try:
-                response = await client.get(
-                    str(article.get("source_url")),
-                    headers=REQUEST_HEADERS,
-                    follow_redirects=True,
-                    timeout=min(float(self.settings.http_timeout_seconds), 2.5),
-                )
+                requested_url = str(article.get("source_url"))
+                current_url = requested_url
+                redirect_count = 0
+                while True:
+                    response = await client.get(
+                        current_url,
+                        headers=REQUEST_HEADERS,
+                        follow_redirects=False,
+                        timeout=min(
+                            float(self.settings.http_timeout_seconds),
+                            2.5,
+                        ),
+                    )
+                    if response.status_code not in {301, 302, 303, 307, 308}:
+                        break
+                    location = response.headers.get("location")
+                    if not location:
+                        raise MetadataRedirectError(
+                            "METADATA_REDIRECT_LOCATION_MISSING",
+                            f"{provider} redirect response has no Location",
+                        )
+                    next_url = urljoin(str(response.url), location)
+                    if not _metadata_redirect_allowed(
+                        provider=provider,
+                        original_url=requested_url,
+                        redirect_url=next_url,
+                    ):
+                        raise MetadataRedirectError(
+                            "METADATA_REDIRECT_NOT_ALLOWLISTED",
+                            f"{provider} redirect target is not allowlisted",
+                        )
+                    if self.network_observer is not None:
+                        self.network_observer.register_metadata_redirect(
+                            provider=provider,
+                            record_id=record_id,
+                            original_url=requested_url,
+                            redirect_url=next_url,
+                        )
+                    redirect_count += 1
+                    if redirect_count > 5:
+                        raise MetadataRedirectError(
+                            "METADATA_REDIRECT_LIMIT_EXCEEDED",
+                            f"{provider} exceeded five metadata redirects",
+                        )
+                    current_url = next_url
                 response.raise_for_status()
                 metadata = extract_page_metadata(response.text, page_url=str(response.url))
             except Exception as exc:
@@ -726,7 +904,11 @@ class NewsProvider(BaseProvider):
                         {
                             "record_id": record_id,
                             "status": "FAILED",
-                            "reason_code": "METADATA_ENRICHMENT_FAILED",
+                            "reason_code": (
+                                exc.reason_code
+                                if isinstance(exc, MetadataRedirectError)
+                                else "METADATA_ENRICHMENT_FAILED"
+                            ),
                             "error_type": type(exc).__name__,
                             "error": error_message,
                         }
@@ -746,6 +928,8 @@ class NewsProvider(BaseProvider):
                         "record_id": record_id,
                         "status": "COMPLETE",
                         "reason_code": None,
+                        "redirect_count": redirect_count,
+                        "final_url": str(response.url),
                     }
                 )
                 if batch.get("metadata_enrichment_status") != "PARTIAL":
@@ -775,6 +959,7 @@ async def _fetch_one_rss_feed(
             timeout=timeout,
         )
         response.raise_for_status()
+        raw_capture = _capture_rss_records(source, response.text)
         parsed, parse_warnings, rejected, outside, raw_ids = (
             parse_rss_articles_with_accounting(
             response.text,
@@ -794,6 +979,7 @@ async def _fetch_one_rss_feed(
             reliability=reliability,
             limit=limit,
             raw_record_ids=raw_ids,
+            raw_capture=raw_capture,
             articles=parsed,
             technical_rejections=rejected,
             explicit_out_of_scope=[*outside, *recency_outside],
@@ -1257,17 +1443,90 @@ def _clean_markup(value: str | None) -> str | None:
 
 
 def _raw_record_id(provider: str, index: int, payload: Any) -> str:
-    serialized = json.dumps(
+    serialized = _canonical_raw_payload(payload)
+    digest = hashlib.sha256(
+        f"{provider}:{index}:{serialized}".encode("utf-8")
+    ).hexdigest()
+    return f"raw:{digest}"
+
+
+def _canonical_raw_payload(payload: Any) -> str:
+    return json.dumps(
         payload,
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
         default=str,
     )
-    digest = hashlib.sha256(
-        f"{provider}:{index}:{serialized}".encode("utf-8")
-    ).hexdigest()
-    return f"raw:{digest}"
+
+
+def _capture_raw_records(
+    provider: str,
+    payloads: list[Any],
+) -> list[dict[str, Any]]:
+    captured: list[dict[str, Any]] = []
+    for index, payload in enumerate(payloads):
+        serialized = _canonical_raw_payload(payload)
+        captured.append(
+            {
+                "record_id": _raw_record_id(provider, index, payload),
+                "provider": provider,
+                "sequence_index": index,
+                "captured_before_parsing": True,
+                "payload_sha256": hashlib.sha256(
+                    serialized.encode("utf-8")
+                ).hexdigest(),
+                "payload_size_bytes": len(serialized.encode("utf-8")),
+                "raw_payload": payload,
+            }
+        )
+    return captured
+
+
+def _capture_rss_records(
+    provider: str,
+    text: str,
+) -> list[dict[str, Any]]:
+    root = ET.fromstring(text)
+    rss_items = list(root.findall(".//item"))
+    atom_items = [
+        node for node in root.iter() if node.tag.split("}")[-1] == "entry"
+    ]
+    payloads = [
+        ET.tostring(item, encoding="unicode")
+        for item in [*rss_items, *atom_items]
+    ]
+    return _capture_raw_records(provider, payloads)
+
+
+def _gdelt_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 500, 502, 503, 504}
+    return False
+
+
+def _metadata_redirect_allowed(
+    *,
+    provider: str,
+    original_url: str,
+    redirect_url: str,
+) -> bool:
+    original = urlparse(original_url)
+    redirect = urlparse(redirect_url)
+    if redirect.scheme != "https" or not redirect.hostname:
+        return False
+    if provider == "Yahoo Finance RSS":
+        return (
+            original.scheme == "https"
+            and original.hostname in YAHOO_METADATA_REDIRECT_HOSTS
+            and redirect.hostname in YAHOO_METADATA_REDIRECT_HOSTS
+        )
+    return (
+        original.scheme == "https"
+        and redirect.hostname == original.hostname
+    )
 
 
 def _source_record_identity(
@@ -1514,6 +1773,7 @@ def _provider_batch(
     reliability: float,
     limit: int,
     raw_record_ids: list[str],
+    raw_capture: list[dict[str, Any]],
     articles: list[dict[str, object]],
     technical_rejections: list[dict[str, object]],
     explicit_out_of_scope: list[dict[str, object]],
@@ -1523,7 +1783,28 @@ def _provider_batch(
     next_cursor: dict[str, object] | None = None,
     coverage_reason: str | None = None,
     records_not_acquired: int | str = 0,
+    calls: int = 1,
+    retry_count: int = 0,
 ) -> dict[str, Any]:
+    captured_ids = [
+        str(item.get("record_id"))
+        for item in raw_capture
+        if item.get("record_id")
+    ]
+    if captured_ids != raw_record_ids:
+        raise AssertionError(
+            f"{provider} raw capture identity differs from parser input"
+        )
+    parsed_record_ids = [
+        str(article.get("raw_record_id"))
+        for article in articles
+        if article.get("raw_record_id")
+    ]
+    parsed_record_ids.extend(
+        str(item.get("record_id"))
+        for item in explicit_out_of_scope
+        if item.get("record_id")
+    )
     status = (
         "PARTIAL"
         if technical_rejections or not pagination_complete
@@ -1535,8 +1816,9 @@ def _provider_batch(
         "status": status,
         "coverage_status": status,
         "reliability": reliability,
-        "calls": 1,
+        "calls": calls,
         "pages": 1,
+        "retry_count": retry_count,
         "metadata_enrichment_calls": 0,
         "metadata_enrichment_status": "NOT_REQUIRED",
         "metadata_enrichment_results": [],
@@ -1548,16 +1830,16 @@ def _provider_batch(
         "next_cursor": next_cursor,
         "coverage_reason": coverage_reason,
         "records_not_acquired": records_not_acquired,
+        "raw_capture_status": "COMPLETE",
+        "raw_capture": raw_capture,
         "raw_record_ids": raw_record_ids,
         "raw_count": len(raw_record_ids),
-        "parsed_record_ids": [
-            str(article.get("raw_record_id"))
-            for article in articles
-            if article.get("raw_record_id")
-        ],
-        "parsed_count": len(articles),
+        "parsed_record_ids": sorted(set(parsed_record_ids)),
+        "parsed_count": len(set(parsed_record_ids)),
         "technical_rejections": list(technical_rejections),
         "explicit_out_of_scope": list(explicit_out_of_scope),
+        "persistence_rejections": [],
+        "exact_technical_duplicates": [],
         "persisted_record_ids": [],
         "warnings": _dedupe_errors(warnings or []),
         "errors": [],
@@ -1572,6 +1854,8 @@ def _failed_provider_batch(
     reliability: float,
     limit: int,
     error: Exception,
+    calls: int = 1,
+    retry_count: int = 0,
 ) -> dict[str, Any]:
     message = _redact_provider_error(str(error) or type(error).__name__)
     return {
@@ -1580,20 +1864,25 @@ def _failed_provider_batch(
         "status": "FAILED",
         "coverage_status": "FAILED",
         "reliability": reliability,
-        "calls": 1,
+        "calls": calls,
         "pages": 0,
+        "retry_count": retry_count,
         "metadata_enrichment_calls": 0,
         "metadata_enrichment_status": "NOT_REQUIRED",
         "metadata_enrichment_results": [],
         "per_provider_limit": limit,
         "pagination_supported": False,
         "pagination_complete": False,
+        "raw_capture_status": "NOT_ACQUIRED",
+        "raw_capture": [],
         "raw_record_ids": [],
         "raw_count": 0,
         "parsed_record_ids": [],
         "parsed_count": 0,
         "technical_rejections": [],
         "explicit_out_of_scope": [],
+        "persistence_rejections": [],
+        "exact_technical_duplicates": [],
         "persisted_record_ids": [],
         "warnings": [],
         "errors": [
