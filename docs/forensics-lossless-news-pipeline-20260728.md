@@ -215,3 +215,133 @@ One later controlled LIVE validation should:
 7. repeat at fixed point and require zero writes/revisions/outbox rows;
 8. verify original operational DB and external artifact hashes are unchanged
    before accepting the result.
+
+## 2026-07-29 adversarial acquisition follow-up
+
+An independent review of HEAD
+`45ff1ab489da392360b20515603862065dd22b0e` found that the downstream v3
+projection was lossless for the captured database but the production
+acquisition path could still lose records before they reached canonical
+persistence:
+
+1. `NewsProvider.fetch_for_symbols()` returned the first non-empty Alpha
+   Vantage or GDELT result and therefore skipped every later RSS provider.
+2. RSS fan-in deduplicated on `url or title` and stopped at an aggregate
+   count, which could collapse temporal updates and discard later feeds.
+3. GDELT, Alpha Vantage and RSS parsers rejected every URL-less record before
+   testing provider-native or stable derived identity.
+4. Persistence exceptions were caught with a silent `continue`; failed rows
+   remained indistinguishable from successfully delivered rows.
+5. `NasdaqDataService.latest_news()` applied another aggregate slice after
+   acquisition.
+
+The v4 correction replaces fallback precedence with independent provider
+fan-in. Alpha Vantage (when configured), GDELT, Federal Reserve, BLS, BEA,
+Yahoo Finance, MarketWatch and Google News RSS each have their own call,
+coverage, raw/parsed/persisted IDs, rejection IDs, errors and configurable
+per-provider limit. One provider failure cannot cancel another provider. No
+aggregate cap is applied after fan-in.
+
+Acquisition completes before persistence starts. Every persistence attempt
+now records the raw ID, technical acquisition ID, outcome, typed error,
+concrete reason code and retryability. Failed persistence is omitted from
+delivered `articles` and produces explicit `PARTIAL` or `UNAVAILABLE`
+readiness. A missing repository is `NOT_CONFIGURED`, not a false successful
+delivery.
+
+Identity is split into two non-lossy layers:
+
+- `technical_acquisition_id` includes provider-native identity, acquisition
+  provider, distributor, source URL and exact editorial occurrence. It is
+  used only for exact acquisition retry detection and idempotent persistence.
+- `editorial_occurrence_id` includes original publisher, canonical URL,
+  published time, editorial update time, normalized title and content hash.
+  It permits exact syndication consolidation while retaining every
+  `source_occurrence` and `distribution_lineage`.
+
+Consequently, same URL/different timestamp, same title/different content and
+same URL/title/different editorial update remain distinct. Different direct
+canonical URLs are no longer inferred to be duplicates from title similarity.
+Exact syndicated copy through two distributors can share one logical article
+only when the editorial identity is exact and both lineages are retained.
+
+URL-less records are accepted when a provider-native ID/GUID exists or a
+stable identity can be derived from provider/feed, timestamp, useful
+title/content and content hash. Missing title is accepted when useful content
+and stable source identity remain. Every record declares
+`content_availability_status`, `canonical_url_status` and
+`source_identity_status`.
+
+### Provider accounting proofs
+
+The fully mocked fan-in test exercised all eight enabled providers with a
+per-provider limit of one:
+
+```text
+for each provider:
+1 raw = 1 persisted + 0 technically rejected + 0 explicit out-of-scope
+
+union:
+8 valid source occurrences
+= 8 canonical deliverable fixtures + 0 exact duplicates
+```
+
+The controlled persistence-fault test proves explicit partial delivery:
+
+```text
+GDELT:
+2 raw = 1 persisted + 1 PERSISTENCE_RUNTIMEERROR + 0 explicit out-of-scope
+```
+
+The rejected record is absent from delivered `articles`, retains its exact raw
+ID and is marked non-retryable. A separate provider-isolation test returns six
+persisted records while one RSS provider reports independent `FAILED`
+coverage.
+
+The occurrence tests additionally prove:
+
+```text
+2 exact syndicated source occurrences
+= 1 canonical logical article + 1 exact duplicate with complete lineage
+
+2 exact technical retry occurrences
+= 1 canonical logical article + 1 TECHNICAL_ACQUISITION_RETRY
+```
+
+### Updated offline replay and verification
+
+The independent two-sandbox replay remains fully balanced:
+
+```text
+273 raw_acquired = 273 persisted_valid + 0 technically_rejected
+273 persisted_valid_in_scope = 273 delivered + 0 quarantined + 0 withheld
+273 delivered = 27 current_delivered + 246 historical_delivered
+```
+
+- sections: **17**;
+- exact canonical UTF-8 size: **19,999,141 bytes**;
+- SHA-256:
+  `6458881A2063795F8F5EBED896D98981C36C7E5C35DE8F5C5BB472BBCD2060F5`;
+- contract checksum:
+  `5d82f8845ff0e592a9f0c3c4f63007256afc0faf0634369d33f077a2d875ba45`;
+- two independent replay outputs byte-identical: true;
+- replay database SHA-256 before/after:
+  `FC51B5EE0F1E0B34B0DDE3449ACC7CC55B8DBF680C44EF0E5D694C419C998185`;
+- replay database and both temporary copies unchanged: true;
+- new writes, revisions and outbox rows: zero;
+- provider LIVE, AI/backend, browser, delivery, trading and order calls: zero.
+
+Offline validation after the v4 correction:
+
+- new fan-in/identity/persistence adversarial suite: **18 passed**;
+- focused news/sync/readiness/schema-22/snapshot suite: **275 passed**;
+- complete repository suite: **1,883 passed in 561.03 seconds**;
+- Ruff: passed;
+- `py_compile` for every changed Python file: passed;
+- `compileall -q app scripts tests`: passed;
+- `git diff --check`: passed.
+- secret scan across all 16 patch files: zero findings.
+
+No controlled LIVE acquisition was run. The obsolete stage-2 script and its
+old sandbox/preflight evidence were not reused or regenerated. The PR must
+remain `OPEN`, `DRAFT` and `DO NOT MERGE`.

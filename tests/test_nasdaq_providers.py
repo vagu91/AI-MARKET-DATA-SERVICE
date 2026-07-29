@@ -405,7 +405,7 @@ def test_news_recency_filter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_news_rss_fallback_after_alpha_and_gdelt_rate_limits(tmp_path) -> None:
+async def test_news_fan_in_keeps_rss_when_alpha_and_gdelt_rate_limit(tmp_path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("ALPHA_VANTAGE_API_KEY=test-key\n", encoding="utf-8")
     settings = Settings(
@@ -441,10 +441,13 @@ async def test_news_rss_fallback_after_alpha_and_gdelt_rate_limits(tmp_path) -> 
         router.get("https://news.test/rss").mock(return_value=httpx.Response(200, text=rss))
         result = await provider.fetch_for_symbols(["NVDA", "AAPL", "MSFT", "QQQ"], limit=20, recency_days=14)
 
-    assert len(result.data["articles"]) == 1
-    assert result.metadata.provider_type == "RSS"
-    assert result.data["data_quality"]["fallback_used"] is True
-    assert result.data["data_quality"]["final_data_available"] is True
+    assert len(result.data["acquired_articles"]) == 1
+    assert result.data["articles"] == []
+    assert result.metadata.provider_type == "MIXED"
+    assert result.data["data_quality"]["fallback_used"] is False
+    assert result.data["data_quality"]["fan_in"] is True
+    assert result.data["data_quality"]["persistence_status"] == "NOT_CONFIGURED"
+    assert result.data["data_quality"]["final_data_available"] is False
     assert result.data["data_quality"]["errors"] == []
     assert any("Alpha Vantage NEWS_SENTIMENT rate_limited" in warning for warning in result.data["data_quality"]["warnings"])
     assert any("GDELT Doc API rate_limited" in warning for warning in result.data["data_quality"]["warnings"])

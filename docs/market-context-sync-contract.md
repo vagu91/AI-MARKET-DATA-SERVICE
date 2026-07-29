@@ -54,9 +54,11 @@ An identical refresh may publish a new global snapshot but does not create a
 false section change.
 
 The producer persists the exact section payload for every snapshot. Payload
-size is measured, never limited. Records are not summarized, title-deduplicated,
-merged across providers, truncated by count or replaced by
-`compacted_item_count`.
+size is measured, never limited. Records are not summarized,
+title-deduplicated, semantically merged across providers, truncated by count
+or replaced by `compacted_item_count`. Exact editorial occurrences may share
+one canonical projection only when every occurrence-defining field matches
+and all source lineages remain present.
 
 ## Section whitelist
 
@@ -179,11 +181,33 @@ publisher is unknown is still delivered with
 `source_verification_status=UNKNOWN`, `analysis_usability=DEGRADED` and
 explicit warning codes. UNKNOWN is not INVALID.
 
+News acquisition is fan-in, never first-success fallback. Alpha Vantage (when
+configured), GDELT and every configured RSS feed are called independently.
+One provider failure cannot suppress another provider's acquisition,
+persistence or coverage result. The request `limit` and configuration caps
+are applied separately to each provider/feed; there is no aggregate cap after
+acquisition. Provider accounting retains calls, pages, raw IDs, parsed IDs,
+technical rejection IDs, explicit out-of-scope IDs, persistence results,
+errors and coverage for each source. A provider that exposes pagination must
+complete its declared scope before its coverage can be `COMPLETE`.
+
+Network acquisition and metadata enrichment finish before canonical SQLite
+persistence begins. Each persistence attempt emits record ID, outcome, typed
+error, concrete reason code and retryability. A failed persistence is omitted
+from delivered `articles` and makes readiness `PARTIAL` or `UNAVAILABLE`; it
+cannot be hidden by a silent `continue`.
+
 Every canonical news record keeps acquisition provider, distribution source,
 original publisher and its status, source verification, headline, summary,
 real full content when present, content availability, canonical URL, publish/
 update/first-seen/last-seen timestamps, lifecycle, category, topics,
 relevance, validation, lineage, raw source identity and reason/warning codes.
+It also declares `content_availability_status`, `canonical_url_status`,
+`source_identity_status`, `editorial_occurrence_id` and
+`technical_acquisition_id`. Missing URL is not technical invalidity when a
+provider-native ID/GUID exists or a stable source/feed, editorial timestamp
+and useful title/content identity can be derived. Missing title is not
+technical invalidity when useful content and stable source identity exist.
 Missing publisher, headline-only or summary-only content, LOW relevance,
 UNCLASSIFIED category, ambiguous topic and an in-window historical lifecycle
 are quality metadata, never destructive filters.
@@ -192,9 +216,13 @@ are quality metadata, never destructive filters.
 `historical_articles`, `directly_relevant`, `supporting`, clusters and digest
 are derived views and cannot replace or truncate it. Similar stories and
 temporal updates remain distinct. Only the exact same editorial occurrence
-(publisher, timestamp, title and content) can be consolidated; all acquisition
-and distribution occurrences remain in `source_occurrences` and
-`distribution_lineage`.
+(provider-native identity when authoritative, original publisher, canonical
+URL, publish timestamp, editorial update timestamp, normalized title and
+content) can be consolidated. Same URL with a different timestamp, same title
+with different content, and same URL/title with a different editorial update
+remain distinct. Exact syndication through multiple distributors may share a
+canonical projection only with every acquisition/distribution occurrence
+retained in `source_occurrences` and `distribution_lineage`.
 
 After withholding, `accepted_article_count`,
 `delivered_raw_article_count`, `historical_article_count`, rejected count,
@@ -207,8 +235,10 @@ News diagnostics must balance all three equations and list the exact record id,
 disposition and reason code for every non-delivered record:
 
 ```text
-raw_acquired
-= persisted_valid + technically_rejected
+raw_acquired_by_provider
+= persisted_valid_by_provider
+  + technically_rejected_with_concrete_reason
+  + explicit_out_of_scope_with_concrete_reason
 
 persisted_valid_in_scope
 = delivered + quarantined_with_concrete_reason

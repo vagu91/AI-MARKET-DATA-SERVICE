@@ -294,7 +294,7 @@ def test_20_readiness_status_matches_delivered_content(records, expected):
 
 def test_21_pipeline_has_zero_ai_browser_or_backend_invocations():
     context = build_news_context(fixture_records(), now=NOW)
-    assert context["pipeline_version"] == "lossless_news_intelligence_v3"
+    assert context["pipeline_version"] == "lossless_news_intelligence_v4"
     encoded = canonical_json(context)
     assert '"AI_called":true' not in encoded
     assert '"provider_calls":1' not in encoded

@@ -813,7 +813,6 @@ def _news_delta_key(item: dict[str, Any]) -> str:
             "stable_id": stable_id,
             "provider": item.get("acquisition_provider")
             or item.get("provider"),
-            "occurrence_id": item.get("occurrence_id"),
             "duplicate_occurrence_index": item.get(
                 "duplicate_occurrence_index"
             ),

@@ -16,8 +16,8 @@ from app.services.source_policy_service import SourcePolicyService
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_VERSION = "lossless_news_intelligence_v3"
-NEWS_CONTRACT_VERSION = "lossless_news_sync_v3"
+PIPELINE_VERSION = "lossless_news_intelligence_v4"
+NEWS_CONTRACT_VERSION = "lossless_news_sync_v4"
 ENTITY_MAP_VERSION = "mnq_entities_v1"
 DEFAULT_CURRENT_WINDOW_HOURS = 24
 
@@ -184,6 +184,170 @@ def canonicalize_url(value: Any) -> str | None:
     query = urlencode([(key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True) if key.lower() not in TRACKING_QUERY_KEYS])
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path.rstrip("/") or "/", "", query, ""))
+
+
+def editorial_occurrence_identity(article: dict[str, Any]) -> dict[str, Any]:
+    """Build an editorial identity without collapsing temporal/content updates."""
+
+    native_id = next(
+        (
+            str(article.get(key)).strip()
+            for key in (
+                "provider_record_id",
+                "guid",
+                "record_id",
+                "source_record_id",
+            )
+            if article.get(key) not in (None, "")
+        ),
+        None,
+    )
+    canonical_candidate = (
+        article.get("canonical_url")
+        if "canonical_url" in article
+        else None
+        if article.get("aggregator_url")
+        else article.get("source_url") or article.get("url")
+    )
+    canonical_url = canonicalize_url(canonical_candidate)
+    publisher = _normalized_text(
+        article.get("original_publisher")
+        or article.get("publisher")
+        or article.get("source")
+    ).strip()
+    published_at = _iso_datetime(article.get("published_at"))
+    editorial_updated_at = _iso_datetime(
+        article.get("editorial_updated_at") or article.get("provider_updated_at")
+    )
+    normalized_title = _normalized_title(article.get("title")).strip()
+    canonical_content = clean_text(
+        article.get("content")
+        or article.get("full_content")
+        or article.get("content_snippet")
+        or article.get("summary")
+        or article.get("description")
+    )
+    content_sha256 = (
+        hashlib.sha256(str(canonical_content).encode("utf-8")).hexdigest()
+        if canonical_content
+        else None
+    )
+    if canonical_url and published_at and (normalized_title or content_sha256):
+        authority = "CANONICAL_EDITORIAL_OCCURRENCE"
+    elif publisher and published_at and (normalized_title or content_sha256):
+        authority = "PUBLISHER_EDITORIAL_OCCURRENCE"
+    elif native_id:
+        authority = "PROVIDER_NATIVE_RECORD"
+    else:
+        authority = "DERIVED_SOURCE_OCCURRENCE"
+    identity: dict[str, Any] = {
+        "identity_authority": authority,
+        "original_publisher": publisher or None,
+        "canonical_url": canonical_url,
+        "published_at": published_at,
+        "editorial_updated_at": editorial_updated_at,
+        "title": normalized_title or None,
+        "content_sha256": content_sha256,
+    }
+    if authority in {"PROVIDER_NATIVE_RECORD", "DERIVED_SOURCE_OCCURRENCE"}:
+        identity["provider_native_record_id"] = native_id
+        identity["provider_namespace"] = str(
+            article.get("acquisition_provider")
+            or article.get("provider")
+            or article.get("provider_name")
+            or article.get("provider_type")
+            or ""
+        ).strip() or None
+    return identity
+
+
+def editorial_occurrence_key(article: dict[str, Any]) -> str:
+    return _sha256_identity(
+        "editorial_occurrence",
+        editorial_occurrence_identity(article),
+    )
+
+
+def canonical_news_record_key(article: dict[str, Any]) -> str:
+    native_id = next(
+        (
+            str(article.get(key)).strip()
+            for key in (
+                "provider_record_id",
+                "guid",
+                "record_id",
+                "source_record_id",
+            )
+            if article.get(key) not in (None, "")
+        ),
+        None,
+    )
+    if not native_id:
+        return editorial_occurrence_key(article)
+    return _sha256_identity(
+        "canonical_provider_record",
+        {
+            "provider_namespace": str(
+                article.get("acquisition_provider")
+                or article.get("provider")
+                or article.get("provider_name")
+                or article.get("provider_type")
+                or ""
+            ).strip()
+            or None,
+            "provider_native_record_id": native_id,
+            "published_at": _iso_datetime(article.get("published_at")),
+            "editorial_updated_at": _iso_datetime(
+                article.get("editorial_updated_at")
+                or article.get("provider_updated_at")
+            ),
+        },
+    )
+
+
+def technical_acquisition_identity(article: dict[str, Any]) -> dict[str, Any]:
+    """Identify an exact acquisition occurrence, including provider lineage."""
+
+    return {
+        "editorial_occurrence_id": editorial_occurrence_key(article),
+        "provider_native_record_id": next(
+            (
+                str(article.get(key)).strip()
+                for key in (
+                    "provider_record_id",
+                    "guid",
+                    "record_id",
+                    "source_record_id",
+                )
+                if article.get(key) not in (None, "")
+            ),
+            None,
+        ),
+        "acquisition_provider": str(
+            article.get("acquisition_provider")
+            or article.get("provider")
+            or article.get("provider_name")
+            or article.get("provider_type")
+            or ""
+        ).strip()
+        or None,
+        "distributor": str(
+            article.get("distribution_source")
+            or article.get("distributor")
+            or ""
+        ).strip()
+        or None,
+        "source_url": canonicalize_url(article.get("source_url") or article.get("url")),
+        "raw_record_id": article.get("raw_record_id"),
+    }
+
+
+def technical_acquisition_key(article: dict[str, Any]) -> str:
+    identity = technical_acquisition_identity(article)
+    # raw_record_id identifies an observed payload position, not the reusable
+    # source occurrence; it remains lineage but must not defeat retry idempotence.
+    identity.pop("raw_record_id", None)
+    return _sha256_identity("technical_acquisition", identity)
 
 
 def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
@@ -494,6 +658,7 @@ def _recover_timestamp(article: dict[str, Any], *, now: datetime) -> dict[str, A
     for value, source, confidence in (
         (article.get("aggregator_published_at"), "aggregator_timestamp", 0.72),
         (article.get("source_page_published_at"), "source_page", 0.82),
+        (article.get("provider_seen_at"), "provider_seen_at", 0.58),
         (article.get("retrieved_at"), "retrieved_at_fallback", 0.35),
     ):
         if parsed := _iso_datetime(value):
@@ -550,6 +715,12 @@ def normalize_news_article(
         _iso_datetime(article.get("first_seen_at") or article.get("created_at"))
         or article["retrieved_at"]
     )
+    editorial_updated_value = (
+        article.get("editorial_updated_at")
+        if "editorial_updated_at" in article
+        else article.get("provider_updated_at") or article.get("updated_at")
+    )
+    article["editorial_updated_at"] = _iso_datetime(editorial_updated_value)
     article["last_seen_at"] = (
         _iso_datetime(article.get("last_seen_at") or article.get("updated_at"))
         or article["retrieved_at"]
@@ -598,7 +769,38 @@ def normalize_news_article(
     article["content_status"] = _delivery_content_status(article)
     article["content_availability"] = article["content_status"]
     article["content_availability_status"] = article["content_status"]
-    article["canonical_status"] = "canonical_resolved" if article.get("canonical_url") else "canonical_unresolved" if article.get("aggregator_url") else "canonical_unavailable"
+    article["canonical_status"] = (
+        "canonical_resolved"
+        if article.get("canonical_url")
+        else "canonical_unresolved"
+        if article.get("aggregator_url")
+        else "canonical_unavailable"
+    )
+    article["canonical_url_status"] = str(
+        article.get("canonical_url_status")
+        or (
+            "RESOLVED"
+            if article.get("canonical_url")
+            else "UNRESOLVED_DISTRIBUTOR_URL"
+            if article.get("aggregator_url")
+            else "ABSENT_SOURCE_IDENTITY_REQUIRED"
+        )
+    )
+    article["source_identity_status"] = str(
+        article.get("source_identity_status")
+        or (
+            "PROVIDER_NATIVE"
+            if any(
+                article.get(key) not in (None, "")
+                for key in ("provider_record_id", "guid", "record_id")
+            )
+            else "URL_IDENTITY"
+            if article.get("canonical_url") or article.get("source_url")
+            else "DERIVED_STABLE"
+            if _has_delivery_identity(article)
+            else "MISSING"
+        )
+    ).upper()
     logger.info("news_metadata_extracted", extra=_log_fields(article))
 
     article.update(_score_article(article, now=now))
@@ -645,20 +847,26 @@ def normalize_news_article(
         scope_start=scope_start,
     )
     article["accepted"] = article["exclusion_reason"] is None
+    article["editorial_occurrence_identity"] = editorial_occurrence_identity(
+        article
+    )
+    article["editorial_occurrence_id"] = editorial_occurrence_key(article)
+    article["technical_acquisition_identity"] = technical_acquisition_identity(
+        article
+    )
+    article["technical_acquisition_id"] = technical_acquisition_key(article)
     article["canonical_news_id"] = str(
-        article.get("news_key")
-        or article.get("provider_record_id")
+        article.get("canonical_news_id")
         or article.get("article_id")
-        or _stable_hash(
-            article.get("canonical_url")
-            or (
-                f"{article.get('original_publisher')}:"
-                f"{_normalized_title(article.get('title'))}:"
-                f"{article.get('published_at')}"
-            )
-        )
+        or canonical_news_record_key(article)
     )
     article["article_id"] = article["canonical_news_id"]
+    article["news_key"] = str(
+        article.get("news_key") or article["technical_acquisition_id"]
+    )
+    article["occurrence_id"] = str(
+        article.get("occurrence_id") or article["technical_acquisition_id"]
+    )
     article["raw_source_identity"] = {
         key: article.get(key)
         for key in (
@@ -666,11 +874,15 @@ def normalize_news_article(
             "provider_record_id",
             "occurrence_id",
             "record_id",
+            "raw_record_id",
             "source",
             "source_url",
             "canonical_url",
             "aggregator_url",
             "published_at",
+            "editorial_updated_at",
+            "editorial_occurrence_id",
+            "technical_acquisition_id",
         )
         if article.get(key) not in (None, "")
     }
@@ -684,6 +896,7 @@ def normalize_news_article(
         "source_url": article.get("source_url"),
         "canonical_url": article.get("canonical_url"),
         "published_at": article.get("published_at"),
+        "editorial_updated_at": article.get("editorial_updated_at"),
         "retrieved_at": article.get("retrieved_at"),
         "validation": article.get("validation"),
         "content_availability": article["content_availability"],
@@ -1074,38 +1287,13 @@ def _has_delivery_identity(article: dict[str, Any]) -> bool:
 
 
 def _deduplicate_articles(articles: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Consolidate only byte-equivalent occurrences while retaining every lineage."""
+    """Consolidate only exact editorial occurrences while retaining every lineage."""
 
     groups: dict[str, list[dict[str, Any]]] = {}
     for article in articles:
-        exact_occurrence = {
-            "original_publisher": _normalized_text(
-                article.get("original_publisher")
-            ).strip(),
-            "identity_guard": (
-                None
-                if article.get("source_verification_status") == "VERIFIED"
-                else article.get("provider_record_id")
-                or article.get("occurrence_id")
-                or article.get("news_key")
-                or article.get("canonical_url")
-                or article.get("source_url")
-                or article.get("article_id")
-            ),
-            "published_at": article.get("published_at"),
-            "title": _normalized_title(article.get("title")),
-            "summary": article.get("summary"),
-            "full_content": article.get("full_content"),
-        }
-        group_id = _stable_hash(
-            "exact_editorial_occurrence:"
-            + json.dumps(
-                exact_occurrence,
-                sort_keys=True,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-            )
+        group_id = str(
+            article.get("editorial_occurrence_id")
+            or editorial_occurrence_key(article)
         )
         groups.setdefault(group_id, []).append(article)
 
@@ -1155,8 +1343,8 @@ def _deduplicate_articles(articles: list[dict[str, Any]]) -> tuple[list[dict[str
         delivered.append(representative)
         for index, duplicate in enumerate(items[1:], start=1):
             same_acquisition_identity = (
-                _source_occurrence(duplicate)
-                == _source_occurrence(representative)
+                duplicate.get("technical_acquisition_id")
+                == representative.get("technical_acquisition_id")
             )
             duplicate["duplicate_group_id"] = group_id
             duplicate["syndication_group"] = group_id
@@ -1496,11 +1684,10 @@ def _event_fingerprint(article: dict[str, Any]) -> str:
 
 
 def _syndication_key(article: dict[str, Any]) -> str:
-    canonical = article.get("canonical_url")
-    if canonical:
-        return _stable_hash(f"url:{canonical}")
-    publisher = str(article.get("original_publisher") or article.get("source") or "unknown").lower()
-    return _stable_hash(f"syndication:{publisher}:{_normalized_title(article.get('title'))}")
+    return str(
+        article.get("editorial_occurrence_id")
+        or editorial_occurrence_key(article)
+    )
 
 
 def _source_occurrence(article: dict[str, Any]) -> dict[str, Any]:
@@ -1510,6 +1697,9 @@ def _source_occurrence(article: dict[str, Any]) -> dict[str, Any]:
         "canonical_news_id": article.get("canonical_news_id"),
         "provider_record_id": article.get("provider_record_id"),
         "occurrence_id": article.get("occurrence_id"),
+        "raw_record_id": article.get("raw_record_id"),
+        "editorial_occurrence_id": article.get("editorial_occurrence_id"),
+        "technical_acquisition_id": article.get("technical_acquisition_id"),
         "acquisition_provider": article.get("acquisition_provider"),
         "distribution_source": article.get("distribution_source"),
         "distributor_status": article.get("distributor_status"),
@@ -1523,6 +1713,10 @@ def _source_occurrence(article: dict[str, Any]) -> dict[str, Any]:
         "source_url": article.get("source_url"),
         "canonical_url": article.get("canonical_url"),
         "aggregator_url": article.get("aggregator_url"),
+        "canonical_url_status": article.get("canonical_url_status"),
+        "source_identity_status": article.get("source_identity_status"),
+        "published_at": article.get("published_at"),
+        "editorial_updated_at": article.get("editorial_updated_at"),
         "retrieved_at": article.get("retrieved_at"),
         "first_seen_at": article.get("first_seen_at"),
         "last_seen_at": article.get("last_seen_at"),
@@ -1783,8 +1977,11 @@ def material_news_fingerprint(article: dict[str, Any]) -> str:
         key: article.get(key)
         for key in (
             "canonical_news_id",
+            "editorial_occurrence_id",
+            "technical_acquisition_id",
             "news_key",
             "provider_record_id",
+            "raw_record_id",
             "version",
             "title",
             "summary",
@@ -1793,6 +1990,8 @@ def material_news_fingerprint(article: dict[str, Any]) -> str:
             "content_snippet",
             "source_url",
             "canonical_url",
+            "canonical_url_status",
+            "source_identity_status",
             "aggregator_url",
             "original_publisher",
             "original_publisher_status",
@@ -1801,6 +2000,7 @@ def material_news_fingerprint(article: dict[str, Any]) -> str:
             "acquisition_provider",
             "source_verification_status",
             "published_at",
+            "editorial_updated_at",
             "valid_from",
             "valid_until",
             "lifecycle_status",
@@ -1837,6 +2037,17 @@ def _pct(count: int, total: int) -> float:
 
 def _stable_hash(value: Any) -> str:
     return hashlib.sha1(str(value or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _sha256_identity(namespace: str, value: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(f"{namespace}:{serialized}".encode("utf-8")).hexdigest()
 
 
 def _log_fields(article: dict[str, Any]) -> dict[str, Any]:

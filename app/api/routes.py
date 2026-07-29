@@ -1695,7 +1695,12 @@ async def nasdaq_earnings_upcoming(
 @router.get("/news/latest", response_model=NewsResponse)
 async def news_latest(
     symbols: str = Query(default="NVDA,AAPL,MSFT,QQQ"),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum records requested from each enabled news provider/feed.",
+    ),
     recency_days: int = Query(default=14, ge=1, le=90),
     nasdaq_service: NasdaqDataService = Depends(get_nasdaq_data_service),
 ) -> NewsResponse:

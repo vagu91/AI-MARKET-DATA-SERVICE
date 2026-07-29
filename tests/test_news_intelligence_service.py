@@ -241,13 +241,12 @@ def test_equal_url_is_consolidated_without_losing_acquisition_lineage():
     )
 
 
-def test_exact_syndication_is_one_logical_article_with_two_lineages():
+def test_different_canonical_urls_are_not_assumed_to_be_exact_syndication():
     rows = [article("Nvidia faces export controls", url="https://one.test/a"), article("NVIDIA faces export controls!", url="https://two.test/a")]
     context = build_news_context(rows, now=NOW)
-    assert context["diagnostics"]["duplicate_count"] == 1
+    assert context["diagnostics"]["duplicate_count"] == 0
     assert context["diagnostics"]["delivered"] == 2
-    assert len(context["latest"]) == 1
-    assert len(context["latest"][0]["source_occurrences"]) == 2
+    assert len(context["latest"]) == 2
 
 
 def test_reuters_through_two_aggregators_preserves_both_lineages():

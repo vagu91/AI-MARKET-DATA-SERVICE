@@ -276,7 +276,8 @@ class SourcePolicyService:
             or ""
         ).strip()
         acquisition_provider = str(
-            candidate.get("provider")
+            candidate.get("acquisition_provider")
+            or candidate.get("provider")
             or candidate.get("provider_name")
             or candidate.get("provider_type")
             or ""

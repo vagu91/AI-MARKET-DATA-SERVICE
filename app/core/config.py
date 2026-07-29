@@ -1217,6 +1217,38 @@ class Settings(BaseSettings):
     yahoo_quote_summary_url: str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary"
     gdelt_doc_api_url: str = "https://api.gdeltproject.org/api/v2/doc/doc"
     alpha_vantage_base_url: str = "https://www.alphavantage.co/query"
+    news_gdelt_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_NEWS_GDELT_ENABLED",
+    )
+    news_rss_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_NEWS_RSS_ENABLED",
+    )
+    news_alpha_vantage_limit: int = Field(
+        default=1000,
+        ge=1,
+        le=1000,
+        validation_alias="AI_MARKET_NEWS_ALPHA_VANTAGE_LIMIT",
+    )
+    news_gdelt_limit: int = Field(
+        default=250,
+        ge=1,
+        le=250,
+        validation_alias="AI_MARKET_NEWS_GDELT_LIMIT",
+    )
+    news_rss_limit_per_feed: int = Field(
+        default=250,
+        ge=1,
+        le=5000,
+        validation_alias="AI_MARKET_NEWS_RSS_LIMIT_PER_FEED",
+    )
+    news_metadata_enrichment_limit_per_provider: int = Field(
+        default=8,
+        ge=0,
+        le=100,
+        validation_alias="AI_MARKET_NEWS_METADATA_ENRICHMENT_LIMIT_PER_PROVIDER",
+    )
     google_news_rss_url: str = "https://news.google.com/rss/search"
     yahoo_finance_rss_url: str = "https://finance.yahoo.com/rss/topstories"
     marketwatch_rss_url: str = "https://feeds.content.dowjones.io/public/rss/mw_topstories"
