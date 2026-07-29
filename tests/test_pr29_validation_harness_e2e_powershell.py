@@ -7,12 +7,12 @@ import subprocess
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_pr29_process_lifecycle_under_windows_powershell_51() -> None:
+def test_pr29_validation_harness_end_to_end_offline() -> None:
     script = (
         REPO_ROOT
         / "tests"
         / "powershell"
-        / "test_pr29_process_lifecycle.ps1"
+        / "test_pr29_validation_harness_e2e.ps1"
     )
     completed = subprocess.run(
         [
@@ -36,4 +36,6 @@ def test_pr29_process_lifecycle_under_windows_powershell_51() -> None:
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )
-    assert "POWERSHELL_5_1_STRICTMODE_TESTS_PASS=15" in completed.stdout
+    assert "OFFLINE_HARNESS_END_TO_END_PASS" in completed.stdout
+    assert '"external_provider_network_calls":  0' in completed.stdout
+    assert '"postflight_port_free":  true' in completed.stdout

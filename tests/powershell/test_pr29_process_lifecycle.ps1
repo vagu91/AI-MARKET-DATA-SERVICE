@@ -6,6 +6,16 @@ $repoRoot = [System.IO.Path]::GetFullPath(
 )
 . (Join-Path $repoRoot 'scripts\pr29_process_lifecycle.ps1')
 
+$pythonExe = (
+    Resolve-Path (Join-Path $repoRoot '.venv\Scripts\python.exe')
+).Path
+$runtimeFile = (
+    Resolve-Path (
+        Join-Path $repoRoot 'tests\fixtures\pr29_local_validation_server.py'
+    )
+).Path
+$sandboxPath = Join-Path $repoRoot 'data\unit-test-sandbox.sqlite'
+
 function Assert-True {
     param(
         [Parameter(Mandatory = $true)][bool]$Condition,
@@ -48,6 +58,25 @@ function Assert-Throws {
             "ASSERT_THROWS_FAILED: $Message; " +
             "pattern=$Pattern caught=$caught"
         )
+    }
+}
+
+function New-MockProcessRecord {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][int]$ParentProcessId,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$ExecutablePath,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$CommandLine
+    )
+    return [pscustomobject]@{
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        ExecutablePath = $ExecutablePath
+        CommandLine = $CommandLine
     }
 }
 
@@ -126,26 +155,6 @@ $tests.Add([pscustomobject]@{
 })
 
 $tests.Add([pscustomobject]@{
-    Name = 'already terminated process'
-    Action = {
-        $stopCalls = New-Object System.Collections.Generic.List[int]
-        $proof = Invoke-Pr29ProcessCleanup `
-            -ServiceProcessId 5001 `
-            -ProcessLookup { param($TargetProcessId) $null } `
-            -StopAction {
-                param($TargetProcessId)
-                $stopCalls.Add([int]$TargetProcessId)
-            } `
-            -ProcessSnapshotProvider { @() } `
-            -ConnectionProvider { param($RequestedPort) @() } `
-            -DelayAction { param($Milliseconds) }
-        Assert-True $proof.cleanup_ok 'already terminated cleanup'
-        Assert-True $proof.parent_terminated 'parent termination proof'
-        Assert-Equal 0 $stopCalls.Count 'already terminated is not stopped twice'
-    }
-})
-
-$tests.Add([pscustomobject]@{
     Name = 'System.Diagnostics.Process identity'
     Action = {
         $handle = [System.Diagnostics.Process]::GetCurrentProcess()
@@ -170,17 +179,232 @@ $tests.Add([pscustomobject]@{
 })
 
 $tests.Add([pscustomobject]@{
+    Name = 'PID zero snapshot record is ignored'
+    Action = {
+        $snapshot = @(
+            (New-MockProcessRecord `
+                -ProcessId 0 `
+                -ParentProcessId 0 `
+                -ExecutablePath '' `
+                -CommandLine '')
+            (New-MockProcessRecord `
+                -ProcessId 6102 `
+                -ParentProcessId 6101 `
+                -ExecutablePath $pythonExe `
+                -CommandLine "`"$pythonExe`" -u `"$runtimeFile`"")
+        )
+        $descendants = @(
+            Get-Pr29DescendantProcessIds `
+                -RootProcessId 6101 `
+                -ProcessSnapshot $snapshot
+        )
+        Assert-Equal 1 $descendants.Count 'only positive child retained'
+        Assert-Equal 6102 $descendants[0] 'positive child identity'
+    }
+})
+
+$tests.Add([pscustomobject]@{
+    Name = 'same-process listener identity'
+    Action = {
+        $record = New-MockProcessRecord `
+            -ProcessId 6201 `
+            -ParentProcessId 100 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
+        $proof = Resolve-Pr29ServiceIdentity `
+            -LauncherProcessId 6201 `
+            -Port 18053 `
+            -RuntimeFilePath $runtimeFile `
+            -LauncherExecutablePath $pythonExe `
+            -ExpectedSandboxDatabasePath $sandboxPath `
+            -ActualSandboxDatabasePath $sandboxPath `
+            -ProcessSnapshotProvider { @($record) } `
+            -ConnectionProvider {
+                param($RequestedPort)
+                @([pscustomobject]@{ OwningProcess = 6201 })
+            }
+        Assert-True $proof.identity_verified 'same process identity'
+        Assert-Equal 'SAME_PROCESS' $proof.process_relation 'same process relation'
+    }
+})
+
+$tests.Add([pscustomobject]@{
+    Name = 'direct-child listener identity'
+    Action = {
+        $launcher = New-MockProcessRecord `
+            -ProcessId 6301 `
+            -ParentProcessId 100 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
+        $listener = New-MockProcessRecord `
+            -ProcessId 6302 `
+            -ParentProcessId 6301 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
+        $proof = Resolve-Pr29ServiceIdentity `
+            -LauncherProcessId 6301 `
+            -Port 18053 `
+            -RuntimeFilePath $runtimeFile `
+            -LauncherExecutablePath $pythonExe `
+            -ExpectedSandboxDatabasePath $sandboxPath `
+            -ActualSandboxDatabasePath $sandboxPath `
+            -ProcessSnapshotProvider { @($launcher, $listener) } `
+            -ConnectionProvider {
+                param($RequestedPort)
+                @([pscustomobject]@{ OwningProcess = 6302 })
+            }
+        Assert-True $proof.identity_verified 'child identity'
+        Assert-True $proof.parent_chain_verified 'child parent chain'
+        Assert-Equal 'DIRECT_CHILD' $proof.process_relation 'child relation'
+        Assert-Equal 6301 $proof.listener_parent_pid 'normalized parent PID'
+    }
+})
+
+$tests.Add([pscustomobject]@{
+    Name = 'unrelated listener is rejected'
+    Action = {
+        $launcher = New-MockProcessRecord `
+            -ProcessId 6401 `
+            -ParentProcessId 100 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
+        $listener = New-MockProcessRecord `
+            -ProcessId 6402 `
+            -ParentProcessId 9999 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
+        $proof = Resolve-Pr29ServiceIdentity `
+            -LauncherProcessId 6401 `
+            -Port 18053 `
+            -RuntimeFilePath $runtimeFile `
+            -LauncherExecutablePath $pythonExe `
+            -ExpectedSandboxDatabasePath $sandboxPath `
+            -ActualSandboxDatabasePath $sandboxPath `
+            -ProcessSnapshotProvider { @($launcher, $listener) } `
+            -ConnectionProvider {
+                param($RequestedPort)
+                @([pscustomobject]@{ OwningProcess = 6402 })
+            }
+        Assert-True (-not $proof.identity_verified) 'unrelated identity fails'
+        Assert-Throws `
+            -Action {
+                Assert-Pr29ServiceIdentity `
+                    -IdentityProof $proof `
+                    -Phase 'unit-unrelated'
+            } `
+            -Pattern 'Service identity verification failed' `
+            -Message 'unrelated listener assertion'
+    }
+})
+
+$tests.Add([pscustomobject]@{
+    Name = 'already terminated process skips descendant inspection'
+    Action = {
+        $snapshotCalls = New-Object System.Collections.Generic.List[string]
+        $proof = Invoke-Pr29ProcessCleanup `
+            -LauncherProcessId 6501 `
+            -ListenerProcessId $null `
+            -ProcessLookup { param($TargetProcessId) $null } `
+            -StopAction { param($TargetProcessId) } `
+            -ProcessSnapshotProvider {
+                $snapshotCalls.Add('snapshot')
+                @()
+            } `
+            -ConnectionProvider { param($RequestedPort) @() } `
+            -DelayAction { param($Milliseconds) }
+        Assert-True $proof.cleanup_ok 'already terminated cleanup'
+        Assert-True $proof.launcher_terminated 'launcher termination proof'
+        Assert-Equal 0 $snapshotCalls.Count 'no descendant inspection'
+    }
+})
+
+$tests.Add([pscustomobject]@{
+    Name = 'PID zero never reaches descendant inspection'
+    Action = {
+        $snapshotCalls = New-Object System.Collections.Generic.List[string]
+        $proof = Invoke-Pr29ProcessCleanup `
+            -LauncherProcessId 0 `
+            -ListenerProcessId $null `
+            -ProcessLookup { param($TargetProcessId) $null } `
+            -StopAction { param($TargetProcessId) } `
+            -ProcessSnapshotProvider {
+                $snapshotCalls.Add('snapshot')
+                @()
+            } `
+            -ConnectionProvider { param($RequestedPort) @() } `
+            -DelayAction { param($Milliseconds) }
+        Assert-True (-not $proof.cleanup_ok) 'PID zero is visible failure'
+        Assert-Equal 0 $snapshotCalls.Count 'PID zero skips descendants'
+        Assert-True (
+            $proof.cleanup_errors[0] -match 'INVALID_PROCESS_ID:LAUNCHER:0'
+        ) 'PID zero reason code'
+    }
+})
+
+$tests.Add([pscustomobject]@{
+    Name = 'launcher and listener cleanup are separate'
+    Action = {
+        $alive = @{
+            6601 = $true
+            6602 = $true
+        }
+        $stopCalls = New-Object System.Collections.Generic.List[int]
+        $child = New-MockProcessRecord `
+            -ProcessId 6602 `
+            -ParentProcessId 6601 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
+        $system = New-MockProcessRecord `
+            -ProcessId 0 `
+            -ParentProcessId 0 `
+            -ExecutablePath '' `
+            -CommandLine ''
+        $proof = Invoke-Pr29ProcessCleanup `
+            -LauncherProcessId 6601 `
+            -ListenerProcessId 6602 `
+            -ProcessLookup {
+                param($TargetProcessId)
+                if ($alive[[int]$TargetProcessId]) {
+                    [pscustomobject]@{ Id = [int]$TargetProcessId }
+                }
+            } `
+            -StopAction {
+                param($TargetProcessId)
+                $stopCalls.Add([int]$TargetProcessId)
+                $alive[[int]$TargetProcessId] = $false
+            } `
+            -ProcessSnapshotProvider { @($system, $child) } `
+            -ConnectionProvider {
+                param($RequestedPort)
+                if ($alive[6602]) {
+                    @([pscustomobject]@{ OwningProcess = 6602 })
+                }
+                else {
+                    @()
+                }
+            } `
+            -DelayAction { param($Milliseconds) }
+        Assert-True $proof.cleanup_ok 'separate cleanup'
+        Assert-True $proof.launcher_terminated 'launcher terminated'
+        Assert-True $proof.listener_terminated 'listener terminated'
+        Assert-True ($stopCalls -contains 6601) 'launcher stop'
+        Assert-True ($stopCalls -contains 6602) 'listener stop'
+        Assert-Equal 0 $proof.cleanup_errors.Count 'no PID zero error'
+    }
+})
+
+$tests.Add([pscustomobject]@{
     Name = 'startup exception still invokes cleanup'
     Action = {
         $cleanupCalls = New-Object System.Collections.Generic.List[string]
         $result = Invoke-Pr29GuardedLifecycle `
             -StartAction { throw 'controlled startup exception' } `
             -BodyAction {
-                param($ServiceProcessId, $ServiceProcessHandle)
+                param($LauncherProcessId, $LauncherProcessHandle)
                 throw 'body must not run'
             } `
             -CleanupAction {
-                param($ServiceProcessId)
+                param($LauncherProcessId, $ListenerProcessId)
                 $cleanupCalls.Add('cleanup')
                 [pscustomobject]@{
                     cleanup_ok = $true
@@ -192,7 +416,7 @@ $tests.Add([pscustomobject]@{
             $result.lifecycle_error -match 'controlled startup exception'
         ) 'startup error retained'
         Assert-True (
-            $null -eq $result.service_pid
+            $null -eq $result.launcher_pid
         ) 'startup failure has no PID'
     }
 })
@@ -205,10 +429,11 @@ $tests.Add([pscustomobject]@{
                 [System.Diagnostics.Process]::GetCurrentProcess()
             } `
             -BodyAction {
-                param($ServiceProcessId, $ServiceProcessHandle)
+                param($LauncherProcessId, $LauncherProcessHandle)
+                [pscustomobject]@{ listener_pid = $LauncherProcessId }
             } `
             -CleanupAction {
-                param($ServiceProcessId)
+                param($LauncherProcessId, $ListenerProcessId)
                 throw 'controlled cleanup exception'
             }
         Assert-True (-not $result.pass) 'cleanup exception fails lifecycle'
@@ -216,26 +441,26 @@ $tests.Add([pscustomobject]@{
             $result.cleanup.cleanup_errors[0] -match
             'controlled cleanup exception'
         ) 'cleanup exception retained'
-        Assert-Equal $PID $result.service_pid 'PID remains normalized integer'
+        Assert-Equal $PID $result.launcher_pid 'launcher PID normalized'
+        Assert-Equal $PID $result.listener_pid 'listener PID normalized'
     }
 })
 
 $tests.Add([pscustomobject]@{
-    Name = 'cleanup fault still terminates parent and child'
+    Name = 'cleanup fault still terminates launcher and listener'
     Action = {
         $alive = @{
-            6101 = $true
-            6102 = $true
+            6701 = $true
+            6702 = $true
         }
-        $stopCalls = New-Object System.Collections.Generic.List[int]
-        $currentWin32 = Get-CimInstance `
-            Win32_Process `
-            -Filter "ProcessId = $PID"
-        $childRecord = $currentWin32 | Select-Object *
-        $childRecord.ProcessId = 6102
-        $childRecord.ParentProcessId = 6101
+        $child = New-MockProcessRecord `
+            -ProcessId 6702 `
+            -ParentProcessId 6701 `
+            -ExecutablePath $pythonExe `
+            -CommandLine "`"$pythonExe`" -u `"$runtimeFile`""
         $proof = Invoke-Pr29ProcessCleanup `
-            -ServiceProcessId 6101 `
+            -LauncherProcessId 6701 `
+            -ListenerProcessId 6702 `
             -ProcessLookup {
                 param($TargetProcessId)
                 if ($alive[[int]$TargetProcessId]) {
@@ -244,10 +469,9 @@ $tests.Add([pscustomobject]@{
             } `
             -StopAction {
                 param($TargetProcessId)
-                $stopCalls.Add([int]$TargetProcessId)
                 $alive[[int]$TargetProcessId] = $false
             } `
-            -ProcessSnapshotProvider { @($childRecord) } `
+            -ProcessSnapshotProvider { @($child) } `
             -ConnectionProvider { param($RequestedPort) @() } `
             -DelayAction { param($Milliseconds) } `
             -FaultHook {
@@ -256,10 +480,9 @@ $tests.Add([pscustomobject]@{
                     throw 'controlled cleanup hook exception'
                 }
             }
-        Assert-True $proof.parent_terminated 'parent terminated after fault'
-        Assert-Equal 0 $proof.final_remaining_descendants.Count 'child terminated'
-        Assert-True ($stopCalls -contains 6101) 'parent stop attempted'
-        Assert-True ($stopCalls -contains 6102) 'child stop attempted'
+        Assert-True $proof.launcher_terminated 'launcher after fault'
+        Assert-True $proof.listener_terminated 'listener after fault'
+        Assert-Equal 0 $proof.final_remaining_descendants.Count 'no child'
         Assert-True (-not $proof.cleanup_ok) 'fault remains visible'
         Assert-True (
             $proof.cleanup_errors[0] -match

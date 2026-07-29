@@ -483,3 +483,95 @@ Offline verification after the lifecycle correction:
 - focused lifecycle/network/fan-in suite: **23 passed**;
 - complete repository suite: **1,888 passed in 596.92 seconds**;
 - no additional LIVE acquisition or provider request was executed.
+
+## 2026-07-29 stage2-v6 launcher/listener identity failure
+
+Stage2-v6 reached local health and stopped before the provider route. Its new
+HEAD guard was not created, the provider audit was not created, and the
+operational main/WAL/SHM remained byte-, timestamp- and hash-identical to the
+pre-run evidence.
+
+The failure exposed the actual Windows virtual-environment process model:
+
+```text
+Start-Process launcher PID       30104
+TCP listener / Uvicorn PID        2012
+health reached                    true
+acquisition guard consumed       false
+```
+
+The stage already invoked `.venv\Scripts\python.exe` directly. On this Windows
+installation that executable is a virtual-environment redirector: the real
+base Python interpreter can be a direct child and own the socket. Treating the
+launcher PID as the required listener PID therefore rejected the legitimate
+controlled runtime.
+
+The cleanup freed port 8053 and terminated both processes, but its proof also
+reported:
+
+```text
+DESCENDANT_SNAPSHOT:RuntimeException:Invalid process ID: 0
+```
+
+The descendant normalizer was attempting to convert the Windows system-idle
+`Win32_Process` record. PID 0 is an operating-system sentinel, not a candidate
+descendant.
+
+The corrected process model now:
+
+- starts the controlled runtime through one shared direct
+  `Start-Process -FilePath .venv\Scripts\python.exe -PassThru` implementation;
+- keeps launcher, listener and descendant identities separate;
+- obtains the single listener owner from `Get-NetTCPConnection`;
+- requires either `SAME_PROCESS` or an explicit `DIRECT_CHILD` relationship;
+- verifies launcher executable, listener Python executable, both command lines,
+  the controlled runtime file, port ownership and sandbox database path;
+- emits a redacted command line and explicit `identity_verified` and
+  `parent_chain_verified` flags;
+- skips invalid system PID records and never invokes descendant inspection for
+  a null, non-positive or already-terminated launcher;
+- stops listener, other descendants and launcher independently, tolerating the
+  normal race where stopping the listener also terminates its redirector.
+
+### Full offline validation-harness integration
+
+The new end-to-end PowerShell 5.1 test uses the same runtime-start function as
+the LIVE stage, but launches a standard-library local fixture on an ephemeral
+loopback port. It performs health, controls, process identity, a mock
+acquisition, exact-ID provider accounting, stage-artifact generation, cleanup,
+port-release verification, negative cases and secret scanning.
+
+The persisted dry-run proof passed with:
+
+```text
+protected LIVE port                 not used
+test port                           63170
+launcher PID                        45904
+listener PID                        33128
+listener parent PID                 45904
+process relation                    DIRECT_CHILD
+identity verified                   true
+parent chain verified               true
+provider network calls              0
+fixture accounting                  PASS
+launcher/listener terminated        true / true
+remaining descendants               0
+postflight port free                true
+stage result                        PASS
+```
+
+The same run also passed the already-terminated launcher, PID 0, unexpected
+listener and child-listener-owner cases. The PID 0 case is a visible negative
+result but performs zero descendant snapshot calls.
+
+Offline verification after the launcher/listener correction:
+
+- PowerShell 5.1 StrictMode lifecycle scenarios: **15 passed**;
+- persisted end-to-end local harness dry-run: **PASS**;
+- PowerShell pytest wrappers: **2 passed**;
+- complete repository suite: **1,889 passed in 597.68 seconds**;
+- Ruff, `py_compile`, `compileall`, PowerShell 5.1 parsing and
+  `git diff --check`: **PASS**;
+- artifact secret scan: **zero findings**;
+- no provider LIVE request, acquisition guard, port 8053 listener or
+  operational database mutation.
