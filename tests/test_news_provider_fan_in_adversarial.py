@@ -14,8 +14,11 @@ from app.providers.news_provider import (
     NewsProvider,
     _article_key,
     _redact_provider_error,
+    parse_alpha_vantage_news_with_accounting,
     parse_gdelt_articles,
+    parse_gdelt_articles_with_accounting,
     parse_rss_articles,
+    parse_rss_articles_with_accounting,
 )
 from app.services.news_intelligence_service import (
     build_news_context,
@@ -160,7 +163,7 @@ async def test_fan_in_calls_every_enabled_provider_and_persists_union(tmp_path) 
     assert result.data["data_quality"]["requested_limit_semantics"] == "PER_PROVIDER"
     assert result.data["data_quality"]["provider_accounting_valid"] is True
     assert result.data["data_quality"]["persistence_status"] == "COMPLETE"
-    assert result.data["data_quality"]["readiness"] == "AVAILABLE"
+    assert result.data["data_quality"]["readiness"] == "DEGRADED"
     for account in accounts:
         assert account["calls"] == 1
         assert account["per_provider_limit"] == 1
@@ -257,6 +260,297 @@ def test_url_less_rss_guid_is_deliverable_with_explicit_statuses() -> None:
     normalized = normalize_news_article(parsed, now=NOW)
     assert normalized["accepted"] is True
     assert normalized["content_availability_status"] == "SUMMARY_ONLY"
+
+
+@pytest.mark.parametrize(
+    ("received_count", "configured_limit"),
+    [(11, 10), (26, 25), (101, 100)],
+)
+def test_rss_processes_every_received_item_without_post_fetch_cap(
+    received_count: int,
+    configured_limit: int,
+) -> None:
+    items = "".join(
+        f"""
+        <item>
+          <guid>rss-{index}</guid>
+          <title>RSS record {index}</title>
+          <link>https://publisher.test/rss-{index}</link>
+          <pubDate>Wed, 29 Jul 2026 12:00:00 GMT</pubDate>
+          <source>Fixture Publisher</source>
+          <description>Complete fixture content {index}.</description>
+        </item>
+        """
+        for index in range(received_count)
+    )
+    articles, _, rejected, outside, raw_ids = (
+        parse_rss_articles_with_accounting(
+            f"<rss><channel>{items}</channel></rss>",
+            symbols=["QQQ"],
+            limit=configured_limit,
+            source_name="Fixture RSS",
+            reliability=0.64,
+        )
+    )
+    assert len(raw_ids) == received_count
+    assert len(articles) == received_count
+    assert rejected == []
+    assert outside == []
+
+
+@pytest.mark.parametrize(
+    ("received_count", "configured_limit"),
+    [(11, 10), (26, 25), (101, 100)],
+)
+def test_api_parsers_process_every_record_already_returned(
+    received_count: int,
+    configured_limit: int,
+) -> None:
+    gdelt_payload = {
+        "articles": [
+            {
+                "id": f"gdelt-{index}",
+                "title": f"GDELT record {index}",
+                "url": f"https://publisher.test/gdelt-{index}",
+                "seendate": "20260729T120000Z",
+                "description": f"Complete GDELT fixture content {index}.",
+            }
+            for index in range(received_count)
+        ]
+    }
+    gdelt, gdelt_rejected, gdelt_outside, gdelt_raw = (
+        parse_gdelt_articles_with_accounting(
+            gdelt_payload,
+            ["QQQ"],
+            configured_limit,
+        )
+    )
+    alpha_payload = {
+        "feed": [
+            {
+                "id": f"alpha-{index}",
+                "title": f"Alpha record {index}",
+                "url": f"https://publisher.test/alpha-{index}",
+                "time_published": "20260729T120000",
+                "source": "Fixture Publisher",
+                "summary": f"Complete Alpha fixture content {index}.",
+            }
+            for index in range(received_count)
+        ]
+    }
+    alpha, alpha_rejected, alpha_outside, alpha_raw = (
+        parse_alpha_vantage_news_with_accounting(
+            alpha_payload,
+            ["QQQ"],
+            configured_limit,
+        )
+    )
+    assert len(gdelt_raw) == len(gdelt) == received_count
+    assert len(alpha_raw) == len(alpha) == received_count
+    assert gdelt_rejected == alpha_rejected == []
+    assert gdelt_outside == alpha_outside == []
+
+
+def test_marketwatch_direct_feed_fallback_is_verified_publisher() -> None:
+    rss = """<rss><channel><item>
+      <guid>WP-MKTW-verified</guid>
+      <title>MarketWatch direct-host record</title>
+      <link>https://www.marketwatch.com/story/direct-host-record</link>
+      <pubDate>Wed, 29 Jul 2026 12:00:00 GMT</pubDate>
+      <description>Direct feed content remains valid without a source tag.</description>
+    </item></channel></rss>"""
+    articles, warnings = parse_rss_articles(
+        rss,
+        symbols=["QQQ"],
+        limit=1,
+        source_name="MarketWatch RSS",
+        reliability=0.56,
+    )
+    assert warnings == []
+    assert articles[0]["original_publisher"] == "MarketWatch"
+    normalized = normalize_news_article(articles[0], now=NOW)
+    assert normalized["accepted"] is True
+    assert normalized["publisher_status"] == "VERIFIED"
+    assert normalized["lineage_status"] == "VERIFIED"
+
+
+@pytest.mark.parametrize(
+    ("source_name", "publisher", "url"),
+    [
+        (
+            "Federal Reserve RSS",
+            "Federal Reserve",
+            "https://www.federalreserve.gov/newsevents/pressreleases/test.htm",
+        ),
+        (
+            "BLS RSS",
+            "U.S. Bureau of Labor Statistics",
+            "https://www.bls.gov/news.release/test.htm",
+        ),
+        (
+            "BEA RSS",
+            "U.S. Bureau of Economic Analysis",
+            "https://www.bea.gov/news/test",
+        ),
+    ],
+)
+def test_official_direct_feed_fallback_matches_source_policy(
+    source_name: str,
+    publisher: str,
+    url: str,
+) -> None:
+    rss = f"""<rss><channel><item>
+      <guid>{source_name}-verified</guid>
+      <title>Official direct-host record</title>
+      <link>{url}</link>
+      <pubDate>Wed, 29 Jul 2026 12:00:00 GMT</pubDate>
+      <description>Official feed content without a source tag.</description>
+    </item></channel></rss>"""
+    articles, _ = parse_rss_articles(
+        rss,
+        symbols=["QQQ"],
+        limit=1,
+        source_name=source_name,
+        reliability=0.86,
+    )
+    assert articles[0]["original_publisher"] == publisher
+    normalized = normalize_news_article(articles[0], now=NOW)
+    assert normalized["accepted"] is True
+    assert normalized["publisher_status"] == "VERIFIED"
+    assert normalized["lineage_status"] == "VERIFIED"
+
+
+def test_aggregator_feed_without_publisher_does_not_invent_one() -> None:
+    rss = """<rss><channel><item>
+      <guid>aggregator-unknown-publisher</guid>
+      <title>Publisher remains unknown</title>
+      <link>https://finance.yahoo.com/news/unknown-publisher</link>
+      <pubDate>Wed, 29 Jul 2026 12:00:00 GMT</pubDate>
+      <description>Useful content remains deliverable with degraded lineage.</description>
+    </item></channel></rss>"""
+    articles, _ = parse_rss_articles(
+        rss,
+        symbols=["QQQ"],
+        limit=1,
+        source_name="Yahoo Finance RSS",
+        reliability=0.58,
+    )
+    assert articles[0]["original_publisher"] is None
+    normalized = normalize_news_article(articles[0], now=NOW)
+    assert normalized["accepted"] is True
+    assert normalized["publisher"] is None
+    assert normalized["original_publisher"] is None
+    assert normalized["publisher_status"] == "UNKNOWN"
+    assert normalized["distribution_source"] == "Yahoo Finance"
+
+
+@pytest.mark.asyncio
+async def test_rss_fan_in_persists_all_items_in_received_document(
+    tmp_path,
+) -> None:
+    repository = RecordingNewsRepository()
+    settings = _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        news_gdelt_enabled=False,
+        federal_reserve_rss_url="",
+        bls_rss_url="",
+        bea_rss_url="",
+        marketwatch_rss_url="",
+        google_news_rss_url="",
+        news_rss_limit_per_feed=25,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+        market_news_repository=repository,
+    )
+    published = datetime.now(UTC).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT"
+    )
+    items = "".join(
+        f"""
+        <item>
+          <guid>yahoo-{index}</guid>
+          <title>Yahoo received record {index}</title>
+          <link>https://finance.yahoo.com/news/record-{index}</link>
+          <pubDate>{published}</pubDate>
+          <source>Fixture Publisher</source>
+          <description>Complete received fixture record {index}.</description>
+        </item>
+        """
+        for index in range(101)
+    )
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        router.get("https://yahoo.test/rss").mock(
+            return_value=httpx.Response(
+                200,
+                text=f"<rss><channel>{items}</channel></rss>",
+            )
+        )
+        result = await provider.fetch_for_symbols(
+            ["QQQ"],
+            limit=25,
+            recency_days=14,
+        )
+    account = result.data["provider_accounting"][0]
+    assert account["raw_count"] == 101
+    assert account["parsed_count"] == 101
+    assert account["persisted_count"] == 101
+    assert account["explicit_out_of_scope"] == []
+    assert account["post_fetch_limit_applied"] is False
+    assert account["received_records_fully_processed"] is True
+    assert len(repository.stored) == len(result.data["articles"]) == 101
+    _assert_exact_provider_accounting(account)
+
+
+@pytest.mark.asyncio
+async def test_provider_page_limit_is_partial_coverage_not_fake_complete(
+    tmp_path,
+) -> None:
+    repository = RecordingNewsRepository()
+    settings = _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        news_rss_enabled=False,
+        news_gdelt_limit=25,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+        market_news_repository=repository,
+    )
+    seen = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    payload = {
+        "articles": [
+            {
+                "id": f"gdelt-{index}",
+                "title": f"GDELT page record {index}",
+                "url": f"https://publisher.test/gdelt-page-{index}",
+                "seendate": seen,
+                "description": f"Complete page fixture content {index}.",
+            }
+            for index in range(25)
+        ]
+    }
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as router:
+        router.get("https://gdelt.test/api").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        result = await provider.fetch_for_symbols(
+            ["QQQ"],
+            limit=25,
+            recency_days=14,
+        )
+    account = result.data["provider_accounting"][0]
+    assert account["raw_count"] == account["persisted_count"] == 25
+    assert account["coverage_status"] == "PARTIAL"
+    assert account["pagination_supported"] is True
+    assert account["pagination_complete"] is False
+    assert account["next_cursor"] == {"startrecord": 26}
+    assert account["records_not_acquired"] == "UNKNOWN"
+    assert account["coverage_reason"] == "PROVIDER_PAGE_LIMIT_REACHED"
+    _assert_exact_provider_accounting(account)
 
 
 def test_url_less_rss_without_guid_builds_stable_source_identity() -> None:

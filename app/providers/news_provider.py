@@ -40,6 +40,13 @@ TOPIC_KEYWORDS = {
     "macro": ["gdp", "inflation", "payrolls", "federal reserve", "treasury"],
 }
 
+DIRECT_RSS_PUBLISHERS = {
+    "Federal Reserve RSS": "Federal Reserve",
+    "BLS RSS": "U.S. Bureau of Labor Statistics",
+    "BEA RSS": "U.S. Bureau of Economic Analysis",
+    "MarketWatch RSS": "MarketWatch",
+}
+
 
 class NewsProvider(BaseProvider):
     source = "Market News"
@@ -510,6 +517,15 @@ class NewsProvider(BaseProvider):
                 articles=articles,
                 technical_rejections=rejected,
                 explicit_out_of_scope=[*outside, *recency_outside],
+                pagination_complete=len(raw_ids) < limit,
+                coverage_reason=(
+                    "PROVIDER_PAGE_LIMIT_REACHED_NO_CURSOR"
+                    if len(raw_ids) >= limit
+                    else None
+                ),
+                records_not_acquired=(
+                    "UNKNOWN" if len(raw_ids) >= limit else 0
+                ),
             )
         except Exception as exc:
             return _failed_provider_batch(
@@ -566,6 +582,21 @@ class NewsProvider(BaseProvider):
                 articles=articles,
                 technical_rejections=rejected,
                 explicit_out_of_scope=[*outside, *recency_outside],
+                pagination_supported=True,
+                pagination_complete=len(raw_ids) < limit,
+                next_cursor=(
+                    {"startrecord": len(raw_ids) + 1}
+                    if len(raw_ids) >= limit
+                    else None
+                ),
+                coverage_reason=(
+                    "PROVIDER_PAGE_LIMIT_REACHED"
+                    if len(raw_ids) >= limit
+                    else None
+                ),
+                records_not_acquired=(
+                    "UNKNOWN" if len(raw_ids) >= limit else 0
+                ),
             )
         except Exception as exc:
             return _failed_provider_batch(
@@ -809,15 +840,6 @@ def parse_gdelt_articles_with_accounting(
     ]
     for index, item in enumerate(items):
         raw_record_id = raw_ids[index]
-        if index >= limit:
-            outside.append(
-                _out_of_scope(
-                    raw_record_id,
-                    "PER_PROVIDER_LIMIT",
-                    provider=provider,
-                )
-            )
-            continue
         title = str(item.get("title") or "").strip()
         url = str(item.get("url") or "").strip() or None
         summary = item.get("summary") or item.get("description")
@@ -842,6 +864,12 @@ def parse_gdelt_articles_with_accounting(
             provider_record_id=provider_record_id,
         )
         if rejection:
+            rejection["source_identity"] = _raw_source_identity(
+                provider_record_id=provider_record_id,
+                title=title,
+                timestamp=provider_seen_at,
+                url=url,
+            )
             rejected.append(rejection)
             continue
         matched_symbols = [
@@ -926,15 +954,6 @@ def parse_alpha_vantage_news_with_accounting(
     ]
     for index, item in enumerate(items):
         raw_record_id = raw_ids[index]
-        if index >= limit:
-            outside.append(
-                _out_of_scope(
-                    raw_record_id,
-                    "PER_PROVIDER_LIMIT",
-                    provider=provider,
-                )
-            )
-            continue
         title = str(item.get("title") or "").strip()
         url = str(item.get("url") or "").strip() or None
         summary = item.get("summary")
@@ -955,6 +974,12 @@ def parse_alpha_vantage_news_with_accounting(
             provider_record_id=provider_record_id,
         )
         if rejection:
+            rejection["source_identity"] = _raw_source_identity(
+                provider_record_id=provider_record_id,
+                title=title,
+                timestamp=published_at,
+                url=url,
+            )
             rejected.append(rejection)
             continue
         ticker_sentiment = item.get("ticker_sentiment") or []
@@ -1055,15 +1080,6 @@ def parse_rss_articles_with_accounting(
     ]
     for index, item in enumerate(items):
         raw_record_id = raw_ids[index]
-        if index >= limit:
-            outside.append(
-                _out_of_scope(
-                    raw_record_id,
-                    "PER_PROVIDER_LIMIT",
-                    provider=source_name,
-                )
-            )
-            continue
         is_atom = item.tag.split("}")[-1] == "entry"
         title = (_node_text(item, "title") or "").strip()
         url = (_node_link(item) or "").strip() or None
@@ -1097,13 +1113,25 @@ def parse_rss_articles_with_accounting(
             provider_record_id=provider_record_id,
         )
         if rejection:
+            rejection["source_identity"] = _raw_source_identity(
+                provider_record_id=provider_record_id,
+                title=title,
+                timestamp=published_at or editorial_updated_at,
+                url=url,
+                guid=guid or None,
+            )
             rejected.append(rejection)
             continue
         article_reliability = reliability
         if not published_at:
             article_reliability = max(reliability - 0.12, 0.0)
             warnings.append(f"{source_name} article missing published_at: {title[:80]}")
-        source = _node_text(item, "source") or _node_text(item, "author") or source_name
+        declared_publisher = (
+            _node_text(item, "source")
+            or _node_text(item, "author")
+            or DIRECT_RSS_PUBLISHERS.get(source_name)
+        )
+        source = declared_publisher or source_name
         is_official = source_name in {"Federal Reserve RSS", "BLS RSS", "BEA RSS"}
         canonical_url = None if "Google News RSS" in source_name else url
         aggregator_url = url if "Google News RSS" in source_name else None
@@ -1126,7 +1154,8 @@ def parse_rss_articles_with_accounting(
                 "source_identity_status": identity_status,
                 "title": title,
                 "source": source,
-                "original_publisher": source,
+                "original_publisher": declared_publisher,
+                "_source_is_declared_publisher": bool(declared_publisher),
                 "published_at": published_at,
                 "published_at_source": (
                     "rss_pub_date"
@@ -1318,6 +1347,28 @@ def _out_of_scope(
     }
 
 
+def _raw_source_identity(
+    *,
+    provider_record_id: str | None,
+    title: str,
+    timestamp: str | None,
+    url: str | None,
+    guid: str | None = None,
+) -> dict[str, object]:
+    return {
+        "provider_record_id": provider_record_id,
+        "guid": guid,
+        "title": title or None,
+        "timestamp": timestamp,
+        "url": url,
+        "content_identity": hashlib.sha256(
+            re.sub(r"\s+", " ", title).strip().casefold().encode("utf-8")
+        ).hexdigest()
+        if title
+        else None,
+    }
+
+
 def parse_rss_date(value: str | None) -> str | None:
     if not value:
         return None
@@ -1416,22 +1467,43 @@ def _partition_recency(
         if published >= cutoff:
             filtered.append(article)
             continue
-        outside.append(
-            _out_of_scope(
-                str(
-                    article.get("raw_record_id")
-                    or article.get("provider_record_id")
-                    or ""
-                ),
-                "OUTSIDE_RECENCY_WINDOW",
-                provider=str(
-                    article.get("acquisition_provider")
-                    or article.get("provider")
-                    or article.get("provider_type")
-                    or "UNKNOWN"
-                ),
+        exclusion = _out_of_scope(
+            str(
+                article.get("raw_record_id")
+                or article.get("provider_record_id")
+                or ""
+            ),
+            "OUTSIDE_RECENCY_WINDOW",
+            provider=str(
+                article.get("acquisition_provider")
+                or article.get("provider")
+                or article.get("provider_type")
+                or "UNKNOWN"
             )
         )
+        exclusion["source_identity"] = _raw_source_identity(
+            provider_record_id=(
+                str(article.get("provider_record_id"))
+                if article.get("provider_record_id")
+                else None
+            ),
+            title=str(article.get("title") or ""),
+            timestamp=str(value),
+            url=(
+                str(
+                    article.get("canonical_url")
+                    or article.get("source_url")
+                    or article.get("url")
+                )
+                if (
+                    article.get("canonical_url")
+                    or article.get("source_url")
+                    or article.get("url")
+                )
+                else None
+            ),
+        )
+        outside.append(exclusion)
     return filtered, outside
 
 
@@ -1446,8 +1518,17 @@ def _provider_batch(
     technical_rejections: list[dict[str, object]],
     explicit_out_of_scope: list[dict[str, object]],
     warnings: list[str] | None = None,
+    pagination_supported: bool = False,
+    pagination_complete: bool = True,
+    next_cursor: dict[str, object] | None = None,
+    coverage_reason: str | None = None,
+    records_not_acquired: int | str = 0,
 ) -> dict[str, Any]:
-    status = "PARTIAL" if technical_rejections else "COMPLETE"
+    status = (
+        "PARTIAL"
+        if technical_rejections or not pagination_complete
+        else "COMPLETE"
+    )
     return {
         "provider": provider,
         "provider_type": provider_type.value,
@@ -1460,8 +1541,13 @@ def _provider_batch(
         "metadata_enrichment_status": "NOT_REQUIRED",
         "metadata_enrichment_results": [],
         "per_provider_limit": limit,
-        "pagination_supported": False,
-        "pagination_complete": True,
+        "post_fetch_limit_applied": False,
+        "received_records_fully_processed": True,
+        "pagination_supported": pagination_supported,
+        "pagination_complete": pagination_complete,
+        "next_cursor": next_cursor,
+        "coverage_reason": coverage_reason,
+        "records_not_acquired": records_not_acquired,
         "raw_record_ids": raw_record_ids,
         "raw_count": len(raw_record_ids),
         "parsed_record_ids": [

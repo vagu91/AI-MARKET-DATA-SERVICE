@@ -373,10 +373,20 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         aggregator_url = source_url
         if canonical_url == source_url:
             canonical_url = None
+    source_is_declared_publisher = bool(
+        article.get(
+            "_source_is_declared_publisher",
+            bool(
+                article.get("original_publisher")
+                or article.get("publisher")
+                or source
+            ),
+        )
+    )
     original = str(
         article.get("original_publisher")
         or article.get("publisher")
-        or source
+        or (source if source_is_declared_publisher else "")
         or ""
     ).strip()
     inferred = _publisher_from_title(title)
@@ -411,7 +421,9 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
     classified = {
         "source": display_source,
         "original_publisher": original or None,
-        "_source_is_declared_publisher": bool(original or source),
+        "_source_is_declared_publisher": bool(
+            source_is_declared_publisher and (original or source)
+        ),
         "source_classification": classification,
         "source_url": source_url,
         "_raw_source_url": raw_source_url or None,
@@ -471,7 +483,7 @@ def classify_news_source(article: dict[str, Any]) -> dict[str, Any]:
         quality_warnings.append("DISTRIBUTOR_UNVERIFIED")
     classified.update(
         {
-            "publisher": display_source,
+            "publisher": lineage.get("original_publisher"),
             "original_publisher": lineage.get("original_publisher"),
             "original_publisher_status": lineage.get(
                 "original_publisher_status"
