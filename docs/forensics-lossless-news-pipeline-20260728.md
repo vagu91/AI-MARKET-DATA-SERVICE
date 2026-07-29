@@ -345,3 +345,63 @@ Offline validation after the v4 correction:
 No controlled LIVE acquisition was run. The obsolete stage-2 script and its
 old sandbox/preflight evidence were not reused or regenerated. The PR must
 remain `OPEN`, `DRAFT` and `DO NOT MERGE`.
+
+## 2026-07-29 stage2-v4 network-surface false positive
+
+The first stage2-v4 execution stopped before service startup and before the
+single-acquisition guard was created. The fail-closed static detector reported
+this import:
+
+```text
+library: urllib
+module: urllib.parse
+callables: parse_qsl, urlencode, urlparse, urlunparse
+production module: app.services.news_intelligence_service
+production functions: canonicalize_url, classify_news_source
+```
+
+This was a detector false positive, not an unobserved transport.
+`urllib.parse` only parses and serializes URL values. It exposes no HTTP client,
+socket connection or network transport. Runtime regression coverage replaces
+`socket.create_connection`, `socket.socket.connect` and
+`urllib.request.urlopen` with fail-fast sentinels while exercising
+`canonicalize_url`; all sentinels remain untouched.
+
+The corrected callsite-aware detector now proves the complete reachable news
+network surface:
+
+```text
+Alpha Vantage       _fetch_alpha_vantage                  httpx.AsyncClient.get
+GDELT               _fetch_gdelt                          httpx.AsyncClient.get
+RSS                  _fetch_one_rss_feed                   httpx.AsyncClient.get
+metadata enrichment _enrich_missing_metadata.enrich       httpx.AsyncClient.get
+```
+
+Every reachable network call routes through both
+`httpx.AsyncClient.send` and
+`httpx.AsyncHTTPTransport.handle_async_request`, where stage 2 applies the exact
+allowlist, redacted audit, timing, HTTP status and per-provider accounting.
+Imports and callsites are distinguished: `urllib.parse` is explicitly
+`NO_NETWORK_CAPABILITY`, while `urllib.request`, `requests`, `aiohttp`,
+`urllib3`, raw sockets and other network-capable modules fail with library,
+module, callable, file, enclosing function, line, reason code and reason.
+
+The post-failure invariant check proved:
+
+- acquisition guard absent;
+- zero listeners on port 8053;
+- zero residual PR29 Python/Uvicorn processes;
+- operational main/WAL/SHM byte size, timestamp and SHA-256 unchanged against
+  the evidence captured before the failed stage;
+- `.env` still ignored and untracked, with a last-write timestamp preceding
+  the failed run; its contents were not read;
+- intentional consumer artifact SHA-256 unchanged:
+  `BCED28DECDF98D65AF9843C3CF3FF23DAB0A164C721B8BEF9B3E0D7697699DD4`.
+
+Offline verification after the detector correction:
+
+- new network-surface regression suite: **4 passed**;
+- focused news/provider/identity suite: **167 passed**;
+- complete repository suite: **1,887 passed in 633.76 seconds**;
+- no LIVE provider, Uvicorn, AI, browser, delivery, trading, order or
+  operational migration activity.
