@@ -405,3 +405,81 @@ Offline verification after the detector correction:
 - complete repository suite: **1,887 passed in 633.76 seconds**;
 - no LIVE provider, Uvicorn, AI, browser, delivery, trading, order or
   operational migration activity.
+
+## 2026-07-29 stage2-v5 process-proof failure
+
+Stage2-v5 passed the corrected static network-surface gate and then consumed its
+single-acquisition guard at `2026-07-29T08:05:35.757140+00:00`. Unlike the v4
+failure, the v5 provider acquisition was real. The audit contains 82 lines:
+
+```text
+acquisition_start      1
+acquisition_end        1, status COMPLETE
+network_call           8
+transport_call         8
+provider_parse_batch   4
+persisted_record      60
+```
+
+The redacted outbound inventory was:
+
+```text
+MarketWatch RSS        MARKETWATCH_RSS              HTTP 200
+Yahoo Finance RSS      YAHOO_FINANCE_RSS            HTTP 200
+Federal Reserve RSS    FEDERAL_RESERVE_RSS           HTTP 200
+Google News RSS        GOOGLE_NEWS_RSS               HTTP 200
+BLS RSS                BLS_RSS                       HTTP 404
+BEA RSS                BEA_RSS                       HTTP 404
+GDELT Doc API          GDELT_DOC_API                 ConnectTimeout
+Yahoo metadata         ARTICLE_METADATA:finance.yahoo.com/... HTTP 307
+```
+
+There were zero blocked calls and zero network calls during persistence. The
+four `observed_network_calls` printed before service startup were the static
+detector's four production callsites; they were not a claim about provider
+traffic. The eight audited calls above are the actual provider/enrichment
+traffic.
+
+The fresh sandbox remains integral (`PRAGMA integrity_check = ok`) and contains
+exactly 60 additional `market_news` rows, matching both the 60
+`persisted_record` audit events and the 60 articles in the response. Its
+readiness is `DEGRADED` because GDELT timed out and the BLS/BEA endpoints
+returned 404. The operational main/WAL/SHM still match their pre-run byte size,
+timestamp and SHA-256 exactly. `.env` and the intentional consumer artifact
+remain invariant.
+
+The service cleanup ran in the `finally` block: port 8053 is free and no parent,
+child or PR29 runtime process remains. The subsequent process-proof assembly
+failed under `Set-StrictMode` because it evaluated:
+
+```powershell
+@($listenerAfter.OwningProcess)
+```
+
+when `$listenerAfter` was an empty array. The line reported by PowerShell also
+contained the adjacent `service_pid` expression, but the missing property was
+`OwningProcess`, not `Id`.
+
+The lifecycle correction separates every identity type:
+
+- `Start-Process -PassThru` remains a `System.Diagnostics.Process` handle;
+- its `.Id` is immediately normalized to an `Int32`;
+- `Win32_Process` instances use `.ProcessId`;
+- listener objects are inspected for an `OwningProcess` property before its
+  value is used;
+- listener snapshots always expose explicit count, PID array and entries,
+  including the zero-listener case;
+- cleanup is idempotent and remains in `finally`, records cleanup exceptions,
+  terminates the known parent and descendants, and verifies port release.
+
+Nine Windows PowerShell 5.1 StrictMode tests cover zero, expected, unexpected
+and multiple listeners; an already terminated process; both process object
+types; startup failure; cleanup failure; and a cleanup fault that must still
+terminate a simulated parent and child.
+
+Offline verification after the lifecycle correction:
+
+- PowerShell 5.1 StrictMode lifecycle scenarios: **9 passed**;
+- focused lifecycle/network/fan-in suite: **23 passed**;
+- complete repository suite: **1,888 passed in 596.92 seconds**;
+- no additional LIVE acquisition or provider request was executed.
