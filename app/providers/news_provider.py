@@ -57,6 +57,19 @@ class MetadataRedirectError(RuntimeError):
         self.reason_code = reason_code
 
 
+class _NewsRequestCallEvidence:
+    """Per-invocation evidence of provider HTTP attempts."""
+
+    def __init__(self) -> None:
+        self._calls: Counter[str] = Counter()
+
+    def record_call(self, provider: str) -> None:
+        self._calls[provider] += 1
+
+    def calls(self, provider: str) -> int:
+        return int(self._calls[provider])
+
+
 class NewsProvider(BaseProvider):
     source = "Market News"
     provider_type = ProviderType.API
@@ -87,32 +100,49 @@ class NewsProvider(BaseProvider):
     ) -> ProviderResult:
         requested_limit = max(int(limit), 1)
         query = " OR ".join(symbols + ["Federal Reserve", "Nasdaq", "QQQ"])
+        loop = asyncio.get_running_loop()
+        total_budget, acquisition_budget = _news_request_budgets(
+            self.settings
+        )
+        internal_deadline = loop.time() + total_budget
+        execution_evidence = _NewsRequestCallEvidence()
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
-            tasks: list[Any] = []
+            task_specs: list[tuple[str, Any]] = []
             if self.settings.alpha_vantage_api_key:
-                tasks.append(
-                    self._fetch_alpha_vantage(
-                        client=client,
-                        symbols=symbols,
-                        limit=min(
-                            requested_limit,
-                            self.settings.news_alpha_vantage_limit,
+                task_specs.append(
+                    (
+                        "Alpha Vantage NEWS_SENTIMENT",
+                        self._fetch_alpha_vantage(
+                            client=client,
+                            symbols=symbols,
+                            limit=min(
+                                requested_limit,
+                                self.settings.news_alpha_vantage_limit,
+                            ),
+                            recency_days=recency_days,
+                            execution_evidence=execution_evidence,
                         ),
-                        recency_days=recency_days,
                     )
                 )
             if self.settings.news_gdelt_enabled:
-                tasks.append(
-                    self._fetch_gdelt(
-                        client=client,
-                        symbols=symbols,
-                        query=query,
-                        limit=min(requested_limit, self.settings.news_gdelt_limit),
-                        recency_days=recency_days,
+                task_specs.append(
+                    (
+                        "GDELT Doc API",
+                        self._fetch_gdelt(
+                            client=client,
+                            symbols=symbols,
+                            query=query,
+                            limit=min(
+                                requested_limit,
+                                self.settings.news_gdelt_limit,
+                            ),
+                            recency_days=recency_days,
+                            execution_evidence=execution_evidence,
+                        ),
                     )
                 )
             if self.settings.news_rss_enabled:
-                tasks.extend(
+                task_specs.extend(
                     self._rss_tasks(
                         client=client,
                         symbols=symbols,
@@ -121,12 +151,14 @@ class NewsProvider(BaseProvider):
                             self.settings.news_rss_limit_per_feed,
                         ),
                         recency_days=recency_days,
+                        execution_evidence=execution_evidence,
                     )
                 )
-            observed_batches = (
-                list(await asyncio.gather(*tasks))
-                if tasks
-                else []
+            observed_batches = await _bounded_news_provider_batches(
+                task_specs,
+                execution_evidence=execution_evidence,
+                limit=requested_limit,
+                timeout_seconds=acquisition_budget,
             )
             batches = _complete_news_provider_batches(
                 observed_batches,
@@ -144,6 +176,10 @@ class NewsProvider(BaseProvider):
                 client,
                 articles,
                 batches=batches,
+                timeout_seconds=max(
+                    internal_deadline - loop.time() - 0.05,
+                    0.0,
+                ),
             )
             articles, post_enrichment_outside = _partition_recency(
                 articles,
@@ -606,9 +642,12 @@ class NewsProvider(BaseProvider):
         symbols: list[str],
         limit: int,
         recency_days: int,
+        execution_evidence: _NewsRequestCallEvidence | None = None,
     ) -> dict[str, Any]:
         provider = "Alpha Vantage NEWS_SENTIMENT"
         try:
+            if execution_evidence is not None:
+                execution_evidence.record_call(provider)
             response = await client.get(
                 self.settings.alpha_vantage_base_url,
                 params={
@@ -676,6 +715,7 @@ class NewsProvider(BaseProvider):
         query: str,
         limit: int,
         recency_days: int,
+        execution_evidence: _NewsRequestCallEvidence | None = None,
     ) -> dict[str, Any]:
         provider = "GDELT Doc API"
         attempts = 0
@@ -683,6 +723,8 @@ class NewsProvider(BaseProvider):
             while True:
                 attempts += 1
                 try:
+                    if execution_evidence is not None:
+                        execution_evidence.record_call(provider)
                     response = await client.get(
                         self.settings.gdelt_doc_api_url,
                         params={
@@ -785,7 +827,8 @@ class NewsProvider(BaseProvider):
         symbols: list[str],
         limit: int,
         recency_days: int,
-    ) -> list[Any]:
+        execution_evidence: _NewsRequestCallEvidence | None = None,
+    ) -> list[tuple[str, Any]]:
         query = f"{' OR '.join(symbols)} Nasdaq"
         feeds = [
             ("Federal Reserve RSS", self.settings.federal_reserve_rss_url, {}, 0.76),
@@ -801,16 +844,23 @@ class NewsProvider(BaseProvider):
             ),
         ]
         return [
-            _fetch_one_rss_feed(
-                client=client,
-                source=source,
-                url=url,
-                params=params,
-                reliability=reliability,
-                symbols=symbols,
-                limit=limit,
-                recency_days=recency_days,
-                timeout=min(float(self.settings.http_timeout_seconds), 4.0),
+            (
+                source,
+                _fetch_one_rss_feed(
+                    client=client,
+                    source=source,
+                    url=url,
+                    params=params,
+                    reliability=reliability,
+                    symbols=symbols,
+                    limit=limit,
+                    recency_days=recency_days,
+                    timeout=min(
+                        float(self.settings.http_timeout_seconds),
+                        4.0,
+                    ),
+                    execution_evidence=execution_evidence,
+                ),
             )
             for source, url, params, reliability in feeds
             if url
@@ -822,6 +872,7 @@ class NewsProvider(BaseProvider):
         articles: list[dict[str, object]],
         *,
         batches: list[dict[str, Any]],
+        timeout_seconds: float | None = None,
     ) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
         per_provider_count: Counter[str] = Counter()
@@ -967,7 +1018,66 @@ class NewsProvider(BaseProvider):
                 if batch.get("metadata_enrichment_status") != "PARTIAL":
                     batch["metadata_enrichment_status"] = "COMPLETE"
 
-        await asyncio.gather(*(enrich(article) for article in candidates))
+        tasks = {
+            asyncio.create_task(enrich(article)): article
+            for article in candidates
+        }
+        if not tasks:
+            return articles
+        if timeout_seconds is None:
+            await asyncio.gather(*tasks)
+            return articles
+
+        _, pending = await asyncio.wait(
+            tasks,
+            timeout=max(float(timeout_seconds), 0.0),
+        )
+        pending_articles = [tasks[task] for task in pending]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for article in pending_articles:
+            provider = str(
+                article.get("acquisition_provider")
+                or article.get("provider")
+                or article.get("provider_type")
+                or "UNKNOWN"
+            )
+            batch = next(
+                (
+                    item
+                    for item in batches
+                    if str(item.get("provider")) == provider
+                ),
+                None,
+            )
+            if batch is None:
+                continue
+            record_id = str(
+                article.get("raw_record_id")
+                or article.get("provider_record_id")
+                or ""
+            )
+            existing = {
+                str(item.get("record_id"))
+                for item in batch.get("metadata_enrichment_results") or []
+            }
+            if record_id in existing:
+                continue
+            batch["metadata_enrichment_status"] = "PARTIAL"
+            batch.setdefault("warnings", []).append(
+                f"{provider} metadata_enrichment_deadline"
+            )
+            batch.setdefault("metadata_enrichment_results", []).append(
+                {
+                    "record_id": record_id,
+                    "status": "FAILED",
+                    "reason_code": "METADATA_ENRICHMENT_DEADLINE",
+                    "error_type": "TimeoutError",
+                    "error": "request-scoped metadata deadline reached",
+                }
+            )
         return articles
 
 
@@ -982,8 +1092,11 @@ async def _fetch_one_rss_feed(
     limit: int,
     recency_days: int,
     timeout: float,
+    execution_evidence: _NewsRequestCallEvidence | None = None,
 ) -> dict[str, Any]:
     try:
+        if execution_evidence is not None:
+            execution_evidence.record_call(source)
         response = await client.get(
             url,
             params=params,
@@ -1858,6 +1971,138 @@ NEWS_PROVIDER_SPECS = (
 )
 
 
+def _news_request_budgets(settings: Settings) -> tuple[float, float]:
+    wrapper_budget = max(
+        float(settings.timeout_news_seconds),
+        1.0,
+    )
+    wrapper_grace = min(
+        1.0,
+        max(0.1, wrapper_budget * 0.1),
+    )
+    total_budget = max(wrapper_budget - wrapper_grace, 0.1)
+    acquisition_budget = max(total_budget * 0.7, 0.05)
+    return total_budget, min(acquisition_budget, total_budget)
+
+
+async def _bounded_news_provider_batches(
+    task_specs: list[tuple[str, Any]],
+    *,
+    execution_evidence: _NewsRequestCallEvidence,
+    limit: int,
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    if not task_specs:
+        return []
+
+    task_by_provider = {
+        provider: asyncio.create_task(awaitable)
+        for provider, awaitable in task_specs
+    }
+    _, pending = await asyncio.wait(
+        task_by_provider.values(),
+        timeout=max(float(timeout_seconds), 0.0),
+    )
+    pending_providers = {
+        provider
+        for provider, task in task_by_provider.items()
+        if task in pending
+    }
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    batches: list[dict[str, Any]] = []
+    for provider, task in task_by_provider.items():
+        provider_type, reliability = _news_provider_identity(provider)
+        calls = execution_evidence.calls(provider)
+        if provider in pending_providers:
+            if calls:
+                batches.append(
+                    _failed_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        error=TimeoutError(
+                            "request-scoped news fan-in deadline reached"
+                        ),
+                        calls=calls,
+                        status="TEMPORARILY_UNAVAILABLE",
+                        reason_code=(
+                            f"{_provider_reason_prefix(provider)}"
+                            "_FAN_IN_DEADLINE"
+                        ),
+                    )
+                )
+            else:
+                batches.append(
+                    _observed_skip_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        reason_code=(
+                            f"{_provider_reason_prefix(provider)}"
+                            "_FAN_IN_DEADLINE_BEFORE_ATTEMPT"
+                        ),
+                    )
+                )
+            continue
+        try:
+            batches.append(task.result())
+        except Exception as exc:
+            if calls:
+                batches.append(
+                    _failed_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        error=exc,
+                        calls=calls,
+                    )
+                )
+            else:
+                batches.append(
+                    _observed_skip_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        reason_code=(
+                            f"{_provider_reason_prefix(provider)}"
+                            "_EXECUTION_FAILED_BEFORE_ATTEMPT"
+                        ),
+                    )
+                )
+    return batches
+
+
+def _news_provider_identity(
+    provider: str,
+) -> tuple[ProviderType, float]:
+    for (
+        expected,
+        provider_type,
+        reliability,
+        _,
+        _,
+    ) in NEWS_PROVIDER_SPECS:
+        if expected == provider:
+            return provider_type, reliability
+    raise ValueError(f"unknown news provider: {provider}")
+
+
+def _provider_reason_prefix(provider: str) -> str:
+    return re.sub(
+        r"[^A-Z0-9]+",
+        "_",
+        provider.upper(),
+    ).strip("_")
+
+
 def _complete_news_provider_batches(
     batches: list[dict[str, Any]],
     *,
@@ -2023,6 +2268,31 @@ def _not_called_provider_batch(
         "errors": [],
         "_articles": [],
     }
+
+
+def _observed_skip_provider_batch(
+    *,
+    provider: str,
+    provider_type: ProviderType,
+    reliability: float,
+    limit: int,
+    reason_code: str,
+) -> dict[str, Any]:
+    batch = _not_called_provider_batch(
+        provider=provider,
+        provider_type=provider_type,
+        reliability=reliability,
+        limit=limit,
+        reason_code=reason_code,
+    )
+    batch.update(
+        {
+            "status": "NOT_CALLED",
+            "availability_status": "NOT_CALLED",
+            "coverage_status": "NOT_CALLED",
+        }
+    )
+    return batch
 
 
 def _failed_provider_batch(

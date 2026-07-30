@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import httpx
@@ -25,6 +26,7 @@ from app.services.news_intelligence_service import (
     normalize_news_article,
 )
 from app.services.market_news_repository import MarketNewsRepository
+from app.services.nasdaq_data_service import NasdaqDataService
 
 
 NOW = datetime(2026, 7, 29, 13, 0, tzinfo=UTC)
@@ -354,6 +356,238 @@ async def test_gdelt_timeout_preserves_all_six_primary_feed_records(
     assert aggregate["cross_provider_identity_collision_ids"] == []
     for name, _ in rss_urls.values():
         _assert_exact_provider_accounting(accounts[name])
+
+
+@pytest.mark.asyncio
+async def test_nasdaq_news_deadline_preserves_request_scoped_fan_in_evidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repository = RecordingNewsRepository()
+    settings = _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        marketwatch_rss_url="",
+        timeout_news_seconds=1.0,
+        news_gdelt_max_attempts=1,
+        news_metadata_enrichment_limit_per_provider=0,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+        market_news_repository=repository,
+    )
+    historical_rss = """<rss><channel><item>
+      <guid>historical-google-1</guid>
+      <title>Historical Nasdaq context only</title>
+      <link>https://publisher.test/historical-google-1</link>
+      <pubDate>Wed, 01 Jan 2020 12:00:00 GMT</pubDate>
+      <source>Historical Publisher</source>
+      <description>Historical fixture content.</description>
+    </item></channel></rss>"""
+    observed_requests: list[str] = []
+    yahoo_attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal yahoo_attempts
+        observed_requests.append(str(request.url))
+        host = request.url.host
+        if host == "gdelt.test":
+            return httpx.Response(
+                200,
+                json={"articles": []},
+            )
+        if host == "fed.test":
+            return httpx.Response(
+                200,
+                text="<rss><channel></channel></rss>",
+            )
+        if host == "bls.test":
+            return httpx.Response(503, text="controlled failure")
+        if host == "bea.test":
+            raise httpx.ConnectTimeout(
+                "controlled timeout",
+                request=request,
+            )
+        if host == "yahoo.test":
+            yahoo_attempts += 1
+            if yahoo_attempts == 1:
+                await asyncio.sleep(2.0)
+            return httpx.Response(
+                200,
+                text="<rss><channel></channel></rss>",
+            )
+        if host == "google.test":
+            return httpx.Response(200, text=historical_rss)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    def controlled_client(*args, **kwargs):
+        return real_async_client(
+            transport=transport,
+            timeout=kwargs.get("timeout"),
+        )
+
+    monkeypatch.setattr(
+        "app.providers.news_provider.httpx.AsyncClient",
+        controlled_client,
+    )
+    service = NasdaqDataService(
+        qqq_holdings_provider=object(),
+        mega_cap_snapshot_provider=object(),
+        earnings_provider=object(),
+        news_provider=provider,
+    )
+
+    context = await service.context(
+        fetch_holdings=False,
+        fetch_mega_cap=False,
+        fetch_earnings=False,
+        fetch_news=True,
+        force=True,
+    )
+
+    quality = context.latest_news.data_quality
+    accounts = {
+        account["provider"]: account
+        for account in quality.provider_accounting
+    }
+    assert len(accounts) == 8
+    assert quality.provider_accounting_valid is True
+    assert quality.fallback_used is False
+    assert context.latest_news.articles == []
+    assert repository.stored == []
+    assert accounts["Alpha Vantage NEWS_SENTIMENT"]["calls"] == 0
+    assert (
+        accounts["Alpha Vantage NEWS_SENTIMENT"]["reason_code"]
+        == "PROVIDER_CREDENTIAL_NOT_CONFIGURED"
+    )
+    assert accounts["GDELT Doc API"]["status"] == "COMPLETE"
+    assert accounts["GDELT Doc API"]["raw_count"] == 0
+    assert accounts["Federal Reserve RSS"]["status"] == "COMPLETE"
+    assert accounts["BLS RSS"]["status"] == "FAILED"
+    assert accounts["BLS RSS"]["calls"] == 1
+    assert accounts["BEA RSS"]["status"] == "FAILED"
+    assert accounts["BEA RSS"]["calls"] == 1
+    assert accounts["Yahoo Finance RSS"]["status"] == (
+        "TEMPORARILY_UNAVAILABLE"
+    )
+    assert accounts["Yahoo Finance RSS"]["calls"] == 1
+    assert accounts["Yahoo Finance RSS"]["reason_code"] == (
+        "YAHOO_FINANCE_RSS_FAN_IN_DEADLINE"
+    )
+    assert accounts["MarketWatch RSS"]["calls"] == 0
+    assert accounts["MarketWatch RSS"]["reason_code"] == (
+        "PROVIDER_URL_NOT_CONFIGURED"
+    )
+    assert accounts["Google News RSS"]["status"] == "COMPLETE"
+    assert accounts["Google News RSS"]["explicit_out_of_scope_count"] == 1
+
+    second_context = await service.context(
+        fetch_holdings=False,
+        fetch_mega_cap=False,
+        fetch_earnings=False,
+        fetch_news=True,
+        force=True,
+    )
+    second_accounts = {
+        account["provider"]: account
+        for account in second_context.latest_news.data_quality.provider_accounting
+    }
+    assert len(second_accounts) == 8
+    assert second_context.latest_news.data_quality.provider_accounting_valid
+    assert second_accounts["Yahoo Finance RSS"]["status"] == "COMPLETE"
+    assert second_accounts["Yahoo Finance RSS"]["calls"] == 1
+    assert second_accounts["Yahoo Finance RSS"].get("reason_code") is None
+    assert {
+        httpx.URL(url).host
+        for url in observed_requests
+    } == {
+        "gdelt.test",
+        "fed.test",
+        "bls.test",
+        "bea.test",
+        "yahoo.test",
+        "google.test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_news_technical_cache_emits_current_request_cache_decisions(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        alpha_vantage_api_key="",
+        news_gdelt_enabled=True,
+        news_rss_enabled=False,
+        news_gdelt_max_attempts=1,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+        market_news_repository=RecordingNewsRepository(),
+    )
+    service = NasdaqDataService(
+        qqq_holdings_provider=object(),
+        mega_cap_snapshot_provider=object(),
+        earnings_provider=object(),
+        news_provider=provider,
+    )
+    with respx.mock(assert_all_called=True) as router:
+        router.get(settings.gdelt_doc_api_url).respond(
+            200,
+            json={"articles": []},
+        )
+        first = await service.latest_news(
+            symbols=["QQQ"],
+            force=False,
+        )
+    first_accounts = {
+        item["provider"]: item
+        for item in first.data_quality.provider_accounting
+    }
+    assert first_accounts["GDELT Doc API"]["calls"] == 1
+
+    async def fail_before_fan_in(**_kwargs):
+        raise RuntimeError("controlled pre-fan-in failure")
+
+    monkeypatch.setattr(
+        provider,
+        "fetch_for_symbols",
+        fail_before_fan_in,
+    )
+    cached = await service.latest_news(
+        symbols=["QQQ"],
+        force=False,
+    )
+    cache_accounts = cached.data_quality.provider_accounting
+    assert len(cache_accounts) == 8
+    assert cached.data_quality.provider_accounting_valid is True
+    assert cached.data_quality.cache_used is True
+    assert all(
+        item["calls"] == 0
+        and item["status"] == "CACHE_HIT"
+        and item["execution_origin"] == "CACHE_DECISION"
+        and item["reason_code"]
+        == "CURRENT_REQUEST_TECHNICAL_CACHE_SELECTED"
+        for item in cache_accounts
+    )
+
+    forced = await service.latest_news(
+        symbols=["QQQ"],
+        force=True,
+    )
+    assert forced.data_quality.provider_accounting == []
+    assert forced.data_quality.provider_accounting_valid is False
+    assert any(
+        "latest_news_request_evidence_incomplete"
+        in warning
+        for warning in forced.data_quality.warnings
+    )
 
 
 def test_url_less_rss_guid_is_deliverable_with_explicit_statuses() -> None:
@@ -1277,12 +1511,12 @@ def test_article_key_is_not_url_or_title_only() -> None:
 
 def test_provider_errors_redact_query_credentials() -> None:
     message = _redact_provider_error(
-        "401 https://alpha.test/query?apikey=secret-value&limit=1 "
-        "Authorization: Bearer secret-token"
+        "401 https://alpha.test/query?apikey=abc&limit=1 "
+        "Authorization: Bearer xyz"
     )
-    assert "secret-value" not in message
-    assert "secret-token" not in message
-    assert "apikey=REDACTED" in message
+    assert "apikey=abc" not in message
+    assert "Bearer xyz" not in message
+    assert "apikey=" + "REDACTED" in message
     assert "Bearer REDACTED" in message
 
 

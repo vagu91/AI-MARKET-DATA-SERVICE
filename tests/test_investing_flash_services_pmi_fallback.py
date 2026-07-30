@@ -11,6 +11,7 @@ from app.infrastructure.persistence.provider_cache_repository import (
 )
 from app.providers.base import ProviderError
 from app.providers.investing_flash_services_pmi import (
+    INVESTING_BROWSER_USER_AGENT,
     SOURCE,
     InvestingFlashServicesPmiProvider,
 )
@@ -62,6 +63,38 @@ async def test_investing_fallback_preserves_exact_occurrence_and_field_lineage(
     assert series["distribution_source"] == "Investing.com"
     assert series["acquisition_provider"] == SOURCE
     assert set(series["field_lineage"]) == {"actual", "forecast", "previous"}
+
+
+async def test_investing_fallback_uses_verified_endpoint_http_contract(
+    tmp_path: Path,
+) -> None:
+    body = FIXTURE.read_bytes()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=body, request=request)
+
+    settings = _settings(tmp_path)
+    provider = InvestingFlashServicesPmiProvider(
+        ProviderCacheRepository(settings.database_path),
+        settings,
+        transport=httpx.MockTransport(handler),
+    )
+
+    await provider.fetch(
+        expected_period="2026-07",
+        release_date="2026-07-24",
+        expected_release_at="2026-07-24T13:45:00Z",
+    )
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == settings.investing_flash_services_pmi_url
+    assert request.headers["Accept"] == "application/json, text/plain, */*"
+    assert request.headers["Origin"] == "https://www.investing.com"
+    assert request.headers["Referer"] == "https://www.investing.com/"
+    assert request.headers["User-Agent"] == INVESTING_BROWSER_USER_AGENT
 
 
 async def test_investing_fallback_rejects_wrong_occurrence_or_period(

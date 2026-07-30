@@ -3,7 +3,7 @@ import inspect
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from app.models.common import ProviderType
+from app.models.common import ProviderResult, ProviderType
 from app.models.nasdaq import (
     BreadthContributor,
     EarningsQuality,
@@ -23,8 +23,9 @@ from app.models.nasdaq import (
 )
 from app.providers.earnings_provider import EarningsProvider
 from app.providers.mega_cap_snapshot_provider import MEGA_CAP_TICKERS, MegaCapSnapshotProvider
-from app.providers.news_provider import NewsProvider
+from app.providers.news_provider import NEWS_PROVIDER_SPECS, NewsProvider
 from app.providers.qqq_holdings_provider import QQQHoldingsProvider
+from app.services.data_freshness_service import parse_datetime
 from app.services.qqq_weight_intelligence_service import (
     EQUAL_WEIGHT_PROXY,
     RECONSTRUCTED_MARKET_CAP_WEIGHT,
@@ -318,18 +319,48 @@ class NasdaqDataService:
         *,
         force: bool = False,
     ) -> NewsResponse:
-        try:
-            result = await self.news_provider.fetch_for_symbols(
-                symbols=symbols,
-                limit=limit,
-                recency_days=recency_days,
-            )
-            self.news_provider.cache.set(self.news_provider.cache_key, result.model_dump(mode="json"))
-        except Exception:
+        fetch_for_symbols = getattr(
+            self.news_provider,
+            "fetch_for_symbols",
+            None,
+        )
+        if not callable(fetch_for_symbols):
             result = await _fetch_safe_with_force(
                 self.news_provider,
                 force=force,
             )
+        else:
+            try:
+                result = await fetch_for_symbols(
+                    symbols=symbols,
+                    limit=limit,
+                    recency_days=recency_days,
+                )
+                cache_deadline = (
+                    datetime.now(UTC) + timedelta(minutes=5)
+                )
+                self.news_provider.cache.set(
+                    self.news_provider.cache_key,
+                    result.model_dump(mode="json"),
+                    provider_name=self.news_provider.source,
+                    valid_until=cache_deadline.isoformat(),
+                    stale_until=cache_deadline.isoformat(),
+                    status="valid_cache",
+                )
+            except Exception as exc:
+                result = (
+                    None
+                    if force
+                    else _request_scoped_news_cache_result(
+                        self.news_provider,
+                        error=exc,
+                    )
+                )
+                if result is None:
+                    return _empty_news(
+                        "latest_news_request_evidence_incomplete:"
+                        f"{type(exc).__name__}"
+                    )
         data = result.data if isinstance(result.data, dict) else {}
         quality_data = data.get("data_quality", {})
         quality_data["fallback_used"] = bool(quality_data.get("fallback_used") or result.metadata.is_fallback)
@@ -460,7 +491,8 @@ class NasdaqDataService:
                     self.news_provider,
                     "timeout_news_seconds",
                     12.0,
-                ),
+                )
+                + 1.0,
                 fallback=lambda error: _empty_news(error),
                 warnings=warnings,
             )
@@ -550,6 +582,99 @@ async def _fetch_safe_with_force(
     return await fetch_call(
         **({"force": force} if supports_force else {})
     )
+
+
+def _request_scoped_news_cache_result(
+    provider: NewsProvider,
+    *,
+    error: Exception,
+) -> ProviderResult | None:
+    get_entry = getattr(provider.cache, "get_entry", None)
+    if not callable(get_entry):
+        return None
+    entry = get_entry(provider.cache_key)
+    now = datetime.now(UTC)
+    valid_until = parse_datetime(
+        entry.get("valid_until") if entry else None
+    )
+    if (
+        not entry
+        or entry.get("status") != "valid_cache"
+        or valid_until is None
+        or valid_until <= now
+    ):
+        return None
+    try:
+        result = ProviderResult.model_validate(entry["payload"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(result.data, dict):
+        return None
+    quality = (
+        dict(result.data.get("data_quality") or {})
+        if isinstance(result.data.get("data_quality"), dict)
+        else {}
+    )
+    cached_accounts = [
+        item
+        for item in (
+            quality.get("provider_accounting")
+            or result.data.get("provider_accounting")
+            or []
+        )
+        if isinstance(item, dict)
+    ]
+    by_provider = {
+        str(item.get("provider") or ""): item
+        for item in cached_accounts
+        if item.get("provider")
+    }
+    expected = [str(spec[0]) for spec in NEWS_PROVIDER_SPECS]
+    if (
+        len(cached_accounts) != len(expected)
+        or len(by_provider) != len(expected)
+        or set(by_provider) != set(expected)
+    ):
+        return None
+    cache_accounts = [
+        {
+            "provider": provider_name,
+            "status": "CACHE_HIT",
+            "calls": 0,
+            "reason_code": "CURRENT_REQUEST_TECHNICAL_CACHE_SELECTED",
+            "execution_origin": "CACHE_DECISION",
+            "cache_key": provider.cache_key,
+            "cached_provider_result": str(
+                by_provider[provider_name].get("status") or "UNKNOWN"
+            ),
+        }
+        for provider_name in expected
+    ]
+    articles = list(result.data.get("articles") or [])
+    quality.update(
+        {
+            "provider_accounting": cache_accounts,
+            "provider_accounting_valid": True,
+            "provider_calls": 0,
+            "actual_network_calls": 0,
+            "cache_used": True,
+            "fallback_used": True,
+            "final_data_available": bool(articles),
+            "no_data_found": not articles,
+            "warnings": _merge_errors(
+                quality.get("warnings") or [],
+                [
+                    "request_scoped_news_technical_cache_selected:"
+                    f"{type(error).__name__}"
+                ],
+            ),
+        }
+    )
+    result.data["provider_accounting"] = cache_accounts
+    result.data["data_quality"] = quality
+    result.metadata.provider_type = ProviderType.CACHE
+    result.metadata.is_fallback = True
+    return result
 
 
 def _provider_timeout(provider, name: str, default: float) -> float:

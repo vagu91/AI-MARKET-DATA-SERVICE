@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from app.main import app
 from app.api.routes import _consumer_projection
@@ -18,6 +22,9 @@ from app.services.senior_analyst_projection_v1 import (
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT_98_FIXTURE = (
     ROOT / "tests" / "fixtures" / "senior_analyst_snapshot98_compact.json"
+)
+DATA_SOURCE_MATRIX = (
+    ROOT / "docs" / "baselines" / "senior-analyst-data-source-matrix.json"
 )
 SNAPSHOT_98_ORIGIN_SHA256 = (
     "3dc318ebdb7df82462f328ac9e623c46b2b3ea57b4238fde37544c0b859ee232"
@@ -85,6 +92,34 @@ def test_snapshot_98_compact_fixture_is_versioned_and_bounded() -> None:
         "risk",
         "vix",
     }
+
+
+def test_data_source_matrix_records_first_live_exact_body_digest() -> None:
+    matrix = json.loads(DATA_SOURCE_MATRIX.read_text(encoding="utf-8"))
+    capture = matrix["authoritative_capture"]
+
+    assert capture == {
+        "snapshot_revision": 99,
+        "generated_at": "2026-07-30T11:57:24.569801+00:00",
+        "run_id": "20260730T115633Z",
+        "path": (
+            "data/senior-analyst-live-validation/20260730T115633Z/"
+            "response-body.json"
+        ),
+        "http_status": 200,
+        "body_size_bytes": 116_469,
+        "body_sha256": (
+            "9a768dd051d5375177723d67ce3c60630b892505b12bb535e883100b7f184835"
+        ),
+        "body_sha256_scope": "EXACT_HTTP_RESPONSE_BODY_BYTES",
+        "gate_status": "FAIL",
+        "provider_accounting_valid": False,
+    }
+    assert len(matrix["datasets"]) == 25
+    assert all(
+        row["last_live_result"].startswith("RUN_20260730T115633Z:")
+        for row in matrix["datasets"]
+    )
 
 
 def _synthetic_sync() -> dict:
@@ -402,8 +437,581 @@ def test_expired_news_and_stale_risk_values_never_feed_current_context() -> None
     assert analytics["news"]["status"] == "NO_DATA"
     assert analytics["vix"]["VIX"]["value"] is None
     assert analytics["vix"]["VVIX"]["value"] is None
+    assert analytics["vix"]["VIX"]["status"] == "UNAVAILABLE"
+    assert analytics["vix"]["VVIX"]["status"] == "UNAVAILABLE"
     assert analytics["risk"]["risk_sentiment"] is None
     assert analytics["risk"]["excluded_inputs_used"] is False
+
+
+def test_vix_and_vvix_null_values_are_not_delivered_from_metadata_only() -> None:
+    source = _synthetic_sync()
+    source["sections"]["vix"] = {
+        "vix": {
+            "value": None,
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "data_as_of": (FIXED_NOW - timedelta(days=1)).isoformat(),
+            "content_valid_until": (FIXED_NOW + timedelta(days=1)).isoformat(),
+            "source": "FRED",
+        },
+        "vvix": {
+            "value": None,
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "data_as_of": (FIXED_NOW - timedelta(hours=1)).isoformat(),
+            "content_valid_until": (FIXED_NOW + timedelta(hours=1)).isoformat(),
+            "source": "CBOE",
+        },
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    analytics = payload["analytics"]["vix"]
+
+    for dataset_id, symbol in (("vix", "VIX"), ("vvix", "VVIX")):
+        datum = analytics[symbol]
+        assert datum["value"] is None
+        assert datum["status"] == "UNAVAILABLE"
+        assert datum["freshness"] == "UNAVAILABLE"
+        assert datum["reason_code"] == f"{symbol}_VALUE_NOT_AVAILABLE"
+        assert any(
+            item["field"] == f"vix.{dataset_id}.value"
+            and item["reason_code"] == f"{symbol}_VALUE_NOT_AVAILABLE"
+            for item in payload["missing_data"]
+        )
+
+
+def test_validator_rejects_available_with_null_value() -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    payload["analytics"]["vix"]["VIX"].update(
+        {
+            "value": None,
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "reason_code": None,
+        }
+    )
+
+    result = validate_senior_analyst_payload_v1(payload, now=FIXED_NOW)
+
+    assert result["status"] == "FAIL"
+    assert result["checks"]["available_without_substantive_value"] == 1
+
+
+@pytest.mark.parametrize("dataset_id", ["vix", "risk"])
+def test_validator_rejects_selected_value_presence_without_substance(
+    dataset_id: str,
+) -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    row = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == dataset_id
+    )
+    row.update(
+        {
+            "selected_value_present": True,
+            "selected_source": {"publisher": "FRED"},
+            "delivered_value": {
+                "symbol": "VIX",
+                "value": None,
+                "status": "UNAVAILABLE",
+                "freshness": "UNAVAILABLE",
+            },
+        }
+    )
+
+    result = validate_senior_analyst_payload_v1(payload, now=FIXED_NOW)
+
+    assert result["status"] == "FAIL"
+    assert result["checks"]["selected_value_presence_mismatches"] == 1
+
+
+def test_validator_rejects_positioning_with_only_metadata() -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    metadata_only = {
+        "report_date": "2026-07-28",
+        "publication_date": "2026-07-30",
+        "contract_code": "209742",
+        "open_interest": None,
+        "asset_managers": {},
+        "leveraged_funds": {},
+        "dealers": {},
+    }
+    payload["analytics"]["positioning"].update(
+        {
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "reason_code": None,
+            "cot": metadata_only,
+        }
+    )
+    row = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == "positioning"
+    )
+    row.update(
+        {
+            "selected_value_present": True,
+            "selected_source": "CFTC",
+            "delivered_value": metadata_only,
+        }
+    )
+
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+
+    assert result["status"] == "FAIL"
+    assert (
+        result["checks"]["available_without_substantive_value"]
+        == 1
+    )
+    assert result["checks"]["selected_value_presence_mismatches"] == 1
+
+
+def test_projection_excludes_positioning_with_only_metadata() -> None:
+    source = _synthetic_sync()
+    source["sections"]["positioning"] = {
+        "status": "AVAILABLE",
+        "freshness": "CURRENT",
+        "source": "CFTC",
+        "data_as_of": (FIXED_NOW - timedelta(days=1)).isoformat(),
+        "content_valid_until": (
+            FIXED_NOW + timedelta(days=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            FIXED_NOW + timedelta(hours=12)
+        ).isoformat(),
+        "cot": {
+            "nasdaq_100": {
+                "report_date": "2026-07-28",
+                "publication_date": "2026-07-29",
+                "cftc_contract_market_code": "209742",
+                "open_interest": None,
+                "asset_managers": {},
+                "leveraged_funds": {},
+                "dealers": {},
+            }
+        },
+    }
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    positioning = payload["analytics"]["positioning"]
+    assert positioning["status"] == "UNAVAILABLE"
+    assert positioning["freshness"] == "UNAVAILABLE"
+    assert positioning["reason_code"] == (
+        "POSITIONING_VALUE_NOT_AVAILABLE"
+    )
+    assert positioning["cot"] == {}
+    assert any(
+        item["field"] == "positioning"
+        and item["reason_code"]
+        == "POSITIONING_VALUE_NOT_AVAILABLE"
+        for item in payload["missing_data"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("section_name", "section", "expected_reason"),
+    [
+        (
+            "options_positioning",
+            {
+                "status": "AVAILABLE",
+                "freshness": "CURRENT",
+                "source": "TRADIER",
+                "open_interest": {
+                    "symbol": "QQQ",
+                    "expiration": "2026-08-01",
+                    "data_as_of": "2026-07-29",
+                },
+                "skew": {
+                    "calculation_version": 1,
+                },
+            },
+            "OPTIONS_POSITIONING_VALUE_NOT_AVAILABLE",
+        ),
+        (
+            "risk",
+            {
+                "risk_context": {
+                    "status": "AVAILABLE",
+                    "freshness": "CURRENT",
+                    "source": "CBOE",
+                    "derived_context": {
+                        "risk_regime": {
+                            "calculation_version": 1,
+                        },
+                        "risk_score": {
+                            "calculation_version": 1,
+                        },
+                    },
+                },
+            },
+            "RISK_VALUE_NOT_AVAILABLE",
+        ),
+        (
+            "market_schedule",
+            {
+                "nasdaq_cash_session_verified": True,
+                "context_date": "2026-07-29",
+                "market_session_status": {
+                    "calculation_version": 1,
+                },
+                "nasdaq_cash_session": {
+                    "status": {"metadata": 1},
+                    "next_open": {"metadata": 1},
+                },
+            },
+            "MARKET_SCHEDULE_VALUE_NOT_AVAILABLE",
+        ),
+    ],
+)
+def test_projection_excludes_other_metadata_only_datasets(
+    section_name: str,
+    section: dict,
+    expected_reason: str,
+) -> None:
+    source = _synthetic_sync()
+    dated_section = deepcopy(section)
+    target = (
+        dated_section["risk_context"]
+        if section_name == "risk"
+        else dated_section
+    )
+    if section_name != "market_schedule":
+        target.update(
+            {
+                "data_as_of": (
+                    FIXED_NOW - timedelta(hours=1)
+                ).isoformat(),
+                "content_valid_until": (
+                    FIXED_NOW + timedelta(hours=1)
+                ).isoformat(),
+                "refresh_due_at": (
+                    FIXED_NOW + timedelta(minutes=30)
+                ).isoformat(),
+            }
+        )
+    source["sections"][section_name] = dated_section
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+    projected = payload["analytics"][section_name]
+
+    assert projected["status"] == "UNAVAILABLE"
+    assert projected["freshness"] == "UNAVAILABLE"
+    assert projected["reason_code"] == expected_reason
+    assert any(
+        item["reason_code"] == expected_reason
+        for item in payload["missing_data"]
+    )
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        None,
+        "N/A",
+        "NULL",
+        "META_TITLE_QUOTE",
+        {"word_count": 10},
+        ["token"],
+        123,
+    ],
+)
+def test_projection_excludes_metadata_only_current_news(
+    summary: object,
+) -> None:
+    source = _synthetic_sync()
+    source["sections"]["news"] = {
+        "latest": [
+            {
+                "article_id": "metadata-only",
+                "published_at": (
+                    FIXED_NOW - timedelta(hours=1)
+                ).isoformat(),
+                "source": "Metadata Wire",
+                "source_url": "https://example.test/metadata-only",
+                "symbols": ["QQQ"],
+                "summary": summary,
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    news = payload["analytics"]["news"]
+    assert news["status"] == "NO_DATA"
+    assert news["current_news"] == []
+    assert news["reason_code"] == "NO_CURRENT_NEWS"
+    assert any(
+        item["field"] == "news.current_news"
+        and item["reason_code"] == "NO_CURRENT_NEWS"
+        for item in payload["missing_data"]
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_calls",
+    [
+        {"metadata": 1},
+        [1],
+        "NaN",
+        "Infinity",
+    ],
+)
+def test_projection_rejects_non_scalar_option_measures(
+    invalid_calls: object,
+) -> None:
+    source = _synthetic_sync()
+    source["sections"]["options_positioning"] = {
+        "status": "AVAILABLE",
+        "freshness": "CURRENT",
+        "source": "TRADIER",
+        "data_as_of": (FIXED_NOW - timedelta(hours=1)).isoformat(),
+        "content_valid_until": (
+            FIXED_NOW + timedelta(hours=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            FIXED_NOW + timedelta(minutes=30)
+        ).isoformat(),
+        "open_interest": {
+            "calls": invalid_calls,
+        },
+    }
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    projected = payload["analytics"]["options_positioning"]
+    assert projected["status"] == "UNAVAILABLE"
+    assert projected["reason_code"] == (
+        "OPTIONS_POSITIONING_VALUE_NOT_AVAILABLE"
+    )
+
+
+@pytest.mark.parametrize(
+    ("section_name", "projected"),
+    [
+        (
+            "news",
+            {
+                "status": "AVAILABLE",
+                "current_news": [
+                    {
+                        "article_id": "metadata-only",
+                        "published_at": "2026-07-29T17:00:00+00:00",
+                        "source": "Metadata Wire",
+                    }
+                ],
+            },
+        ),
+        (
+            "options_positioning",
+            {
+                "status": "AVAILABLE",
+                "open_interest": {
+                    "symbol": "QQQ",
+                    "expiration": "2026-08-01",
+                },
+                "volume": {},
+                "skew": {},
+                "iv_atm": None,
+            },
+        ),
+        (
+            "risk",
+            {
+                "status": "AVAILABLE",
+                "risk_sentiment": None,
+                "risk_score": None,
+                "excluded_inputs_used": False,
+            },
+        ),
+        (
+            "market_schedule",
+            {
+                "status": "AVAILABLE",
+                "context_date": "2026-07-29",
+                "market_session_status": None,
+                "nasdaq_cash_session": {},
+                "mnq_futures_session": {},
+            },
+        ),
+    ],
+)
+def test_validator_rejects_metadata_only_available_dataset(
+    section_name: str,
+    projected: dict,
+) -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    payload["analytics"][section_name].update(projected)
+
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+
+    assert result["status"] == "FAIL"
+    assert (
+        result["checks"]["available_without_substantive_value"]
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("section_name", "projected"),
+    [
+        (
+            "options_positioning",
+            {
+                "status": "AVAILABLE",
+                "open_interest": {"calls": 0},
+            },
+        ),
+        (
+            "risk",
+            {
+                "status": "AVAILABLE",
+                "risk_sentiment": None,
+                "risk_score": 0,
+            },
+        ),
+        (
+            "market_schedule",
+            {
+                "status": "AVAILABLE",
+                "market_session_status": None,
+                "nasdaq_cash_session": {
+                    "status": None,
+                    "is_open": False,
+                },
+            },
+        ),
+    ],
+)
+def test_validator_treats_zero_and_false_as_observed_values(
+    section_name: str,
+    projected: dict,
+) -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    payload["analytics"][section_name].update(projected)
+
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+
+    assert (
+        result["checks"]["available_without_substantive_value"]
+        == 0
+    )
+
+
+def test_validator_accepts_zero_as_substantive_positioning_value() -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    payload["analytics"]["positioning"].update(
+        {
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "reason_code": None,
+            "cot": {
+                "report_date": "2026-07-28",
+                "publication_date": "2026-07-30",
+                "contract_code": "209742",
+                "open_interest": 0,
+                "asset_managers": {},
+                "leveraged_funds": {},
+                "dealers": {},
+            },
+        }
+    )
+
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+
+    assert (
+        result["checks"]["available_without_substantive_value"]
+        == 0
+    )
+
+
+def test_cli_gate_rejects_available_with_null_value(
+    tmp_path: Path,
+) -> None:
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=FIXED_NOW,
+    )
+    payload["analytics"]["vix"]["VIX"].update(
+        {
+            "value": None,
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "reason_code": None,
+        }
+    )
+    input_path = tmp_path / "payload.json"
+    output_path = tmp_path / "report.json"
+    input_path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "validate_senior_analyst_payload.py"),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--process-cleanup-ok",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert completed.returncode == 1
+    assert report["status"] == "FAIL"
+    assert report["checks"]["available_without_substantive_value"] == 1
 
 
 def test_readiness_counts_only_filtered_delivered_values() -> None:

@@ -2,9 +2,16 @@
   "contract": "SeniorAnalystDataSourceMatrix",
   "schema_version": "1.0",
   "authoritative_capture": {
-    "snapshot_revision": 98,
-    "generated_at": "2026-07-29T18:17:25.927920+00:00",
-    "path": "data/live-ai-trader-capture-20260729T181632Z/senior-analyst-consumer-full.json"
+    "snapshot_revision": 99,
+    "generated_at": "2026-07-30T11:57:24.569801+00:00",
+    "run_id": "20260730T115633Z",
+    "path": "data/senior-analyst-live-validation/20260730T115633Z/response-body.json",
+    "http_status": 200,
+    "body_size_bytes": 116469,
+    "body_sha256": "9a768dd051d5375177723d67ce3c60630b892505b12bb535e883100b7f184835",
+    "body_sha256_scope": "EXACT_HTTP_RESPONSE_BODY_BYTES",
+    "gate_status": "FAIL",
+    "provider_accounting_valid": false
   },
   "failure_policy": "RETURN_NULL",
   "known_rate_limit_policy": "Use UNKNOWN unless proved by repository configuration or captured headers.",
@@ -24,7 +31,7 @@
       "retry_policy": "bounded; no retry inferred beyond configured runtime",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "AVAILABLE_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_INCOMPLETE; DELIVERY_PRESENT_CURRENT"
     },
     {
       "dataset_id": "mega_cap_quotes",
@@ -41,7 +48,7 @@
       "retry_policy": "bounded",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "AVAILABLE; legacy driver_context contradicted canonical quote changes"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; DELIVERY_PRESENT_CURRENT"
     },
     {
       "dataset_id": "market_internals",
@@ -58,7 +65,7 @@
       "retry_policy": "bounded",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "REJECTED_SNAPSHOT_98_STALE_CONSTITUENT_QUOTES"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_STALE_CONSTITUENT_QUOTES"
     },
     {
       "dataset_id": "vix",
@@ -75,7 +82,7 @@
       "retry_policy": "configured FRED bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "EXPIRED_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; INVALID_AVAILABLE_WITH_NULL_VALUE"
     },
     {
       "dataset_id": "vvix",
@@ -92,7 +99,7 @@
       "retry_policy": "risk lifecycle bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "EXPIRED_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; INVALID_SELECTED_VALUE_PRESENT_WITH_NULL_VALUE; LATEST_OFFICIAL_RELEASE_NOT_PROVEN"
     },
     {
       "dataset_id": "risk",
@@ -109,7 +116,7 @@
       "retry_policy": "risk lifecycle bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "REJECTED_SNAPSHOT_98_STALE_INPUTS"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_DATASET_SLA_EXCEEDED"
     },
     {
       "dataset_id": "treasury_rates",
@@ -126,7 +133,7 @@
       "retry_policy": "configured FRED bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "PARTIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "fed_funds",
@@ -143,7 +150,7 @@
       "retry_policy": "configured FRED bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "PARTIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "target_range",
@@ -160,7 +167,7 @@
       "retry_policy": "next scheduled lifecycle refresh",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "PRE_RELEASE_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "fomc_expectations",
@@ -177,7 +184,7 @@
       "retry_policy": "bounded",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "NO_PROBABILITIES_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_OFFICIAL_OUTCOME_NOT_AVAILABLE"
     },
     {
       "dataset_id": "cpi",
@@ -194,7 +201,7 @@
       "retry_policy": "configured BLS bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "CORE_AVAILABLE_HEADLINE_MISSING_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_CONTENT_VALIDITY_EXPIRED"
     },
     {
       "dataset_id": "ppi",
@@ -211,7 +218,7 @@
       "retry_policy": "configured BLS bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "AVAILABLE_LATEST_OFFICIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_CONTENT_VALIDITY_EXPIRED"
     },
     {
       "dataset_id": "pce",
@@ -228,7 +235,7 @@
       "retry_policy": "configured BEA bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "NOMINAL_AND_CORE_AVAILABLE_HEADLINE_PRICE_INDEX_MISSING"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_INCOMPLETE; NULL_SOURCE_SERIES_NOT_AVAILABLE"
     },
     {
       "dataset_id": "gdp",
@@ -245,7 +252,7 @@
       "retry_policy": "configured BEA bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "AVAILABLE_LATEST_OFFICIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "employment",
@@ -262,7 +269,7 @@
       "retry_policy": "configured BLS bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "AVAILABLE_LATEST_OFFICIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "wages",
@@ -279,7 +286,7 @@
       "retry_policy": "configured BLS bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "LEVEL_AVAILABLE_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "nfp",
@@ -296,7 +303,7 @@
       "retry_policy": "configured BLS bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "LEVEL_AVAILABLE_CHANGE_NULL_INSUFFICIENT_HISTORY"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL"
     },
     {
       "dataset_id": "jobless_claims",
@@ -313,7 +320,7 @@
       "retry_policy": "configured FRED bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "187000_CLAIMS_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; DELIVERY_PRESENT_CURRENT"
     },
     {
       "dataset_id": "macro_calendar",
@@ -330,7 +337,7 @@
       "retry_policy": "bounded per configured provider runtime",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "LEGACY_DUPLICATES_AND_PAST_AWAITING_PRESENT_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_INCOMPLETE; SCHEDULE_CATCH_UP_COMPLETED; DELIVERY_PRESENT_CURRENT"
     },
     {
       "dataset_id": "flash_services_pmi",
@@ -347,7 +354,7 @@
       "retry_policy": "primary once then authorized fallback once",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "PRIMARY_HTTP_403; LEGACY_ACTUAL_NULL; OFFLINE_FALLBACK_FIXTURE_SUCCESS"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; PRIMARY_HTTP_403; INVESTING_EVENT_1062_HTTP_403; NULL"
     },
     {
       "dataset_id": "earnings",
@@ -364,7 +371,7 @@
       "retry_policy": "bounded",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "NO_CURRENT_CANONICAL_EVENTS_IN_PROJECTION_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_NO_CURRENT_EARNINGS_EVENTS"
     },
     {
       "dataset_id": "options_positioning",
@@ -381,7 +388,7 @@
       "retry_policy": "bounded",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "REJECTED_FUTURE_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_STALE_VALUE_EXCLUDED"
     },
     {
       "dataset_id": "positioning",
@@ -398,7 +405,7 @@
       "retry_policy": "next scheduled weekly refresh",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "AVAILABLE_LATEST_OFFICIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; NULL_LATEST_OFFICIAL_RELEASE_NOT_PROVEN"
     },
     {
       "dataset_id": "current_news",
@@ -415,7 +422,7 @@
       "retry_policy": "configured fan-in bounded retry",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "NO_CURRENT_NEWS_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_INCOMPLETE; NULL_NO_CURRENT_NEWS"
     },
     {
       "dataset_id": "market_schedule",
@@ -432,7 +439,7 @@
       "retry_policy": "bounded per provider",
       "known_rate_limit": "UNKNOWN",
       "failure_policy": "RETURN_NULL",
-      "last_live_result": "PARTIAL_SNAPSHOT_98"
+      "last_live_result": "RUN_20260730T115633Z: ACCOUNTING_COMPLETE; DELIVERY_PRESENT_CURRENT"
     }
   ]
 }

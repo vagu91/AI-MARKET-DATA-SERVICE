@@ -446,7 +446,7 @@ def _provider_flow_valid(
             or (
                 attempt.get("called") is False
                 and attempt.get("execution_origin")
-                == "OBSERVED_SKIP"
+                in {"OBSERVED_SKIP", "CACHE_DECISION"}
             )
             for attempt in attempts
         )
@@ -518,6 +518,8 @@ def _attempt_succeeded(attempt: dict[str, Any]) -> bool:
     if attempt.get("called") is not True:
         return False
     result = str(attempt.get("result") or "").upper()
+    if result.startswith("SCHEDULE_CATCH_UP_"):
+        return result == "SCHEDULE_CATCH_UP_COMPLETED"
     return bool(
         any(
             token in result

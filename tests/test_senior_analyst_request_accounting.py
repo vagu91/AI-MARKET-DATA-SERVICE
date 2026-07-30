@@ -373,3 +373,42 @@ def test_flash_pmi_event_without_actual_has_null_delivery_evidence() -> None:
     assert row["selected_value_present"] is False
     assert row["delivered_value"] is None
     assert row["selected_source"] is None
+
+
+def test_vix_and_vvix_null_delivery_is_not_selected_from_metadata() -> None:
+    source = _source()
+    source["sections"]["vix"] = {
+        "vix": {
+            "value": None,
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "data_as_of": (NOW - timedelta(days=1)).isoformat(),
+            "content_valid_until": (NOW + timedelta(days=1)).isoformat(),
+            "source": "FRED",
+        },
+        "vvix": {
+            "value": None,
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "data_as_of": (NOW - timedelta(hours=1)).isoformat(),
+            "content_valid_until": (NOW + timedelta(hours=1)).isoformat(),
+            "source": "CBOE",
+        },
+    }
+    source["request_scoped_provider_accounting"] = _manifest()
+
+    payload = _build(source)
+    rows = {
+        row["dataset_id"]: row
+        for row in payload["provider_accounting"]
+        if row["dataset_id"] in {"vix", "vvix"}
+    }
+
+    for dataset_id in ("vix", "vvix"):
+        row = rows[dataset_id]
+        assert row["evidence_status"] == "COMPLETE"
+        assert row["selected_value_present"] is False
+        assert row["delivered_value"] is None
+        assert row["selected_source"] is None
+        assert row["payload_freshness"] == "UNAVAILABLE"
+    assert _validate_live(payload)["checks"]["provider_accounting_valid"] is True

@@ -140,29 +140,66 @@ def fact_temporal_status(fact: dict[str, Any], *, now: datetime | None = None) -
 
 
 def news_content_status(item: dict[str, Any]) -> str:
-    title = clean_text(item.get("title"))
-    text = str(title or "").strip()
-    upper = text.upper()
-    alternative_content = clean_text(
-        item.get("content")
-        or item.get("full_content")
-        or item.get("content_snippet")
-        or item.get("summary")
-        or item.get("description")
-    )
-    if not text:
-        return "valid" if alternative_content else "invalid_content"
-    if upper in {"META_TITLE_QUOTE", "TITLE_QUOTE", "N/A", "NULL", "NONE"}:
-        return "valid" if alternative_content else "invalid_content"
-    if "META_TITLE_QUOTE" in upper:
-        return "valid" if alternative_content else "invalid_content"
-    if upper.endswith("_TITLE_QUOTE") or upper.endswith("_QUOTE"):
-        return "valid" if alternative_content else "invalid_content"
-    if "_" in text and upper == text and not any(ch.isalpha() and ch.islower() for ch in text):
-        return "valid" if alternative_content else "invalid_content"
-    if any(token in text for token in ("Ã", "â", "\ufffd")):
+    title = item.get("title") or item.get("headline")
+    normalized_title = clean_text(title)
+    if (
+        isinstance(normalized_title, str)
+        and any(
+            token in normalized_title
+            for token in ("Ã", "â", "\ufffd")
+        )
+    ):
         return "invalid_content"
-    return "valid"
+    if substantive_news_text(title):
+        return "valid"
+    alternatives = (
+        item.get("content"),
+        item.get("full_content"),
+        item.get("content_snippet"),
+        item.get("summary"),
+        item.get("description"),
+    )
+    return (
+        "valid"
+        if any(
+            substantive_news_text(value)
+            for value in alternatives
+        )
+        else "invalid_content"
+    )
+
+
+def substantive_news_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = str(clean_text(value) or "").strip()
+    if not text:
+        return False
+    upper = text.upper()
+    if upper in {
+        "META_TITLE_QUOTE",
+        "TITLE_QUOTE",
+        "N/A",
+        "NULL",
+        "NONE",
+    }:
+        return False
+    if "META_TITLE_QUOTE" in upper:
+        return False
+    if upper.endswith("_TITLE_QUOTE") or upper.endswith("_QUOTE"):
+        return False
+    if (
+        "_" in text
+        and upper == text
+        and not any(
+            character.isalpha() and character.islower()
+            for character in text
+        )
+    ):
+        return False
+    if any(token in text for token in ("Ã", "â", "\ufffd")):
+        return False
+    return True
 
 
 def reject_future_actual(item: dict[str, Any], *, now: datetime | None = None) -> tuple[dict[str, Any], bool]:

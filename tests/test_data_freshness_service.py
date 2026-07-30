@@ -194,7 +194,149 @@ def test_recent_retrieval_does_not_refresh_old_official_release() -> None:
     assert result.usable is False
     assert result.expired is True
     assert result.evaluation == "SLA_EXPIRED"
-    assert result.data_as_of == "2026-01"
+    assert result.data_as_of == (
+        "2026-01-31T23:59:59.999999+00:00"
+    )
+
+
+@pytest.mark.parametrize(
+    ("data_as_of", "canonical_data_as_of"),
+    [
+        (
+            "Jul 29, 2026",
+            "2026-07-29T00:00:00+00:00",
+        ),
+        (
+            "Jul 29, 2026 2:16 PM",
+            "2026-07-29T14:16:00+00:00",
+        ),
+    ],
+)
+def test_english_textual_reference_is_not_replaced_by_retrieval_time(
+    data_as_of: str,
+    canonical_data_as_of: str,
+) -> None:
+    row = {
+        "data_as_of": data_as_of,
+        "retrieved_at": NOW.isoformat(),
+        "content_valid_until": (
+            NOW + timedelta(hours=2)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW + timedelta(hours=1)
+        ).isoformat(),
+    }
+
+    result = _evaluate(
+        row,
+        policy=_policy(
+            mode="point_in_time",
+            max_age=timedelta(days=2),
+        ),
+    )
+
+    assert result.complete is True
+    assert result.usable is True
+    assert result.evaluation == "VALID"
+    assert result.data_as_of == canonical_data_as_of
+    assert result.content_valid_until == row["content_valid_until"]
+    assert result.refresh_due_at == row["refresh_due_at"]
+
+
+def test_nasdaq_weight_as_of_precedes_recent_retrieval_time() -> None:
+    row = {
+        "retrieved_at": NOW.isoformat(),
+        "content_valid_until": (
+            NOW + timedelta(hours=2)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW + timedelta(hours=1)
+        ).isoformat(),
+        "raw_payload": {
+            "weight_as_of": "Jul 29, 2026",
+            "as_of": "Jul 29, 2026 2:16 PM",
+        },
+    }
+
+    result = _evaluate(
+        row,
+        policy=_policy(
+            mode="point_in_time",
+            max_age=timedelta(days=2),
+        ),
+    )
+
+    assert result.complete is True
+    assert result.usable is True
+    assert result.data_as_of == "2026-07-29T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("data_as_of", ["2026M05", "2026M5"])
+def test_bea_month_reference_uses_official_month_end(
+    data_as_of: str,
+) -> None:
+    month_end_plus_30_days = datetime(
+        2026,
+        6,
+        30,
+        23,
+        59,
+        59,
+        999999,
+        tzinfo=UTC,
+    )
+    row = {
+        "data_as_of": data_as_of,
+        "retrieved_at": month_end_plus_30_days.isoformat(),
+        "content_valid_until": "2026-07-02T00:00:00+00:00",
+        "refresh_due_at": "2026-07-02T00:00:00+00:00",
+    }
+    policy = _policy(max_age=timedelta(days=30))
+
+    at_boundary = evaluate_canonical_freshness(
+        row,
+        policy=policy,
+        observed_at=month_end_plus_30_days,
+    )
+    after_boundary = evaluate_canonical_freshness(
+        row,
+        policy=policy,
+        observed_at=month_end_plus_30_days + timedelta(microseconds=1),
+    )
+
+    assert at_boundary.complete is True
+    assert at_boundary.usable is True
+    assert at_boundary.evaluation == "VALID"
+    assert at_boundary.data_as_of == (
+        "2026-05-31T23:59:59.999999+00:00"
+    )
+    assert after_boundary.complete is True
+    assert after_boundary.usable is False
+    assert after_boundary.expired is True
+    assert after_boundary.evaluation == "SLA_EXPIRED"
+
+
+def test_invalid_explicit_reference_does_not_fall_back_to_retrieved_at() -> None:
+    row = {
+        "data_as_of": "not-a-canonical-reference",
+        "retrieved_at": NOW.isoformat(),
+        "content_valid_until": (
+            NOW + timedelta(hours=2)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW + timedelta(hours=1)
+        ).isoformat(),
+    }
+
+    result = _evaluate(
+        row,
+        policy=_policy(mode="point_in_time"),
+    )
+
+    assert result.complete is False
+    assert result.usable is False
+    assert result.evaluation == "INVALID_DATA_AS_OF"
+    assert result.data_as_of == row["data_as_of"]
 
 
 def test_future_occurrence_is_allowed_only_for_event_policy() -> None:

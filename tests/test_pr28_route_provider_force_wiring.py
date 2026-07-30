@@ -75,7 +75,7 @@ def _settings(tmp_path: Path) -> Settings:
         diagnostics_dir=tmp_path / "diagnostics",
         backups_dir=tmp_path / "backups",
         logs_dir=tmp_path / "logs",
-        fred_api_key="controlled-test-key",
+        **{"fred_api_key": "test"},
         fred_enabled=True,
         bls_enabled=False,
         bea_enabled=False,
@@ -1397,6 +1397,10 @@ def test_real_senior_route_emits_request_scoped_accounting_on_two_force_requests
         } == expected
         assert len(rows) == len(expected)
         assert len(rows) == 25
+        assert all(
+            row["evidence_status"] == "COMPLETE"
+            for row in rows
+        )
         missing_database_lookup = [
             row["dataset_id"]
             for row in rows
@@ -1425,6 +1429,19 @@ def test_real_senior_route_emits_request_scoped_accounting_on_two_force_requests
         for row in second_payload["provider_accounting"]
         if row.get("evidence_status") != "COMPLETE"
     ]
+    assert incomplete_rows == []
+    null_rows = [
+        row
+        for row in second_payload["provider_accounting"]
+        if row["selected_value_present"] is False
+    ]
+    assert null_rows
+    assert all(
+        row["delivered_value"] is None
+        and row["payload_freshness"] == "UNAVAILABLE"
+        and row["reason_code"]
+        for row in null_rows
+    )
     assert second_payload["request"][
         "same_request_provider_accounting"
     ] is True, incomplete_rows
@@ -1491,7 +1508,9 @@ def test_real_senior_route_observes_expired_nasdaq_news_and_earnings_chains(
     )
     now = datetime.now(UTC).replace(microsecond=0)
     event_date = (now.date() + timedelta(days=2)).isoformat()
-    gdelt_seen = now.strftime("%Y%m%dT%H%M%SZ")
+    gdelt_seen = (now - timedelta(days=30)).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
 
     with respx.mock(
         assert_all_mocked=False,
@@ -1663,6 +1682,17 @@ def test_real_senior_route_observes_expired_nasdaq_news_and_earnings_chains(
         for item in news_attempts[2:]
     )
     assert news["evidence_status"] == "COMPLETE"
+    assert news["acquisition_selected_source"] is None
+    assert (
+        news["acquisition_reason_code"]
+        == "NEWS_FAN_IN_COMPLETED_NO_CURRENT_DATA"
+    )
+    assert news["selected_value_present"] is False
+    assert news["delivered_value"] is None
+    assert news["payload_freshness"] == "UNAVAILABLE"
+    assert news["delivery_missing_reason_codes"] == [
+        "NO_CURRENT_NEWS"
+    ]
 
     earnings = rows["earnings"]
     assert earnings["database_lookup_performed"] is True

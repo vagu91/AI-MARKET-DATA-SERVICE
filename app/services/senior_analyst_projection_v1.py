@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
 
+from app.services.data_integrity_service import (
+    news_content_status,
+    substantive_news_text,
+)
 from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_sync_service import extract_sync_sections
 from app.services.official_actual_semantics import normalize_reference_period
@@ -401,6 +406,14 @@ def validate_senior_analyst_payload_v1(
         if item.get("invalid_period_mapping") is True
     )
     invalid_states = _invalid_state_count(analytics)
+    available_without_value = _available_without_substantive_value_count(
+        analytics
+    )
+    selected_value_presence_mismatches = (
+        _selected_value_presence_mismatch_count(
+            payload.get("provider_accounting") or []
+        )
+    )
     expired_values = _expired_or_future_delivered_value_count(
         analytics,
         now=clock,
@@ -436,6 +449,10 @@ def validate_senior_analyst_payload_v1(
     checks = {
         "response_generated_recently": response_recent,
         "expired_values_delivered": invalid_states + expired_values,
+        "available_without_substantive_value": available_without_value,
+        "selected_value_presence_mismatches": (
+            selected_value_presence_mismatches
+        ),
         "stale_values_presented_as_current": _stale_presented_current(analytics),
         "invalid_temporal_mappings": invalid_mappings,
         "semantic_mapping_errors": semantic_errors,
@@ -453,6 +470,8 @@ def validate_senior_analyst_payload_v1(
             checks[key] == 0
             for key in (
                 "expired_values_delivered",
+                "available_without_substantive_value",
+                "selected_value_presence_mismatches",
                 "stale_values_presented_as_current",
                 "invalid_temporal_mappings",
                 "semantic_mapping_errors",
@@ -1069,6 +1088,17 @@ def _project_market_internals(
         "percent_advancers",
         "weighted_breadth",
     )
+    if assessment["usable"] and not any(
+        _finite_scalar_number_present(section.get(field))
+        for field in fields
+    ):
+        assessment = {
+            **assessment,
+            "usable": False,
+            "status": "UNAVAILABLE",
+            "freshness": "UNAVAILABLE",
+            "reason_code": "MARKET_INTERNALS_VALUE_NOT_AVAILABLE",
+        }
     values = {
         field: section.get(field) if assessment["usable"] else None
         for field in fields
@@ -1109,6 +1139,48 @@ def _project_news(
     for raw in candidates:
         if not isinstance(raw, dict):
             continue
+        headline = raw.get("headline") or raw.get("title")
+        summary = (
+            raw.get("summary")
+            or raw.get("content_snippet")
+            or raw.get("description")
+            or raw.get("content")
+        )
+        headline = (
+            headline
+            if substantive_news_text(headline)
+            else None
+        )
+        summary = (
+            summary
+            if substantive_news_text(summary)
+            else None
+        )
+        if headline is None and summary is None:
+            continue
+        normalized_news = {
+            **raw,
+            "title": headline,
+            "summary": summary,
+        }
+        if news_content_status(normalized_news) == "invalid_content":
+            continue
+        audit_status = str(
+            raw.get("source_audit_status") or ""
+        ).upper()
+        disposition = str(raw.get("disposition") or "").upper()
+        if (
+            (audit_status and audit_status != "ACTIVE")
+            or disposition
+            in {
+                "QUARANTINED",
+                "WITHHELD",
+                "TECHNICALLY_INVALID",
+                "TECHNICALLY_REJECTED",
+            }
+            or raw.get("accepted") is False
+        ):
+            continue
         published = parse_datetime(
             raw.get("published_at")
             or raw.get("published_at_utc")
@@ -1131,7 +1203,8 @@ def _project_news(
         )
         selected[identity] = {
             "article_id": raw.get("article_id"),
-            "headline": raw.get("headline") or raw.get("title"),
+            "headline": headline,
+            "summary": summary,
             "published_at": _utc(published).isoformat(),
             "symbols": sorted(set(raw.get("symbols") or [])),
             "source": _source(raw),
@@ -1181,6 +1254,19 @@ def _project_vix(
             frequency="intraday" if key == "vvix" else "daily",
             section_sync=section.get("sync"),
         )
+        if raw.get("value") is None:
+            assessment = {
+                **assessment,
+                "usable": False,
+                "status": "UNAVAILABLE",
+                "freshness": "UNAVAILABLE",
+                "reason_code": (
+                    f"{key.upper()}_VALUE_NOT_AVAILABLE"
+                    if assessment.get("reason_code")
+                    in {None, "VALUE_NOT_AVAILABLE"}
+                    else assessment.get("reason_code")
+                ),
+            }
         output[key.upper()] = {
             "symbol": key.upper(),
             "value": raw.get("value") if assessment["usable"] else None,
@@ -1216,6 +1302,28 @@ def _project_risk(
 ) -> dict[str, Any]:
     raw = section.get("risk_context") if isinstance(section.get("risk_context"), dict) else {}
     assessment = _assess_datum(raw, now, frequency="intraday")
+    derived = raw.get("derived_context") if isinstance(raw.get("derived_context"), dict) else {}
+    risk_sentiment = (
+        derived.get("risk_regime")
+        or derived.get("sentiment")
+    )
+    risk_score = derived.get("risk_score")
+    if (
+        assessment["usable"]
+        and not _risk_delivery_present(
+            {
+                "risk_sentiment": risk_sentiment,
+                "risk_score": risk_score,
+            }
+        )
+    ):
+        assessment = {
+            **assessment,
+            "usable": False,
+            "status": "UNAVAILABLE",
+            "freshness": "UNAVAILABLE",
+            "reason_code": "RISK_VALUE_NOT_AVAILABLE",
+        }
     if not assessment["usable"]:
         _missing(
             missing,
@@ -1225,16 +1333,14 @@ def _project_risk(
             assessment["refresh_due_at"],
             ["trading_context"],
         )
-    derived = raw.get("derived_context") if isinstance(raw.get("derived_context"), dict) else {}
     return {
         **_metadata(raw, assessment),
         "risk_sentiment": (
-            derived.get("risk_regime")
-            or derived.get("sentiment")
+            risk_sentiment
             if assessment["usable"]
             else None
         ),
-        "risk_score": derived.get("risk_score") if assessment["usable"] else None,
+        "risk_score": risk_score if assessment["usable"] else None,
         "excluded_inputs_used": False,
     }
 
@@ -1301,6 +1407,38 @@ def _project_generic_section(
 ) -> dict[str, Any]:
     frequency = "weekly" if name == "positioning" else "intraday"
     assessment = _assess_datum(section, now, frequency=frequency)
+    if name == "positioning":
+        projected_values = {
+            "cot": _project_positioning_cot(section),
+        }
+        substantive = _positioning_delivery_present(
+            projected_values["cot"]
+        )
+        missing_reason = "POSITIONING_VALUE_NOT_AVAILABLE"
+    else:
+        projected_values = {
+            "iv_atm": section.get("iv_atm"),
+            "open_interest": deepcopy(
+                section.get("open_interest") or {}
+            ),
+            "volume": deepcopy(section.get("volume") or {}),
+            "skew": deepcopy(section.get("skew") or {}),
+        }
+        substantive = _options_positioning_delivery_present(
+            projected_values
+        )
+        missing_reason = "OPTIONS_POSITIONING_VALUE_NOT_AVAILABLE"
+    if (
+        assessment["usable"]
+        and not substantive
+    ):
+        assessment = {
+            **assessment,
+            "usable": False,
+            "status": "UNAVAILABLE",
+            "freshness": "UNAVAILABLE",
+            "reason_code": missing_reason,
+        }
     if not assessment["usable"]:
         _missing(
             missing,
@@ -1310,39 +1448,10 @@ def _project_generic_section(
             assessment["refresh_due_at"],
             ["trading_context"],
         )
-    values: dict[str, Any] = {}
-    if assessment["usable"]:
-        if name == "positioning":
-            cot = section.get("cot") if isinstance(section.get("cot"), dict) else {}
-            nasdaq = (
-                cot.get("nasdaq_100")
-                if isinstance(cot.get("nasdaq_100"), dict)
-                else {}
-            )
-            values["cot"] = {
-                "report_date": nasdaq.get("report_date") or section.get("data_as_of"),
-                "publication_date": nasdaq.get("publication_date"),
-                "contract_code": nasdaq.get("cftc_contract_market_code"),
-                "open_interest": nasdaq.get("open_interest"),
-                "asset_managers": _select_position_group(
-                    nasdaq.get("asset_managers")
-                ),
-                "leveraged_funds": _select_position_group(
-                    nasdaq.get("leveraged_funds")
-                ),
-                "dealers": _select_position_group(nasdaq.get("dealers")),
-            }
-        else:
-            values.update(
-                {
-                    "iv_atm": section.get("iv_atm"),
-                    "open_interest": deepcopy(section.get("open_interest") or {}),
-                    "volume": deepcopy(section.get("volume") or {}),
-                    "skew": deepcopy(section.get("skew") or {}),
-                }
-            )
-    else:
-        values = (
+    values = (
+        projected_values
+        if assessment["usable"]
+        else (
             {"cot": {}}
             if name == "positioning"
             else {
@@ -1352,6 +1461,7 @@ def _project_generic_section(
                 "skew": {},
             }
         )
+    )
     return {
         **_metadata(section, assessment),
         **values,
@@ -1450,9 +1560,38 @@ def _project_schedule(
             == "accepted"
         )
     )
-    status = "AVAILABLE" if verified else "PARTIAL" if section else "UNAVAILABLE"
-    reason = None if verified else "SESSION_VERIFICATION_PARTIAL"
-    if not verified:
+    nasdaq_session = _select_schedule_session(
+        section.get("nasdaq_cash_session")
+    )
+    mnq_session = _select_schedule_session(
+        section.get("mnq_futures_session")
+        or section.get("mnq_session")
+    )
+    schedule_values = {
+        "market_session_status": section.get(
+            "market_session_status"
+        ),
+        "nasdaq_cash_session": nasdaq_session,
+        "mnq_futures_session": mnq_session,
+    }
+    substantive = _market_schedule_delivery_present(
+        schedule_values
+    )
+    status = (
+        "AVAILABLE"
+        if verified and substantive
+        else "PARTIAL"
+        if substantive
+        else "UNAVAILABLE"
+    )
+    reason = (
+        None
+        if status == "AVAILABLE"
+        else "SESSION_VERIFICATION_PARTIAL"
+        if substantive
+        else "MARKET_SCHEDULE_VALUE_NOT_AVAILABLE"
+    )
+    if status != "AVAILABLE":
         _missing(
             missing,
             "market_schedule.session_state",
@@ -1471,12 +1610,8 @@ def _project_schedule(
         ),
         "context_date": section.get("context_date"),
         "market_session_status": section.get("market_session_status"),
-        "nasdaq_cash_session": _select_schedule_session(
-            section.get("nasdaq_cash_session")
-        ),
-        "mnq_futures_session": _select_schedule_session(
-            section.get("mnq_futures_session") or section.get("mnq_session")
-        ),
+        "nasdaq_cash_session": nasdaq_session,
+        "mnq_futures_session": mnq_session,
     }
 
 
@@ -2022,7 +2157,12 @@ def _delivery_evidence(
         dataset_id,
         analytics,
     )
-    delivered = deepcopy(value) if _meaningful_delivery(value) else None
+    delivered = (
+        deepcopy(value)
+        if _substantive_delivery_present(dataset_id, value)
+        else None
+    )
+    present = delivered is not None
     section = (
         analytics.get(section_name)
         if isinstance(analytics.get(section_name), dict)
@@ -2033,7 +2173,11 @@ def _delivery_evidence(
         source = section.get("source")
     freshness = _first_delivery_field(delivered, "freshness")
     if freshness is None:
-        freshness = section.get("freshness") or "UNAVAILABLE"
+        freshness = (
+            section.get("freshness") or "UNAVAILABLE"
+            if present
+            else "UNAVAILABLE"
+        )
     missing_reasons = sorted(
         {
             str(item.get("reason_code"))
@@ -2046,7 +2190,6 @@ def _delivery_evidence(
             )
         }
     )
-    present = delivered is not None
     return {
         "selected_source": source if present else None,
         "selected_value_present": present,
@@ -2146,8 +2289,12 @@ def _dataset_delivery_value(
             ),
         )
     if dataset_id in {"vix", "vvix"}:
-        return "vix", (analytics.get("vix") or {}).get(
-            dataset_id.upper()
+        value = (analytics.get("vix") or {}).get(dataset_id.upper())
+        return (
+            "vix",
+            value
+            if isinstance(value, dict) and value.get("value") is not None
+            else None,
         )
     if dataset_id == "risk":
         return "risk", _delivery_fields(
@@ -2286,6 +2433,206 @@ def _meaningful_delivery(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_meaningful_delivery(item) for item in value)
     return value != ""
+
+
+def _substantive_delivery_present(dataset_id: str, value: Any) -> bool:
+    if dataset_id == "positioning":
+        return _positioning_delivery_present(value)
+    if dataset_id == "options_positioning":
+        return _options_positioning_delivery_present(value)
+    if dataset_id == "current_news":
+        return _current_news_delivery_present(value)
+    if dataset_id == "risk":
+        return _risk_delivery_present(value)
+    if dataset_id == "market_schedule":
+        return _market_schedule_delivery_present(value)
+    if isinstance(value, dict) and "value" in value:
+        return _meaningful_delivery(value.get("value"))
+    return _meaningful_delivery(value)
+
+
+def _positioning_delivery_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if _finite_scalar_number_present(
+        value.get("open_interest")
+    ):
+        return True
+    return any(
+        _numeric_measure_present(value.get(group))
+        for group in (
+            "asset_managers",
+            "leveraged_funds",
+            "dealers",
+        )
+    )
+
+
+def _numeric_measure_present(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, dict):
+        return any(
+            _numeric_measure_present(item)
+            for key, item in value.items()
+            if key
+            not in {
+                "symbol",
+                "underlying",
+                "target_context",
+                "expiration",
+                "expiration_date",
+                "date",
+                "data_as_of",
+                "as_of",
+                "retrieved_at",
+                "content_valid_until",
+                "refresh_due_at",
+                "source",
+                "source_url",
+                "provider",
+                "provider_type",
+                "status",
+                "freshness",
+                "reason_code",
+                "contract_code",
+                "cftc_contract_market_code",
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_numeric_measure_present(item) for item in value)
+    return _finite_scalar_number_present(value)
+
+
+def _finite_scalar_number_present(value: Any) -> bool:
+    if (
+        isinstance(value, bool)
+        or value is None
+        or isinstance(value, (dict, list, tuple, set))
+    ):
+        return False
+    number = _number(value)
+    return bool(number is not None and math.isfinite(number))
+
+
+def _options_positioning_delivery_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return bool(
+        _finite_scalar_number_present(value.get("iv_atm"))
+        or _option_metric_present(
+            value.get("open_interest"),
+            keys={
+                "calls",
+                "puts",
+                "put_call_ratio",
+                "total",
+                "total_contracts",
+                "total_open_interest",
+                "call_open_interest",
+                "put_open_interest",
+            },
+        )
+        or _option_metric_present(
+            value.get("volume"),
+            keys={
+                "calls",
+                "puts",
+                "put_call_ratio",
+                "total",
+                "total_contracts",
+                "total_volume",
+                "call_volume",
+                "put_volume",
+            },
+        )
+        or _option_metric_present(
+            value.get("skew"),
+            keys={
+                "value",
+                "skew",
+                "iv_skew",
+                "put_call_skew",
+                "slope",
+                "percentile",
+            },
+        )
+    )
+
+
+def _option_metric_present(
+    value: Any,
+    *,
+    keys: set[str],
+) -> bool:
+    if not isinstance(value, dict):
+        return _finite_scalar_number_present(value)
+    return any(
+        _finite_scalar_number_present(value.get(key))
+        for key in keys
+        if key in value
+    )
+
+
+def _current_news_delivery_present(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and any(
+            substantive_news_text(item.get(field))
+            for field in (
+                "headline",
+                "title",
+                "summary",
+                "content",
+                "content_snippet",
+                "description",
+            )
+        )
+        for item in value
+    )
+
+
+def _risk_delivery_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return bool(
+        _nonempty_text_present(value.get("risk_sentiment"))
+        or _finite_scalar_number_present(value.get("risk_score"))
+    )
+
+
+def _market_schedule_delivery_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if _nonempty_text_present(
+        value.get("market_session_status")
+    ):
+        return True
+    for key in ("nasdaq_cash_session", "mnq_futures_session"):
+        session = value.get(key)
+        if not isinstance(session, dict):
+            continue
+        if (
+            _nonempty_text_present(session.get("status"))
+            or type(session.get("is_open")) is bool
+            or _valid_timestamp_present(session.get("next_open"))
+            or _valid_timestamp_present(session.get("next_close"))
+        ):
+            return True
+    return False
+
+
+def _nonempty_text_present(value: Any) -> bool:
+    return bool(isinstance(value, str) and value.strip())
+
+
+def _valid_timestamp_present(value: Any) -> bool:
+    return bool(
+        not isinstance(value, (dict, list, tuple, set, bool))
+        and parse_datetime(value) is not None
+    )
 
 
 def _first_delivery_field(value: Any, field: str) -> Any:
@@ -2635,19 +2982,28 @@ def _field_lineage(value: Any) -> list[dict[str, Any]]:
 
 def _datum_has_value(value: dict[str, Any]) -> bool:
     scalar_keys = (
-        "value",
         "actual",
         "price",
-        "status",
         "market_session_status",
         "iv_atm",
     )
-    if any(value.get(key) not in {None, ""} for key in scalar_keys):
+    if any(value.get(key) not in (None, "") for key in scalar_keys):
         return True
+    if "value" in value:
+        return value.get("value") not in (None, "")
     return any(
         isinstance(item, (list, dict)) and bool(item)
         for key, item in value.items()
-        if key not in {"warnings", "errors", "validation", "sync", "lifecycle"}
+        if key
+        not in {
+            "warnings",
+            "errors",
+            "validation",
+            "sync",
+            "lifecycle",
+            "source",
+            "lineage",
+        }
     )
 
 
@@ -2751,6 +3107,78 @@ def _invalid_state_count(value: Any) -> int:
     elif isinstance(value, list):
         count += sum(_invalid_state_count(item) for item in value)
     return count
+
+
+def _available_without_substantive_value_count(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    count = 0
+    for section_name in SECTION_NAMES:
+        section = value.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        explicit_nulls = _explicit_available_null_count(section)
+        datasets = [
+            policy.dataset_id
+            for policy in DATASET_POLICIES
+            if policy.section == section_name
+        ]
+        section_declared_available_without_value = bool(
+            str(section.get("status") or "").upper()
+            == "AVAILABLE"
+            and datasets
+            and not any(
+                _substantive_delivery_present(
+                    dataset_id,
+                    _dataset_delivery_value(
+                        dataset_id,
+                        value,
+                    )[1],
+                )
+                for dataset_id in datasets
+            )
+        )
+        count += (
+            explicit_nulls
+            if explicit_nulls
+            else int(section_declared_available_without_value)
+        )
+    return count
+
+
+def _explicit_available_null_count(value: Any) -> int:
+    if isinstance(value, dict):
+        count = int(
+            str(value.get("status") or "").upper() == "AVAILABLE"
+            and "value" in value
+            and value.get("value") is None
+        )
+        return count + sum(
+            _explicit_available_null_count(item)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return sum(
+            _explicit_available_null_count(item)
+            for item in value
+        )
+    return 0
+
+
+def _selected_value_presence_mismatch_count(rows: Any) -> int:
+    if not isinstance(rows, list):
+        return 0
+    return sum(
+        1
+        for item in rows
+        if isinstance(item, dict)
+        and isinstance(item.get("selected_value_present"), bool)
+        and item["selected_value_present"]
+        != _substantive_delivery_present(
+            str(item.get("dataset_id") or ""),
+            item.get("delivered_value"),
+        )
+    )
 
 
 def _expired_or_future_delivered_value_count(
@@ -2940,7 +3368,10 @@ def _request_accounting_row_complete(
         )
         or (
             item.get("selected_value_present")
-            != (item.get("delivered_value") is not None)
+            != _substantive_delivery_present(
+                str(item.get("dataset_id") or ""),
+                item.get("delivered_value"),
+            )
         )
         or str(item.get("reason_code") or "").upper()
         in {"DB_VALID_REUSED", "SOURCE_SELECTED_FROM_SAME_REQUEST"}
@@ -3098,6 +3529,39 @@ def _select_position_group(value: Any) -> dict[str, Any]:
         key: _number(value.get(key))
         for key in ("long", "short", "spreading", "net", "net_change_week")
         if value.get(key) is not None
+    }
+
+
+def _project_positioning_cot(
+    section: dict[str, Any],
+) -> dict[str, Any]:
+    cot = (
+        section.get("cot")
+        if isinstance(section.get("cot"), dict)
+        else {}
+    )
+    nasdaq = (
+        cot.get("nasdaq_100")
+        if isinstance(cot.get("nasdaq_100"), dict)
+        else {}
+    )
+    return {
+        "report_date": (
+            nasdaq.get("report_date")
+            or section.get("data_as_of")
+        ),
+        "publication_date": nasdaq.get("publication_date"),
+        "contract_code": nasdaq.get(
+            "cftc_contract_market_code"
+        ),
+        "open_interest": nasdaq.get("open_interest"),
+        "asset_managers": _select_position_group(
+            nasdaq.get("asset_managers")
+        ),
+        "leveraged_funds": _select_position_group(
+            nasdaq.get("leveraged_funds")
+        ),
+        "dealers": _select_position_group(nasdaq.get("dealers")),
     }
 
 

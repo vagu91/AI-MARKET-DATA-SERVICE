@@ -20,6 +20,18 @@ EVENT_ID = 1062
 SOURCE = "INVESTING_EVENT_1062"
 ALLOWED_HOST = "endpoints.investing.com"
 EXPECTED_PATH = "/pd-instruments/v1/calendars/economic/events/1062/occurrences"
+INVESTING_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+INVESTING_API_HEADERS = {
+    **REQUEST_HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.investing.com",
+    "Referer": "https://www.investing.com/",
+    "User-Agent": INVESTING_BROWSER_USER_AGENT,
+}
 
 
 class InvestingFlashServicesPmiProvider(BaseProvider):
@@ -58,7 +70,10 @@ class InvestingFlashServicesPmiProvider(BaseProvider):
                 follow_redirects=False,
                 transport=self.transport,
             ) as client:
-                response = await client.get(url, headers={**REQUEST_HEADERS, "Accept": "application/json"})
+                response = await client.get(
+                    url,
+                    headers=INVESTING_API_HEADERS,
+                )
                 response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise ProviderError("investing_flash_services_pmi_timeout") from exc

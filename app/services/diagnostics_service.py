@@ -285,16 +285,12 @@ class DiagnosticsService:
             limit=None,
             include_quarantined=True,
         )
-        initial_news_item = (
-            initial_news_items[0]
-            if initial_news_items
-            else None
-        )
-        initial_news_freshness = (
-            self.freshness.evaluate_canonical(
-                initial_news_item,
-                max_age=timedelta(hours=24),
-            )
+        (
+            initial_news_item,
+            initial_news_freshness,
+        ) = _select_current_news_database_candidate(
+            initial_news_items,
+            freshness_service=self.freshness,
         )
         news_database_valid = bool(
             initial_news_item
@@ -437,8 +433,16 @@ class DiagnosticsService:
                         "provider_calls_executed"
                     )
                 )
+                calendar_catch_up_complete = bool(
+                    calendar_provider_called
+                    and _calendar_catch_up_succeeded(
+                        force_schedule_coverage
+                    )
+                )
                 calendar_provider_result = (
                     "SCHEDULE_CATCH_UP_COMPLETED"
+                    if calendar_catch_up_complete
+                    else "SCHEDULE_CATCH_UP_INCOMPLETE"
                     if calendar_provider_called
                     else "NOT_CALLED"
                 )
@@ -629,22 +633,11 @@ class DiagnosticsService:
             None,
         )
         multi_runtime = MultiSourceRuntimeService(self.settings)
-        primary_calendar_succeeded = bool(
-            enriched
-            and pending_calendar_accounting.get(
-                "database_lookup_performed"
+        primary_calendar_succeeded = (
+            _calendar_primary_acquisition_succeeded(
+                pending_calendar_accounting,
+                events=enriched,
             )
-            and not pending_calendar_accounting.get(
-                "provider_called"
-            )
-        ) or bool(
-            enriched
-            and pending_calendar_accounting.get("provider_called")
-            and str(
-                pending_calendar_accounting.get("provider_result")
-                or ""
-            ).upper()
-            not in {"FAILED", "TIMEOUT", "NO_DATA"}
         )
         investing_refresh = (
             "false"
@@ -2026,7 +2019,9 @@ class DiagnosticsService:
                     fact is not None if lookup_performed else None
                 ),
                 database_data_as_of=(
-                    _fact_data_as_of(fact) if lookup_performed else None
+                    freshness.data_as_of
+                    if lookup_performed and freshness
+                    else None
                 ),
                 database_content_valid_until=(
                     freshness.content_valid_until
@@ -2265,7 +2260,9 @@ class DiagnosticsService:
                     fact is not None if lookup_performed else None
                 ),
                 database_data_as_of=(
-                    _fact_data_as_of(fact) if lookup_performed else None
+                    freshness.data_as_of
+                    if lookup_performed and freshness
+                    else None
                 ),
                 database_content_valid_until=(
                     freshness.content_valid_until
@@ -2436,7 +2433,18 @@ class DiagnosticsService:
     ) -> None:
         if collector is None:
             return
-        item = news_items[0] if news_items else None
+        item = next(
+            (
+                candidate
+                for candidate in news_items
+                if _news_exclusion_reason(candidate) is None
+                and self.freshness.evaluate_canonical(
+                    candidate,
+                    max_age=timedelta(hours=24),
+                ).usable
+            ),
+            None,
+        )
         database_valid = bool(
             database_item
             and database_freshness.usable
@@ -2453,14 +2461,18 @@ class DiagnosticsService:
             ]
             evidence_complete = True
         else:
-            raw_accounts = {
-                actual_name: account
+            raw_account_rows = [
+                account
                 for account in provider_quality.get(
                     "provider_accounting",
                     [],
                 )
                 if isinstance(account, dict)
-                and (
+            ]
+            raw_accounts = {
+                actual_name: account
+                for account in raw_account_rows
+                if (
                     actual_name := str(
                         account.get("provider") or ""
                     )
@@ -2468,9 +2480,10 @@ class DiagnosticsService:
             }
             attempts = []
             evidence_complete = bool(
-                provider_quality.get(
-                    "provider_accounting_valid"
-                )
+                len(raw_account_rows) == len(policy_providers)
+                and len(raw_accounts) == len(policy_providers)
+                and set(raw_accounts)
+                == set(NEWS_ACCOUNTING_PROVIDER_NAMES.values())
             )
             for provider in policy_providers:
                 actual_name = NEWS_ACCOUNTING_PROVIDER_NAMES[
@@ -2492,8 +2505,21 @@ class DiagnosticsService:
                     )
                     evidence_complete = False
                     continue
-                calls = int(account.get("calls") or 0)
-                called = calls > 0
+                raw_calls = account.get("calls")
+                calls = (
+                    raw_calls
+                    if isinstance(raw_calls, int)
+                    and not isinstance(raw_calls, bool)
+                    and raw_calls >= 0
+                    else 0
+                )
+                declared_origin = str(
+                    account.get("execution_origin") or ""
+                ).upper()
+                called = bool(
+                    calls > 0
+                    and declared_origin != "CACHE_DECISION"
+                )
                 reason = str(
                     account.get("reason_code") or ""
                 ) or None
@@ -2510,7 +2536,14 @@ class DiagnosticsService:
                             None if called else reason
                         ),
                         execution_origin=(
-                            "PROVIDER_CALL"
+                            declared_origin
+                            if declared_origin
+                            in {
+                                "PROVIDER_CALL",
+                                "OBSERVED_SKIP",
+                                "CACHE_DECISION",
+                            }
+                            else "PROVIDER_CALL"
                             if called
                             else "OBSERVED_SKIP"
                         ),
@@ -2518,11 +2551,24 @@ class DiagnosticsService:
                 )
                 if not called and not reason:
                     evidence_complete = False
+                if not _news_provider_execution_evidence_complete(
+                    account
+                ):
+                    evidence_complete = False
         primary = attempts[0]
         fallbacks = attempts[1:]
         called_count = sum(
             attempt.get("called") is True
             for attempt in attempts
+        )
+        technical_cache_selected = bool(
+            evidence_complete
+            and attempts
+            and all(
+                attempt.get("execution_origin")
+                == "CACHE_DECISION"
+                for attempt in attempts
+            )
         )
         collector.record(
             "current_news",
@@ -2573,10 +2619,14 @@ class DiagnosticsService:
             acquisition_reason_code=(
                 "PERSISTED_NEWS_SELECTED"
                 if item and database_valid
+                else "NEWS_TECHNICAL_CACHE_VALUE_SELECTED"
+                if item and technical_cache_selected
                 else "NEWS_FAN_IN_VALUE_ACQUIRED"
                 if item and called_count
-                else "NEWS_FAN_IN_COMPLETED_NO_DATA"
-                if called_count
+                else "NEWS_TECHNICAL_CACHE_NO_CURRENT_DATA"
+                if technical_cache_selected
+                else "NEWS_FAN_IN_COMPLETED_NO_CURRENT_DATA"
+                if evidence_complete
                 else "CURRENT_NEWS_NOT_AVAILABLE"
             ),
             evidence_complete=evidence_complete,
@@ -3122,21 +3172,6 @@ def _matching_macro_fact(
     return None
 
 
-def _fact_data_as_of(fact: dict[str, Any] | None) -> Any:
-    if not fact:
-        return None
-    raw = (
-        fact.get("raw_payload")
-        if isinstance(fact.get("raw_payload"), dict)
-        else {}
-    )
-    return (
-        raw.get("data_as_of")
-        or fact.get("release_at")
-        or fact.get("retrieved_at")
-    )
-
-
 def _event_value(event: Any, *keys: str) -> Any:
     for key in keys:
         value = (
@@ -3352,6 +3387,8 @@ def _attempt_succeeded(attempt: dict[str, Any]) -> bool:
     if not attempt.get("called"):
         return False
     result = str(attempt.get("result") or "").upper()
+    if result.startswith("SCHEDULE_CATCH_UP_"):
+        return result == "SCHEDULE_CATCH_UP_COMPLETED"
     return any(
         token in result
         for token in ("SUCCESS", "FOUND", "AVAILABLE", "VALID", "PARTIAL")
@@ -3359,6 +3396,89 @@ def _attempt_succeeded(attempt: dict[str, Any]) -> bool:
         token in result
         for token in ("FAIL", "ERROR", "NO_DATA", "NOT_FOUND", "TIMEOUT")
     )
+
+
+def _calendar_primary_acquisition_succeeded(
+    accounting: dict[str, Any],
+    *,
+    events: list[Any],
+) -> bool:
+    if accounting.get("provider_called") is True:
+        return _attempt_succeeded(
+            {
+                "called": True,
+                "result": accounting.get("provider_result"),
+            }
+        )
+    return bool(
+        events
+        and accounting.get("database_lookup_performed") is True
+    )
+
+
+def _calendar_catch_up_succeeded(coverage: dict[str, Any]) -> bool:
+    daily_matrix = (
+        coverage.get("daily_matrix")
+        if isinstance(coverage.get("daily_matrix"), dict)
+        else {}
+    )
+    return bool(
+        int(coverage.get("provider_calls_executed") or 0) > 0
+        and int(coverage.get("provider_success_count") or 0) > 0
+        and str(coverage.get("status") or "").upper()
+        == "VERIFIED_COMPLETE"
+        and str(daily_matrix.get("status") or "").upper()
+        == "VERIFIED_COMPLETE"
+        and not coverage.get("unknown_coverage_days")
+        and not coverage.get("partial_coverage_days")
+        and int(coverage.get("quarantined_occurrence_count") or 0)
+        == 0
+    )
+
+
+def _news_provider_execution_evidence_complete(
+    account: dict[str, Any],
+) -> bool:
+    calls = account.get("calls")
+    status = str(account.get("status") or "").strip().upper()
+    if (
+        not account.get("provider")
+        or not isinstance(calls, int)
+        or isinstance(calls, bool)
+        or calls < 0
+        or not status
+        or status
+        in {
+            "UNKNOWN",
+            "MISSING",
+            "EVIDENCE_NOT_AVAILABLE",
+        }
+    ):
+        return False
+    if calls == 0 and not str(
+        account.get("reason_code") or ""
+    ).strip():
+        return False
+    if calls > 0 and status in {
+        "NOT_CALLED",
+        "DISABLED",
+        "NOT_CONFIGURED",
+    }:
+        return False
+    origin = str(account.get("execution_origin") or "").upper()
+    if origin and origin not in {
+        "PROVIDER_CALL",
+        "OBSERVED_SKIP",
+        "CACHE_DECISION",
+    }:
+        return False
+    if origin == "PROVIDER_CALL" and calls == 0:
+        return False
+    if origin in {"OBSERVED_SKIP", "CACHE_DECISION"} and calls != 0:
+        return False
+    if origin == "CACHE_DECISION" and status != "CACHE_HIT":
+        return False
+    return True
 
 
 def _runtime_block_available(block: dict[str, Any]) -> bool:
@@ -3608,6 +3728,21 @@ def _news_pipeline_status(
 
 
 def _news_exclusion_reason(item: dict[str, Any]) -> str | None:
+    audit_status = str(
+        item.get("source_audit_status") or ""
+    ).upper()
+    if audit_status and audit_status != "ACTIVE":
+        return "source_quarantined"
+    disposition = str(item.get("disposition") or "").upper()
+    if disposition in {
+        "QUARANTINED",
+        "WITHHELD",
+        "TECHNICALLY_INVALID",
+        "TECHNICALLY_REJECTED",
+    }:
+        return "source_quarantined"
+    if item.get("accepted") is False:
+        return "source_rejected"
     if news_content_status(item) == "invalid_content":
         return "invalid_content"
     if not (item.get("source_url") or item.get("url")) and not any(
@@ -3627,6 +3762,36 @@ def _news_exclusion_reason(item: dict[str, Any]) -> str | None:
         if parsed and parsed > datetime.now(UTC) + timedelta(minutes=1):
             return "future_published"
     return None
+
+
+def _select_current_news_database_candidate(
+    items: list[dict[str, Any]],
+    *,
+    freshness_service: Any,
+) -> tuple[dict[str, Any] | None, Any]:
+    observed_item: dict[str, Any] | None = None
+    observed_freshness: Any = None
+    for item in items:
+        if _news_exclusion_reason(item) is not None:
+            continue
+        freshness = freshness_service.evaluate_canonical(
+            item,
+            max_age=timedelta(hours=24),
+        )
+        if observed_item is None:
+            observed_item = item
+            observed_freshness = freshness
+        if freshness.usable:
+            return item, freshness
+    if observed_item is not None:
+        return observed_item, observed_freshness
+    return (
+        None,
+        freshness_service.evaluate_canonical(
+            None,
+            max_age=timedelta(hours=24),
+        ),
+    )
 
 
 def _macro_pipeline_status(macro: MacroLatestResponse, macro_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:

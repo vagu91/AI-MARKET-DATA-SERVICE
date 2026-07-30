@@ -52,6 +52,8 @@ def main() -> int:
     result["checks"]["process_cleanup_ok"] = args.process_cleanup_ok
     required_zero = (
         "expired_values_delivered",
+        "available_without_substantive_value",
+        "selected_value_presence_mismatches",
         "stale_values_presented_as_current",
         "invalid_temporal_mappings",
         "semantic_mapping_errors",

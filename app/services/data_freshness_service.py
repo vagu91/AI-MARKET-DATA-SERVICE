@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Literal
@@ -58,6 +59,7 @@ _REFERENCE_FIELDS: dict[CanonicalDataReferenceMode, tuple[str, ...]] = {
         "database_data_as_of",
         "data_as_of",
         "observed_at",
+        "weight_as_of",
         "as_of",
         "retrieved_at",
         "last_successful_refresh_at",
@@ -110,6 +112,40 @@ _INVALID_LIFECYCLE_STATES = {
     "PROVIDER_FAILED",
     "NOT_CALLED",
 }
+_ENGLISH_MONTHS = {
+    "JAN": 1,
+    "JANUARY": 1,
+    "FEB": 2,
+    "FEBRUARY": 2,
+    "MAR": 3,
+    "MARCH": 3,
+    "APR": 4,
+    "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUNE": 6,
+    "JUL": 7,
+    "JULY": 7,
+    "AUG": 8,
+    "AUGUST": 8,
+    "SEP": 9,
+    "SEPT": 9,
+    "SEPTEMBER": 9,
+    "OCT": 10,
+    "OCTOBER": 10,
+    "NOV": 11,
+    "NOVEMBER": 11,
+    "DEC": 12,
+    "DECEMBER": 12,
+}
+_ENGLISH_DATA_REFERENCE = re.compile(
+    r"^(?P<month>[A-Za-z]+)\s+"
+    r"(?P<day>\d{1,2}),\s*"
+    r"(?P<year>\d{4})"
+    r"(?:\s+(?P<hour>\d{1,2}):(?P<minute>\d{2})"
+    r"(?::(?P<second>\d{2}))?\s*(?P<ampm>AM|PM))?$",
+    re.IGNORECASE,
+)
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -275,12 +311,13 @@ def evaluate_canonical_freshness(
             lifecycle=lifecycle,
             decision_at=decision_at,
         )
+    canonical_data_as_of = data_reference.isoformat()
     if content_deadline.missing:
         return _canonical_result(
             complete=False,
             evaluation="MISSING_CONTENT_VALID_UNTIL",
             reason_code="CANONICAL_CONTENT_VALID_UNTIL_NOT_PROVED",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=None,
             refresh_due_at=refresh_iso,
             lifecycle=lifecycle,
@@ -291,7 +328,7 @@ def evaluate_canonical_freshness(
             complete=False,
             evaluation="INVALID_CONTENT_VALID_UNTIL",
             reason_code="CANONICAL_CONTENT_VALID_UNTIL_INVALID",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=None,
             refresh_due_at=refresh_iso,
             lifecycle=lifecycle,
@@ -302,7 +339,7 @@ def evaluate_canonical_freshness(
             complete=False,
             evaluation="MISSING_REFRESH_DUE_AT",
             reason_code="CANONICAL_REFRESH_DUE_AT_NOT_PROVED",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=None,
             lifecycle=lifecycle,
@@ -313,7 +350,7 @@ def evaluate_canonical_freshness(
             complete=False,
             evaluation="INVALID_REFRESH_DUE_AT",
             reason_code="CANONICAL_REFRESH_DUE_AT_INVALID",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=None,
             lifecycle=lifecycle,
@@ -343,7 +380,7 @@ def evaluate_canonical_freshness(
             complete=True,
             evaluation="INVALID_LIFECYCLE",
             reason_code=reason,
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=refresh_iso,
             lifecycle=invalid_lifecycle or lifecycle,
@@ -359,7 +396,7 @@ def evaluate_canonical_freshness(
             complete=True,
             evaluation="FUTURE_DATA_AS_OF",
             reason_code="CANONICAL_RECORD_FROM_FUTURE",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=refresh_iso,
             lifecycle=lifecycle,
@@ -370,7 +407,7 @@ def evaluate_canonical_freshness(
             complete=True,
             evaluation="EXPIRED_CONTENT_VALID_UNTIL",
             reason_code="CANONICAL_CONTENT_VALID_UNTIL_EXPIRED",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=refresh_iso,
             lifecycle=lifecycle,
@@ -382,7 +419,7 @@ def evaluate_canonical_freshness(
             complete=True,
             evaluation="REFRESH_DUE",
             reason_code="CANONICAL_REFRESH_DUE_REACHED",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=refresh_iso,
             lifecycle=lifecycle,
@@ -394,7 +431,7 @@ def evaluate_canonical_freshness(
             complete=True,
             evaluation="SLA_EXPIRED",
             reason_code="CANONICAL_RECORD_OUTSIDE_DATASET_SLA",
-            data_as_of=data_as_of,
+            data_as_of=canonical_data_as_of,
             content_valid_until=content_iso,
             refresh_due_at=refresh_iso,
             lifecycle=lifecycle,
@@ -405,7 +442,7 @@ def evaluate_canonical_freshness(
         complete=True,
         evaluation="VALID",
         reason_code="CANONICAL_RECORD_WITHIN_SLA",
-        data_as_of=data_as_of,
+        data_as_of=canonical_data_as_of,
         content_valid_until=content_iso,
         refresh_due_at=refresh_iso,
         lifecycle=lifecycle,
@@ -543,8 +580,51 @@ def _parse_data_reference(value: Any) -> datetime | None:
     parsed = parse_datetime(value)
     if parsed is not None:
         return parsed
-    text = str(value or "").strip().upper()
+    raw_text = str(value or "").strip()
+    text = raw_text.upper()
     try:
+        bea_month = re.fullmatch(
+            r"(?P<year>\d{4})M(?P<month>0?[1-9]|1[0-2])",
+            text,
+        )
+        if bea_month:
+            year = int(bea_month.group("year"))
+            month = int(bea_month.group("month"))
+            next_month = (
+                datetime(year + 1, 1, 1, tzinfo=UTC)
+                if month == 12
+                else datetime(year, month + 1, 1, tzinfo=UTC)
+            )
+            return next_month - timedelta(microseconds=1)
+        english_reference = _ENGLISH_DATA_REFERENCE.fullmatch(
+            raw_text
+        )
+        if english_reference:
+            month = _ENGLISH_MONTHS.get(
+                english_reference.group("month").upper()
+            )
+            if month is None:
+                return None
+            hour_text = english_reference.group("hour")
+            hour = int(hour_text) if hour_text is not None else 0
+            minute = int(english_reference.group("minute") or 0)
+            second = int(english_reference.group("second") or 0)
+            ampm = english_reference.group("ampm")
+            if ampm:
+                if not 1 <= hour <= 12:
+                    return None
+                hour = hour % 12 + (
+                    12 if ampm.upper() == "PM" else 0
+                )
+            return datetime(
+                int(english_reference.group("year")),
+                month,
+                int(english_reference.group("day")),
+                hour,
+                minute,
+                second,
+                tzinfo=UTC,
+            )
         if len(text) == 7 and text[4] == "-":
             year = int(text[:4])
             month = int(text[5:])
