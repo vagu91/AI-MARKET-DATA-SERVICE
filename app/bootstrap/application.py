@@ -28,6 +28,10 @@ from app.providers.fed_calendar import FederalReserveCalendarProvider
 from app.providers.federal_reserve import FederalReserveRssProvider
 from app.providers.fred import FredProvider
 from app.providers.sp_global_pmi import SpGlobalPmiProvider
+from app.providers.investing_flash_services_pmi import (
+    SOURCE as INVESTING_FLASH_SOURCE,
+    InvestingFlashServicesPmiProvider,
+)
 from app.providers.census import CensusProvider
 from app.providers.finnhub import FinnhubProvider
 from app.providers.tradier import TradierProvider
@@ -88,6 +92,10 @@ def build_application_state(
         "bea": BeaProvider(cache, settings),
         "census": CensusProvider(cache, settings),
         "spglobal": SpGlobalPmiProvider(cache, settings),
+        "investing_flash_services_pmi": InvestingFlashServicesPmiProvider(
+            cache,
+            settings,
+        ),
         "finnhub": FinnhubProvider(cache, settings),
         "tradier": TradierProvider(cache, settings),
     }
@@ -168,9 +176,15 @@ def build_application_state(
                 *macro_providers,
                 census_provider,
                 deterministic_providers["spglobal"],
+                deterministic_providers["investing_flash_services_pmi"],
             ]
             if getattr(provider, "source", "") in {
-                "BLS", "BEA", "CENSUS", "FRED", "SPGLOBAL"
+                "BLS",
+                "BEA",
+                "CENSUS",
+                "FRED",
+                "SPGLOBAL",
+                INVESTING_FLASH_SOURCE,
             }
         },
     )

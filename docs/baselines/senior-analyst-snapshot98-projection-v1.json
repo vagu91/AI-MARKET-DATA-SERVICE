@@ -1,0 +1,3484 @@
+{
+  "analytics": {
+    "calendar": {
+      "active_event_windows": [
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "fomc_decision",
+          "name": "Conferenza stampa del FOMC",
+          "occurrence_id": "xtb:135360:2026-07-29",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "Luglio",
+          "release_at": "2026-07-29T18:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        }
+      ],
+      "content_valid_until": "2026-07-29T19:17:25.927920+00:00",
+      "data_as_of": "2026-07-29T18:17:25.927920+00:00",
+      "freshness": "CURRENT",
+      "lineage": [],
+      "next_24h_events": [
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "fomc_decision",
+          "name": "Conferenza stampa del FOMC",
+          "occurrence_id": "xtb:135360:2026-07-29",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "Luglio",
+          "release_at": "2026-07-29T18:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": "XTB Economic Calendar",
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "gdp",
+          "name": "PIL (Annualizzato)",
+          "occurrence_id": "xtb:149741:2026-07-30",
+          "previous": 2.1,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "2Q",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": "XTB Economic Calendar",
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA Release Schedule",
+                "source_url": "https://www.bea.gov/news/schedule"
+              }
+            }
+          ],
+          "metric_id": "gdp_advance_estimate_2nd_quarter_2026",
+          "name": "GDP (Advance Estimate), 2nd Quarter 2026",
+          "occurrence_id": "event:f60bf89cac233b735629ff9b",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": null,
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA Release Schedule",
+            "source_url": "https://www.bea.gov/news/schedule"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "MEDIUM",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": "XTB Economic Calendar",
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "other",
+          "name": "Personal Income M/M",
+          "occurrence_id": "xtb:145333:2026-07-30",
+          "previous": 0.7,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "2026-06",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": "XTB Economic Calendar",
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": "XTB Economic Calendar",
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "other",
+          "name": "Rapporto settimanale sulle richieste di sussidio di disoccupazione",
+          "occurrence_id": "xtb:151249:2026-07-30",
+          "previous": 187.0,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "settimana",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": "XTB Economic Calendar",
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "MEDIUM",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": "XTB Economic Calendar",
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "other",
+          "name": "Spesa per i consumi (Annualizzato)",
+          "occurrence_id": "xtb:149744:2026-07-30",
+          "previous": 0.5,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "2Q",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": "XTB Economic Calendar",
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "MEDIUM",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "pce",
+          "name": "PCE A/A",
+          "occurrence_id": "xtb:145296:2026-07-30",
+          "previous": 4.1,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "Giugno",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "MEDIUM",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "pce",
+          "name": "PCE Core T/T",
+          "occurrence_id": "xtb:149743:2026-07-30",
+          "previous": 4.4,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "2Q",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA Release Schedule",
+                "source_url": "https://www.bea.gov/news/schedule"
+              }
+            }
+          ],
+          "metric_id": "personal_income_and_outlays_june_2026",
+          "name": "Personal Income and Outlays, June 2026",
+          "occurrence_id": "event:dfe82af8b5acddad87543a10",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": null,
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA Release Schedule",
+            "source_url": "https://www.bea.gov/news/schedule"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "MEDIUM",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BLS Release Calendar",
+                "source_url": "https://www.bls.gov/schedule/2026/07_sched.htm"
+              }
+            }
+          ],
+          "metric_id": "job_openings_and_labor_turnover_survey_may_2026",
+          "name": "Job Openings and Labor Turnover Survey (May 2026)",
+          "occurrence_id": "bls-a2b649f7decacbed",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": null,
+          "release_at": "2026-07-30T14:00:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BLS Release Calendar",
+            "source_url": "https://www.bls.gov/schedule/2026/07_sched.htm"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "MEDIUM",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": "XTB Economic Calendar",
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "other",
+          "name": "EIA Natural Gas Storage",
+          "occurrence_id": "xtb:151212:2026-07-30",
+          "previous": 32.0,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "settimana",
+          "release_at": "2026-07-30T14:30:00+00:00",
+          "release_status": "PRE_RELEASE",
+          "source": {
+            "acquisition_provider": "XTB Economic Calendar",
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        }
+      ],
+      "next_7d_high_impact_events": [
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "fomc_decision",
+          "name": "Conferenza stampa del FOMC",
+          "occurrence_id": "xtb:135360:2026-07-29",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "Luglio",
+          "release_at": "2026-07-29T18:30:00+00:00",
+          "release_status": "SCHEDULED",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": "XTB Economic Calendar",
+                "distributor": null,
+                "publisher": "XTB Economic Calendar",
+                "source_url": "https://www.xtb.com/it/calendario-economico"
+              }
+            }
+          ],
+          "metric_id": "gdp",
+          "name": "PIL (Annualizzato)",
+          "occurrence_id": "xtb:149741:2026-07-30",
+          "previous": 2.1,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": "2Q",
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "SCHEDULED",
+          "source": {
+            "acquisition_provider": "XTB Economic Calendar",
+            "distributor": null,
+            "publisher": "XTB Economic Calendar",
+            "source_url": "https://www.xtb.com/it/calendario-economico"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA Release Schedule",
+                "source_url": "https://www.bea.gov/news/schedule"
+              }
+            }
+          ],
+          "metric_id": "gdp_advance_estimate_2nd_quarter_2026",
+          "name": "GDP (Advance Estimate), 2nd Quarter 2026",
+          "occurrence_id": "event:f60bf89cac233b735629ff9b",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": null,
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "SCHEDULED",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA Release Schedule",
+            "source_url": "https://www.bea.gov/news/schedule"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        },
+        {
+          "actual": null,
+          "actual_is_official": null,
+          "consensus": null,
+          "impact": "HIGH",
+          "invalid_period_mapping": false,
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA Release Schedule",
+                "source_url": "https://www.bea.gov/news/schedule"
+              }
+            }
+          ],
+          "metric_id": "personal_income_and_outlays_june_2026",
+          "name": "Personal Income and Outlays, June 2026",
+          "occurrence_id": "event:dfe82af8b5acddad87543a10",
+          "previous": null,
+          "previous_revised": null,
+          "reason_code": null,
+          "reference_period": null,
+          "release_at": "2026-07-30T12:30:00+00:00",
+          "release_status": "SCHEDULED",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA Release Schedule",
+            "source_url": "https://www.bea.gov/news/schedule"
+          },
+          "surprise_absolute": null,
+          "surprise_direction": null,
+          "surprise_percent": null
+        }
+      ],
+      "reason_code": null,
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": "CANONICAL_EVENT_REPOSITORY",
+      "status": "AVAILABLE"
+    },
+    "earnings": {
+      "content_valid_until": "2026-07-30T00:17:25.927920+00:00",
+      "data_as_of": "2026-07-29T18:17:25.927920+00:00",
+      "events": [],
+      "freshness": "UNAVAILABLE",
+      "lineage": [],
+      "reason_code": "NO_CURRENT_EARNINGS_EVENTS",
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": "NASDAQ",
+      "status": "NO_DATA"
+    },
+    "fomc": {
+      "action": null,
+      "change_bps": null,
+      "content_valid_until": "2026-07-29T18:17:25+00:00",
+      "data_as_of": null,
+      "freshness": "CURRENT",
+      "lineage": [],
+      "pre_meeting_probabilities": [],
+      "probability_state": "UNAVAILABLE",
+      "reason_code": "PRE_RELEASE_FOMC_FIELDS_UNAVAILABLE",
+      "refresh_due_at": null,
+      "release_at": "2026-07-29T18:30:00+00:00",
+      "snapshot_transport_valid_until": null,
+      "source": {
+        "acquisition_provider": null,
+        "distributor": null,
+        "publisher": "XTB Economic Calendar",
+        "source_url": "https://www.xtb.com/it/calendario-economico"
+      },
+      "status": "PARTIAL",
+      "target_range_lower": null,
+      "target_range_upper": null
+    },
+    "macro": {
+      "content_valid_until": "2026-09-12T18:17:01.556441+00:00",
+      "data_as_of": "2026-07-29T00:00:00+00:00",
+      "freshness": "CURRENT",
+      "lineage": [],
+      "metrics": [
+        {
+          "content_valid_until": "2026-08-08T18:16:55.747069+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BLS",
+                "source_url": "https://www.bls.gov/"
+              }
+            }
+          ],
+          "metric_id": "average_hourly_earnings",
+          "name": "Average Hourly Earnings of All Employees: Total Private",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "CES0500000003",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BLS",
+            "source_url": "https://www.bls.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "dollars per hour",
+          "value": 37.64
+        },
+        {
+          "content_valid_until": "2026-08-08T18:16:55.747069+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BLS",
+                "source_url": "https://www.bls.gov/"
+              }
+            }
+          ],
+          "metric_id": "core_cpi_index",
+          "name": "Core Consumer Price Index",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "CUSR0000SA0L1E",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BLS",
+            "source_url": "https://www.bls.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "index_points",
+          "value": 336.065
+        },
+        {
+          "content_valid_until": "2026-08-08T18:17:01.556441+00:00",
+          "data_as_of": "2026M05",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA",
+                "source_url": "https://www.bea.gov/"
+              }
+            }
+          ],
+          "metric_id": "core_pce_price_index",
+          "name": "Core PCE Price Index",
+          "reason_code": null,
+          "reference_period": "2026M05",
+          "refresh_due_at": null,
+          "series_id": "BEA:CORE_PCE",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA",
+            "source_url": "https://www.bea.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "Level",
+          "value": 130.082
+        },
+        {
+          "content_valid_until": "2026-08-08T18:16:54.460753+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "effective_fed_funds_rate",
+          "name": "Effective Federal Funds Rate",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "FEDFUNDS",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.63
+        },
+        {
+          "content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-27T00:00:00+00:00",
+          "freshness": "UNAVAILABLE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "effective_fed_funds_rate_daily",
+          "name": "Federal Funds Effective Rate",
+          "reason_code": "STALE_VALUE_EXCLUDED",
+          "reference_period": "2026-07-27",
+          "refresh_due_at": null,
+          "series_id": "DFF",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-07-31T00:00:00+00:00",
+          "data_as_of": "2026-07-29T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "fed_funds_target_lower_bound",
+          "name": "Federal Funds Target Range - Lower Limit",
+          "reason_code": null,
+          "reference_period": "2026-07-29",
+          "refresh_due_at": null,
+          "series_id": "DFEDTARL",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.5
+        },
+        {
+          "content_valid_until": "2026-07-31T00:00:00+00:00",
+          "data_as_of": "2026-07-29T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "fed_funds_target_upper_bound",
+          "name": "Federal Funds Target Range - Upper Limit",
+          "reason_code": null,
+          "reference_period": "2026-07-29",
+          "refresh_due_at": null,
+          "series_id": "DFEDTARU",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.75
+        },
+        {
+          "content_valid_until": null,
+          "data_as_of": null,
+          "freshness": "UNAVAILABLE",
+          "lineage": [],
+          "metric_id": "headline_cpi_index",
+          "name": "Headline Consumer Price Index",
+          "reason_code": "SOURCE_SERIES_NOT_AVAILABLE",
+          "reference_period": null,
+          "refresh_due_at": null,
+          "series_id": "CUSR0000SA0",
+          "snapshot_transport_valid_until": null,
+          "source": null,
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "index_points",
+          "value": null
+        },
+        {
+          "content_valid_until": null,
+          "data_as_of": null,
+          "freshness": "UNAVAILABLE",
+          "lineage": [],
+          "metric_id": "headline_pce_price_index",
+          "name": "PCE Price Index",
+          "reason_code": "SOURCE_SERIES_NOT_AVAILABLE",
+          "reference_period": null,
+          "refresh_due_at": null,
+          "series_id": "BEA:PCE_PRICE_INDEX",
+          "snapshot_transport_valid_until": null,
+          "source": null,
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "index_points",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-08-08T18:16:55.747069+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BLS",
+                "source_url": "https://www.bls.gov/"
+              }
+            }
+          ],
+          "metric_id": "headline_ppi_final_demand_index",
+          "name": "Producer Price Index: Final Demand",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "WPUFD4",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BLS",
+            "source_url": "https://www.bls.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "index",
+          "value": 157.045
+        },
+        {
+          "content_valid_until": "2026-08-06T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-18T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "initial_jobless_claims",
+          "name": "Initial Jobless Claims",
+          "reason_code": null,
+          "reference_period": "2026-07-18",
+          "refresh_due_at": null,
+          "series_id": "ICSA",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "claims",
+          "value": 187000.0
+        },
+        {
+          "content_valid_until": "2026-08-06T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-24T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "national_financial_conditions_index",
+          "name": "Chicago Fed National Financial Conditions Index",
+          "reason_code": null,
+          "reference_period": "2026-07-24",
+          "refresh_due_at": null,
+          "series_id": "NFCI",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "index",
+          "value": -0.554
+        },
+        {
+          "content_valid_until": null,
+          "data_as_of": null,
+          "freshness": "UNAVAILABLE",
+          "lineage": [],
+          "metric_id": "nonfarm_payrolls_change",
+          "name": "Monthly change in Total Nonfarm Payrolls",
+          "reason_code": "INSUFFICIENT_VALID_HISTORY",
+          "reference_period": null,
+          "refresh_due_at": null,
+          "series_id": "CES0000000001",
+          "snapshot_transport_valid_until": null,
+          "source": null,
+          "status": "UNAVAILABLE",
+          "transformation": "delta",
+          "unit": "thousands_jobs",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-08-08T18:17:01.556441+00:00",
+          "data_as_of": "2026M05",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA",
+                "source_url": "https://www.bea.gov/"
+              }
+            }
+          ],
+          "metric_id": "personal_consumption_expenditures_nominal_level",
+          "name": "Personal Consumption Expenditures",
+          "reason_code": null,
+          "reference_period": "2026M05",
+          "refresh_due_at": null,
+          "series_id": "BEA:PCE",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA",
+            "source_url": "https://www.bea.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "millions_usd_saar",
+          "value": 22059839.0
+        },
+        {
+          "content_valid_until": "2026-08-08T18:17:01.556441+00:00",
+          "data_as_of": "2026M05",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA",
+                "source_url": "https://www.bea.gov/"
+              }
+            }
+          ],
+          "metric_id": "personal_income",
+          "name": "Personal Income",
+          "reason_code": null,
+          "reference_period": "2026M05",
+          "refresh_due_at": null,
+          "series_id": "BEA:PERSONAL_INCOME",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA",
+            "source_url": "https://www.bea.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "Level",
+          "value": 26916376.0
+        },
+        {
+          "content_valid_until": "2026-08-08T18:17:01.556441+00:00",
+          "data_as_of": "2026M05",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA",
+                "source_url": "https://www.bea.gov/"
+              }
+            }
+          ],
+          "metric_id": "personal_spending",
+          "name": "Personal Spending",
+          "reason_code": null,
+          "reference_period": "2026M05",
+          "refresh_due_at": null,
+          "series_id": "BEA:PERSONAL_SPENDING",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA",
+            "source_url": "https://www.bea.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "Level",
+          "value": 22947517.0
+        },
+        {
+          "content_valid_until": "2026-09-12T18:17:01.556441+00:00",
+          "data_as_of": "2026Q1",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA",
+                "source_url": "https://www.bea.gov/"
+              }
+            }
+          ],
+          "metric_id": "real_gdp",
+          "name": "Real GDP",
+          "reason_code": null,
+          "reference_period": "2026Q1",
+          "refresh_due_at": null,
+          "series_id": "BEA:REAL_GDP",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA",
+            "source_url": "https://www.bea.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "Level",
+          "value": 24180419.0
+        },
+        {
+          "content_valid_until": "2026-09-12T18:17:01.556441+00:00",
+          "data_as_of": "2026Q1",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BEA",
+                "source_url": "https://www.bea.gov/"
+              }
+            }
+          ],
+          "metric_id": "real_gdp_annualized_qoq",
+          "name": "Real GDP annualized quarterly growth",
+          "reason_code": null,
+          "reference_period": "2026Q1",
+          "refresh_due_at": null,
+          "series_id": "BEA:GDP",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BEA",
+            "source_url": "https://www.bea.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "official_annualized_qoq_rate",
+          "unit": "percent",
+          "value": 2.1
+        },
+        {
+          "content_valid_until": "2026-07-30T00:00:00+00:00",
+          "data_as_of": "2026-07-28T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "secured_overnight_financing_rate",
+          "name": "Secured Overnight Financing Rate",
+          "reason_code": null,
+          "reference_period": "2026-07-28",
+          "refresh_due_at": null,
+          "series_id": "SOFR",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.65
+        },
+        {
+          "content_valid_until": "2026-08-08T18:16:55.747069+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BLS",
+                "source_url": "https://www.bls.gov/"
+              }
+            }
+          ],
+          "metric_id": "total_nonfarm_payroll_level",
+          "name": "Total Nonfarm Payrolls",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "CES0000000001",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BLS",
+            "source_url": "https://www.bls.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "thousands_jobs",
+          "value": 158984.0
+        },
+        {
+          "content_valid_until": "2026-07-30T00:00:00+00:00",
+          "data_as_of": "2026-07-28T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "treasury_10y_minus_2y",
+          "name": "10-Year Treasury Minus 2-Year Treasury",
+          "reason_code": null,
+          "reference_period": "2026-07-28",
+          "refresh_due_at": null,
+          "series_id": "T10Y2Y",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 0.35
+        },
+        {
+          "content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-27T00:00:00+00:00",
+          "freshness": "UNAVAILABLE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "treasury_10y_yield",
+          "name": "10-Year Treasury Constant Maturity Rate",
+          "reason_code": "STALE_VALUE_EXCLUDED",
+          "reference_period": "2026-07-27",
+          "refresh_due_at": null,
+          "series_id": "DGS10",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-27T00:00:00+00:00",
+          "freshness": "UNAVAILABLE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "treasury_2y_yield",
+          "name": "2-Year Treasury Constant Maturity Rate",
+          "reason_code": "STALE_VALUE_EXCLUDED",
+          "reference_period": "2026-07-27",
+          "refresh_due_at": null,
+          "series_id": "DGS2",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-08-08T18:16:55.747069+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "BLS",
+                "source_url": "https://www.bls.gov/"
+              }
+            }
+          ],
+          "metric_id": "unemployment_rate",
+          "name": "Unemployment Rate",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "LNS14000000",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "BLS",
+            "source_url": "https://www.bls.gov/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 4.2
+        },
+        {
+          "content_valid_until": "2026-07-30T00:00:00+00:00",
+          "data_as_of": "2026-07-28T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "vix_index",
+          "name": "CBOE Volatility Index: VIX",
+          "reason_code": null,
+          "reference_period": "2026-07-28",
+          "refresh_due_at": null,
+          "series_id": "VIXCLS",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "index",
+          "value": 18.21
+        }
+      ],
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": "BLS/BEA/FRED",
+      "status": "PARTIAL"
+    },
+    "market_internals": {
+      "advance_decline_ratio": null,
+      "advancers": null,
+      "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+      "data_as_of": null,
+      "decliners": null,
+      "freshness": "UNAVAILABLE",
+      "lineage": [
+        {
+          "field": "value",
+          "source": {
+            "acquisition_provider": "TRADIER",
+            "distributor": null,
+            "publisher": "TRADIER",
+            "source_url": null
+          }
+        }
+      ],
+      "percent_advancers": null,
+      "reason_code": "STALE_CONSTITUENT_QUOTES",
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": {
+        "acquisition_provider": "TRADIER",
+        "distributor": null,
+        "publisher": "TRADIER",
+        "source_url": null
+      },
+      "status": "UNAVAILABLE",
+      "weighted_breadth": null
+    },
+    "market_schedule": {
+      "content_valid_until": "2026-07-29T20:00:00+00:00",
+      "context_date": "2026-07-29",
+      "data_as_of": "2026-07-29T00:00:00+00:00",
+      "freshness": "CURRENT",
+      "lineage": [],
+      "market_session_status": "open",
+      "mnq_futures_session": {
+        "is_open": true,
+        "next_close": "2026-07-29T21:00:00+00:00",
+        "next_open": "2026-07-29T18:18:13.268381+00:00",
+        "reason_code": null,
+        "status": "GLOBEX_OPEN"
+      },
+      "nasdaq_cash_session": {
+        "is_open": true,
+        "next_close": "2026-07-29T20:00:00+00:00",
+        "next_open": "2026-07-30T13:30:00+00:00",
+        "reason_code": null,
+        "status": "Market Open"
+      },
+      "reason_code": null,
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": {
+        "acquisition_provider": null,
+        "distributor": null,
+        "publisher": "mixed verified and deterministic session rules",
+        "source_url": "https://www.cmegroup.com/trading-hours.html"
+      },
+      "status": "AVAILABLE"
+    },
+    "nasdaq": {
+      "components": [
+        {
+          "change_pct": 1.12,
+          "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+          "data_as_of": "Jul 29, 2026 2:16 PM",
+          "freshness": "CURRENT",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "Nasdaq official constituent market-cap snapshot",
+                "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+              }
+            }
+          ],
+          "price": 343.905,
+          "quote_occurrence": "Jul 29, 2026 2:16 PM",
+          "reason_code": null,
+          "refresh_due_at": null,
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "Nasdaq official constituent market-cap snapshot",
+            "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+          },
+          "status": "AVAILABLE",
+          "symbol": "AAPL",
+          "weight_pct": 13.07711439
+        },
+        {
+          "change_pct": -1.98,
+          "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+          "data_as_of": "Jul 29, 2026 2:16 PM",
+          "freshness": "CURRENT",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "Nasdaq official constituent market-cap snapshot",
+                "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+              }
+            }
+          ],
+          "price": 193.115,
+          "quote_occurrence": "Jul 29, 2026 2:16 PM",
+          "reason_code": null,
+          "refresh_due_at": null,
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "Nasdaq official constituent market-cap snapshot",
+            "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+          },
+          "status": "AVAILABLE",
+          "symbol": "NVDA",
+          "weight_pct": 12.10095266
+        },
+        {
+          "change_pct": 0.24,
+          "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+          "data_as_of": "Jul 29, 2026 2:16 PM",
+          "freshness": "CURRENT",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "Nasdaq official constituent market-cap snapshot",
+                "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+              }
+            }
+          ],
+          "price": 231.405,
+          "quote_occurrence": "Jul 29, 2026 2:16 PM",
+          "reason_code": null,
+          "refresh_due_at": null,
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "Nasdaq official constituent market-cap snapshot",
+            "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+          },
+          "status": "AVAILABLE",
+          "symbol": "AMZN",
+          "weight_pct": 6.44653082
+        },
+        {
+          "change_pct": 0.28,
+          "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+          "data_as_of": "Jul 29, 2026 2:16 PM",
+          "freshness": "CURRENT",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "Nasdaq official constituent market-cap snapshot",
+                "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+              }
+            }
+          ],
+          "price": 595.08,
+          "quote_occurrence": "Jul 29, 2026 2:16 PM",
+          "reason_code": null,
+          "refresh_due_at": null,
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "Nasdaq official constituent market-cap snapshot",
+            "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+          },
+          "status": "AVAILABLE",
+          "symbol": "META",
+          "weight_pct": 3.91226531
+        },
+        {
+          "change_pct": -1.06,
+          "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+          "data_as_of": "Jul 29, 2026 2:16 PM",
+          "freshness": "CURRENT",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "Nasdaq official constituent market-cap snapshot",
+                "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+              }
+            }
+          ],
+          "price": 304.1794,
+          "quote_occurrence": "Jul 29, 2026 2:16 PM",
+          "reason_code": null,
+          "refresh_due_at": null,
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "Nasdaq official constituent market-cap snapshot",
+            "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+          },
+          "status": "AVAILABLE",
+          "symbol": "TSLA",
+          "weight_pct": 3.11010728
+        },
+        {
+          "change_pct": -2.75,
+          "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+          "data_as_of": "Jul 29, 2026 2:16 PM",
+          "freshness": "CURRENT",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "Nasdaq official constituent market-cap snapshot",
+                "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+              }
+            }
+          ],
+          "price": 442.12,
+          "quote_occurrence": "Jul 29, 2026 2:16 PM",
+          "reason_code": null,
+          "refresh_due_at": null,
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "Nasdaq official constituent market-cap snapshot",
+            "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+          },
+          "status": "AVAILABLE",
+          "symbol": "AMD",
+          "weight_pct": 1.86792367
+        }
+      ],
+      "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+      "data_as_of": "Jul 29, 2026 2:16 PM",
+      "drivers": [],
+      "freshness": "CURRENT",
+      "lineage": [],
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "refresh_due_at": null,
+      "required_symbols": [
+        "AAPL",
+        "NVDA",
+        "AMZN",
+        "META",
+        "TSLA",
+        "AMD"
+      ],
+      "snapshot_transport_valid_until": null,
+      "source": {
+        "acquisition_provider": null,
+        "distributor": null,
+        "publisher": "Nasdaq official constituent market-cap snapshot",
+        "source_url": "https://api.nasdaq.com/api/quote/list-type/nasdaq100?assetclass=stocks"
+      },
+      "status": "PARTIAL"
+    },
+    "news": {
+      "content_valid_until": "2026-07-29T19:17:25.927920+00:00",
+      "current_news": [],
+      "data_as_of": null,
+      "freshness": "UNAVAILABLE",
+      "lineage": [],
+      "reason_code": "NO_CURRENT_NEWS",
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": "SOURCE_GATEWAY",
+      "status": "NO_DATA"
+    },
+    "options_positioning": {
+      "content_valid_until": null,
+      "data_as_of": "2026-07-29T18:18:07+00:00",
+      "freshness": "UNAVAILABLE",
+      "iv_atm": null,
+      "lineage": [],
+      "open_interest": {},
+      "reason_code": "REJECTED_FUTURE_VALUE_EXCLUDED",
+      "refresh_due_at": null,
+      "skew": {},
+      "snapshot_transport_valid_until": "2026-07-29T18:18:10.828632+00:00",
+      "source": {
+        "acquisition_provider": "TRADIER",
+        "distributor": null,
+        "publisher": "TRADIER",
+        "source_url": null
+      },
+      "status": "UNAVAILABLE",
+      "volume": {}
+    },
+    "positioning": {
+      "content_valid_until": "2026-08-06T18:17:13+00:00",
+      "cot": {
+        "asset_managers": {
+          "long": 10261.0,
+          "net": 9691.0,
+          "net_change_week": 1098.0,
+          "short": 570.0,
+          "spreading": 709.0
+        },
+        "contract_code": "209747",
+        "dealers": {
+          "long": 94039.0,
+          "net": 88768.0,
+          "net_change_week": 5155.0,
+          "short": 5271.0,
+          "spreading": 1.0
+        },
+        "leveraged_funds": {
+          "long": 44192.0,
+          "net": -158974.0,
+          "net_change_week": 2629.0,
+          "short": 203166.0,
+          "spreading": 2735.0
+        },
+        "open_interest": 246195,
+        "publication_date": "2026-07-24T19:30:00Z",
+        "report_date": "2026-07-21"
+      },
+      "data_as_of": "2026-07-21T00:00:00+00:00",
+      "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+      "lineage": [
+        {
+          "field": "value",
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "CFTC",
+            "source_url": "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
+          }
+        }
+      ],
+      "reason_code": null,
+      "refresh_due_at": "2026-07-31T19:30:00+00:00",
+      "snapshot_transport_valid_until": "2026-07-31T19:30:00+00:00",
+      "source": {
+        "acquisition_provider": null,
+        "distributor": null,
+        "publisher": "CFTC",
+        "source_url": "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
+      },
+      "status": "AVAILABLE"
+    },
+    "rates": {
+      "content_valid_until": "2026-08-08T18:16:54.460753+00:00",
+      "data_as_of": "2026-07-29T00:00:00+00:00",
+      "freshness": "CURRENT",
+      "lineage": [],
+      "metrics": [
+        {
+          "content_valid_until": "2026-07-31T00:00:00+00:00",
+          "data_as_of": "2026-07-29T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "dfedtarl",
+          "reason_code": null,
+          "reference_period": "2026-07-29",
+          "refresh_due_at": null,
+          "series_id": "DFEDTARL",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.5
+        },
+        {
+          "content_valid_until": "2026-07-31T00:00:00+00:00",
+          "data_as_of": "2026-07-29T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "dfedtaru",
+          "reason_code": null,
+          "reference_period": "2026-07-29",
+          "refresh_due_at": null,
+          "series_id": "DFEDTARU",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.75
+        },
+        {
+          "content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-27T00:00:00+00:00",
+          "freshness": "UNAVAILABLE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "dff",
+          "reason_code": "STALE_VALUE_EXCLUDED",
+          "reference_period": "2026-07-27",
+          "refresh_due_at": null,
+          "series_id": "DFF",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-27T00:00:00+00:00",
+          "freshness": "UNAVAILABLE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "dgs10",
+          "reason_code": "STALE_VALUE_EXCLUDED",
+          "reference_period": "2026-07-27",
+          "refresh_due_at": null,
+          "series_id": "DGS10",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+          "data_as_of": "2026-07-27T00:00:00+00:00",
+          "freshness": "UNAVAILABLE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "dgs2",
+          "reason_code": "STALE_VALUE_EXCLUDED",
+          "reference_period": "2026-07-27",
+          "refresh_due_at": null,
+          "series_id": "DGS2",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "UNAVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": null
+        },
+        {
+          "content_valid_until": "2026-08-08T18:16:54.460753+00:00",
+          "data_as_of": "2026-06-01T00:00:00+00:00",
+          "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "fedfunds",
+          "reason_code": null,
+          "reference_period": "2026-06-01",
+          "refresh_due_at": null,
+          "series_id": "FEDFUNDS",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.63
+        },
+        {
+          "content_valid_until": "2026-07-30T00:00:00+00:00",
+          "data_as_of": "2026-07-28T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "sofr",
+          "reason_code": null,
+          "reference_period": "2026-07-28",
+          "refresh_due_at": null,
+          "series_id": "SOFR",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 3.65
+        },
+        {
+          "content_valid_until": "2026-07-30T00:00:00+00:00",
+          "data_as_of": "2026-07-28T00:00:00+00:00",
+          "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+          "lineage": [
+            {
+              "field": "value",
+              "source": {
+                "acquisition_provider": null,
+                "distributor": null,
+                "publisher": "FRED",
+                "source_url": "https://fred.stlouisfed.org/"
+              }
+            }
+          ],
+          "metric_id": "t10y2y",
+          "reason_code": null,
+          "reference_period": "2026-07-28",
+          "refresh_due_at": null,
+          "series_id": "T10Y2Y",
+          "snapshot_transport_valid_until": null,
+          "source": {
+            "acquisition_provider": null,
+            "distributor": null,
+            "publisher": "FRED",
+            "source_url": "https://fred.stlouisfed.org/"
+          },
+          "status": "AVAILABLE",
+          "transformation": "level",
+          "unit": "percent",
+          "value": 0.35
+        }
+      ],
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": "FRED",
+      "status": "PARTIAL"
+    },
+    "risk": {
+      "content_valid_until": "2026-07-27T16:47:02+00:00",
+      "data_as_of": "2026-07-27T12:01:31+00:00",
+      "excluded_inputs_used": false,
+      "freshness": "UNAVAILABLE",
+      "lineage": [],
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "refresh_due_at": "2026-07-27T16:47:15+00:00",
+      "risk_score": null,
+      "risk_sentiment": null,
+      "snapshot_transport_valid_until": null,
+      "source": null,
+      "status": "UNAVAILABLE"
+    },
+    "vix": {
+      "VIX": {
+        "content_valid_until": "2026-07-27T16:16:03.502668+00:00",
+        "data_as_of": "2026-07-24T00:00:00+00:00",
+        "freshness": "UNAVAILABLE",
+        "lineage": [
+          {
+            "field": "value",
+            "source": {
+              "acquisition_provider": null,
+              "distributor": null,
+              "publisher": "FRED",
+              "source_url": "https://fred.stlouisfed.org/"
+            }
+          }
+        ],
+        "reason_code": "EXPIRED_VALUE_EXCLUDED",
+        "refresh_due_at": null,
+        "snapshot_transport_valid_until": null,
+        "source": {
+          "acquisition_provider": null,
+          "distributor": null,
+          "publisher": "FRED",
+          "source_url": "https://fred.stlouisfed.org/"
+        },
+        "status": "UNAVAILABLE",
+        "symbol": "VIX",
+        "value": null
+      },
+      "VVIX": {
+        "content_valid_until": "2026-07-27T16:46:43+00:00",
+        "data_as_of": "2026-07-27T12:01:31+00:00",
+        "freshness": "UNAVAILABLE",
+        "lineage": [
+          {
+            "field": "value",
+            "source": {
+              "acquisition_provider": null,
+              "distributor": null,
+              "publisher": "CBOE",
+              "source_url": "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VVIX.json"
+            }
+          }
+        ],
+        "reason_code": "STALE_VALUE_EXCLUDED",
+        "refresh_due_at": "2026-07-27T16:46:43+00:00",
+        "snapshot_transport_valid_until": null,
+        "source": {
+          "acquisition_provider": null,
+          "distributor": null,
+          "publisher": "CBOE",
+          "source_url": "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VVIX.json"
+        },
+        "status": "UNAVAILABLE",
+        "symbol": "VVIX",
+        "value": null
+      },
+      "content_valid_until": "2026-07-27T16:46:43+00:00",
+      "data_as_of": "2026-07-27T12:01:31+00:00",
+      "freshness": "UNAVAILABLE",
+      "lineage": [],
+      "reason_code": "NO_VALID_VALUES_AVAILABLE",
+      "refresh_due_at": null,
+      "snapshot_transport_valid_until": null,
+      "source": "CBOE/FRED",
+      "status": "UNAVAILABLE"
+    }
+  },
+  "checksum_scope": "PAYLOAD_WITHOUT_CHECKSUM_AND_SIZE",
+  "checksum_sha256": "df0d8bb61bab08755ae941e97a78c8b57f7bdeaf93249698dca0142f4b2bc76d",
+  "contract": "SeniorAnalystPayloadV1",
+  "data_as_of": "2026-07-29T18:18:07+00:00",
+  "generated_at": "2026-07-29T18:17:25.927920+00:00",
+  "missing_data": [
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.active_event_windows.xtb:135360:2026-07-29.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.active_event_windows.xtb:135360:2026-07-29.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.active_event_windows.xtb:135360:2026-07-29.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:00:00+00:00",
+      "field": "calendar.next_24h_events.bls-a2b649f7decacbed.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:00:00+00:00",
+      "field": "calendar.next_24h_events.bls-a2b649f7decacbed.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:00:00+00:00",
+      "field": "calendar.next_24h_events.bls-a2b649f7decacbed.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:dfe82af8b5acddad87543a10.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:dfe82af8b5acddad87543a10.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:dfe82af8b5acddad87543a10.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:f60bf89cac233b735629ff9b.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:f60bf89cac233b735629ff9b.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:f60bf89cac233b735629ff9b.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:135360:2026-07-29.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:135360:2026-07-29.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:135360:2026-07-29.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145296:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145296:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145333:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145333:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149741:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149741:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149743:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149743:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149744:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149744:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151212:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151212:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151249:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151249:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:dfe82af8b5acddad87543a10.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:dfe82af8b5acddad87543a10.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:dfe82af8b5acddad87543a10.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:f60bf89cac233b735629ff9b.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:f60bf89cac233b735629ff9b.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:f60bf89cac233b735629ff9b.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:135360:2026-07-29.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:135360:2026-07-29.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:135360:2026-07-29.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:149741:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:149741:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "earnings.events",
+      "reason_code": "NO_CURRENT_EARNINGS_EVENTS",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.action",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.pre_meeting_probabilities",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.target_range_lower",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.target_range_upper",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.effective_fed_funds_rate_daily.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.headline_cpi_index.value",
+      "reason_code": "SOURCE_SERIES_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.headline_pce_price_index.value",
+      "reason_code": "SOURCE_SERIES_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.nonfarm_payrolls_change.value",
+      "reason_code": "INSUFFICIENT_VALID_HISTORY",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.treasury_10y_yield.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.treasury_2y_yield.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "market_internals",
+      "reason_code": "STALE_CONSTITUENT_QUOTES",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AAPL",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AMD",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AMZN",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.ASML",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AVGO",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.CSCO",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.GOOG",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.GOOGL",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.META",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.MSFT",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.MU",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.NVDA",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.SPCX",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.TSLA",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.WMT",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "news_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "news.current_news",
+      "reason_code": "NO_CURRENT_NEWS",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "options_positioning",
+      "reason_code": "REJECTED_FUTURE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "rates.metrics.dff.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "rates.metrics.dgs10.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "rates.metrics.dgs2.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": "2026-07-27T16:47:15+00:00",
+      "field": "risk.risk_sentiment",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "vix.vix.value",
+      "reason_code": "EXPIRED_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": "2026-07-27T16:46:43+00:00",
+      "field": "vix.vvix.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    }
+  ],
+  "payload_size_bytes": 78006,
+  "provider_accounting": [
+    {
+      "database_content_valid_until": "2026-07-30T00:00:00+00:00",
+      "database_data_as_of": "2026-07-29T18:17:43Z",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "nasdaq_100",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 7,
+        "called": true,
+        "provider": "NASDAQ",
+        "result": "SUCCESS"
+      },
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "Nasdaq official constituent market-cap snapshot",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-30T00:00:00+00:00",
+      "database_data_as_of": "2026-07-29T18:17:43Z",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "mega_cap_quotes",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 7,
+        "called": true,
+        "provider": "NASDAQ",
+        "result": "SUCCESS"
+      },
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "Nasdaq official constituent market-cap snapshot",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": null,
+      "database_data_as_of": "2026-07-29T18:17:25.927920+00:00",
+      "database_freshness_evaluation": "CURRENT",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "market_internals",
+      "fallbacks": [],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "TRADIER",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "STALE_CONSTITUENT_QUOTES",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "TRADIER",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-27T16:16:03.502668+00:00",
+      "database_data_as_of": "2026-07-24",
+      "database_freshness_evaluation": "LAST_SESSION",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "vix",
+      "fallbacks": [
+        {
+          "attempts": 0,
+          "called": false,
+          "provider": "CBOE",
+          "result": "NOT_CALLED"
+        }
+      ],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "FRED",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "NO_VALID_VALUES_AVAILABLE",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "CBOE/FRED",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-27T16:16:03.502668+00:00",
+      "database_data_as_of": "2026-07-24",
+      "database_freshness_evaluation": "LAST_SESSION",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "vvix",
+      "fallbacks": [],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "CBOE",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "NO_VALID_VALUES_AVAILABLE",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "CBOE/FRED",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-27T16:47:15Z",
+      "database_data_as_of": "2026-07-27T12:01:31Z",
+      "database_freshness_evaluation": "STALE",
+      "database_record_expired": true,
+      "database_record_found": true,
+      "dataset_id": "risk",
+      "fallbacks": [],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 12,
+        "called": true,
+        "provider": "CBOE",
+        "result": "WITHHELD"
+      },
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": null,
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+      "database_data_as_of": "2026-07-28",
+      "database_freshness_evaluation": "CURRENT",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "treasury_rates",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "FRED",
+        "result": "SUCCESS"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:16:54.460753+00:00",
+      "database_data_as_of": "2026-07-28",
+      "database_freshness_evaluation": "CURRENT",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "fed_funds",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "FRED",
+        "result": "SUCCESS"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": null,
+      "database_data_as_of": null,
+      "database_freshness_evaluation": "UNAVAILABLE",
+      "database_record_expired": false,
+      "database_record_found": false,
+      "dataset_id": "target_range",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "FEDERAL_RESERVE",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "PRE_RELEASE_FOMC_FIELDS_UNAVAILABLE",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "XTB Economic Calendar",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": null,
+      "database_data_as_of": null,
+      "database_freshness_evaluation": "UNAVAILABLE",
+      "database_record_expired": false,
+      "database_record_found": false,
+      "dataset_id": "fomc_expectations",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "INVESTING_FED_RATE_MONITOR",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "PRE_RELEASE_FOMC_FIELDS_UNAVAILABLE",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "XTB Economic Calendar",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "cpi",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BLS",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "ppi",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BLS",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "pce",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BEA",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "gdp",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BEA",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "employment",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BLS",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "wages",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BLS",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "nfp",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "BLS",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:01.556441+00:00",
+      "database_data_as_of": "2026M05",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "jobless_claims",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "FRED",
+        "result": "DB_VALID_REUSED"
+      },
+      "reason_code": "DB_VALID_REUSED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "BLS/BEA/FRED",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-23T19:42:01+00:00",
+      "database_data_as_of": "2026-07-29T18:18:12.777244+00:00",
+      "database_freshness_evaluation": "STALE",
+      "database_record_expired": true,
+      "database_record_found": true,
+      "dataset_id": "macro_calendar",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "CANONICAL_EVENT_REPOSITORY",
+        "result": "SUCCESS"
+      },
+      "reason_code": "SOURCE_SELECTED_FROM_SAME_REQUEST",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "CANONICAL_EVENT_REPOSITORY",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-23T19:42:01+00:00",
+      "database_data_as_of": "2026-07-29T18:18:12.777244+00:00",
+      "database_freshness_evaluation": "STALE",
+      "database_record_expired": true,
+      "database_record_found": true,
+      "dataset_id": "flash_services_pmi",
+      "fallbacks": [
+        {
+          "attempts": 0,
+          "called": false,
+          "provider": "INVESTING_EVENT_1062",
+          "result": "NOT_NEEDED"
+        }
+      ],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "SPGLOBAL",
+        "result": "SUCCESS"
+      },
+      "reason_code": "SOURCE_SELECTED_FROM_SAME_REQUEST",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "CANONICAL_EVENT_REPOSITORY",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-30T06:17:41Z",
+      "database_data_as_of": "2026-07-29T18:17:41Z",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "earnings",
+      "fallbacks": [],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "NASDAQ",
+        "result": "FOUND"
+      },
+      "reason_code": "NO_CURRENT_EARNINGS_EVENTS",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "NASDAQ",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:18:10.828632+00:00",
+      "database_data_as_of": "2026-07-29T18:18:10.828632+00:00",
+      "database_freshness_evaluation": "REJECTED_FUTURE",
+      "database_record_expired": true,
+      "database_record_found": true,
+      "dataset_id": "options_positioning",
+      "fallbacks": [],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "TRADIER",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "REJECTED_FUTURE_VALUE_EXCLUDED",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "TRADIER",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-31T19:30:00Z",
+      "database_data_as_of": "2026-07-21",
+      "database_freshness_evaluation": "WEEKLY",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "positioning",
+      "fallbacks": [],
+      "payload_freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "CFTC",
+        "result": "SUCCESS"
+      },
+      "reason_code": "SOURCE_SELECTED_FROM_SAME_REQUEST",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "CFTC",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-28T10:16:06+00:00",
+      "database_data_as_of": "2026-07-29T18:17:07+00:00",
+      "database_freshness_evaluation": "STALE",
+      "database_record_expired": true,
+      "database_record_found": true,
+      "dataset_id": "current_news",
+      "fallbacks": [],
+      "payload_freshness": "UNAVAILABLE",
+      "primary_provider": {
+        "attempts": 0,
+        "called": false,
+        "provider": "FINNHUB",
+        "result": "NOT_CALLED"
+      },
+      "reason_code": "NO_CURRENT_NEWS",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "SOURCE_GATEWAY",
+      "selected_value_present": false,
+      "source_snapshot_revision": 98
+    },
+    {
+      "database_content_valid_until": "2026-07-29T18:17:38+00:00",
+      "database_data_as_of": "2026-07-29T18:17:43Z",
+      "database_freshness_evaluation": "LIVE",
+      "database_record_expired": false,
+      "database_record_found": true,
+      "dataset_id": "market_schedule",
+      "fallbacks": [
+        {
+          "attempts": 0,
+          "called": false,
+          "provider": "CME",
+          "result": "NOT_NEEDED"
+        },
+        {
+          "attempts": 0,
+          "called": false,
+          "provider": "INVESTING_HOLIDAYS",
+          "result": "NOT_NEEDED"
+        },
+        {
+          "attempts": 0,
+          "called": false,
+          "provider": "MARKETBEAT",
+          "result": "NOT_NEEDED"
+        }
+      ],
+      "payload_freshness": "CURRENT",
+      "primary_provider": {
+        "attempts": 1,
+        "called": true,
+        "provider": "NASDAQ_MARKET_INFO",
+        "result": "SUCCESS"
+      },
+      "reason_code": "SOURCE_SELECTED_FROM_SAME_REQUEST",
+      "refresh_mode": "replay",
+      "request_id": "offline-snapshot-98",
+      "selected_source": "mixed verified and deterministic session rules",
+      "selected_value_present": true,
+      "source_snapshot_revision": 98
+    }
+  ],
+  "quality_gate": {
+    "calculated_from_delivered_payload": true,
+    "invalid_analytic_state_count": 0,
+    "live_acceptance": "PENDING",
+    "projection_is_not_live_acceptance": true,
+    "status": "PASS_OFFLINE_STRUCTURE_ONLY",
+    "unexplained_omissions": 0
+  },
+  "readiness": {
+    "available_section_count": 6,
+    "calculated_from_delivered_payload": true,
+    "coverage_ratio": 0.4615,
+    "degraded_section_count": 3,
+    "delivered_value_counts": {
+      "calendar": 24,
+      "earnings": 0,
+      "fomc": 0,
+      "macro": 19,
+      "market_internals": 0,
+      "market_schedule": 1,
+      "nasdaq": 18,
+      "news": 0,
+      "options_positioning": 0,
+      "positioning": 16,
+      "rates": 5,
+      "risk": 0,
+      "vix": 0
+    },
+    "excluded_values_contribute": false,
+    "section_count": 13,
+    "section_status": {
+      "calendar": "AVAILABLE",
+      "earnings": "NO_DATA",
+      "fomc": "PARTIAL",
+      "macro": "PARTIAL",
+      "market_internals": "UNAVAILABLE",
+      "market_schedule": "AVAILABLE",
+      "nasdaq": "PARTIAL",
+      "news": "NO_DATA",
+      "options_positioning": "UNAVAILABLE",
+      "positioning": "AVAILABLE",
+      "rates": "PARTIAL",
+      "risk": "UNAVAILABLE",
+      "vix": "UNAVAILABLE"
+    },
+    "sections_available": [
+      "macro",
+      "calendar",
+      "nasdaq",
+      "rates",
+      "positioning",
+      "market_schedule"
+    ],
+    "sections_degraded": [
+      "macro",
+      "nasdaq",
+      "rates"
+    ],
+    "sections_unavailable": [
+      "fomc",
+      "market_internals",
+      "news",
+      "vix",
+      "risk",
+      "earnings",
+      "options_positioning"
+    ],
+    "status": "PARTIAL",
+    "unavailable_section_count": 7
+  },
+  "request": {
+    "refresh_mode": "replay",
+    "request_id": "offline-snapshot-98",
+    "same_request_provider_accounting": true
+  },
+  "schema_version": "1.0",
+  "snapshot_id": "mcs-d787d9a2-0e29-4636-9203-976d165008ab",
+  "snapshot_revision": 98,
+  "source_snapshot_generated_at": "2026-07-29T18:17:25.927920+00:00",
+  "symbol": "MNQ"
+}

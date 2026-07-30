@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -85,6 +86,9 @@ from app.services.force_generation_lease_service import (
 from app.services.market_context_sync_service import (
     MarketContextSyncService,
     SyncContractError,
+)
+from app.services.senior_analyst_projection_v1 import (
+    build_senior_analyst_payload_v1,
 )
 
 router = APIRouter()
@@ -374,6 +378,10 @@ async def events_active_windows(
 async def market_context_mnq(
     refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
     view: str = Query(default="consumer", pattern="^(consumer|debug)$"),
+    audience: str = Query(
+        default="legacy_v2",
+        pattern="^(legacy_v2|senior_analyst_v1)$",
+    ),
     macro_service: MacroService = Depends(get_macro_service),
     event_service: EventService = Depends(get_event_service),
     event_window_service: EventWindowService = Depends(get_event_window_service),
@@ -382,12 +390,20 @@ async def market_context_mnq(
     deterministic_runtime=Depends(get_deterministic_provider_runtime),
     lifecycle_due_resolver=Depends(get_lifecycle_due_resolver),
 ) -> dict[str, object]:
+    request_id = f"sa-{uuid.uuid4()}"
     settings = enrichment_orchestrator.settings
     snapshots = MarketContextSnapshotRepository(settings)
     if refresh == "false":
         stored = snapshots.latest("MNQ")
         if stored is not None:
-            return stored["debug_payload"] if view == "debug" else stored["consumer_payload"]
+            if view == "debug":
+                return stored["debug_payload"]
+            return _consumer_projection(
+                stored,
+                audience=audience,
+                refresh=refresh,
+                request_id=request_id,
+            )
         raise HTTPException(
             status_code=404,
             detail="No immutable market-context snapshot is available",
@@ -480,11 +496,22 @@ async def market_context_mnq(
                         status="NO_OP",
                         reason_code="FORCE_FIXED_POINT",
                     )
-                    return (
-                        previous["debug_payload"]
-                        if view == "debug"
-                        else previous["consumer_payload"]
-                    )
+                    if view == "debug":
+                        return previous["debug_payload"]
+                    if audience == "senior_analyst_v1":
+                        current = dict(contract)
+                        current["snapshot_id"] = previous[
+                            "debug_payload"
+                        ].get("snapshot_id")
+                        current["snapshot_revision"] = previous[
+                            "debug_payload"
+                        ].get("snapshot_revision")
+                        return build_senior_analyst_payload_v1(
+                            current,
+                            request_id=request_id,
+                            request_refresh_mode=refresh,
+                        )
+                    return previous["consumer_payload"]
             response = _materialize_market_context(
                 contract,
                 refresh=refresh,
@@ -492,6 +519,8 @@ async def market_context_mnq(
                 settings=settings,
                 actual_reconciliation_plan=actual_plan,
                 canonical_generation_plan=canonical_generation_plan,
+                audience=audience,
+                request_id=request_id,
             )
             if refresh == "force":
                 _emit_force_finalization(
@@ -689,7 +718,14 @@ async def market_context_mnq(
         contract,
         refresh=refresh,
     )
-    return _materialize_market_context(contract, refresh=refresh, view=view, settings=settings)
+    return _materialize_market_context(
+        contract,
+        refresh=refresh,
+        view=view,
+        settings=settings,
+        audience=audience,
+        request_id=request_id,
+    )
 
 
 @router.get("/market-context/mnq/debug")
@@ -706,6 +742,7 @@ async def market_context_mnq_debug(
     return await market_context_mnq(
         refresh=refresh,
         view="debug",
+        audience="legacy_v2",
         macro_service=macro_service,
         event_service=event_service,
         event_window_service=event_window_service,
@@ -720,6 +757,10 @@ async def market_context_mnq_debug(
 async def market_context_mnq_consumer(
     response: Response,
     refresh: str = Query(default="auto", pattern="^(auto|false|force)$"),
+    audience: str = Query(
+        default="legacy_v2",
+        pattern="^(legacy_v2|senior_analyst_v1)$",
+    ),
     macro_service: MacroService = Depends(get_macro_service),
     event_service: EventService = Depends(get_event_service),
     event_window_service: EventWindowService = Depends(get_event_window_service),
@@ -735,6 +776,7 @@ async def market_context_mnq_consumer(
     return await market_context_mnq(
         refresh=refresh,
         view="consumer",
+        audience=audience,
         macro_service=macro_service,
         event_service=event_service,
         event_window_service=event_window_service,
@@ -943,6 +985,8 @@ def _materialize_market_context(
     settings,
     actual_reconciliation_plan: dict[str, object] | None = None,
     canonical_generation_plan: dict[str, object] | None = None,
+    audience: str = "legacy_v2",
+    request_id: str | None = None,
 ) -> dict[str, object]:
     snapshots = MarketContextSnapshotRepository(settings)
     event_keys = _context_event_keys(contract)
@@ -982,7 +1026,32 @@ def _materialize_market_context(
         (debug.get("data_quality") or {}).get("ai_diagnostic_artifact_dir"),
         consumer,
     )
-    return stored["debug_payload"] if view == "debug" else stored["consumer_payload"]
+    return (
+        stored["debug_payload"]
+        if view == "debug"
+        else _consumer_projection(
+            stored,
+            audience=audience,
+            refresh=refresh,
+            request_id=request_id,
+        )
+    )
+
+
+def _consumer_projection(
+    stored: dict[str, object],
+    *,
+    audience: str,
+    refresh: str,
+    request_id: str | None,
+) -> dict[str, object]:
+    if audience != "senior_analyst_v1":
+        return dict(stored["consumer_payload"])
+    return build_senior_analyst_payload_v1(
+        dict(stored["debug_payload"]),
+        request_id=request_id,
+        request_refresh_mode=refresh,
+    )
 
 
 def _context_event_keys(contract: dict[str, object]) -> list[str]:

@@ -1,0 +1,857 @@
+{
+  "contract": "SeniorAnalystPayloadV1",
+  "generated_at": "2026-07-29T18:17:25.927920+00:00",
+  "live_acceptance": "PENDING",
+  "missing_data": [
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.active_event_windows.xtb:135360:2026-07-29.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.active_event_windows.xtb:135360:2026-07-29.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.active_event_windows.xtb:135360:2026-07-29.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:00:00+00:00",
+      "field": "calendar.next_24h_events.bls-a2b649f7decacbed.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:00:00+00:00",
+      "field": "calendar.next_24h_events.bls-a2b649f7decacbed.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:00:00+00:00",
+      "field": "calendar.next_24h_events.bls-a2b649f7decacbed.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:dfe82af8b5acddad87543a10.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:dfe82af8b5acddad87543a10.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:dfe82af8b5acddad87543a10.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:f60bf89cac233b735629ff9b.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:f60bf89cac233b735629ff9b.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.event:f60bf89cac233b735629ff9b.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:135360:2026-07-29.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:135360:2026-07-29.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:135360:2026-07-29.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145296:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145296:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145333:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:145333:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149741:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149741:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149743:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149743:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149744:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:149744:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151212:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T14:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151212:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151249:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_24h_events.xtb:151249:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:dfe82af8b5acddad87543a10.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:dfe82af8b5acddad87543a10.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:dfe82af8b5acddad87543a10.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:f60bf89cac233b735629ff9b.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:f60bf89cac233b735629ff9b.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.event:f60bf89cac233b735629ff9b.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:135360:2026-07-29.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:135360:2026-07-29.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:135360:2026-07-29.previous",
+      "reason_code": "PREVIOUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:149741:2026-07-30.actual",
+      "reason_code": "ACTUAL_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "event_risk_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-30T12:30:00+00:00",
+      "field": "calendar.next_7d_high_impact_events.xtb:149741:2026-07-30.consensus",
+      "reason_code": "CONSENSUS_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "earnings.events",
+      "reason_code": "NO_CURRENT_EARNINGS_EVENTS",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.action",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.pre_meeting_probabilities",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.target_range_lower",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": "2026-07-29T18:30:00+00:00",
+      "field": "fomc.target_range_upper",
+      "reason_code": "PRE_RELEASE_FOMC_FIELD_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.effective_fed_funds_rate_daily.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.headline_cpi_index.value",
+      "reason_code": "SOURCE_SERIES_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.headline_pce_price_index.value",
+      "reason_code": "SOURCE_SERIES_NOT_AVAILABLE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.nonfarm_payrolls_change.value",
+      "reason_code": "INSUFFICIENT_VALID_HISTORY",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.treasury_10y_yield.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "macro.metrics.treasury_2y_yield.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "market_internals",
+      "reason_code": "STALE_CONSTITUENT_QUOTES",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AAPL",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AMD",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AMZN",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.ASML",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.AVGO",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.CSCO",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.GOOG",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.GOOGL",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.META",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.MSFT",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.MU",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.NVDA",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.SPCX",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.TSLA",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "nasdaq.drivers.WMT",
+      "reason_code": "CONTRADICTORY_CANONICAL_QUOTE",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "news_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "news.current_news",
+      "reason_code": "NO_CURRENT_NEWS",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "options_positioning",
+      "reason_code": "REJECTED_FUTURE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "rates.metrics.dff.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "rates.metrics.dgs10.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "macro_analysis"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "rates.metrics.dgs2.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": "2026-07-27T16:47:15+00:00",
+      "field": "risk.risk_sentiment",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": null,
+      "field": "vix.vix.value",
+      "reason_code": "EXPIRED_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    {
+      "blocking_for": [
+        "trading_context"
+      ],
+      "expected_refresh_due_at": "2026-07-27T16:46:43+00:00",
+      "field": "vix.vvix.value",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    }
+  ],
+  "offline_validation": {
+    "checks": {
+      "calendar_exact_duplicates": 0,
+      "contradictory_nasdaq_drivers": 0,
+      "expired_current_news": 0,
+      "expired_values_delivered": 0,
+      "invalid_temporal_mappings": 0,
+      "past_due_awaiting_actual": 0,
+      "post_release_pre_fomc_probabilities": 0,
+      "provider_accounting_valid": true,
+      "response_generated_recently": true,
+      "semantic_mapping_errors": 0,
+      "stale_values_presented_as_current": 0,
+      "unexplained_omissions": 0
+    },
+    "live_acceptance_evaluated": false,
+    "status": "PASS_OFFLINE"
+  },
+  "readiness": {
+    "available_section_count": 6,
+    "calculated_from_delivered_payload": true,
+    "coverage_ratio": 0.4615,
+    "degraded_section_count": 3,
+    "delivered_value_counts": {
+      "calendar": 24,
+      "earnings": 0,
+      "fomc": 0,
+      "macro": 19,
+      "market_internals": 0,
+      "market_schedule": 1,
+      "nasdaq": 18,
+      "news": 0,
+      "options_positioning": 0,
+      "positioning": 16,
+      "rates": 5,
+      "risk": 0,
+      "vix": 0
+    },
+    "excluded_values_contribute": false,
+    "section_count": 13,
+    "section_status": {
+      "calendar": "AVAILABLE",
+      "earnings": "NO_DATA",
+      "fomc": "PARTIAL",
+      "macro": "PARTIAL",
+      "market_internals": "UNAVAILABLE",
+      "market_schedule": "AVAILABLE",
+      "nasdaq": "PARTIAL",
+      "news": "NO_DATA",
+      "options_positioning": "UNAVAILABLE",
+      "positioning": "AVAILABLE",
+      "rates": "PARTIAL",
+      "risk": "UNAVAILABLE",
+      "vix": "UNAVAILABLE"
+    },
+    "sections_available": [
+      "macro",
+      "calendar",
+      "nasdaq",
+      "rates",
+      "positioning",
+      "market_schedule"
+    ],
+    "sections_degraded": [
+      "macro",
+      "nasdaq",
+      "rates"
+    ],
+    "sections_unavailable": [
+      "fomc",
+      "market_internals",
+      "news",
+      "vix",
+      "risk",
+      "earnings",
+      "options_positioning"
+    ],
+    "status": "PARTIAL",
+    "unavailable_section_count": 7
+  },
+  "schema_version": "1.0",
+  "sections": {
+    "calendar": {
+      "content_valid_until": "2026-07-29T19:17:25.927920+00:00",
+      "data_as_of": "2026-07-29T18:17:25.927920+00:00",
+      "freshness": "CURRENT",
+      "reason_code": null,
+      "status": "AVAILABLE"
+    },
+    "earnings": {
+      "content_valid_until": "2026-07-30T00:17:25.927920+00:00",
+      "data_as_of": "2026-07-29T18:17:25.927920+00:00",
+      "freshness": "UNAVAILABLE",
+      "reason_code": "NO_CURRENT_EARNINGS_EVENTS",
+      "status": "NO_DATA"
+    },
+    "fomc": {
+      "content_valid_until": "2026-07-29T18:17:25+00:00",
+      "data_as_of": null,
+      "freshness": "CURRENT",
+      "reason_code": "PRE_RELEASE_FOMC_FIELDS_UNAVAILABLE",
+      "status": "PARTIAL"
+    },
+    "macro": {
+      "content_valid_until": "2026-09-12T18:17:01.556441+00:00",
+      "data_as_of": "2026-07-29T00:00:00+00:00",
+      "freshness": "CURRENT",
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "status": "PARTIAL"
+    },
+    "market_internals": {
+      "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+      "data_as_of": null,
+      "freshness": "UNAVAILABLE",
+      "reason_code": "STALE_CONSTITUENT_QUOTES",
+      "status": "UNAVAILABLE"
+    },
+    "market_schedule": {
+      "content_valid_until": "2026-07-29T20:00:00+00:00",
+      "data_as_of": "2026-07-29T00:00:00+00:00",
+      "freshness": "CURRENT",
+      "reason_code": null,
+      "status": "AVAILABLE"
+    },
+    "nasdaq": {
+      "content_valid_until": "2026-07-29T20:17:25.927920+00:00",
+      "data_as_of": "Jul 29, 2026 2:16 PM",
+      "freshness": "CURRENT",
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "status": "PARTIAL"
+    },
+    "news": {
+      "content_valid_until": "2026-07-29T19:17:25.927920+00:00",
+      "data_as_of": null,
+      "freshness": "UNAVAILABLE",
+      "reason_code": "NO_CURRENT_NEWS",
+      "status": "NO_DATA"
+    },
+    "options_positioning": {
+      "content_valid_until": null,
+      "data_as_of": "2026-07-29T18:18:07+00:00",
+      "freshness": "UNAVAILABLE",
+      "reason_code": "REJECTED_FUTURE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    "positioning": {
+      "content_valid_until": "2026-08-06T18:17:13+00:00",
+      "data_as_of": "2026-07-21T00:00:00+00:00",
+      "freshness": "CURRENT_LATEST_OFFICIAL_RELEASE",
+      "reason_code": null,
+      "status": "AVAILABLE"
+    },
+    "rates": {
+      "content_valid_until": "2026-08-08T18:16:54.460753+00:00",
+      "data_as_of": "2026-07-29T00:00:00+00:00",
+      "freshness": "CURRENT",
+      "reason_code": "ONE_OR_MORE_VALUES_UNAVAILABLE",
+      "status": "PARTIAL"
+    },
+    "risk": {
+      "content_valid_until": "2026-07-27T16:47:02+00:00",
+      "data_as_of": "2026-07-27T12:01:31+00:00",
+      "freshness": "UNAVAILABLE",
+      "reason_code": "STALE_VALUE_EXCLUDED",
+      "status": "UNAVAILABLE"
+    },
+    "vix": {
+      "content_valid_until": "2026-07-27T16:46:43+00:00",
+      "data_as_of": "2026-07-27T12:01:31+00:00",
+      "freshness": "UNAVAILABLE",
+      "reason_code": "NO_VALID_VALUES_AVAILABLE",
+      "status": "UNAVAILABLE"
+    }
+  },
+  "snapshot_revision": 98
+}

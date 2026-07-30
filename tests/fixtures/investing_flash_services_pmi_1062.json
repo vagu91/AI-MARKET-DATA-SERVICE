@@ -1,0 +1,15 @@
+{
+  "occurrences": [
+    {
+      "event_id": 1062,
+      "occurrence_id": 552847,
+      "occurrence_time": "2026-07-24T13:45:00Z",
+      "actual": 53.6,
+      "forecast": 51.3,
+      "previous": 51.2,
+      "preliminary": true,
+      "reference_period": "Jul",
+      "precision": 1
+    }
+  ]
+}
