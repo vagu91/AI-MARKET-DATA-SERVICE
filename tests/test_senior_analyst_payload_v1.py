@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 from app.main import app
 from app.api.routes import _consumer_projection
@@ -17,11 +16,14 @@ from app.services.senior_analyst_projection_v1 import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SNAPSHOT_98 = (
-    ROOT
-    / "data"
-    / "live-ai-trader-capture-20260729T181632Z"
-    / "senior-analyst-consumer-full.json"
+SNAPSHOT_98_FIXTURE = (
+    ROOT / "tests" / "fixtures" / "senior_analyst_snapshot98_compact.json"
+)
+SNAPSHOT_98_ORIGIN_SHA256 = (
+    "3dc318ebdb7df82462f328ac9e623c46b2b3ea57b4238fde37544c0b859ee232"
+)
+SNAPSHOT_98_FIXTURE_PAYLOAD_SHA256 = (
+    "6b9db5776477882109401abbba301014d3a3c15d44a741acdbfab020e9307d2e"
 )
 FIXED_NOW = datetime(2026, 7, 29, 18, 17, 25, tzinfo=UTC)
 REQUIRED_METADATA = {
@@ -38,12 +40,51 @@ REQUIRED_METADATA = {
 
 
 def _load_snapshot_98() -> dict:
-    if not SNAPSHOT_98.exists():
-        pytest.skip("authoritative local snapshot 98 is not present")
-    payload = json.loads(SNAPSHOT_98.read_text(encoding="utf-8"))
+    fixture = json.loads(SNAPSHOT_98_FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["fixture_contract"] == (
+        "SeniorAnalystSnapshot98RegressionFixture"
+    )
+    assert fixture["fixture_version"] == 1
+    metadata = fixture["metadata"]
+    assert metadata["origin"] == {
+        "generated_at": "2026-07-29T18:17:25.927920+00:00",
+        "path": (
+            "data/live-ai-trader-capture-20260729T181632Z/"
+            "senior-analyst-consumer-full.json"
+        ),
+        "sha256": SNAPSHOT_98_ORIGIN_SHA256,
+        "size_bytes": 17_993_060,
+        "snapshot_id": "mcs-d787d9a2-0e29-4636-9203-976d165008ab",
+        "snapshot_revision": 98,
+    }
+    payload = fixture["payload"]
+    canonical_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_sha256 = hashlib.sha256(canonical_payload).hexdigest()
+    assert metadata["payload_sha256"] == SNAPSHOT_98_FIXTURE_PAYLOAD_SHA256
+    assert payload_sha256 == SNAPSHOT_98_FIXTURE_PAYLOAD_SHA256
     assert payload["snapshot_revision"] == 98
     assert payload["generated_at"].startswith("2026-07-29T18:17:25")
     return payload
+
+
+def test_snapshot_98_compact_fixture_is_versioned_and_bounded() -> None:
+    source = _load_snapshot_98()
+    assert SNAPSHOT_98_FIXTURE.stat().st_size < 50_000
+    assert set(source["sections"]) == {
+        "event_calendar",
+        "macro",
+        "market_internals",
+        "nasdaq",
+        "news",
+        "options_positioning",
+        "risk",
+        "vix",
+    }
 
 
 def _synthetic_sync() -> dict:
@@ -164,7 +205,7 @@ def test_required_structure_survives_all_null_values() -> None:
     assert payload["readiness"]["available_section_count"] == 0
 
 
-def test_monthly_latest_official_release_is_not_rejected_for_old_reference_period() -> None:
+def test_recent_official_read_does_not_prove_latest_monthly_release() -> None:
     source = _synthetic_sync()
     source["sections"]["macro"]["snapshot"]["inflation"]["CUSR0000SA0"] = {
         "series_id": "CUSR0000SA0",
@@ -182,8 +223,9 @@ def test_monthly_latest_official_release_is_not_rejected_for_old_reference_perio
     metric = build_senior_analyst_payload_v1(source, now=FIXED_NOW)["analytics"][
         "macro"
     ]["metrics"][0]
-    assert metric["value"] == 325.4
-    assert metric["freshness"] == "CURRENT_LATEST_OFFICIAL_RELEASE"
+    assert metric["value"] is None
+    assert metric["freshness"] == "UNAVAILABLE"
+    assert metric["reason_code"] == "LATEST_OFFICIAL_RELEASE_NOT_PROVEN"
     assert metric["metric_id"] == "headline_cpi_index"
 
 
@@ -200,7 +242,10 @@ def test_required_macro_semantics_do_not_reinterpret_levels_as_changes() -> None
     assert by_metric["personal_consumption_expenditures_nominal_level"][
         "transformation"
     ] == "level"
-    assert by_metric["total_nonfarm_payroll_level"]["value"] == 158984.0
+    assert by_metric["total_nonfarm_payroll_level"]["value"] is None
+    assert by_metric["total_nonfarm_payroll_level"]["reason_code"] == (
+        "CONTENT_VALIDITY_EXPIRED"
+    )
     assert by_metric["nonfarm_payrolls_change"]["value"] is None
     assert by_metric["nonfarm_payrolls_change"]["reason_code"] == (
         "INSUFFICIENT_VALID_HISTORY"
@@ -370,13 +415,14 @@ def test_readiness_counts_only_filtered_delivered_values() -> None:
     assert readiness["coverage_ratio"] < 1.0
 
 
-def test_every_omission_has_a_reason_and_provider_accounting_is_complete() -> None:
+def test_every_omission_has_a_reason_and_inferred_accounting_is_incomplete() -> None:
     payload = build_senior_analyst_payload_v1(_load_snapshot_98(), now=FIXED_NOW)
     assert payload["missing_data"]
     assert all(item["reason_code"] for item in payload["missing_data"])
     result = validate_senior_analyst_payload_v1(payload, now=FIXED_NOW)
     assert result["checks"]["unexplained_omissions"] == 0
-    assert result["checks"]["provider_accounting_valid"] is True
+    assert result["checks"]["provider_accounting_valid"] is False
+    assert result["status"] == "PASS_OFFLINE"
 
 
 def test_validator_rejects_temporally_expired_value_labeled_current() -> None:
@@ -453,11 +499,10 @@ def test_route_projection_materializes_v1_without_replacing_legacy_storage() -> 
     )
     assert legacy["contract"] == "ai_trader_market_context_consumer"
     assert senior["contract"] == "SeniorAnalystPayloadV1"
-    assert senior["request"] == {
-        "request_id": "route-test",
-        "refresh_mode": "force",
-        "same_request_provider_accounting": True,
-    }
+    assert senior["request"]["request_id"] == "route-test"
+    assert senior["request"]["refresh_mode"] == "force"
+    assert senior["request"]["same_request_provider_accounting"] is False
+    assert senior["request"]["accounting_correlation_id"] is None
 
 
 def test_second_projection_does_not_mutate_authoritative_input() -> None:

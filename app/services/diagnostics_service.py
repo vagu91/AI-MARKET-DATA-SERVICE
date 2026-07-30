@@ -133,6 +133,7 @@ class DiagnosticsService:
         symbol: str = "MNQ",
         fetch_missing_nasdaq: bool = True,
         refresh: str = "auto",
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
         fetch_missing = refresh != "false"
@@ -140,7 +141,7 @@ class DiagnosticsService:
         staged_force_events: list[Any] = []
         self.force_generation_plan = {}
         request_context = ExecutionContext.provider_only(
-            correlation_id=f"market-context-{uuid.uuid4()}",
+            correlation_id=request_id or f"market-context-{uuid.uuid4()}",
             allow_live_providers=fetch_missing,
         )
         force_schedule_coverage: dict[str, Any] = {}
@@ -475,6 +476,16 @@ class DiagnosticsService:
         contract["risk_context"] = risk_context
         contract["risk_sentiment"] = risk_sentiment
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
+        contract["request_scoped_provider_accounting"] = {
+            "request_id": request_id,
+            "correlation_id": request_context.correlation_id,
+            "request_started_at": now.isoformat(),
+            "request_completed_at": datetime.now(UTC).isoformat(),
+            "evidence_origin": "NORMAL_APPLICATION_REQUEST",
+            "evidence_status": "INCOMPLETE",
+            "reason_code": "PER_DATASET_REQUEST_EVIDENCE_NOT_EMITTED",
+            "datasets": [],
+        }
         return harden_market_context(contract, settings=self.settings)
 
     def _canonical_three_week_events(

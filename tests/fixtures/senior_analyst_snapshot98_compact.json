@@ -1,0 +1,371 @@
+{
+  "fixture_contract": "SeniorAnalystSnapshot98RegressionFixture",
+  "fixture_version": 1,
+  "metadata": {
+    "description": "Compact field-level extraction of snapshot 98 retaining only the source nodes needed to reproduce the SeniorAnalystPayloadV1 regressions.",
+    "origin": {
+      "generated_at": "2026-07-29T18:17:25.927920+00:00",
+      "path": "data/live-ai-trader-capture-20260729T181632Z/senior-analyst-consumer-full.json",
+      "sha256": "3dc318ebdb7df82462f328ac9e623c46b2b3ea57b4238fde37544c0b859ee232",
+      "size_bytes": 17993060,
+      "snapshot_id": "mcs-d787d9a2-0e29-4636-9203-976d165008ab",
+      "snapshot_revision": 98
+    },
+    "derivation": {
+      "method": "Exact scalar and object-field selection; values were not synthesized or time-shifted.",
+      "retained_defects": [
+        "stale official macro records and an incorrectly keyed core CPI series",
+        "past calendar occurrence still marked AWAITING_ACTUAL",
+        "invalid calendar reference-period mapping",
+        "Nasdaq driver inconsistent with its canonical holding quote",
+        "stale/expired volatility and risk context",
+        "expired current-news candidate",
+        "stale market-internal constituents",
+        "future-dated options observation"
+      ],
+      "source_json_object_roots": [
+        "/contract",
+        "/schema_version",
+        "/symbol",
+        "/snapshot_id",
+        "/snapshot_revision",
+        "/generated_at",
+        "/sections/macro/snapshot/growth/BEA:GDP",
+        "/sections/macro/snapshot/inflation/BEA:PCE",
+        "/sections/macro/snapshot/inflation/CUSR0000SA0",
+        "/sections/macro/snapshot/labor/CES0000000001",
+        "/sections/macro/snapshot/labor/ICSA",
+        "/sections/event_calendar/window/current_week/events/0",
+        "/sections/event_calendar/calendar/other_economic_events/38",
+        "/sections/nasdaq/qqq_holdings/holdings/0",
+        "/sections/nasdaq/driver_context/0",
+        "/sections/market_internals",
+        "/sections/news/context/articles/0",
+        "/sections/vix/vix",
+        "/sections/vix/vvix",
+        "/sections/risk/risk_context",
+        "/sections/options_positioning"
+      ]
+    },
+    "payload_sha256": "6b9db5776477882109401abbba301014d3a3c15d44a741acdbfab020e9307d2e"
+  },
+  "payload": {
+    "contract": "ai_trader_market_context_sync",
+    "schema_version": "1.0",
+    "symbol": "MNQ",
+    "snapshot_id": "mcs-d787d9a2-0e29-4636-9203-976d165008ab",
+    "snapshot_revision": 98,
+    "generated_at": "2026-07-29T18:17:25.927920+00:00",
+    "sections": {
+      "macro": {
+        "snapshot": {
+          "growth": {
+            "BEA:GDP": {
+              "actual_is_official": true,
+              "cache_status": "DB",
+              "data_as_of": "2026Q1",
+              "data_origin_is_official": true,
+              "distribution_source_is_official": true,
+              "frequency": "quarterly",
+              "freshness": "LIVE",
+              "is_official_source": true,
+              "latest_release_at": "2026Q1",
+              "latest_released_period": "2026Q1",
+              "latest_released_value": 2.1,
+              "metric": "gdp_current_dollars",
+              "name": "Gross Domestic Product",
+              "provider_type": "API",
+              "retrieved_at": "2026-07-29T18:17:01.556441Z",
+              "series_id": "BEA:GDP",
+              "source": "BEA",
+              "unit": "Percent change, annual rate",
+              "valid_until": "2026-07-29T18:17:01.556441+00:00",
+              "value": 2.1
+            }
+          },
+          "inflation": {
+            "BEA:PCE": {
+              "actual_is_official": true,
+              "cache_status": "DB",
+              "data_as_of": "2026M05",
+              "data_origin_is_official": true,
+              "distribution_source_is_official": true,
+              "frequency": "monthly",
+              "freshness": "LIVE",
+              "is_official_source": true,
+              "latest_release_at": "2026M05",
+              "latest_released_period": "2026M05",
+              "latest_released_value": 22059839.0,
+              "metric": "personal_consumption_expenditures",
+              "name": "Personal Consumption Expenditures",
+              "provider_type": "API",
+              "retrieved_at": "2026-07-29T18:17:01.556441Z",
+              "series_id": "BEA:PCE",
+              "source": "BEA",
+              "unit": "Level",
+              "valid_until": "2026-07-29T18:17:01.556441+00:00",
+              "value": 22059839.0
+            },
+            "CUSR0000SA0": {
+              "actual_is_official": true,
+              "cache_status": "DB",
+              "data_as_of": "2026-06-01",
+              "data_origin_is_official": true,
+              "distribution_source_is_official": true,
+              "frequency": "monthly",
+              "freshness": "STALE",
+              "is_official_source": true,
+              "latest_release_at": "2026-06-01",
+              "latest_released_period": "2026-06-01",
+              "latest_released_value": 336.065,
+              "metric": "headline_cpi_index",
+              "name": "Core Consumer Price Index",
+              "provider_type": "API",
+              "retrieved_at": "2026-07-29T18:16:55.747069Z",
+              "series_id": "CUSR0000SA0L1E",
+              "source": "BLS",
+              "unit": "index",
+              "valid_until": "2026-07-29T18:16:55.747069+00:00",
+              "value": 336.065
+            }
+          },
+          "labor": {
+            "CES0000000001": {
+              "actual_is_official": true,
+              "cache_status": "DB",
+              "data_as_of": "2026-06-01",
+              "data_origin_is_official": true,
+              "distribution_source_is_official": true,
+              "frequency": "monthly",
+              "freshness": "STALE",
+              "is_official_source": true,
+              "latest_release_at": "2026-06-01",
+              "latest_released_period": "2026-06-01",
+              "latest_released_value": 158984.0,
+              "metric": "nonfarm_payrolls_level",
+              "name": "Total Nonfarm Payrolls",
+              "provider_type": "API",
+              "retrieved_at": "2026-07-29T18:16:55.747069Z",
+              "series_id": "CES0000000001",
+              "source": "BLS",
+              "unit": "thousands of jobs",
+              "valid_until": "2026-07-29T18:16:55.747069+00:00",
+              "value": 158984.0
+            },
+            "ICSA": {
+              "actual_is_official": true,
+              "cache_status": "DB",
+              "data_as_of": "2026-07-18",
+              "data_origin_is_official": true,
+              "distribution_source_is_official": true,
+              "frequency": "weekly",
+              "freshness": "CURRENT_RELEASE",
+              "is_official_source": true,
+              "latest_release_at": "2026-07-18",
+              "latest_released_period": "2026-07-18",
+              "latest_released_value": 187000.0,
+              "metric": "initial_jobless_claims",
+              "name": "Initial Claims",
+              "provider_type": "API",
+              "retrieved_at": "2026-07-29T18:16:54.460753Z",
+              "series_id": "ICSA",
+              "source": "FRED",
+              "unit": "thousands of claims",
+              "valid_until": "2026-07-29T18:16:54.460753+00:00",
+              "value": 187000.0
+            }
+          }
+        }
+      },
+      "event_calendar": {
+        "calendar": {
+          "other_economic_events": [
+            {
+              "actual": null,
+              "calendar_verified": false,
+              "country": "US",
+              "date": "2026-08-04",
+              "event_id": "bls-252a6c2994ae7849",
+              "event_risk_level": "HIGH",
+              "event_type": "employment_situation",
+              "impact": "HIGH",
+              "invalid_period_mapping": true,
+              "is_official_source": true,
+              "name": "Employment Situation (August 2026)",
+              "source": "BLS Release Calendar",
+              "temporal_status": "PRE_RELEASE"
+            }
+          ]
+        },
+        "window": {
+          "current_week": {
+            "events": [
+              {
+                "actual": null,
+                "actual_required": true,
+                "country": "US",
+                "event_id": "xtb:146265:2026-07-27",
+                "event_type": "XTB_INDICATOR_60",
+                "impact": "HIGH",
+                "is_future": false,
+                "is_past": true,
+                "is_today": false,
+                "occurrence_id": "xtb:146265:2026-07-27",
+                "provider": "XTB Economic Calendar",
+                "release_status": "AWAITING_ACTUAL",
+                "retrieved_at": "2026-07-22T15:53:24+00:00",
+                "scheduled_at_utc": "2026-07-27T12:30:00+00:00",
+                "source": "XTB Economic Calendar",
+                "title": "Ordini di beni durevoli ex trasporto M/M"
+              }
+            ]
+          }
+        }
+      },
+      "nasdaq": {
+        "driver_context": [
+          {
+            "change_pct": 5.5233360950013815,
+            "earnings_date": "2026-07-30",
+            "has_recent_news": false,
+            "qqq_weight": 13.07711439,
+            "recent_news_count": 0,
+            "symbol": "AAPL",
+            "upcoming_earnings": true,
+            "weighted_contribution": 0.722293
+          }
+        ],
+        "qqq_holdings": {
+          "holdings": [
+            {
+              "as_of": "Jul 29, 2026 2:16 PM",
+              "change_pct": 1.12,
+              "data_origin_is_official": true,
+              "freshness": "LIVE",
+              "is_official_source": true,
+              "price": 343.905,
+              "retrieved_at": "2026-07-29T18:16:50Z",
+              "source": "Nasdaq official constituent market-cap snapshot",
+              "symbol": "AAPL",
+              "valid_until": "2026-07-30T06:16:50Z",
+              "weight": 13.07711439,
+              "weight_pct": 13.07711439
+            }
+          ],
+          "source": "Nasdaq official constituent market-cap snapshot"
+        }
+      },
+      "market_internals": {
+        "advance_decline_ratio": 1.0196078431372548,
+        "advancers": 52,
+        "decliners": 51,
+        "percent_advancers": 50.485437,
+        "provider": "TRADIER",
+        "stale_quote_count": 40,
+        "status": "AVAILABLE",
+        "weighted_breadth": 0.09582640065208681
+      },
+      "news": {
+        "context": {
+          "articles": [
+            {
+              "article_id": "aa29cbf35b5792b4",
+              "freshness": "STALE",
+              "headline": "Apple Stock Hits Record High Before Fiscal Q3 Earnings",
+              "published_at": "2026-07-27T16:16:06+00:00",
+              "source": "Investor's Business Daily",
+              "title": "Apple Stock Hits Record High Before Fiscal Q3 Earnings",
+              "url": "https://www.investors.com/news/technology/apple-stock-hits-record-high-before-fiscal-q3-earnings/?src=A00220&yptr=yahoo"
+            }
+          ]
+        },
+        "latest": []
+      },
+      "vix": {
+        "vix": {
+          "cache_status": "DB",
+          "change": -0.12,
+          "change_pct": -0.641711,
+          "data_as_of": "2026-07-24",
+          "data_origin_is_official": true,
+          "freshness": "LAST_SESSION",
+          "is_official_source": true,
+          "provider_type": "API",
+          "retrieved_at": "2026-07-27T16:16:03.502668Z",
+          "source": "FRED",
+          "status": "found",
+          "symbol": "VIX",
+          "valid_until": "2026-07-27T16:16:03.502668+00:00",
+          "value": 18.58
+        },
+        "vvix": {
+          "cache_status": "DB",
+          "change": 1.92,
+          "change_pct": 1.9061,
+          "data_as_of": "2026-07-27T12:01:31Z",
+          "data_origin_is_official": true,
+          "freshness": "RECENT",
+          "is_official_source": true,
+          "lifecycle": {
+            "currently_valid": false,
+            "freshness": "STALE",
+            "freshness_state": "DUE",
+            "next_refresh_at": "2026-07-27T16:46:43+00:00",
+            "valid_until": "2026-07-27T16:46:43+00:00"
+          },
+          "provider_type": "OFFICIAL_EXCHANGE_DELAYED_QUOTE",
+          "retrieved_at": "2026-07-27T16:16:43Z",
+          "source": "CBOE",
+          "status": "found",
+          "symbol": "VVIX",
+          "valid_until": "2026-07-27T16:16:43+00:00",
+          "value": 102.65
+        }
+      },
+      "risk": {
+        "risk_context": {
+          "data_as_of": "2026-07-27T12:01:31Z",
+          "derived_context": {
+            "composite_status": "PARTIAL"
+          },
+          "freshness": "STALE",
+          "last_successful_refresh_at": "2026-07-27T16:17:15Z",
+          "lifecycle": {
+            "currently_valid": false,
+            "freshness": "STALE",
+            "freshness_state": "DUE",
+            "next_refresh_at": "2026-07-27T16:47:15+00:00",
+            "valid_until": "2026-07-27T16:47:02+00:00"
+          },
+          "next_refresh_at": "2026-07-27T16:47:15Z",
+          "status": "stale_acceptable"
+        }
+      },
+      "options_positioning": {
+        "freshness": "REJECTED_FUTURE",
+        "iv_atm": 0.55065,
+        "observed_at": "2026-07-29T18:18:07+00:00",
+        "open_interest": {
+          "calls": 296417.0,
+          "put_call_ratio": 1.2521447825192211,
+          "puts": 371157.0,
+          "ratio_reason_code": null
+        },
+        "provider": "TRADIER",
+        "retrieved_at": "2026-07-29T18:18:10.828632+00:00",
+        "skew": {
+          "convention": "mean_put_iv_minus_mean_call_iv_within_10pct_spot",
+          "reason_code": null,
+          "value": -0.15343285714285726
+        },
+        "status": "AVAILABLE",
+        "volume": {
+          "calls": 2100631.0,
+          "put_call_ratio": 0.9615001397199222,
+          "puts": 2019757.0,
+          "ratio_reason_code": null
+        }
+      }
+    }
+  }
+}

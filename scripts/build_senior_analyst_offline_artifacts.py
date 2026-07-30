@@ -89,7 +89,12 @@ def main() -> int:
         {
             "request_id": "offline-snapshot-98",
             "source_snapshot_revision": 98,
-            "same_request": True,
+            "same_request": projection["request"][
+                "same_request_provider_accounting"
+            ],
+            "accounting_evidence_origin": projection["request"][
+                "accounting_evidence_origin"
+            ],
             "provider_accounting": projection["provider_accounting"],
             "live_values": False,
             "live_acceptance": "PENDING",

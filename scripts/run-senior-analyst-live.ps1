@@ -16,6 +16,7 @@ $Output = Join-Path $Repo "data\senior-analyst-live-validation\$RunId"
 $BodyPath = Join-Path $Output "response-body.json"
 $HeadersPath = Join-Path $Output "response-headers.json"
 $ReportPath = Join-Path $Output "acceptance-report.json"
+$LatestPath = Join-Path $Repo "data\senior-analyst-live-latest.json"
 $ServiceOut = Join-Path $Output "service.stdout.log"
 $ServiceErr = Join-Path $Output "service.stderr.log"
 $Process = $null
@@ -80,6 +81,75 @@ function Save-DatabaseBundle {
         sqlite_integrity_check = $integrity.Trim()
     } | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $Destination "manifest.json") -Encoding UTF8
+}
+
+function Publish-LatestAcceptance {
+    param(
+        [string]$PayloadPath,
+        [string]$ValidationReportPath,
+        [string]$Destination
+    )
+    if (-not (Test-Path -LiteralPath $PayloadPath -PathType Leaf)) {
+        throw "Cannot publish latest acceptance without the exact HTTP body."
+    }
+    if (-not (Test-Path -LiteralPath $ValidationReportPath -PathType Leaf)) {
+        throw "Cannot publish latest acceptance without the validation report."
+    }
+
+    $report = Get-Content -LiteralPath $ValidationReportPath -Raw |
+        ConvertFrom-Json
+    if ($report.status -ne "PASS" -or -not $report.validated_exact_http_body) {
+        throw "Latest acceptance can be published only from an exact-body PASS."
+    }
+
+    $payload = Get-Content -LiteralPath $PayloadPath -Raw |
+        ConvertFrom-Json
+    $payloadHash = (
+        Get-FileHash -LiteralPath $PayloadPath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    if ($payloadHash -ne ([string]$report.body_sha256).ToLowerInvariant()) {
+        throw "Exact HTTP body hash does not match the validation report."
+    }
+
+    $responseGeneratedAt = $payload.generated_at
+    $readinessStatus = $payload.readiness.status
+    if (
+        [string]::IsNullOrWhiteSpace([string]$responseGeneratedAt) -or
+        [string]::IsNullOrWhiteSpace([string]$readinessStatus)
+    ) {
+        throw "Validated payload is missing generated_at or readiness.status."
+    }
+
+    $destinationDirectory = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $destinationDirectory -Force |
+        Out-Null
+    $temporary = Join-Path $destinationDirectory (
+        ".senior-analyst-live-latest.$([Guid]::NewGuid().ToString('N')).tmp"
+    )
+    try {
+        $latest = [ordered]@{
+            result = "PASS"
+            response_generated_at = [string]$responseGeneratedAt
+            full_payload_path = [IO.Path]::GetFullPath($PayloadPath)
+            full_payload_sha256 = $payloadHash
+            readiness_status = [string]$readinessStatus
+        }
+        $json = ($latest | ConvertTo-Json -Depth 4) + [Environment]::NewLine
+        [IO.File]::WriteAllText(
+            $temporary,
+            $json,
+            [Text.UTF8Encoding]::new($false)
+        )
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Destination, $null)
+        } else {
+            [IO.File]::Move($temporary, $Destination)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
 }
 
 Push-Location $Repo
@@ -198,4 +268,9 @@ if (-not (Test-Path -LiteralPath $BodyPath -PathType Leaf)) {
 if ($LASTEXITCODE -ne 0) {
     throw "Senior Analyst LIVE validation failed. See $ReportPath"
 }
+Publish-LatestAcceptance `
+    -PayloadPath $BodyPath `
+    -ValidationReportPath $ReportPath `
+    -Destination $LatestPath
 Write-Output "LIVE validation passed: $ReportPath"
+Write-Output "Latest acceptance published: $LatestPath"

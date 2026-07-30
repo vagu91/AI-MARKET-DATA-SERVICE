@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_sync_service import extract_sync_sections
+from app.services.official_actual_semantics import normalize_reference_period
 
 
 CONTRACT_NAME = "SeniorAnalystPayloadV1"
@@ -234,12 +235,13 @@ def build_senior_analyst_payload_v1(
     }
     missing = _deduplicate_missing(missing)
     readiness = _readiness(analytics)
-    provider_accounting = _provider_accounting(
+    accounting = _provider_accounting(
         analytics,
         source_payload=source_payload,
         request_id=request_id,
         refresh_mode=request_refresh_mode,
     )
+    provider_accounting = accounting["rows"]
     output = {
         "contract": CONTRACT_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -254,9 +256,17 @@ def build_senior_analyst_payload_v1(
         "request": {
             "request_id": request_id,
             "refresh_mode": request_refresh_mode,
-            "same_request_provider_accounting": (
-                request_refresh_mode in {"force", "replay"}
+            "accounting_correlation_id": accounting.get("correlation_id"),
+            "accounting_request_started_at": accounting.get(
+                "request_started_at"
             ),
+            "accounting_request_completed_at": accounting.get(
+                "request_completed_at"
+            ),
+            "accounting_evidence_origin": accounting.get("evidence_origin"),
+            "same_request_provider_accounting": accounting[
+                "same_request_complete"
+            ],
         },
         "readiness": readiness,
         "analytics": analytics,
@@ -342,9 +352,14 @@ def validate_senior_analyst_payload_v1(
         for item in payload.get("missing_data") or []
         if not item.get("reason_code")
     )
+    request = (
+        payload.get("request")
+        if isinstance(payload.get("request"), dict)
+        else {}
+    )
     accounting_valid = _provider_accounting_valid(
         payload.get("provider_accounting") or [],
-        request_id=_nested_value(payload, "request", "request_id"),
+        request=request,
         require_request_id=require_recent_response,
     )
     if require_recent_response:
@@ -372,7 +387,7 @@ def validate_senior_analyst_payload_v1(
         "unexplained_omissions": unexplained,
         "provider_accounting_valid": accounting_valid,
     }
-    passed = (
+    content_passed = (
         checks["response_generated_recently"]
         and all(
             checks[key] == 0
@@ -389,7 +404,9 @@ def validate_senior_analyst_payload_v1(
                 "unexplained_omissions",
             )
         )
-        and accounting_valid
+    )
+    passed = content_passed and (
+        accounting_valid if require_recent_response else True
     )
     return {
         "status": (
@@ -1395,13 +1412,18 @@ def _assess_datum(
     )
     policy_age = _policy_age(frequency)
     reference = _utc(data_as_of) if data_as_of else None
-    official_reconfirmed = bool(
+    recent_official_read = bool(
         retrieved
         and abs((now - _utc(retrieved)).total_seconds()) <= 24 * 60 * 60
         and (
             value.get("is_official_source") is True
             or value.get("data_origin_is_official") is True
         )
+    )
+    latest_official_release_verified = _latest_official_release_verified(
+        value,
+        now=now,
+        frequency=frequency,
     )
     if data_as_of and _utc(data_as_of) > now + timedelta(minutes=5):
         return _assessment(
@@ -1413,23 +1435,7 @@ def _assess_datum(
             explicit_until,
             refresh_due,
         )
-    invalid = (
-        {raw_status, raw_freshness, lifecycle_freshness}
-        & INVALID_ANALYTIC_STATES
-    )
-    if invalid and not (
-        official_reconfirmed and frequency.lower() in {"monthly", "quarterly", "weekly"}
-    ):
-        return _assessment(
-            False,
-            "UNAVAILABLE",
-            "UNAVAILABLE",
-            f"{_worst_state(invalid)}_VALUE_EXCLUDED",
-            value,
-            explicit_until,
-            refresh_due,
-        )
-    if explicit_until and _utc(explicit_until) < now and not official_reconfirmed:
+    if explicit_until and _utc(explicit_until) < now:
         return _assessment(
             False,
             "UNAVAILABLE",
@@ -1439,12 +1445,41 @@ def _assess_datum(
             explicit_until,
             refresh_due,
         )
-    if reference and now - reference > policy_age and not official_reconfirmed:
+    invalid = (
+        {raw_status, raw_freshness, lifecycle_freshness}
+        & INVALID_ANALYTIC_STATES
+    )
+    if invalid and not (
+        latest_official_release_verified
+        and frequency.lower() in {"monthly", "quarterly", "weekly"}
+    ):
         return _assessment(
             False,
             "UNAVAILABLE",
             "UNAVAILABLE",
-            "DATASET_SLA_EXCEEDED",
+            (
+                "LATEST_OFFICIAL_RELEASE_NOT_PROVEN"
+                if recent_official_read
+                else f"{_worst_state(invalid)}_VALUE_EXCLUDED"
+            ),
+            value,
+            explicit_until,
+            refresh_due,
+        )
+    if (
+        reference
+        and now - reference > policy_age
+        and not latest_official_release_verified
+    ):
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            (
+                "LATEST_OFFICIAL_RELEASE_NOT_PROVEN"
+                if recent_official_read
+                else "DATASET_SLA_EXCEEDED"
+            ),
             value,
             explicit_until,
             refresh_due,
@@ -1460,9 +1495,25 @@ def _assess_datum(
             explicit_until,
             refresh_due,
         )
-    if official_reconfirmed and frequency.lower() in {"monthly", "quarterly", "weekly"}:
+    if (
+        latest_official_release_verified
+        and frequency.lower() in {"monthly", "quarterly", "weekly"}
+    ):
         freshness = "CURRENT_LATEST_OFFICIAL_RELEASE"
-        content_until = _utc(retrieved) + _confirmation_ttl(frequency)
+        evidence_until = parse_datetime(
+            (value.get("official_release_evidence") or {}).get(
+                "next_expected_release_at"
+            )
+        )
+        content_until = (
+            min(_utc(explicit_until), _utc(evidence_until))
+            if explicit_until and evidence_until
+            else _utc(explicit_until)
+            if explicit_until
+            else _utc(evidence_until)
+            if evidence_until
+            else None
+        )
     elif frequency.lower() == "daily":
         freshness = "LAST_AVAILABLE_OFFICIAL_CLOSE"
         content_until = (
@@ -1484,6 +1535,67 @@ def _assess_datum(
         content_until,
         refresh_due,
     )
+
+
+def _latest_official_release_verified(
+    value: dict[str, Any],
+    *,
+    now: datetime,
+    frequency: str,
+) -> bool:
+    evidence = value.get("official_release_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    cadence = frequency.lower()
+    if (
+        cadence not in {"weekly", "monthly", "quarterly"}
+        or str(evidence.get("status") or "").upper() != "VERIFIED"
+        or evidence.get("is_latest_expected_release") is not True
+        or str(evidence.get("frequency") or "").lower() != cadence
+        or str(evidence.get("source_series_id") or "")
+        != str(value.get("series_id") or "")
+    ):
+        return False
+    occurrence_id = str(value.get("occurrence_id") or "")
+    if (
+        not occurrence_id
+        or str(evidence.get("occurrence_id") or "") != occurrence_id
+    ):
+        return False
+    release_at = parse_datetime(
+        value.get("release_at")
+        or value.get("latest_release_at")
+        or value.get("released_at")
+    )
+    expected_release_at = parse_datetime(evidence.get("expected_release_at"))
+    next_expected_release_at = parse_datetime(
+        evidence.get("next_expected_release_at")
+    )
+    validated_at = parse_datetime(evidence.get("validated_at"))
+    if (
+        not release_at
+        or not expected_release_at
+        or _utc(release_at) != _utc(expected_release_at)
+        or not next_expected_release_at
+        or _utc(next_expected_release_at) <= now
+        or not validated_at
+        or _utc(validated_at) > now + timedelta(minutes=5)
+        or now - _utc(validated_at) > timedelta(hours=24)
+    ):
+        return False
+    observed_period = normalize_reference_period(
+        value.get("reference_period")
+        or value.get("latest_released_period")
+        or value.get("data_as_of"),
+        frequency=cadence,
+        release_date=_utc(release_at),
+    )
+    expected_period = normalize_reference_period(
+        evidence.get("expected_reference_period"),
+        frequency=cadence,
+        release_date=_utc(expected_release_at),
+    )
+    return bool(observed_period and observed_period == expected_period)
 
 
 def _assessment(
@@ -1580,128 +1692,161 @@ def _provider_accounting(
     source_payload: dict[str, Any],
     request_id: str | None,
     refresh_mode: str | None,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    # Accounting is deliberately not reconstructed from analytical values,
+    # cache-looking fields, or provider counters. Only the explicit manifest
+    # emitted by the normal application request is eligible.
+    del analytics
+    envelope = source_payload.get("request_scoped_provider_accounting")
+    manifest = envelope if isinstance(envelope, dict) else {}
+    correlation_id = manifest.get("correlation_id")
+    request_started_at = manifest.get("request_started_at")
+    request_completed_at = manifest.get("request_completed_at")
+    evidence_origin = manifest.get("evidence_origin")
+    raw_rows = manifest.get("datasets")
+    raw_rows = raw_rows if isinstance(raw_rows, list) else []
+    by_dataset: dict[str, dict[str, Any]] = {}
+    duplicates: set[str] = set()
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        dataset_id = str(item.get("dataset_id") or "")
+        if dataset_id in by_dataset:
+            duplicates.add(dataset_id)
+            continue
+        by_dataset[dataset_id] = item
+
+    correlated_manifest = bool(
+        request_id
+        and manifest.get("request_id") == request_id
+        and correlation_id == request_id
+        and evidence_origin == "NORMAL_APPLICATION_REQUEST"
+        and manifest.get("evidence_status") == "COMPLETE"
+        and parse_datetime(request_started_at)
+        and parse_datetime(request_completed_at)
+    )
     rows: list[dict[str, Any]] = []
-    raw_sections = _source_sections(source_payload)
     for policy in DATASET_POLICIES:
-        section = analytics.get(policy.section)
-        raw_name = "event_calendar" if policy.section == "calendar" else policy.section
-        raw_section = raw_sections.get(raw_name) or {}
-        value_present = _analytic_section_value_count(section) > 0
-        selected_source = _selected_source(section)
-        db_record_found = bool(raw_section)
-        raw_freshness = str(
-            _find_first(raw_section, "freshness") or "UNAVAILABLE"
-        ).upper()
-        raw_status = str(_find_first(raw_section, "status") or "UNAVAILABLE")
-        provider_calls = _integer(_find_first(raw_section, "provider_calls"))
-        network_calls = _integer(
-            _find_first(raw_section, "actual_network_calls")
-        )
-        primary_called = max(provider_calls, network_calls) > 0
-        db_valid = value_present and (
-            _contains_token(raw_section, "DB")
-            or _find_first(raw_section, "cache_used") is True
-            or not primary_called
-        )
-        exact_accounting = _find_provider_accounting(raw_section)
-        primary = {
-            "provider": policy.primary_provider,
-            "called": primary_called,
-            "attempts": max(provider_calls, network_calls),
-            "result": (
-                "SUCCESS"
-                if primary_called and value_present
-                else raw_status.upper()
-                if primary_called
-                else "DB_VALID_REUSED"
-                if db_valid
-                else "NOT_CALLED"
-            ),
-        }
-        fallbacks = [
-            {
-                "provider": provider,
-                "called": False,
-                "attempts": 0,
-                "result": "NOT_NEEDED" if value_present else "NOT_CALLED",
-            }
-            for provider in policy.fallback_providers
-        ]
-        selection_reason = (
-            "DB_VALID_REUSED"
-            if db_valid
-            else _find_first(section, "reason_code")
-            or (
-                "SOURCE_SELECTED_FROM_SAME_REQUEST"
-                if value_present
-                else "NO_VALID_VALUE_AVAILABLE"
-            )
-        )
+        raw = by_dataset.get(policy.dataset_id)
         if (
-            policy.dataset_id == "flash_services_pmi"
-            and isinstance(exact_accounting, dict)
+            raw is None
+            or policy.dataset_id in duplicates
+            or not correlated_manifest
         ):
-            primary = dict(exact_accounting.get("primary") or primary)
-            fallbacks = [
-                dict(item)
-                for item in exact_accounting.get("fallbacks") or fallbacks
-                if isinstance(item, dict)
-            ]
-            selected_source = (
-                exact_accounting.get("selected_source") or selected_source
+            rows.append(
+                _incomplete_provider_accounting_row(
+                    policy,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
+                    refresh_mode=refresh_mode,
+                    reason_code=(
+                        "DUPLICATE_REQUEST_SCOPED_EVIDENCE"
+                        if policy.dataset_id in duplicates
+                        else "UNCORRELATED_REQUEST_SCOPED_EVIDENCE"
+                        if raw is not None
+                        else "REQUEST_SCOPED_EVIDENCE_NOT_AVAILABLE"
+                    ),
+                )
             )
-            selection_reason = (
-                exact_accounting.get("reason_code") or selection_reason
-            )
+            continue
         rows.append(
             {
                 "dataset_id": policy.dataset_id,
-                "request_id": request_id,
-                "database_record_found": db_record_found,
-                "database_data_as_of": _find_first(raw_section, "data_as_of"),
-                "database_content_valid_until": _find_first(
-                    raw_section,
-                    "content_valid_until",
-                )
-                or _find_first(raw_section, "valid_until"),
-                "database_record_expired": (
-                    raw_freshness in INVALID_ANALYTIC_STATES
+                "request_id": raw.get("request_id"),
+                "correlation_id": raw.get("correlation_id"),
+                "evidence_origin": raw.get("evidence_origin"),
+                "evidence_status": raw.get("evidence_status"),
+                "observed_at": raw.get("observed_at"),
+                "database_record_found": raw.get("database_record_found"),
+                "database_data_as_of": raw.get("database_data_as_of"),
+                "database_content_valid_until": raw.get(
+                    "database_content_valid_until"
                 ),
-                "database_freshness_evaluation": raw_freshness,
-                "primary_provider": primary,
-                "fallbacks": fallbacks,
-                "selected_source": selected_source,
-                "selected_value_present": value_present,
-                "payload_freshness": _find_first(section, "freshness")
-                or "UNAVAILABLE",
-                "reason_code": selection_reason,
+                "database_record_expired": raw.get("database_record_expired"),
+                "database_freshness_evaluation": raw.get(
+                    "database_freshness_evaluation"
+                ),
+                "primary_provider": deepcopy(raw.get("primary_provider")),
+                "fallbacks": deepcopy(raw.get("fallbacks")),
+                "selected_source": raw.get("selected_source"),
+                "selected_value_present": raw.get("selected_value_present"),
+                "delivered_value": deepcopy(raw.get("delivered_value")),
+                "payload_freshness": raw.get("payload_freshness"),
+                "reason_code": raw.get("reason_code"),
                 "refresh_mode": refresh_mode,
-                "source_snapshot_revision": source_payload.get("snapshot_revision"),
+                "source_snapshot_revision": source_payload.get(
+                    "snapshot_revision"
+                ),
             }
         )
-    return rows
+    same_request_complete = bool(
+        correlated_manifest
+        and not duplicates
+        and len(by_dataset) == len(DATASET_POLICIES)
+        and all(
+            _request_accounting_row_complete(
+                row,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                request_started_at=request_started_at,
+                request_completed_at=request_completed_at,
+            )
+            for row in rows
+        )
+    )
+    return {
+        "rows": rows,
+        "correlation_id": correlation_id,
+        "request_started_at": request_started_at,
+        "request_completed_at": request_completed_at,
+        "evidence_origin": evidence_origin,
+        "same_request_complete": same_request_complete,
+    }
 
 
-def _find_provider_accounting(value: Any) -> dict[str, Any] | None:
-    if isinstance(value, dict):
-        accounting = value.get("provider_accounting")
-        if (
-            isinstance(accounting, dict)
-            and isinstance(accounting.get("primary"), dict)
-            and isinstance(accounting.get("fallbacks"), list)
-        ):
-            return accounting
-        for item in value.values():
-            found = _find_provider_accounting(item)
-            if found is not None:
-                return found
-    elif isinstance(value, list):
-        for item in value:
-            found = _find_provider_accounting(item)
-            if found is not None:
-                return found
-    return None
+def _incomplete_provider_accounting_row(
+    policy: DatasetPolicy,
+    *,
+    request_id: str | None,
+    correlation_id: Any,
+    refresh_mode: str | None,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "dataset_id": policy.dataset_id,
+        "request_id": request_id,
+        "correlation_id": correlation_id,
+        "evidence_origin": None,
+        "evidence_status": "INCOMPLETE",
+        "observed_at": None,
+        "database_record_found": None,
+        "database_data_as_of": None,
+        "database_content_valid_until": None,
+        "database_record_expired": None,
+        "database_freshness_evaluation": None,
+        "primary_provider": {
+            "provider": policy.primary_provider,
+            "called": None,
+            "attempts": None,
+            "result": "EVIDENCE_NOT_AVAILABLE",
+        },
+        "fallbacks": [
+            {
+                "provider": provider,
+                "called": None,
+                "attempts": None,
+                "result": "EVIDENCE_NOT_AVAILABLE",
+            }
+            for provider in policy.fallback_providers
+        ],
+        "selected_source": None,
+        "selected_value_present": None,
+        "delivered_value": None,
+        "payload_freshness": None,
+        "reason_code": reason_code,
+        "refresh_mode": refresh_mode,
+        "source_snapshot_revision": None,
+    }
 
 
 def _readiness(analytics: dict[str, Any]) -> dict[str, Any]:
@@ -1910,14 +2055,6 @@ def _policy_age(frequency: str) -> timedelta:
     }.get(frequency.lower(), timedelta(hours=24))
 
 
-def _confirmation_ttl(frequency: str) -> timedelta:
-    return {
-        "weekly": timedelta(days=8),
-        "monthly": timedelta(days=10),
-        "quarterly": timedelta(days=45),
-    }.get(frequency.lower(), timedelta(hours=24))
-
-
 def _worst_state(values: set[str]) -> str:
     for item in ("REJECTED_FUTURE", "EXPIRED", "VERY_STALE", "STALE"):
         if item in values:
@@ -2081,10 +2218,24 @@ def _stale_presented_current(value: Any) -> int:
 def _provider_accounting_valid(
     rows: Any,
     *,
-    request_id: Any,
+    request: dict[str, Any],
     require_request_id: bool,
 ) -> bool:
     if not isinstance(rows, list):
+        return False
+    request_id = request.get("request_id")
+    correlation_id = request.get("accounting_correlation_id")
+    request_started_at = request.get("accounting_request_started_at")
+    request_completed_at = request.get("accounting_request_completed_at")
+    evidence_origin = request.get("accounting_evidence_origin")
+    if (
+        (require_request_id and not request_id)
+        or not correlation_id
+        or correlation_id != request_id
+        or evidence_origin != "NORMAL_APPLICATION_REQUEST"
+        or not parse_datetime(request_started_at)
+        or not parse_datetime(request_completed_at)
+    ):
         return False
     expected = {policy.dataset_id for policy in DATASET_POLICIES}
     observed = {
@@ -2092,8 +2243,38 @@ def _provider_accounting_valid(
         for item in rows
         if isinstance(item, dict)
     }
+    if (
+        expected != observed
+        or len(rows) != len(expected)
+    ):
+        return False
+    return all(
+        _request_accounting_row_complete(
+            item,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            request_started_at=request_started_at,
+            request_completed_at=request_completed_at,
+        )
+        for item in rows
+    )
+
+
+def _request_accounting_row_complete(
+    item: Any,
+    *,
+    request_id: Any,
+    correlation_id: Any,
+    request_started_at: Any,
+    request_completed_at: Any,
+) -> bool:
     required = {
         "dataset_id",
+        "request_id",
+        "correlation_id",
+        "evidence_origin",
+        "evidence_status",
+        "observed_at",
         "database_record_found",
         "database_data_as_of",
         "database_content_valid_until",
@@ -2103,45 +2284,63 @@ def _provider_accounting_valid(
         "fallbacks",
         "selected_source",
         "selected_value_present",
+        "delivered_value",
         "payload_freshness",
         "reason_code",
     }
-    if (
-        expected != observed
-        or len(rows) != len(expected)
-        or (require_request_id and not request_id)
-    ):
-        return False
-    return all(
-        _provider_accounting_row_valid(
-            item,
-            required=required,
-            request_id=request_id,
-        )
-        for item in rows
-    )
-
-
-def _provider_accounting_row_valid(
-    item: Any,
-    *,
-    required: set[str],
-    request_id: Any,
-) -> bool:
     if (
         not isinstance(item, dict)
         or not required <= set(item)
         or not item.get("reason_code")
         or item.get("request_id") != request_id
+        or item.get("correlation_id") != correlation_id
+        or item.get("evidence_origin") != "NORMAL_APPLICATION_REQUEST"
+        or item.get("evidence_status") != "COMPLETE"
         or not isinstance(item.get("database_record_found"), bool)
         or not isinstance(item.get("database_record_expired"), bool)
         or not isinstance(item.get("selected_value_present"), bool)
+        or (
+            item.get("selected_value_present")
+            != (item.get("delivered_value") is not None)
+        )
+        or str(item.get("reason_code") or "").upper()
+        in {"DB_VALID_REUSED", "SOURCE_SELECTED_FROM_SAME_REQUEST"}
     ):
+        return False
+    observed_at = parse_datetime(item.get("observed_at"))
+    started_at = parse_datetime(request_started_at)
+    completed_at = parse_datetime(request_completed_at)
+    if (
+        not observed_at
+        or not started_at
+        or not completed_at
+        or _utc(started_at) > _utc(completed_at)
+        or _utc(observed_at) < _utc(started_at)
+        or _utc(observed_at) > _utc(completed_at)
+    ):
+        return False
+    policy = next(
+        (
+            policy
+            for policy in DATASET_POLICIES
+            if policy.dataset_id == item.get("dataset_id")
+        ),
+        None,
+    )
+    if policy is None:
         return False
     primary = item.get("primary_provider")
     fallbacks = item.get("fallbacks")
     attempts = [primary, *fallbacks] if isinstance(fallbacks, list) else []
     if not isinstance(primary, dict) or len(attempts) != len(fallbacks or []) + 1:
+        return False
+    if primary.get("provider") != policy.primary_provider:
+        return False
+    if [
+        attempt.get("provider")
+        for attempt in fallbacks
+        if isinstance(attempt, dict)
+    ] != list(policy.fallback_providers):
         return False
     for attempt in attempts:
         if not isinstance(attempt, dict):
@@ -2155,14 +2354,25 @@ def _provider_accounting_row_valid(
             or not attempt.get("result")
             or not isinstance(called, bool)
             or not isinstance(attempt_count, int)
+            or isinstance(attempt_count, bool)
             or attempt_count < 0
             or (called and attempt_count < 1)
             or (not called and attempt_count != 0)
         ):
             return False
-    return not (
-        item["selected_value_present"]
-        and not item.get("selected_source")
+    if not item.get("database_freshness_evaluation"):
+        return False
+    if item["database_record_found"] and (
+        not item.get("database_data_as_of")
+        or not item.get("database_content_valid_until")
+    ):
+        return False
+    return bool(
+        item.get("payload_freshness")
+        and not (
+            item["selected_value_present"]
+            and not item.get("selected_source")
+        )
     )
 
 

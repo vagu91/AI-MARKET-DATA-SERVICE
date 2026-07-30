@@ -391,6 +391,7 @@ async def market_context_mnq(
     lifecycle_due_resolver=Depends(get_lifecycle_due_resolver),
 ) -> dict[str, object]:
     request_id = f"sa-{uuid.uuid4()}"
+    request_started_at = datetime.now(UTC).isoformat()
     settings = enrichment_orchestrator.settings
     snapshots = MarketContextSnapshotRepository(settings)
     if refresh == "false":
@@ -432,6 +433,7 @@ async def market_context_mnq(
                 symbol="MNQ",
                 fetch_missing_nasdaq=refresh == "force",
                 refresh=refresh,
+                request_id=request_id,
             )
             canonical_generation_plan = (
                 dict(
@@ -506,6 +508,11 @@ async def market_context_mnq(
                         current["snapshot_revision"] = previous[
                             "debug_payload"
                         ].get("snapshot_revision")
+                        current = _attach_request_scoped_accounting(
+                            current,
+                            request_id=request_id,
+                            request_started_at=request_started_at,
+                        )
                         return build_senior_analyst_payload_v1(
                             current,
                             request_id=request_id,
@@ -521,6 +528,7 @@ async def market_context_mnq(
                 canonical_generation_plan=canonical_generation_plan,
                 audience=audience,
                 request_id=request_id,
+                request_started_at=request_started_at,
             )
             if refresh == "force":
                 _emit_force_finalization(
@@ -725,6 +733,7 @@ async def market_context_mnq(
         settings=settings,
         audience=audience,
         request_id=request_id,
+        request_started_at=request_started_at,
     )
 
 
@@ -987,11 +996,20 @@ def _materialize_market_context(
     canonical_generation_plan: dict[str, object] | None = None,
     audience: str = "legacy_v2",
     request_id: str | None = None,
+    request_started_at: str | None = None,
 ) -> dict[str, object]:
     snapshots = MarketContextSnapshotRepository(settings)
     event_keys = _context_event_keys(contract)
     ai_enrichment = AIResearchJobService(settings).enrichment_status("MNQ", event_keys=event_keys)
-    debug = dict(contract)
+    debug = (
+        _attach_request_scoped_accounting(
+            contract,
+            request_id=request_id,
+            request_started_at=request_started_at,
+        )
+        if audience == "senior_analyst_v1"
+        else dict(contract)
+    )
     debug["data_as_of"] = debug.get("generated_at_utc") or debug.get("generated_at")
     debug["ai_enrichment"] = ai_enrichment
     debug["research"] = _research_summary(ResearchRuntimeRepository(settings).latest("MNQ"))
@@ -1052,6 +1070,38 @@ def _consumer_projection(
         request_id=request_id,
         request_refresh_mode=refresh,
     )
+
+
+def _attach_request_scoped_accounting(
+    contract: dict[str, object],
+    *,
+    request_id: str | None,
+    request_started_at: str | None,
+) -> dict[str, object]:
+    output = dict(contract)
+    existing = contract.get("request_scoped_provider_accounting")
+    if (
+        isinstance(existing, dict)
+        and request_id
+        and existing.get("request_id") == request_id
+        and existing.get("correlation_id") == request_id
+        and existing.get("evidence_origin") == "NORMAL_APPLICATION_REQUEST"
+    ):
+        manifest = dict(existing)
+        manifest.setdefault("request_completed_at", datetime.now(UTC).isoformat())
+        output["request_scoped_provider_accounting"] = manifest
+        return output
+    output["request_scoped_provider_accounting"] = {
+        "request_id": request_id,
+        "correlation_id": request_id,
+        "request_started_at": request_started_at,
+        "request_completed_at": datetime.now(UTC).isoformat(),
+        "evidence_origin": "NORMAL_APPLICATION_REQUEST",
+        "evidence_status": "INCOMPLETE",
+        "reason_code": "PER_DATASET_REQUEST_EVIDENCE_NOT_EMITTED",
+        "datasets": [],
+    }
+    return output
 
 
 def _context_event_keys(contract: dict[str, object]) -> list[str]:
