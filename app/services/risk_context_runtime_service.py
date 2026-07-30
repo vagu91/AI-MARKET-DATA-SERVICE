@@ -31,6 +31,7 @@ class RiskContextRuntimeService:
         self.vix_futures_provider = CboeVixFuturesProvider(settings)
         self.put_call_provider = CboePutCallProvider(settings)
         self.qqq_options_provider = NasdaqQQQOptionChainProvider(settings)
+        self.last_database_lookup: dict[str, Any] | None = None
 
     async def snapshot(
         self,
@@ -43,6 +44,20 @@ class RiskContextRuntimeService:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         logger.info("risk_context_lookup_started", extra={"refresh": refresh})
         latest = self.repository.latest()
+        self.last_database_lookup = {
+            "performed": True,
+            "found": bool(latest),
+            "data_as_of": (latest or {}).get("data_as_of"),
+            "content_valid_until": (latest or {}).get("valid_until"),
+            "expired": bool(latest and _is_stale(latest)),
+            "freshness": (
+                "EXPIRED"
+                if latest and _is_stale(latest)
+                else "VALID"
+                if latest
+                else "NOT_FOUND"
+            ),
+        }
         if refresh == "false" or (refresh == "auto" and latest and not _is_stale(latest)):
             canonical = _runtime_view(latest, refresh=refresh) if latest else empty_risk_context(refresh=refresh)
             return canonical, build_legacy_risk_sentiment(canonical, existing_legacy)

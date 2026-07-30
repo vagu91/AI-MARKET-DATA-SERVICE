@@ -39,8 +39,12 @@ def _complete_row(policy) -> dict:
         "request_id": REQUEST_ID,
         "correlation_id": REQUEST_ID,
         "evidence_origin": "NORMAL_APPLICATION_REQUEST",
-        "evidence_status": "COMPLETE",
+        "evidence_status": "ACQUISITION_COMPLETE",
         "observed_at": OBSERVED_AT,
+        "acquisition_id": f"observed:{policy.dataset_id}",
+        "shared_acquisition_dataset_ids": [policy.dataset_id],
+        "database_lookup_performed": True,
+        "database_lookup_reason": "CONTROLLED_DATABASE_LOOKUP",
         "database_record_found": False,
         "database_data_as_of": None,
         "database_content_valid_until": None,
@@ -51,6 +55,8 @@ def _complete_row(policy) -> dict:
             "called": False,
             "attempts": 0,
             "result": "NOT_CALLED",
+            "not_called_reason": "CONTROLLED_PROVIDER_SKIP",
+            "execution_origin": "OBSERVED_SKIP",
         },
         "fallbacks": [
             {
@@ -58,14 +64,13 @@ def _complete_row(policy) -> dict:
                 "called": False,
                 "attempts": 0,
                 "result": "NOT_CALLED",
+                "not_called_reason": "CONTROLLED_PROVIDER_SKIP",
+                "execution_origin": "OBSERVED_SKIP",
             }
             for provider in policy.fallback_providers
         ],
-        "selected_source": None,
-        "selected_value_present": False,
-        "delivered_value": None,
-        "payload_freshness": "UNAVAILABLE",
-        "reason_code": "NO_VALID_VALUE_AVAILABLE",
+        "acquisition_selected_source": None,
+        "acquisition_reason_code": "CONTROLLED_NO_VALUE_AVAILABLE",
     }
 
 
@@ -76,8 +81,8 @@ def _manifest() -> dict:
         "request_started_at": STARTED_AT,
         "request_completed_at": COMPLETED_AT,
         "evidence_origin": "NORMAL_APPLICATION_REQUEST",
-        "evidence_status": "COMPLETE",
-        "reason_code": "REQUEST_ACCOUNTING_COMPLETE",
+        "evidence_status": "ACQUISITION_COMPLETE",
+        "reason_code": "REQUEST_ACQUISITION_EVIDENCE_COMPLETE",
         "datasets": [_complete_row(policy) for policy in DATASET_POLICIES],
     }
 
@@ -144,10 +149,12 @@ def test_different_correlation_id_fails_live_gate() -> None:
     assert _validate_live(payload)["status"] == "FAIL"
 
 
-def test_missing_delivered_value_evidence_fails_live_gate() -> None:
+def test_inferred_provider_attempt_fails_live_gate() -> None:
     source = _source()
     manifest = _manifest()
-    manifest["datasets"][0]["selected_value_present"] = True
+    manifest["datasets"][0]["primary_provider"][
+        "execution_origin"
+    ] = "INFERRED"
     source["request_scoped_provider_accounting"] = manifest
     payload = _build(source)
     assert payload["request"]["same_request_provider_accounting"] is False

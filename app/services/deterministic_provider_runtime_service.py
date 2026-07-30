@@ -13,6 +13,10 @@ from app.services.deterministic_market_context_service import (
     compute_market_internals,
     compute_options_positioning,
 )
+from app.services.request_provider_accounting import (
+    RequestProviderAccountingCollector,
+    provider_attempt,
+)
 
 
 class DeterministicProviderRuntimeService:
@@ -38,6 +42,9 @@ class DeterministicProviderRuntimeService:
         *,
         refresh: str,
         trigger_type: str | None = None,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
     ) -> dict[str, Any]:
         if refresh == "false":
             return contract
@@ -89,6 +96,12 @@ class DeterministicProviderRuntimeService:
             holdings,
             quotes,
             telemetry,
+        )
+        self._record_tradier_accounting(
+            accounting_collector,
+            tradier=tradier,
+            market_internals=output["market_internals"],
+            options_positioning=output["options_positioning"],
         )
         output["cross_asset_context"] = self._cross_asset(
             quotes,
@@ -158,13 +171,146 @@ class DeterministicProviderRuntimeService:
         *,
         refresh: str,
         trigger_type: str | None = None,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
     ) -> dict[str, Any]:
         return asyncio.run(
             self.enrich_market_context(
                 contract,
                 refresh=refresh,
                 trigger_type=trigger_type,
+                accounting_collector=accounting_collector,
             )
+        )
+
+    def _record_tradier_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        tradier: Any,
+        market_internals: dict[str, Any],
+        options_positioning: dict[str, Any],
+    ) -> None:
+        if collector is None:
+            return
+        details = getattr(tradier, "last_telemetry", {})
+        details = details if isinstance(details, dict) else {}
+        quote_details = [
+            value
+            for key, value in details.items()
+            if key == "quotes" and isinstance(value, dict)
+        ]
+        option_details = [
+            value
+            for key, value in details.items()
+            if (
+                key.startswith("option_")
+                and isinstance(value, dict)
+            )
+        ]
+        self._record_tradier_dataset(
+            collector,
+            dataset_id="market_internals",
+            acquisition_id="tradier_quotes_for_market_internals",
+            endpoint_details=quote_details,
+            section=market_internals,
+            enabled=bool(
+                tradier is not None
+                and self.settings.tradier_enabled
+                and self.settings.tradier_market_data_enabled
+                and self.settings.deterministic_market_internals_enabled
+            ),
+        )
+        self._record_tradier_dataset(
+            collector,
+            dataset_id="options_positioning",
+            acquisition_id="tradier_option_chain_for_positioning",
+            endpoint_details=[*quote_details, *option_details],
+            section=options_positioning,
+            enabled=bool(
+                tradier is not None
+                and self.settings.tradier_enabled
+                and self.settings.tradier_market_data_enabled
+                and self.settings.deterministic_options_positioning_enabled
+            ),
+        )
+
+    def _record_tradier_dataset(
+        self,
+        collector: RequestProviderAccountingCollector,
+        *,
+        dataset_id: str,
+        acquisition_id: str,
+        endpoint_details: list[dict[str, Any]],
+        section: dict[str, Any],
+        enabled: bool,
+    ) -> None:
+        calls = sum(
+            int(item.get("actual_provider_requests") or 0)
+            for item in endpoint_details
+        )
+        cache_hits = sum(
+            int(item.get("cache_hit") or 0)
+            for item in endpoint_details
+        )
+        if calls:
+            attempt = provider_attempt(
+                "TRADIER",
+                called=True,
+                attempts=calls,
+                result=str(section.get("status") or "NO_DATA").upper(),
+                execution_origin="PROVIDER_CALL",
+            )
+            complete = True
+        elif cache_hits:
+            attempt = provider_attempt(
+                "TRADIER",
+                called=False,
+                attempts=0,
+                result="CACHE_HIT",
+                not_called_reason="PROVIDER_ADAPTER_CACHE_HIT",
+                execution_origin="CACHE_DECISION",
+            )
+            complete = True
+        else:
+            warning = next(
+                iter(section.get("warnings") or []),
+                "PROVIDER_DISABLED_OR_PREREQUISITE_MISSING",
+            )
+            attempt = provider_attempt(
+                "TRADIER",
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason=str(warning).upper(),
+                execution_origin="OBSERVED_SKIP",
+            )
+            complete = not enabled or bool(section.get("warnings"))
+        collector.record(
+            dataset_id,
+            acquisition_id=acquisition_id,
+            shared_dataset_ids=(dataset_id,),
+            database_lookup_performed=False,
+            database_lookup_reason="DETERMINISTIC_PROVIDER_ONLY_STAGE",
+            database_record_found=None,
+            database_data_as_of=None,
+            database_content_valid_until=None,
+            database_record_expired=None,
+            database_freshness_evaluation="NOT_LOOKED_UP",
+            primary_provider=attempt,
+            fallbacks=[],
+            acquisition_selected_source=(
+                section.get("provider")
+                if section.get("status") == "AVAILABLE"
+                else None
+            ),
+            acquisition_reason_code=(
+                "TRADIER_VALUE_ACQUIRED"
+                if section.get("status") == "AVAILABLE"
+                else "TRADIER_VALUE_NOT_AVAILABLE"
+            ),
+            evidence_complete=complete,
         )
 
     async def _official_context(

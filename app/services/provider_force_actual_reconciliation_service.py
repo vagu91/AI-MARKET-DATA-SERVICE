@@ -18,6 +18,10 @@ from app.services.observability_contract_service import TelemetryRepository
 from app.services.official_actual_semantics import (
     normalize_reference_period,
 )
+from app.services.request_provider_accounting import (
+    RequestProviderAccountingCollector,
+    provider_attempt,
+)
 
 
 CALENDAR_SECTIONS = (
@@ -38,6 +42,9 @@ class ProviderForceActualReconciliationService:
         clock: Callable[[], datetime] | None = None,
         generation_id: str | None = None,
         coverage_write_count: int = 0,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
     ) -> None:
         self.settings = settings
         self.lifecycle_resolver = lifecycle_resolver
@@ -49,6 +56,7 @@ class ProviderForceActualReconciliationService:
             int(coverage_write_count),
             0,
         )
+        self.accounting_collector = accounting_collector
 
     def prepare(
         self,
@@ -242,6 +250,11 @@ class ProviderForceActualReconciliationService:
                 "provider_request_attempted": bool(
                     result.get("provider_request_attempted")
                 ),
+                "provider_attempts": [
+                    dict(item)
+                    for item in result.get("provider_attempts") or []
+                    if isinstance(item, dict)
+                ],
                 "provider_http_outcome": result.get(
                     "provider_http_outcome"
                 )
@@ -429,12 +442,150 @@ class ProviderForceActualReconciliationService:
                 reconciliation_audit
             )
             output["data_quality"] = data_quality
+        self._record_flash_pmi_accounting(
+            contract=output,
+            audits=audits,
+        )
         return {
             "contract": output,
             "resolved_items": resolved_items,
             "canonical_reconciliations": canonical_reconciliations,
             "audit": reconciliation_audit,
         }
+
+    def _record_flash_pmi_accounting(
+        self,
+        *,
+        contract: dict[str, Any],
+        audits: list[dict[str, Any]],
+    ) -> None:
+        collector = self.accounting_collector
+        if collector is None:
+            return
+        occurrences = [
+            event
+            for event in _contract_occurrences(contract).values()
+            if (
+                (official_actual_mapping(event) or {}).get("metric_id")
+                == "flash_services_pmi"
+            )
+        ]
+        relevant = [
+            item
+            for item in audits
+            if item.get("mapping_selected") == "flash_services_pmi"
+        ]
+        raw_attempts = [
+            dict(attempt)
+            for item in relevant
+            for attempt in item.get("provider_attempts") or []
+            if isinstance(attempt, dict)
+        ]
+        attempts_by_provider = {
+            str(item.get("provider") or ""): item
+            for item in raw_attempts
+        }
+        primary = _actual_attempt(
+            "SPGLOBAL",
+            attempts_by_provider.get("SPGLOBAL"),
+            skipped_reason=(
+                "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                if not occurrences
+                else "OFFICIAL_ACTUAL_RESOLVER_NOT_DUE"
+                if not relevant
+                else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+            ),
+        )
+        fallback = _actual_attempt(
+            "INVESTING_EVENT_1062",
+            attempts_by_provider.get("INVESTING_EVENT_1062"),
+            skipped_reason=(
+                "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                if not occurrences
+                else "PRIMARY_SUCCEEDED_OR_RESOLVER_NOT_DUE"
+                if not relevant or attempts_by_provider.get("SPGLOBAL", {}).get(
+                    "result"
+                )
+                == "SUCCESS"
+                else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+            ),
+        )
+        provider_calls = sum(
+            int(item.get("provider_call_count") or 0)
+            for item in relevant
+        )
+        evidence_complete = bool(
+            not provider_calls
+            or raw_attempts
+        )
+        selected = next(
+            (
+                event
+                for event in occurrences
+                if event.get("actual") not in (None, "")
+            ),
+            None,
+        )
+        db_lookup = bool(relevant)
+        db_found = bool(
+            relevant
+            and provider_calls == 0
+            and selected is not None
+        )
+        data_as_of = (
+            selected.get("reference_period")
+            or selected.get("release_at")
+            if selected
+            else None
+        )
+        valid_until = (
+            selected.get("valid_until")
+            or selected.get("content_valid_until")
+            or selected.get("release_at")
+            if selected
+            else None
+        )
+        collector.record(
+            "flash_services_pmi",
+            acquisition_id="flash_services_pmi_actual_resolution",
+            shared_dataset_ids=("flash_services_pmi",),
+            database_lookup_performed=db_lookup,
+            database_lookup_reason=(
+                "OFFICIAL_ACTUAL_CANDIDATE_DATABASE_LOOKUP"
+                if db_lookup
+                else "NO_DUE_FLASH_SERVICES_PMI_RESOLUTION"
+            ),
+            database_record_found=db_found if db_lookup else None,
+            database_data_as_of=data_as_of if db_found else None,
+            database_content_valid_until=(
+                valid_until if db_found else None
+            ),
+            database_record_expired=False if db_lookup else None,
+            database_freshness_evaluation=(
+                "VALID"
+                if db_found
+                else "NOT_FOUND"
+                if db_lookup
+                else "NOT_LOOKED_UP"
+            ),
+            primary_provider=primary,
+            fallbacks=[fallback],
+            acquisition_selected_source=(
+                selected.get("actual_source")
+                or selected.get("publisher")
+                or selected.get("source")
+                if selected
+                else None
+            ),
+            acquisition_reason_code=(
+                "FLASH_SERVICES_PMI_DELIVERABLE_ACQUIRED"
+                if selected
+                else "FLASH_SERVICES_PMI_NOT_DUE"
+                if not occurrences
+                else "FLASH_SERVICES_PMI_VALUE_NOT_AVAILABLE"
+            ),
+            evidence_complete=evidence_complete,
+        )
 
     def _emit_prepared(self, audit: dict[str, Any]) -> None:
         try:
@@ -542,6 +693,30 @@ def _replace_occurrence(
         calendar.setdefault("other_economic_events", []).append(event)
     output["event_calendar"] = calendar
     return output
+
+
+def _actual_attempt(
+    provider: str,
+    raw: dict[str, Any] | None,
+    *,
+    skipped_reason: str,
+) -> dict[str, Any]:
+    if raw is not None:
+        return provider_attempt(
+            provider,
+            called=True,
+            attempts=max(int(raw.get("attempts") or 0), 1),
+            result=str(raw.get("result") or "UNKNOWN"),
+            execution_origin="PROVIDER_CALL",
+        )
+    return provider_attempt(
+        provider,
+        called=False,
+        attempts=0,
+        result="NOT_CALLED",
+        not_called_reason=skipped_reason,
+        execution_origin="OBSERVED_SKIP",
+    )
 
 
 def _negative_cache_active(

@@ -21,11 +21,15 @@ The response contract is `SeniorAnalystPayloadV1` schema `1.0`. The request is
 bounded to 1,200 seconds by default. The exact HTTP body byte array and response
 headers are saved before validation. SHA-256 is calculated from those bytes.
 The validator accepts provider accounting only when every dataset row carries
-complete evidence emitted by the normal application request and the request ID,
-correlation ID, observation time, and request window all match. Missing,
-invented, incomplete, or uncorrelated evidence fails the LIVE gate; it is never
-reconstructed from analytical payload fields. The validator reads the saved
-body directly and does not query or reconstruct data from the database.
+acquisition evidence emitted by the DB/provider service during the normal
+application request and delivery evidence calculated after the final
+projection. The request ID, correlation ID, observation time, and request
+window must all match. Provider attempts must identify an observed call,
+cache decision, or explicit skip; delivery values, selected sources, and
+omissions are recalculated from the delivered payload. Missing, invented,
+incomplete, uncorrelated, or delivery-inconsistent evidence fails the LIVE
+gate. The validator reads the saved body directly and does not query or
+reconstruct data from the database.
 
 Only after that exact body passes LIVE validation, the runner atomically
 creates or replaces:
@@ -49,5 +53,5 @@ contradictory or temporally invalid conditions are present.
 Before this user-executed command, the only permitted verdict is:
 
 ```text
-IMPLEMENTAZIONE OFFLINE CORRETTA — ACCETTAZIONE LIVE PENDENTE
+IMPLEMENTAZIONE OFFLINE COMPLETA — CHIAMATA LIVE AUTORIZZABILE MA NON ESEGUITA
 ```

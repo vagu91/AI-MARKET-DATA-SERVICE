@@ -12,7 +12,10 @@ from app.models.common import Freshness, ProviderMetadata, ProviderType
 from app.models.macro import MacroLatestResponse
 from app.models.macro import MacroSeries
 from app.models.nasdaq import NasdaqContextResponse
-from app.services.data_freshness_service import DataFreshnessService
+from app.services.data_freshness_service import (
+    DataFreshnessService,
+    parse_datetime,
+)
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.economic_event_materialization_service import EconomicEventMaterializationService
 from app.services.event_service import EventService
@@ -56,6 +59,41 @@ from app.services.social_sentiment_service import SocialSentimentService
 from app.services.temporal_domain_service import exact_occurrence_key, reconcile_calendar_events
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
 from app.services.execution_context import ExecutionContext
+from app.services.request_provider_accounting import (
+    RequestProviderAccountingCollector,
+    provider_attempt,
+)
+
+
+MACRO_ACCOUNTING_SERIES: dict[str, tuple[str, ...]] = {
+    "treasury_rates": (
+        "DGS2",
+        "DGS10",
+        "DGS30",
+        "T10Y2Y",
+        "T10Y3M",
+        "NFCI",
+    ),
+    "fed_funds": ("DFF", "FEDFUNDS", "SOFR"),
+    "target_range": ("DFEDTARL", "DFEDTARU"),
+    "cpi": ("CUSR0000SA0", "CUSR0000SA0L1E"),
+    "ppi": ("WPUFD4",),
+    "pce": (
+        "BEA:PCE",
+        "BEA:PCE_PRICE_INDEX",
+        "BEA:CORE_PCE",
+    ),
+    "gdp": ("BEA:GDP", "GDP"),
+    "employment": ("LNS14000000", "UNRATE"),
+    "wages": ("CES0500000003",),
+    "nfp": ("CES0000000001", "PAYEMS"),
+    "jobless_claims": ("ICSA",),
+}
+NASDAQ_ACCOUNTING_FACT_TYPES: dict[str, tuple[str, ...]] = {
+    "nasdaq_100": ("qqq_holdings", "nasdaq_context"),
+    "mega_cap_quotes": ("mega_cap_snapshot", "mega_cap_breadth"),
+    "earnings": ("earnings_event",),
+}
 
 
 class DiagnosticsService:
@@ -134,16 +172,32 @@ class DiagnosticsService:
         fetch_missing_nasdaq: bool = True,
         refresh: str = "auto",
         request_id: str | None = None,
+        execution_context: ExecutionContext | None = None,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
         fetch_missing = refresh != "false"
         force = refresh == "force"
         staged_force_events: list[Any] = []
         self.force_generation_plan = {}
-        request_context = ExecutionContext.provider_only(
-            correlation_id=request_id or f"market-context-{uuid.uuid4()}",
-            allow_live_providers=fetch_missing,
+        request_context = execution_context or (
+            ExecutionContext.provider_only(
+                correlation_id=(
+                    request_id
+                    or f"market-context-{uuid.uuid4()}"
+                ),
+                allow_live_providers=fetch_missing,
+            )
         )
+        if (
+            request_id
+            and request_context.correlation_id != request_id
+        ):
+            raise ValueError(
+                "market_context_request_correlation_mismatch"
+            )
         force_schedule_coverage: dict[str, Any] = {}
         if (
             force
@@ -172,10 +226,22 @@ class DiagnosticsService:
         async def load_macro() -> tuple[MacroLatestResponse, dict[str, Any]]:
             try:
                 return await asyncio.wait_for(
-                    self._macro_db_first(fetch_missing=fetch_missing, force=force),
+                    self._macro_db_first(
+                        fetch_missing=fetch_missing,
+                        force=force,
+                        accounting_collector=accounting_collector,
+                    ),
                     timeout=max(float(self.settings.timeout_macro_seconds), 1.0),
                 )
             except TimeoutError:
+                self._record_macro_accounting(
+                    accounting_collector,
+                    lookup_performed=not force,
+                    lookup_rows=[],
+                    macro=MacroLatestResponse(),
+                    provider_batch_called=True,
+                    provider_not_called_reason=None,
+                )
                 return MacroLatestResponse(), {
                     "db_hits": 0,
                     "db_misses": 1,
@@ -192,6 +258,19 @@ class DiagnosticsService:
                     start=now,
                     end=now + timedelta(days=days),
                     refresh_mode="false",
+                )
+                self._record_calendar_accounting(
+                    accounting_collector,
+                    events=events,
+                    database_lookup_performed=True,
+                    provider_called=False,
+                    provider_result="NOT_CALLED",
+                    provider_not_called_reason=(
+                        "REFRESH_FALSE_DATABASE_ONLY"
+                    ),
+                    acquisition_reason_code=(
+                        "CANONICAL_EVENT_HISTORY_SELECTED"
+                    ),
                 )
                 return events, {
                     "data_quality": {
@@ -213,6 +292,24 @@ class DiagnosticsService:
                         now=now,
                     )
                 )
+                calendar_db_lookup = not bool(
+                    staged_force_events
+                )
+                calendar_provider_called = bool(
+                    force_schedule_coverage.get(
+                        "provider_calls_executed"
+                    )
+                )
+                calendar_provider_result = (
+                    "SCHEDULE_CATCH_UP_COMPLETED"
+                    if calendar_provider_called
+                    else "NOT_CALLED"
+                )
+                calendar_not_called_reason = (
+                    None
+                    if calendar_provider_called
+                    else "CANONICAL_EVENT_HISTORY_AVAILABLE"
+                )
             else:
                 try:
                     events = await asyncio.wait_for(
@@ -224,12 +321,29 @@ class DiagnosticsService:
                         timeout=max(float(self.settings.timeout_events_seconds), 1.0),
                     )
                     self._persist_official_events(events)
+                    calendar_db_lookup = False
+                    calendar_provider_called = True
+                    calendar_provider_result = (
+                        "SUCCESS" if events else "NO_DATA"
+                    )
+                    calendar_not_called_reason = None
                 except TimeoutError:
                     events, materialization = self.event_materializer.load_from_history(
                         country=country,
                         start=now,
                         end=now + timedelta(days=days),
                         refresh_mode=refresh,
+                    )
+                    self._record_calendar_accounting(
+                        accounting_collector,
+                        events=events,
+                        database_lookup_performed=True,
+                        provider_called=True,
+                        provider_result="TIMEOUT",
+                        provider_not_called_reason=None,
+                        acquisition_reason_code=(
+                            "PROVIDER_TIMEOUT_DATABASE_HISTORY_SELECTED"
+                        ),
                     )
                     return events, {
                         "data_quality": {
@@ -244,7 +358,7 @@ class DiagnosticsService:
             enrichment_timeout = max(float(self.settings.timeout_events_seconds), 1.0)
             enrichment_timeout += 5.0
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self.enrichment_orchestrator.enrich_events(
                         events=events,
                         country=country,
@@ -256,6 +370,22 @@ class DiagnosticsService:
                     ),
                     timeout=enrichment_timeout,
                 )
+                self._record_calendar_accounting(
+                    accounting_collector,
+                    events=result[0],
+                    database_lookup_performed=(
+                        calendar_db_lookup
+                    ),
+                    provider_called=calendar_provider_called,
+                    provider_result=calendar_provider_result,
+                    provider_not_called_reason=(
+                        calendar_not_called_reason
+                    ),
+                    acquisition_reason_code=(
+                        "CANONICAL_EVENT_ACQUISITION_COMPLETED"
+                    ),
+                )
+                return result
             except TimeoutError:
                 # The orchestrator persists this counter in its finally block.  It
                 # lets the outer deadline distinguish a skipped pipeline from an
@@ -266,6 +396,21 @@ class DiagnosticsService:
                     self.enrichment_orchestrator._ai_candidates(events)
                     if ai_started
                     else []
+                )
+                self._record_calendar_accounting(
+                    accounting_collector,
+                    events=events,
+                    database_lookup_performed=(
+                        calendar_db_lookup
+                    ),
+                    provider_called=calendar_provider_called,
+                    provider_result=calendar_provider_result,
+                    provider_not_called_reason=(
+                        calendar_not_called_reason
+                    ),
+                    acquisition_reason_code=(
+                        "CANONICAL_EVENT_ACQUISITION_COMPLETED"
+                    ),
                 )
                 return events, {
                     "data_quality": {
@@ -301,10 +446,19 @@ class DiagnosticsService:
                         symbol=symbol,
                         fetch_missing=fetch_missing and fetch_missing_nasdaq,
                         force=force,
+                        accounting_collector=accounting_collector,
                     ),
                     timeout=max(float(self.settings.timeout_nasdaq_seconds), 1.0),
                 )
             except TimeoutError:
+                self._record_nasdaq_accounting(
+                    accounting_collector,
+                    lookup_performed=not force,
+                    lookup_rows={},
+                    provider_invoked=True,
+                    context=None,
+                    provider_error="TIMEOUT",
+                )
                 return None, {
                     "db_hits": 0,
                     "db_misses": 1,
@@ -393,6 +547,10 @@ class DiagnosticsService:
             limit=None,
             include_quarantined=True,
         )
+        self._record_news_accounting(
+            accounting_collector,
+            news_items=news_items,
+        )
         news_context, news_runtime = self.news_intelligence.materialize(
             news_items,
             refresh_mode=refresh,
@@ -410,6 +568,11 @@ class DiagnosticsService:
         }
         cot_payload = await self.positioning_runtime.cot(refresh=refresh)
         aaii_payload = await self.positioning_runtime.aaii(refresh=refresh)
+        self._record_positioning_accounting(
+            accounting_collector,
+            payload=cot_payload,
+            refresh=refresh,
+        )
         positioning_context = _positioning_context_from_runtime(cot_payload)
         sentiment_context = _sentiment_context_from_runtime(aaii_payload)
         event_facts = self.facts.search_facts(country=country, limit=500)
@@ -475,17 +638,17 @@ class DiagnosticsService:
         )
         contract["risk_context"] = risk_context
         contract["risk_sentiment"] = risk_sentiment
+        self._record_multi_source_accounting(
+            accounting_collector,
+            blocks=multi_source.get("blocks") or {},
+            risk_context=risk_context,
+            risk_database_lookup=getattr(
+                self.risk_context,
+                "last_database_lookup",
+                None,
+            ),
+        )
         contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
-        contract["request_scoped_provider_accounting"] = {
-            "request_id": request_id,
-            "correlation_id": request_context.correlation_id,
-            "request_started_at": now.isoformat(),
-            "request_completed_at": datetime.now(UTC).isoformat(),
-            "evidence_origin": "NORMAL_APPLICATION_REQUEST",
-            "evidence_status": "INCOMPLETE",
-            "reason_code": "PER_DATASET_REQUEST_EVIDENCE_NOT_EMITTED",
-            "datasets": [],
-        }
         return harden_market_context(contract, settings=self.settings)
 
     def _canonical_three_week_events(
@@ -777,10 +940,44 @@ class DiagnosticsService:
             },
         }
 
-    async def _macro_db_first(self, *, fetch_missing: bool = True, force: bool = False) -> tuple[MacroLatestResponse, dict[str, Any]]:
-        cached = [] if force else self.facts.get_valid_facts_by_type("official_macro_latest")
+    async def _macro_db_first(
+        self,
+        *,
+        fetch_missing: bool = True,
+        force: bool = False,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
+    ) -> tuple[MacroLatestResponse, dict[str, Any]]:
+        lookup_performed = not force
+        lookup_rows = (
+            []
+            if force
+            else self.facts.get_valid_facts_by_type(
+                "official_macro_latest",
+                allow_stale=True,
+            )
+        )
+        cached = [
+            fact
+            for fact in lookup_rows
+            if self.freshness.evaluate(
+                fact,
+                allow_stale=False,
+            ).usable
+        ]
         if cached:
             macro = self._macro_from_facts(cached)
+            self._record_macro_accounting(
+                accounting_collector,
+                lookup_performed=lookup_performed,
+                lookup_rows=lookup_rows,
+                macro=macro,
+                provider_batch_called=False,
+                provider_not_called_reason=(
+                    "VALID_DATABASE_RECORD_SELECTED"
+                ),
+            )
             return macro, {
                 "db_hits": len(cached),
                 "db_misses": 0,
@@ -792,6 +989,16 @@ class DiagnosticsService:
                 "errors": [],
             }
         if not fetch_missing:
+            self._record_macro_accounting(
+                accounting_collector,
+                lookup_performed=lookup_performed,
+                lookup_rows=lookup_rows,
+                macro=MacroLatestResponse(),
+                provider_batch_called=False,
+                provider_not_called_reason=(
+                    "REFRESH_DISABLED_AFTER_DATABASE_LOOKUP"
+                ),
+            )
             return MacroLatestResponse(), {
                 "db_hits": 0,
                 "db_misses": 1,
@@ -807,6 +1014,14 @@ class DiagnosticsService:
         read_back = self.facts.get_valid_facts_by_type("official_macro_latest")
         read_back_macro = self._macro_from_facts(read_back) if read_back else MacroLatestResponse(provider_results=macro.provider_results)
         provider_failures = sum(1 for item in macro.provider_results if item.errors)
+        self._record_macro_accounting(
+            accounting_collector,
+            lookup_performed=lookup_performed,
+            lookup_rows=lookup_rows,
+            macro=macro,
+            provider_batch_called=True,
+            provider_not_called_reason=None,
+        )
         return read_back_macro, {
             "db_hits": len(read_back),
             "db_misses": 1,
@@ -937,14 +1152,45 @@ class DiagnosticsService:
         )
         return events
 
-    async def _nasdaq_db_first(self, *, symbol: str, fetch_missing: bool = True, force: bool = False) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    async def _nasdaq_db_first(
+        self,
+        *,
+        symbol: str,
+        fetch_missing: bool = True,
+        force: bool = False,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         allow_stale = not fetch_missing and not force
+        lookup_performed = not force
+        lookup_rows = {
+            fact_type: (
+                []
+                if force
+                else self.facts.get_valid_facts_by_type(
+                    fact_type,
+                    allow_stale=True,
+                )
+            )
+            for fact_type in (
+                "qqq_holdings",
+                "mega_cap_snapshot",
+                "mega_cap_breadth",
+                "earnings_event",
+                "nasdaq_context",
+            )
+        }
         facts_by_type = {
-            "qqq_holdings": [] if force else self.facts.get_valid_facts_by_type("qqq_holdings", allow_stale=allow_stale),
-            "mega_cap_snapshot": [] if force else self.facts.get_valid_facts_by_type("mega_cap_snapshot", allow_stale=allow_stale),
-            "mega_cap_breadth": [] if force else self.facts.get_valid_facts_by_type("mega_cap_breadth", allow_stale=allow_stale),
-            "earnings_event": [] if force else self.facts.get_valid_facts_by_type("earnings_event", allow_stale=allow_stale),
-            "nasdaq_context": [] if force else self.facts.get_valid_facts_by_type("nasdaq_context", allow_stale=allow_stale),
+            fact_type: [
+                fact
+                for fact in facts
+                if self.freshness.evaluate(
+                    fact,
+                    allow_stale=allow_stale,
+                ).usable
+            ]
+            for fact_type, facts in lookup_rows.items()
         }
         cached_count = sum(len(items) for items in facts_by_type.values())
         if cached_count:
@@ -968,6 +1214,14 @@ class DiagnosticsService:
                     constituent_count=qqq.get("holdings_count"),
                     stale=stale_used,
                 )
+            self._record_nasdaq_accounting(
+                accounting_collector,
+                lookup_performed=lookup_performed,
+                lookup_rows=lookup_rows,
+                provider_invoked=False,
+                context=None,
+                provider_error=None,
+            )
             return materialized, {
                 "db_hits": cached_count,
                 "db_misses": 0,
@@ -979,6 +1233,14 @@ class DiagnosticsService:
                 "errors": [],
             }
         if not fetch_missing:
+            self._record_nasdaq_accounting(
+                accounting_collector,
+                lookup_performed=lookup_performed,
+                lookup_rows=lookup_rows,
+                provider_invoked=False,
+                context=None,
+                provider_error=None,
+            )
             return None, {
                 "db_hits": 0,
                 "db_misses": 1,
@@ -992,6 +1254,16 @@ class DiagnosticsService:
         try:
             context = await self.nasdaq_data_service.context(force=force)
         except Exception as exc:
+            self._record_nasdaq_accounting(
+                accounting_collector,
+                lookup_performed=lookup_performed,
+                lookup_rows=lookup_rows,
+                provider_invoked=True,
+                context=None,
+                provider_error=(
+                    str(exc) or type(exc).__name__
+                ),
+            )
             return None, {
                 "db_hits": 0,
                 "db_misses": 1,
@@ -1003,6 +1275,14 @@ class DiagnosticsService:
                 "errors": [str(exc) or type(exc).__name__],
             }
         written = self._save_nasdaq_context(context)
+        self._record_nasdaq_accounting(
+            accounting_collector,
+            lookup_performed=lookup_performed,
+            lookup_rows=lookup_rows,
+            provider_invoked=True,
+            context=context,
+            provider_error=None,
+        )
         return normalize_nasdaq_context(context), {
             "db_hits": 0,
             "db_misses": 1,
@@ -1105,6 +1385,789 @@ class DiagnosticsService:
                 "SELECT provider_name, status, COUNT(*) c FROM provider_observations GROUP BY provider_name, status"
             ).fetchall()
         return {"by_provider_status": [dict(row) for row in rows]}
+
+    def _record_macro_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        lookup_performed: bool,
+        lookup_rows: list[dict[str, Any]],
+        macro: MacroLatestResponse,
+        provider_batch_called: bool,
+        provider_not_called_reason: str | None,
+    ) -> None:
+        if collector is None:
+            return
+        shared = tuple(MACRO_ACCOUNTING_SERIES)
+        provider_results = {
+            str(item.source or "").upper(): item
+            for item in macro.provider_results
+        }
+        configured_sources = {
+            type(provider).__name__.replace("Provider", "").upper()
+            for provider in self.macro_service.providers
+        }
+        for dataset_id, series_ids in MACRO_ACCOUNTING_SERIES.items():
+            policy = collector.policies[dataset_id]
+            fact = _matching_macro_fact(lookup_rows, series_ids)
+            freshness = (
+                self.freshness.evaluate(fact, allow_stale=False)
+                if fact is not None
+                else None
+            )
+            selected = next(
+                (
+                    item
+                    for item in macro.series
+                    if str(item.series_id).upper() in series_ids
+                ),
+                None,
+            )
+            metadata = next(
+                (
+                    item
+                    for source, item in provider_results.items()
+                    if policy.primary_provider in source
+                ),
+                None,
+            )
+            evidence_complete = True
+            if provider_batch_called and metadata is not None:
+                from_cache = metadata.provider_type == ProviderType.CACHE
+                primary = provider_attempt(
+                    policy.primary_provider,
+                    called=not from_cache,
+                    attempts=0 if from_cache else 1,
+                    result=(
+                        "CACHE_HIT"
+                        if from_cache
+                        else "FAILED"
+                        if metadata.errors
+                        else "SUCCESS"
+                        if selected is not None
+                        else "NO_DATA"
+                    ),
+                    not_called_reason=(
+                        "PROVIDER_ADAPTER_CACHE_HIT"
+                        if from_cache
+                        else None
+                    ),
+                    execution_origin=(
+                        "CACHE_DECISION"
+                        if from_cache
+                        else "PROVIDER_CALL"
+                    ),
+                )
+            elif provider_batch_called:
+                provider_configured = (
+                    policy.primary_provider.replace("_", "")
+                    in {
+                        item.replace("_", "")
+                        for item in configured_sources
+                    }
+                )
+                primary = provider_attempt(
+                    policy.primary_provider,
+                    called=False,
+                    attempts=0,
+                    result="NOT_CALLED",
+                    not_called_reason=(
+                        "PRIMARY_NOT_CONFIGURED_IN_MACRO_BATCH"
+                        if not provider_configured
+                        else "PROVIDER_RESULT_EVIDENCE_MISSING"
+                    ),
+                    execution_origin="OBSERVED_SKIP",
+                )
+                evidence_complete = not provider_configured
+            else:
+                primary = provider_attempt(
+                    policy.primary_provider,
+                    called=False,
+                    attempts=0,
+                    result="NOT_CALLED",
+                    not_called_reason=(
+                        provider_not_called_reason
+                        or "PROVIDER_BATCH_NOT_EXECUTED"
+                    ),
+                    execution_origin=(
+                        "CACHE_DECISION"
+                        if fact is not None and freshness and freshness.usable
+                        else "OBSERVED_SKIP"
+                    ),
+                )
+            collector.record(
+                dataset_id,
+                acquisition_id="macro_db_provider_batch",
+                shared_dataset_ids=shared,
+                database_lookup_performed=lookup_performed,
+                database_lookup_reason=(
+                    "OFFICIAL_MACRO_DATABASE_LOOKUP"
+                    if lookup_performed
+                    else "FORCE_REFRESH_BYPASSED_DATABASE_LOOKUP"
+                ),
+                database_record_found=(
+                    fact is not None if lookup_performed else None
+                ),
+                database_data_as_of=(
+                    _fact_data_as_of(fact) if lookup_performed else None
+                ),
+                database_content_valid_until=(
+                    fact.get("valid_until")
+                    if lookup_performed and fact
+                    else None
+                ),
+                database_record_expired=(
+                    bool(fact and freshness and not freshness.usable)
+                    if lookup_performed
+                    else None
+                ),
+                database_freshness_evaluation=(
+                    "VALID"
+                    if fact and freshness and freshness.usable
+                    else "EXPIRED"
+                    if fact
+                    else "NOT_FOUND"
+                    if lookup_performed
+                    else "NOT_LOOKED_UP"
+                ),
+                primary_provider=primary,
+                fallbacks=[],
+                acquisition_selected_source=(
+                    selected.source
+                    if selected is not None
+                    else fact.get("source")
+                    if fact
+                    else None
+                ),
+                acquisition_reason_code=(
+                    "PROVIDER_VALUE_ACQUIRED"
+                    if selected is not None and provider_batch_called
+                    else "VALID_DATABASE_RECORD_SELECTED"
+                    if fact and freshness and freshness.usable
+                    else "VALUE_NOT_ACQUIRED"
+                ),
+                evidence_complete=evidence_complete,
+            )
+
+    def _record_nasdaq_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        lookup_performed: bool,
+        lookup_rows: dict[str, list[dict[str, Any]]],
+        provider_invoked: bool,
+        context: NasdaqContextResponse | None,
+        provider_error: str | None,
+    ) -> None:
+        if collector is None:
+            return
+        shared = tuple(NASDAQ_ACCOUNTING_FACT_TYPES)
+        metadata = dict(context.metadata or {}) if context else {}
+        network_calls = int(metadata.get("actual_network_calls") or 0)
+        cache_hits = int(metadata.get("cache_hits") or 0)
+        for dataset_id, fact_types in NASDAQ_ACCOUNTING_FACT_TYPES.items():
+            policy = collector.policies[dataset_id]
+            facts = [
+                fact
+                for fact_type in fact_types
+                for fact in lookup_rows.get(fact_type, [])
+            ]
+            fact = facts[0] if facts else None
+            freshness = (
+                self.freshness.evaluate(fact, allow_stale=False)
+                if fact
+                else None
+            )
+            if provider_invoked and network_calls:
+                attempt = provider_attempt(
+                    policy.primary_provider,
+                    called=True,
+                    attempts=network_calls,
+                    result=(
+                        "FAILED"
+                        if provider_error
+                        else "SUCCESS"
+                        if context is not None
+                        else "NO_DATA"
+                    ),
+                    execution_origin="PROVIDER_CALL",
+                )
+                complete = True
+            elif provider_invoked and cache_hits:
+                attempt = provider_attempt(
+                    policy.primary_provider,
+                    called=False,
+                    attempts=0,
+                    result="CACHE_HIT",
+                    not_called_reason="PROVIDER_ADAPTER_CACHE_HIT",
+                    execution_origin="CACHE_DECISION",
+                )
+                complete = True
+            elif provider_invoked:
+                attempt = provider_attempt(
+                    policy.primary_provider,
+                    called=False,
+                    attempts=0,
+                    result="EVIDENCE_NOT_AVAILABLE",
+                    not_called_reason="PROVIDER_EXECUTION_EVIDENCE_MISSING",
+                    execution_origin="OBSERVED_SKIP",
+                )
+                complete = False
+            else:
+                attempt = provider_attempt(
+                    policy.primary_provider,
+                    called=False,
+                    attempts=0,
+                    result="NOT_CALLED",
+                    not_called_reason=(
+                        "VALID_DATABASE_RECORD_SELECTED"
+                        if fact and freshness and freshness.usable
+                        else "REFRESH_DISABLED_AFTER_DATABASE_LOOKUP"
+                    ),
+                    execution_origin=(
+                        "CACHE_DECISION"
+                        if fact and freshness and freshness.usable
+                        else "OBSERVED_SKIP"
+                    ),
+                )
+                complete = True
+            collector.record(
+                dataset_id,
+                acquisition_id="nasdaq_context_db_provider_batch",
+                shared_dataset_ids=shared,
+                database_lookup_performed=lookup_performed,
+                database_lookup_reason=(
+                    "NASDAQ_CONTEXT_DATABASE_LOOKUP"
+                    if lookup_performed
+                    else "FORCE_REFRESH_BYPASSED_DATABASE_LOOKUP"
+                ),
+                database_record_found=(
+                    fact is not None if lookup_performed else None
+                ),
+                database_data_as_of=(
+                    _fact_data_as_of(fact) if lookup_performed else None
+                ),
+                database_content_valid_until=(
+                    fact.get("valid_until")
+                    if lookup_performed and fact
+                    else None
+                ),
+                database_record_expired=(
+                    bool(fact and freshness and not freshness.usable)
+                    if lookup_performed
+                    else None
+                ),
+                database_freshness_evaluation=(
+                    "VALID"
+                    if fact and freshness and freshness.usable
+                    else "EXPIRED"
+                    if fact
+                    else "NOT_FOUND"
+                    if lookup_performed
+                    else "NOT_LOOKED_UP"
+                ),
+                primary_provider=attempt,
+                fallbacks=[],
+                acquisition_selected_source=(
+                    fact.get("source")
+                    if fact
+                    else "NASDAQ"
+                    if context
+                    else None
+                ),
+                acquisition_reason_code=(
+                    "NASDAQ_PROVIDER_CONTEXT_ACQUIRED"
+                    if context
+                    else "VALID_DATABASE_RECORD_SELECTED"
+                    if fact and freshness and freshness.usable
+                    else "NASDAQ_CONTEXT_NOT_ACQUIRED"
+                ),
+                evidence_complete=complete,
+            )
+
+    def _record_calendar_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        events: list[Any],
+        database_lookup_performed: bool,
+        provider_called: bool,
+        provider_result: str,
+        provider_not_called_reason: str | None,
+        acquisition_reason_code: str,
+    ) -> None:
+        if collector is None:
+            return
+        event = events[0] if events else None
+        data_as_of = _event_value(
+            event,
+            "release_at",
+            "scheduled_at_utc",
+            "time_utc",
+            "date",
+        )
+        valid_until = (
+            self.freshness.macro_valid_until(event)
+            if event is not None
+            else None
+        )
+        expired = bool(
+            valid_until
+            and parse_datetime(valid_until)
+            and datetime.now(UTC) >= parse_datetime(valid_until)
+        )
+        collector.record(
+            "macro_calendar",
+            acquisition_id="canonical_event_calendar",
+            shared_dataset_ids=("macro_calendar",),
+            database_lookup_performed=database_lookup_performed,
+            database_lookup_reason=(
+                "CANONICAL_EVENT_HISTORY_LOOKUP"
+                if database_lookup_performed
+                else "FORCE_EVENT_PROVIDER_PATH"
+            ),
+            database_record_found=(
+                bool(events) if database_lookup_performed else None
+            ),
+            database_data_as_of=(
+                data_as_of if database_lookup_performed else None
+            ),
+            database_content_valid_until=(
+                valid_until if database_lookup_performed else None
+            ),
+            database_record_expired=(
+                expired if database_lookup_performed else None
+            ),
+            database_freshness_evaluation=(
+                "EXPIRED"
+                if database_lookup_performed and events and expired
+                else "VALID"
+                if database_lookup_performed and events
+                else "NOT_FOUND"
+                if database_lookup_performed
+                else "NOT_LOOKED_UP"
+            ),
+            primary_provider=provider_attempt(
+                "CANONICAL_EVENT_REPOSITORY",
+                called=provider_called,
+                attempts=1 if provider_called else 0,
+                result=provider_result,
+                not_called_reason=provider_not_called_reason,
+                execution_origin=(
+                    "PROVIDER_CALL"
+                    if provider_called
+                    else "CACHE_DECISION"
+                    if database_lookup_performed and events
+                    else "OBSERVED_SKIP"
+                ),
+            ),
+            fallbacks=[],
+            acquisition_selected_source=(
+                _event_value(event, "source", "provider")
+                if event is not None
+                else None
+            ),
+            acquisition_reason_code=acquisition_reason_code,
+        )
+
+    def _record_news_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        news_items: list[dict[str, Any]],
+    ) -> None:
+        if collector is None:
+            return
+        item = news_items[0] if news_items else None
+        valid_until = (
+            item.get("valid_until") if item else None
+        )
+        expired = bool(
+            valid_until
+            and parse_datetime(valid_until)
+            and datetime.now(UTC) >= parse_datetime(valid_until)
+        )
+        collector.record(
+            "current_news",
+            acquisition_id="stored_market_news_lookup",
+            shared_dataset_ids=("current_news",),
+            database_lookup_performed=True,
+            database_lookup_reason="MARKET_NEWS_DATABASE_LOOKUP",
+            database_record_found=bool(item),
+            database_data_as_of=(
+                item.get("published_at") or item.get("retrieved_at")
+                if item
+                else None
+            ),
+            database_content_valid_until=valid_until,
+            database_record_expired=expired,
+            database_freshness_evaluation=(
+                "EXPIRED" if item and expired else "VALID" if item else "NOT_FOUND"
+            ),
+            primary_provider=provider_attempt(
+                "FINNHUB",
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="ROUTE_USES_PERSISTED_NEWS_GATEWAY",
+                execution_origin="OBSERVED_SKIP",
+            ),
+            fallbacks=[],
+            acquisition_selected_source=(
+                item.get("source") if item else None
+            ),
+            acquisition_reason_code=(
+                "PERSISTED_NEWS_SELECTED"
+                if item and not expired
+                else "CURRENT_NEWS_NOT_AVAILABLE"
+            ),
+        )
+
+    def _record_positioning_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        payload: dict[str, Any],
+        refresh: str,
+    ) -> None:
+        if collector is None:
+            return
+        lookup = refresh != "force"
+        found = bool(payload.get("cache_used"))
+        called = bool(
+            payload.get("attempted")
+            and int(payload.get("provider_calls") or 0) > 0
+        )
+        valid_until = payload.get("valid_until")
+        expired = bool(
+            found
+            and valid_until
+            and parse_datetime(valid_until)
+            and datetime.now(UTC) >= parse_datetime(valid_until)
+        )
+        collector.record(
+            "positioning",
+            acquisition_id="cftc_cot_db_provider",
+            shared_dataset_ids=("positioning",),
+            database_lookup_performed=lookup,
+            database_lookup_reason=(
+                "CFTC_COT_DATABASE_LOOKUP"
+                if lookup
+                else "FORCE_REFRESH_BYPASSED_DATABASE_LOOKUP"
+            ),
+            database_record_found=found if lookup else None,
+            database_data_as_of=(
+                payload.get("report_date") if found and lookup else None
+            ),
+            database_content_valid_until=(
+                valid_until if found and lookup else None
+            ),
+            database_record_expired=expired if lookup else None,
+            database_freshness_evaluation=(
+                "EXPIRED"
+                if lookup and found and expired
+                else "VALID"
+                if lookup and found
+                else "NOT_FOUND"
+                if lookup
+                else "NOT_LOOKED_UP"
+            ),
+            primary_provider=provider_attempt(
+                "CFTC",
+                called=called,
+                attempts=int(payload.get("provider_calls") or 0),
+                result=(
+                    str(payload.get("status") or "NO_DATA").upper()
+                    if called
+                    else "NOT_CALLED"
+                ),
+                not_called_reason=(
+                    None
+                    if called
+                    else "VALID_DATABASE_RECORD_SELECTED"
+                    if found
+                    else "PROVIDER_EXECUTION_SKIPPED"
+                ),
+                execution_origin=(
+                    "PROVIDER_CALL"
+                    if called
+                    else "CACHE_DECISION"
+                    if found
+                    else "OBSERVED_SKIP"
+                ),
+            ),
+            fallbacks=[],
+            acquisition_selected_source=(
+                payload.get("source")
+                if payload.get("status") == "found"
+                else None
+            ),
+            acquisition_reason_code=(
+                "CFTC_POSITIONING_ACQUIRED"
+                if payload.get("status") == "found"
+                else "CFTC_POSITIONING_NOT_AVAILABLE"
+            ),
+        )
+
+    def _record_multi_source_accounting(
+        self,
+        collector: RequestProviderAccountingCollector | None,
+        *,
+        blocks: dict[str, dict[str, Any]],
+        risk_context: dict[str, Any],
+        risk_database_lookup: dict[str, Any] | None,
+    ) -> None:
+        if collector is None:
+            return
+        self._record_block_dataset(
+            collector,
+            dataset_id="fomc_expectations",
+            acquisition_id="investing_fed_rate_monitor",
+            block=blocks.get("investing_fed_rate_monitor") or {},
+        )
+        risk_block = blocks.get("cboe_risk_indices") or {}
+        for dataset_id in ("vix", "vvix", "risk"):
+            policy = collector.policies[dataset_id]
+            cboe_attempt = _attempt_from_runtime_block(
+                "CBOE",
+                risk_block,
+            )
+            if dataset_id == "vix":
+                primary = provider_attempt(
+                    "FRED",
+                    called=False,
+                    attempts=0,
+                    result="NOT_CALLED",
+                    not_called_reason="RISK_STAGE_USES_CBOE_PROVIDER",
+                    execution_origin="OBSERVED_SKIP",
+                )
+                fallbacks = [cboe_attempt]
+            else:
+                primary = cboe_attempt
+                fallbacks = []
+            lookup = risk_database_lookup or {
+                "performed": False,
+                "found": None,
+                "data_as_of": None,
+                "content_valid_until": None,
+                "expired": None,
+                "freshness": "NOT_LOOKED_UP",
+            }
+            risk_value = (
+                risk_context.get(dataset_id)
+                if dataset_id in {"vix", "vvix"}
+                else risk_context.get("derived_context")
+            )
+            collector.record(
+                dataset_id,
+                acquisition_id="cboe_risk_context",
+                shared_dataset_ids=("vix", "vvix", "risk"),
+                database_lookup_performed=bool(lookup.get("performed")),
+                database_lookup_reason="RISK_CONTEXT_DATABASE_LOOKUP",
+                database_record_found=lookup.get("found"),
+                database_data_as_of=lookup.get("data_as_of"),
+                database_content_valid_until=lookup.get(
+                    "content_valid_until"
+                ),
+                database_record_expired=lookup.get("expired"),
+                database_freshness_evaluation=str(
+                    lookup.get("freshness") or "NOT_LOOKED_UP"
+                ),
+                primary_provider=primary,
+                fallbacks=fallbacks,
+                acquisition_selected_source=(
+                    (risk_context.get("source_summary") or {})
+                    .get("selected_sources", {})
+                    .get(dataset_id)
+                    or risk_block.get("source")
+                    if risk_value
+                    else None
+                ),
+                acquisition_reason_code=(
+                    "RISK_CONTEXT_ACQUIRED"
+                    if risk_value
+                    else "RISK_CONTEXT_NOT_AVAILABLE"
+                ),
+            )
+        schedule_blocks = [
+            blocks.get("nasdaq_market_info") or {},
+            blocks.get("cme_market_schedule") or {},
+            blocks.get("investing_holidays") or {},
+            blocks.get("marketbeat_holidays") or {},
+        ]
+        policy = collector.policies["market_schedule"]
+        schedule_attempts = [
+            _attempt_from_runtime_block(provider, block)
+            for provider, block in zip(
+                (
+                    policy.primary_provider,
+                    *policy.fallback_providers,
+                ),
+                schedule_blocks,
+                strict=True,
+            )
+        ]
+        collector.record(
+            "market_schedule",
+            acquisition_id="market_schedule_provider_chain",
+            shared_dataset_ids=("market_schedule",),
+            database_lookup_performed=False,
+            database_lookup_reason="FORCE_MULTI_SOURCE_PROVIDER_PATH",
+            database_record_found=None,
+            database_data_as_of=None,
+            database_content_valid_until=None,
+            database_record_expired=None,
+            database_freshness_evaluation="NOT_LOOKED_UP",
+            primary_provider=schedule_attempts[0],
+            fallbacks=schedule_attempts[1:],
+            acquisition_selected_source=next(
+                (
+                    block.get("source")
+                    for block in schedule_blocks
+                    if str(block.get("status") or "").lower()
+                    in {"found", "available", "valid", "partial"}
+                ),
+                None,
+            ),
+            acquisition_reason_code="MARKET_SCHEDULE_PROVIDER_CHAIN_COMPLETED",
+        )
+
+    def _record_block_dataset(
+        self,
+        collector: RequestProviderAccountingCollector,
+        *,
+        dataset_id: str,
+        acquisition_id: str,
+        block: dict[str, Any],
+    ) -> None:
+        policy = collector.policies[dataset_id]
+        cache_used = bool(block.get("cache_used"))
+        collector.record(
+            dataset_id,
+            acquisition_id=acquisition_id,
+            shared_dataset_ids=(dataset_id,),
+            database_lookup_performed=cache_used,
+            database_lookup_reason="MULTI_SOURCE_RUNTIME_DATABASE_LOOKUP",
+            database_record_found=True if cache_used else None,
+            database_data_as_of=(
+                block.get("data_as_of")
+                or block.get("retrieved_at")
+                if cache_used
+                else None
+            ),
+            database_content_valid_until=(
+                block.get("valid_until") if cache_used else None
+            ),
+            database_record_expired=False if cache_used else None,
+            database_freshness_evaluation=(
+                "VALID" if cache_used else "NOT_LOOKED_UP"
+            ),
+            primary_provider=_attempt_from_runtime_block(
+                policy.primary_provider,
+                block,
+            ),
+            fallbacks=[],
+            acquisition_selected_source=(
+                block.get("source")
+                if str(block.get("status") or "").lower()
+                in {"found", "available", "valid", "partial"}
+                else None
+            ),
+            acquisition_reason_code=(
+                "PROVIDER_BLOCK_ACQUIRED"
+                if block.get("materialized_count")
+                else "PROVIDER_BLOCK_NOT_AVAILABLE"
+            ),
+        )
+
+
+def _matching_macro_fact(
+    rows: list[dict[str, Any]],
+    series_ids: tuple[str, ...],
+) -> dict[str, Any] | None:
+    expected = {item.upper() for item in series_ids}
+    for fact in rows:
+        raw = (
+            fact.get("raw_payload")
+            if isinstance(fact.get("raw_payload"), dict)
+            else {}
+        )
+        observed = str(
+            raw.get("series_id")
+            or fact.get("category")
+            or fact.get("fact_key")
+            or ""
+        ).upper()
+        if observed in expected or any(
+            f":{series_id}:" in observed
+            for series_id in expected
+        ):
+            return fact
+    return None
+
+
+def _fact_data_as_of(fact: dict[str, Any] | None) -> Any:
+    if not fact:
+        return None
+    raw = (
+        fact.get("raw_payload")
+        if isinstance(fact.get("raw_payload"), dict)
+        else {}
+    )
+    return (
+        raw.get("data_as_of")
+        or fact.get("release_at")
+        or fact.get("retrieved_at")
+    )
+
+
+def _event_value(event: Any, *keys: str) -> Any:
+    for key in keys:
+        value = (
+            event.get(key)
+            if isinstance(event, dict)
+            else getattr(event, key, None)
+        )
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _attempt_from_runtime_block(
+    provider: str,
+    block: dict[str, Any],
+) -> dict[str, Any]:
+    calls = int(block.get("provider_calls") or 0)
+    attempted = bool(block.get("attempted"))
+    cache_used = bool(block.get("cache_used"))
+    if attempted and calls:
+        return provider_attempt(
+            provider,
+            called=True,
+            attempts=calls,
+            result=str(block.get("status") or "NO_DATA").upper(),
+            execution_origin="PROVIDER_CALL",
+        )
+    if cache_used:
+        return provider_attempt(
+            provider,
+            called=False,
+            attempts=0,
+            result="CACHE_HIT",
+            not_called_reason="VALID_DATABASE_RECORD_SELECTED",
+            execution_origin="CACHE_DECISION",
+        )
+    return provider_attempt(
+        provider,
+        called=False,
+        attempts=0,
+        result="NOT_CALLED",
+        not_called_reason=(
+            str(block.get("reason") or "").upper()
+            or "PROVIDER_DISABLED_OR_NOT_REQUIRED"
+        ),
+        execution_origin="OBSERVED_SKIP",
+    )
 
 
 def _event_enrichment_metadata(

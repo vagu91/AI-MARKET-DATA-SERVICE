@@ -237,6 +237,7 @@ def build_senior_analyst_payload_v1(
     readiness = _readiness(analytics)
     accounting = _provider_accounting(
         analytics,
+        missing_data=missing,
         source_payload=source_payload,
         request_id=request_id,
         refresh_mode=request_refresh_mode,
@@ -361,6 +362,8 @@ def validate_senior_analyst_payload_v1(
         payload.get("provider_accounting") or [],
         request=request,
         require_request_id=require_recent_response,
+        analytics=analytics,
+        missing_data=payload.get("missing_data") or [],
     )
     if require_recent_response:
         accounting_valid = bool(
@@ -1689,14 +1692,13 @@ def _section_metadata(
 def _provider_accounting(
     analytics: dict[str, Any],
     *,
+    missing_data: list[dict[str, Any]],
     source_payload: dict[str, Any],
     request_id: str | None,
     refresh_mode: str | None,
 ) -> dict[str, Any]:
-    # Accounting is deliberately not reconstructed from analytical values,
-    # cache-looking fields, or provider counters. Only the explicit manifest
-    # emitted by the normal application request is eligible.
-    del analytics
+    # Acquisition is accepted only from the explicit request-scoped manifest.
+    # Delivery is computed here from the final analytical projection.
     envelope = source_payload.get("request_scoped_provider_accounting")
     manifest = envelope if isinstance(envelope, dict) else {}
     correlation_id = manifest.get("correlation_id")
@@ -1721,7 +1723,7 @@ def _provider_accounting(
         and manifest.get("request_id") == request_id
         and correlation_id == request_id
         and evidence_origin == "NORMAL_APPLICATION_REQUEST"
-        and manifest.get("evidence_status") == "COMPLETE"
+        and manifest.get("evidence_status") == "ACQUISITION_COMPLETE"
         and parse_datetime(request_started_at)
         and parse_datetime(request_completed_at)
     )
@@ -1749,14 +1751,28 @@ def _provider_accounting(
                 )
             )
             continue
-        rows.append(
-            {
+        delivery = _delivery_evidence(
+            policy.dataset_id,
+            analytics=analytics,
+            missing_data=missing_data,
+        )
+        candidate = {
                 "dataset_id": policy.dataset_id,
                 "request_id": raw.get("request_id"),
                 "correlation_id": raw.get("correlation_id"),
                 "evidence_origin": raw.get("evidence_origin"),
-                "evidence_status": raw.get("evidence_status"),
+                "evidence_status": "COMPLETE",
                 "observed_at": raw.get("observed_at"),
+                "acquisition_id": raw.get("acquisition_id"),
+                "shared_acquisition_dataset_ids": deepcopy(
+                    raw.get("shared_acquisition_dataset_ids")
+                ),
+                "database_lookup_performed": raw.get(
+                    "database_lookup_performed"
+                ),
+                "database_lookup_reason": raw.get(
+                    "database_lookup_reason"
+                ),
                 "database_record_found": raw.get("database_record_found"),
                 "database_data_as_of": raw.get("database_data_as_of"),
                 "database_content_valid_until": raw.get(
@@ -1768,16 +1784,35 @@ def _provider_accounting(
                 ),
                 "primary_provider": deepcopy(raw.get("primary_provider")),
                 "fallbacks": deepcopy(raw.get("fallbacks")),
-                "selected_source": raw.get("selected_source"),
-                "selected_value_present": raw.get("selected_value_present"),
-                "delivered_value": deepcopy(raw.get("delivered_value")),
-                "payload_freshness": raw.get("payload_freshness"),
-                "reason_code": raw.get("reason_code"),
+                "acquisition_selected_source": raw.get(
+                    "acquisition_selected_source"
+                ),
+                **delivery,
                 "refresh_mode": refresh_mode,
                 "source_snapshot_revision": source_payload.get(
                     "snapshot_revision"
                 ),
             }
+        if not _acquisition_accounting_row_complete(
+            raw,
+            policy=policy,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            request_started_at=request_started_at,
+            request_completed_at=request_completed_at,
+        ):
+            rows.append(
+                _incomplete_provider_accounting_row(
+                    policy,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
+                    refresh_mode=refresh_mode,
+                    reason_code="REQUEST_ACQUISITION_EVIDENCE_INCOMPLETE",
+                )
+            )
+            continue
+        rows.append(
+            candidate
         )
     same_request_complete = bool(
         correlated_manifest
@@ -1819,6 +1854,10 @@ def _incomplete_provider_accounting_row(
         "evidence_origin": None,
         "evidence_status": "INCOMPLETE",
         "observed_at": None,
+        "acquisition_id": None,
+        "shared_acquisition_dataset_ids": [],
+        "database_lookup_performed": None,
+        "database_lookup_reason": None,
         "database_record_found": None,
         "database_data_as_of": None,
         "database_content_valid_until": None,
@@ -1847,6 +1886,405 @@ def _incomplete_provider_accounting_row(
         "refresh_mode": refresh_mode,
         "source_snapshot_revision": None,
     }
+
+
+def _delivery_evidence(
+    dataset_id: str,
+    *,
+    analytics: dict[str, Any],
+    missing_data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    section_name, value = _dataset_delivery_value(
+        dataset_id,
+        analytics,
+    )
+    delivered = deepcopy(value) if _meaningful_delivery(value) else None
+    section = (
+        analytics.get(section_name)
+        if isinstance(analytics.get(section_name), dict)
+        else {}
+    )
+    source = _first_delivery_field(delivered, "source")
+    if source is None:
+        source = section.get("source")
+    freshness = _first_delivery_field(delivered, "freshness")
+    if freshness is None:
+        freshness = section.get("freshness") or "UNAVAILABLE"
+    missing_reasons = sorted(
+        {
+            str(item.get("reason_code"))
+            for item in missing_data
+            if isinstance(item, dict)
+            and item.get("reason_code")
+            and _missing_matches_dataset(
+                dataset_id,
+                str(item.get("field") or item.get("path") or ""),
+            )
+        }
+    )
+    present = delivered is not None
+    return {
+        "selected_source": source if present else None,
+        "selected_value_present": present,
+        "delivered_value": delivered,
+        "payload_freshness": str(freshness),
+        "delivery_missing_reason_codes": missing_reasons,
+        "reason_code": (
+            "FINAL_PAYLOAD_VALUE_DELIVERED"
+            if present
+            else missing_reasons[0]
+            if missing_reasons
+            else "FINAL_PAYLOAD_VALUE_NOT_AVAILABLE"
+        ),
+    }
+
+
+def _dataset_delivery_value(
+    dataset_id: str,
+    analytics: dict[str, Any],
+) -> tuple[str, Any]:
+    macro_series = {
+        "cpi": {"CUSR0000SA0", "CUSR0000SA0L1E"},
+        "ppi": {"WPUFD4"},
+        "pce": {
+            "BEA:PCE",
+            "BEA:PCE_PRICE_INDEX",
+            "BEA:CORE_PCE",
+        },
+        "gdp": {"BEA:GDP", "GDP"},
+        "employment": {"LNS14000000", "UNRATE"},
+        "wages": {"CES0500000003"},
+        "nfp": {"CES0000000001", "PAYEMS"},
+        "jobless_claims": {"ICSA"},
+    }
+    if dataset_id in macro_series:
+        metrics = (analytics.get("macro") or {}).get("metrics") or []
+        return "macro", [
+            item
+            for item in metrics
+            if isinstance(item, dict)
+            and str(item.get("series_id") or "").upper()
+            in macro_series[dataset_id]
+            and item.get("value") is not None
+        ]
+    if dataset_id in {"treasury_rates", "fed_funds"}:
+        expected = (
+            {"DFF", "FEDFUNDS", "SOFR"}
+            if dataset_id == "fed_funds"
+            else {
+                "DGS2",
+                "DGS10",
+                "DGS30",
+                "T10Y2Y",
+                "T10Y3M",
+                "NFCI",
+            }
+        )
+        metrics = (analytics.get("rates") or {}).get("metrics") or []
+        return "rates", [
+            item
+            for item in metrics
+            if isinstance(item, dict)
+            and str(item.get("series_id") or "").upper() in expected
+            and item.get("value") is not None
+        ]
+    if dataset_id in {"nasdaq_100", "mega_cap_quotes"}:
+        components = (analytics.get("nasdaq") or {}).get("components") or []
+        keys = (
+            ("symbol", "weight_pct")
+            if dataset_id == "nasdaq_100"
+            else ("symbol", "price", "change_pct")
+        )
+        return "nasdaq", [
+            {
+                key: item.get(key)
+                for key in (
+                    *keys,
+                    "source",
+                    "freshness",
+                    "data_as_of",
+                    "content_valid_until",
+                )
+            }
+            for item in components
+            if isinstance(item, dict)
+            and any(item.get(key) is not None for key in keys[1:])
+        ]
+    if dataset_id == "market_internals":
+        return "market_internals", _delivery_fields(
+            analytics.get("market_internals") or {},
+            (
+                "advance_decline_ratio",
+                "advancers",
+                "decliners",
+                "percent_advancers",
+                "weighted_breadth",
+            ),
+        )
+    if dataset_id in {"vix", "vvix"}:
+        return "vix", (analytics.get("vix") or {}).get(
+            dataset_id.upper()
+        )
+    if dataset_id == "risk":
+        return "risk", _delivery_fields(
+            analytics.get("risk") or {},
+            ("risk_sentiment", "risk_score"),
+        )
+    if dataset_id == "target_range":
+        return "fomc", _delivery_fields(
+            analytics.get("fomc") or {},
+            ("target_range_lower", "target_range_upper"),
+        )
+    if dataset_id == "fomc_expectations":
+        return "fomc", _delivery_fields(
+            analytics.get("fomc") or {},
+            (
+                "action",
+                "change_bps",
+                "pre_meeting_probabilities",
+            ),
+        )
+    if dataset_id in {"macro_calendar", "flash_services_pmi"}:
+        calendar = analytics.get("calendar") or {}
+        events = [
+            item
+            for key in (
+                "active_event_windows",
+                "next_24h_events",
+                "next_7d_high_impact_events",
+            )
+            for item in calendar.get(key) or []
+            if isinstance(item, dict)
+        ]
+        if dataset_id == "flash_services_pmi":
+            events = [
+                item
+                for item in events
+                if "flash_services_pmi"
+                in str(item.get("metric_id") or "").lower()
+                or "flash services pmi"
+                in str(item.get("name") or "").lower()
+            ]
+        return "calendar", events
+    if dataset_id == "earnings":
+        return "earnings", (analytics.get("earnings") or {}).get(
+            "events"
+        )
+    if dataset_id == "options_positioning":
+        return "options_positioning", _delivery_fields(
+            analytics.get("options_positioning") or {},
+            ("iv_atm", "open_interest", "volume", "skew"),
+        )
+    if dataset_id == "positioning":
+        return "positioning", (analytics.get("positioning") or {}).get(
+            "cot"
+        )
+    if dataset_id == "current_news":
+        return "news", (analytics.get("news") or {}).get(
+            "current_news"
+        )
+    if dataset_id == "market_schedule":
+        return "market_schedule", analytics.get("market_schedule")
+    return dataset_id, None
+
+
+def _delivery_fields(
+    section: dict[str, Any],
+    fields: tuple[str, ...],
+) -> dict[str, Any] | None:
+    values = {
+        key: deepcopy(section.get(key))
+        for key in fields
+        if _meaningful_delivery(section.get(key))
+    }
+    if not values:
+        return None
+    return {
+        **values,
+        "source": section.get("source"),
+        "freshness": section.get("freshness"),
+        "data_as_of": section.get("data_as_of"),
+        "content_valid_until": section.get("content_valid_until"),
+    }
+
+
+def _meaningful_delivery(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        ignored = {
+            "status",
+            "freshness",
+            "source",
+            "reason_code",
+            "data_as_of",
+            "content_valid_until",
+            "snapshot_transport_valid_until",
+            "refresh_due_at",
+            "lineage",
+        }
+        return any(
+            _meaningful_delivery(item)
+            for key, item in value.items()
+            if key not in ignored
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_meaningful_delivery(item) for item in value)
+    return value != ""
+
+
+def _first_delivery_field(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        if value.get(field) not in (None, ""):
+            return value[field]
+        for item in value.values():
+            found = _first_delivery_field(item, field)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_delivery_field(item, field)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _missing_matches_dataset(dataset_id: str, field: str) -> bool:
+    lowered = field.lower()
+    tokens = {
+        "nasdaq_100": ("nasdaq.components",),
+        "mega_cap_quotes": ("nasdaq.components", "nasdaq.drivers"),
+        "market_internals": ("market_internals",),
+        "vix": ("vix.vix",),
+        "vvix": ("vix.vvix",),
+        "risk": ("risk.",),
+        "treasury_rates": ("rates.",),
+        "fed_funds": ("rates.",),
+        "target_range": ("fomc.target_range",),
+        "fomc_expectations": ("fomc.action", "fomc.pre_meeting"),
+        "cpi": ("headline_cpi", "core_cpi",),
+        "ppi": ("ppi", "wpufd4"),
+        "pce": ("pce",),
+        "gdp": ("gdp",),
+        "employment": ("employment", "unrate"),
+        "wages": ("wage",),
+        "nfp": ("payroll", "nfp"),
+        "jobless_claims": ("jobless", "icsa"),
+        "macro_calendar": ("calendar.",),
+        "flash_services_pmi": ("flash_services_pmi",),
+        "earnings": ("earnings.",),
+        "options_positioning": ("options_positioning",),
+        "positioning": ("positioning",),
+        "current_news": ("news.current_news",),
+        "market_schedule": ("market_schedule",),
+    }
+    return any(token in lowered for token in tokens.get(dataset_id, ()))
+
+
+def _acquisition_accounting_row_complete(
+    item: Any,
+    *,
+    policy: DatasetPolicy,
+    request_id: Any,
+    correlation_id: Any,
+    request_started_at: Any,
+    request_completed_at: Any,
+) -> bool:
+    if (
+        not isinstance(item, dict)
+        or item.get("dataset_id") != policy.dataset_id
+        or item.get("request_id") != request_id
+        or item.get("correlation_id") != correlation_id
+        or item.get("evidence_origin") != "NORMAL_APPLICATION_REQUEST"
+        or item.get("evidence_status") != "ACQUISITION_COMPLETE"
+        or not item.get("acquisition_id")
+        or policy.dataset_id
+        not in (item.get("shared_acquisition_dataset_ids") or [])
+        or type(item.get("database_lookup_performed")) is not bool
+        or not item.get("database_lookup_reason")
+        or not item.get("database_freshness_evaluation")
+        or not item.get("acquisition_reason_code")
+    ):
+        return False
+    observed = parse_datetime(item.get("observed_at"))
+    started = parse_datetime(request_started_at)
+    completed = parse_datetime(request_completed_at)
+    if (
+        not observed
+        or not started
+        or not completed
+        or _utc(observed) < _utc(started)
+        or _utc(observed) > _utc(completed)
+    ):
+        return False
+    lookup = item["database_lookup_performed"]
+    if lookup:
+        if (
+            type(item.get("database_record_found")) is not bool
+            or type(item.get("database_record_expired")) is not bool
+        ):
+            return False
+        if item["database_record_found"] and (
+            not item.get("database_data_as_of")
+            or not item.get("database_content_valid_until")
+        ):
+            return False
+    elif any(
+        item.get(key) is not None
+        for key in (
+            "database_record_found",
+            "database_data_as_of",
+            "database_content_valid_until",
+            "database_record_expired",
+        )
+    ) or item.get("database_freshness_evaluation") != "NOT_LOOKED_UP":
+        return False
+    primary = item.get("primary_provider")
+    fallbacks = item.get("fallbacks")
+    if (
+        not isinstance(primary, dict)
+        or primary.get("provider") != policy.primary_provider
+        or not isinstance(fallbacks, list)
+        or [
+            value.get("provider")
+            for value in fallbacks
+            if isinstance(value, dict)
+        ]
+        != list(policy.fallback_providers)
+    ):
+        return False
+    return all(
+        _provider_attempt_complete(attempt)
+        for attempt in [primary, *fallbacks]
+    )
+
+
+def _provider_attempt_complete(attempt: Any) -> bool:
+    if not isinstance(attempt, dict):
+        return False
+    called = attempt.get("called")
+    count = attempt.get("attempts")
+    origin = attempt.get("execution_origin")
+    if (
+        type(called) is not bool
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        or not attempt.get("provider")
+        or not attempt.get("result")
+    ):
+        return False
+    if called:
+        return bool(
+            count > 0
+            and origin == "PROVIDER_CALL"
+            and not attempt.get("not_called_reason")
+        )
+    return bool(
+        count == 0
+        and attempt.get("not_called_reason")
+        and origin in {"OBSERVED_SKIP", "CACHE_DECISION"}
+    )
 
 
 def _readiness(analytics: dict[str, Any]) -> dict[str, Any]:
@@ -2220,6 +2658,8 @@ def _provider_accounting_valid(
     *,
     request: dict[str, Any],
     require_request_id: bool,
+    analytics: dict[str, Any],
+    missing_data: list[dict[str, Any]],
 ) -> bool:
     if not isinstance(rows, list):
         return False
@@ -2248,16 +2688,33 @@ def _provider_accounting_valid(
         or len(rows) != len(expected)
     ):
         return False
-    return all(
-        _request_accounting_row_complete(
+    for item in rows:
+        if not _request_accounting_row_complete(
             item,
             request_id=request_id,
             correlation_id=correlation_id,
             request_started_at=request_started_at,
             request_completed_at=request_completed_at,
+        ):
+            return False
+        expected_delivery = _delivery_evidence(
+            str(item.get("dataset_id")),
+            analytics=analytics,
+            missing_data=missing_data,
         )
-        for item in rows
-    )
+        if any(
+            item.get(key) != expected_delivery.get(key)
+            for key in (
+                "selected_source",
+                "selected_value_present",
+                "delivered_value",
+                "payload_freshness",
+                "delivery_missing_reason_codes",
+                "reason_code",
+            )
+        ):
+            return False
+    return True
 
 
 def _request_accounting_row_complete(
@@ -2275,6 +2732,10 @@ def _request_accounting_row_complete(
         "evidence_origin",
         "evidence_status",
         "observed_at",
+        "acquisition_id",
+        "shared_acquisition_dataset_ids",
+        "database_lookup_performed",
+        "database_lookup_reason",
         "database_record_found",
         "database_data_as_of",
         "database_content_valid_until",
@@ -2286,6 +2747,7 @@ def _request_accounting_row_complete(
         "selected_value_present",
         "delivered_value",
         "payload_freshness",
+        "delivery_missing_reason_codes",
         "reason_code",
     }
     if (
@@ -2296,9 +2758,12 @@ def _request_accounting_row_complete(
         or item.get("correlation_id") != correlation_id
         or item.get("evidence_origin") != "NORMAL_APPLICATION_REQUEST"
         or item.get("evidence_status") != "COMPLETE"
-        or not isinstance(item.get("database_record_found"), bool)
-        or not isinstance(item.get("database_record_expired"), bool)
+        or type(item.get("database_lookup_performed")) is not bool
         or not isinstance(item.get("selected_value_present"), bool)
+        or not isinstance(
+            item.get("delivery_missing_reason_codes"),
+            list,
+        )
         or (
             item.get("selected_value_present")
             != (item.get("delivered_value") is not None)
@@ -2329,6 +2794,13 @@ def _request_accounting_row_complete(
     )
     if policy is None:
         return False
+    if (
+        not item.get("acquisition_id")
+        or policy.dataset_id
+        not in (item.get("shared_acquisition_dataset_ids") or [])
+        or not item.get("database_lookup_reason")
+    ):
+        return False
     primary = item.get("primary_provider")
     fallbacks = item.get("fallbacks")
     attempts = [primary, *fallbacks] if isinstance(fallbacks, list) else []
@@ -2345,27 +2817,38 @@ def _request_accounting_row_complete(
     for attempt in attempts:
         if not isinstance(attempt, dict):
             return False
-        if not {"provider", "called", "attempts", "result"} <= set(attempt):
+        if not {
+            "provider",
+            "called",
+            "attempts",
+            "result",
+            "execution_origin",
+        } <= set(attempt):
             return False
-        called = attempt.get("called")
-        attempt_count = attempt.get("attempts")
-        if (
-            not attempt.get("provider")
-            or not attempt.get("result")
-            or not isinstance(called, bool)
-            or not isinstance(attempt_count, int)
-            or isinstance(attempt_count, bool)
-            or attempt_count < 0
-            or (called and attempt_count < 1)
-            or (not called and attempt_count != 0)
-        ):
+        if not _provider_attempt_complete(attempt):
             return False
     if not item.get("database_freshness_evaluation"):
         return False
-    if item["database_record_found"] and (
-        not item.get("database_data_as_of")
-        or not item.get("database_content_valid_until")
-    ):
+    if item["database_lookup_performed"]:
+        if (
+            type(item.get("database_record_found")) is not bool
+            or type(item.get("database_record_expired")) is not bool
+        ):
+            return False
+        if item["database_record_found"] and (
+            not item.get("database_data_as_of")
+            or not item.get("database_content_valid_until")
+        ):
+            return False
+    elif any(
+        item.get(key) is not None
+        for key in (
+            "database_record_found",
+            "database_data_as_of",
+            "database_content_valid_until",
+            "database_record_expired",
+        )
+    ) or item.get("database_freshness_evaluation") != "NOT_LOOKED_UP":
         return False
     return bool(
         item.get("payload_freshness")

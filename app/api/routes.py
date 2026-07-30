@@ -88,7 +88,11 @@ from app.services.market_context_sync_service import (
     SyncContractError,
 )
 from app.services.senior_analyst_projection_v1 import (
+    DATASET_POLICIES,
     build_senior_analyst_payload_v1,
+)
+from app.services.request_provider_accounting import (
+    RequestProviderAccountingCollector,
 )
 
 router = APIRouter()
@@ -391,8 +395,28 @@ async def market_context_mnq(
     lifecycle_due_resolver=Depends(get_lifecycle_due_resolver),
 ) -> dict[str, object]:
     request_id = f"sa-{uuid.uuid4()}"
-    request_started_at = datetime.now(UTC).isoformat()
+    request_started = datetime.now(UTC)
+    request_started_at = request_started.isoformat()
     settings = enrichment_orchestrator.settings
+    request_context = (
+        ExecutionContext.provider_only(
+            correlation_id=request_id,
+            allow_live_providers=True,
+        )
+        if audience == "senior_analyst_v1"
+        and refresh == "force"
+        else None
+    )
+    accounting_collector = (
+        RequestProviderAccountingCollector(
+            request_id=request_id,
+            correlation_id=request_id,
+            request_started_at=request_started,
+            policies=DATASET_POLICIES,
+        )
+        if request_context is not None
+        else None
+    )
     snapshots = MarketContextSnapshotRepository(settings)
     if refresh == "false":
         stored = snapshots.latest("MNQ")
@@ -427,13 +451,23 @@ async def market_context_mnq(
         if force_lock is not None:
             await asyncio.to_thread(force_lock.acquire)
         try:
+            full_model_kwargs = {
+                "country": "US",
+                "days": 30,
+                "symbol": "MNQ",
+                "fetch_missing_nasdaq": refresh == "force",
+                "refresh": refresh,
+                "request_id": request_id,
+            }
+            if accounting_collector is not None:
+                full_model_kwargs.update(
+                    {
+                        "execution_context": request_context,
+                        "accounting_collector": accounting_collector,
+                    }
+                )
             contract = await diagnostics.full_model(
-                country="US",
-                days=30,
-                symbol="MNQ",
-                fetch_missing_nasdaq=refresh == "force",
-                refresh=refresh,
-                request_id=request_id,
+                **full_model_kwargs,
             )
             canonical_generation_plan = (
                 dict(
@@ -446,9 +480,14 @@ async def market_context_mnq(
                 if refresh == "force"
                 else {}
             )
+            runtime_kwargs = {"refresh": refresh}
+            if accounting_collector is not None:
+                runtime_kwargs["accounting_collector"] = (
+                    accounting_collector
+                )
             contract = await deterministic_runtime.enrich_market_context(
                 contract,
-                refresh=refresh,
+                **runtime_kwargs,
             )
             actual_plan = None
             if (
@@ -471,10 +510,16 @@ async def market_context_mnq(
                             )
                             or 0
                         ),
+                        accounting_collector=accounting_collector,
                     ).prepare,
                     contract,
                 )
                 contract = actual_plan["contract"]
+            if accounting_collector is not None:
+                contract = dict(contract)
+                contract["request_scoped_provider_accounting"] = (
+                    accounting_collector.manifest()
+                )
             if (
                 refresh == "force"
                 and not _force_plan_has_writes(
