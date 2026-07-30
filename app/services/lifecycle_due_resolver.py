@@ -726,6 +726,7 @@ class DeterministicLifecycleDueResolver:
             "provider_request_failed": False,
             "provider_cache_hit": False,
             "provider_negative_cache_hit": False,
+            "provider_negative_cache_bypassed": False,
         }
         if entity_type == "schedule_only":
             return {
@@ -771,10 +772,16 @@ class DeterministicLifecycleDueResolver:
         cached_until = parse_datetime(
             item.get("negative_cache_expires_at") or item.get("next_retry_at")
         )
+        provider_force_refresh = bool(
+            item.get("force_refresh") is True
+            and str(item.get("resolution_mode") or "")
+            == "prepare_atomic_provider_force"
+        )
         if (
             str(item.get("freshness_state") or "") == "NO_DATA_BACKOFF"
             and cached_until is not None
             and cached_until > now
+            and not provider_force_refresh
         ):
             return {
                 "status": "DEFERRED",
@@ -786,6 +793,13 @@ class DeterministicLifecycleDueResolver:
                     "provider_negative_cache_hit": True,
                 },
             }
+        if (
+            str(item.get("freshness_state") or "") == "NO_DATA_BACKOFF"
+            and cached_until is not None
+            and cached_until > now
+            and provider_force_refresh
+        ):
+            telemetry["provider_negative_cache_bypassed"] = True
 
         adapter = self.adapters.get(entity_type)
         if adapter is None:
@@ -1467,6 +1481,26 @@ def _official_actual_datum(
     actual_is_official = bool(
         candidate.get("actual_is_official", True)
     )
+    candidate_field_lineage = (
+        dict(candidate.get("field_lineage") or {})
+        if isinstance(candidate.get("field_lineage"), dict)
+        else {}
+    )
+    candidate_actual_lineage = (
+        dict(candidate_field_lineage.get("actual") or {})
+        if isinstance(candidate_field_lineage.get("actual"), dict)
+        else {}
+    )
+    exact_fallback_forecast = bool(
+        candidate.get("canonical_forecast_selection_reason")
+        == "EXACT_OCCURRENCE_MATCH_WITH_SELECTED_ACTUAL"
+        and candidate.get("forecast") not in (None, "")
+    )
+    selected_forecast = (
+        candidate.get("forecast")
+        if exact_fallback_forecast
+        else event.get("forecast")
+    )
     actual_lineage = {
         "source": source,
         "publisher": candidate.get("publisher"),
@@ -1503,6 +1537,7 @@ def _official_actual_datum(
             candidate.get("validation_status") or "accepted"
         ),
         "source_field": "actual",
+        **candidate_actual_lineage,
     }
     enrichment = (
         dict(event.get("enrichment") or {})
@@ -1518,7 +1553,14 @@ def _official_actual_datum(
     persisted_fields = dict(
         persisted_lineage.get("field_lineage") or {}
     )
-    if "forecast" not in field_lineage:
+    if exact_fallback_forecast and isinstance(
+        candidate_field_lineage.get("forecast"), dict
+    ):
+        field_lineage["forecast"] = {
+            **dict(candidate_field_lineage["forecast"]),
+            "field_semantics": "forecast",
+        }
+    elif "forecast" not in field_lineage:
         scheduled_forecast = (
             persisted_fields.get("forecast")
             or persisted_fields.get("consensus")
@@ -1530,8 +1572,17 @@ def _official_actual_datum(
             }
     field_lineage["actual"] = actual_lineage
     if candidate.get("previous") not in (None, ""):
+        candidate_previous_lineage = (
+            dict(candidate_field_lineage.get("previous") or {})
+            if isinstance(
+                candidate_field_lineage.get("previous"),
+                dict,
+            )
+            else {}
+        )
         field_lineage["previous"] = {
             **actual_lineage,
+            **candidate_previous_lineage,
             "field_semantics": "previous",
             "source_field": "previous",
             "value": candidate.get("previous"),
@@ -1543,7 +1594,7 @@ def _official_actual_datum(
     enrichment.update(
         {
             "actual": value,
-            "forecast": event.get("forecast"),
+            "forecast": selected_forecast,
             "previous": (
                 candidate.get("previous")
                 if candidate.get("previous") not in (None, "")
@@ -1566,7 +1617,12 @@ def _official_actual_datum(
             else event.get("previous")
         ),
         "previous_revised": candidate.get("previous_revised"),
-        "forecast": event.get("forecast"),
+        "forecast": selected_forecast,
+        **(
+            {"consensus": selected_forecast}
+            if exact_fallback_forecast
+            else {}
+        ),
         "metric_id": (
             candidate.get("event_metric_id")
             or candidate.get("metric_id")
@@ -1611,6 +1667,29 @@ def _official_actual_datum(
         "actual_source": acquisition_source,
         "actual_source_url": source_url,
         "source_lineage": [actual_lineage],
+        **(
+            {"field_lineage": field_lineage}
+            if exact_fallback_forecast
+            else {}
+        ),
+        **(
+            {
+                "provider_event_id": candidate.get("event_id"),
+                "provider_occurrence_id": candidate.get(
+                    "occurrence_id"
+                ),
+                "forecast_observations": candidate.get(
+                    "forecast_observations"
+                ),
+                "canonical_forecast_selection_reason": (
+                    candidate.get(
+                        "canonical_forecast_selection_reason"
+                    )
+                ),
+            }
+            if exact_fallback_forecast
+            else {}
+        ),
         "comparison_lineage": {
             **dict(event.get("comparison_lineage") or {}),
             "scheduled_previous": event.get("previous"),

@@ -511,6 +511,7 @@ async def market_context_mnq(
                             or 0
                         ),
                         accounting_collector=accounting_collector,
+                        force_refresh=True,
                     ).prepare,
                     contract,
                 )

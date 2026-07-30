@@ -146,6 +146,68 @@ class DeterministicActualResolver:
             }
         fallback_used = False
         primary_failure: str | None = None
+
+        def fetch_flash_pmi_fallback(
+            failure: str,
+        ) -> tuple[Any | None, dict[str, Any] | None]:
+            fallback_config = self.providers.get(
+                INVESTING_FLASH_SOURCE
+            )
+            if fallback_config is None:
+                return None, {
+                    **_feed_delayed(
+                        failure,
+                        provider=spec.provider,
+                        source_series=spec.source_series_id,
+                        provider_http_outcome=(
+                            "HTTP_403"
+                            if failure
+                            == "sp_global_public_release_access_restricted"
+                            else None
+                        ),
+                    ),
+                    "fallback_reason_code": (
+                        "investing_flash_services_pmi_fallback_unavailable"
+                    ),
+                    "provider_attempts": [
+                        _observed_provider_call(
+                            spec.provider,
+                            _primary_attempt_result(failure),
+                        ),
+                        _observed_provider_skip(
+                            INVESTING_FLASH_SOURCE,
+                            (
+                                "INVESTING_FLASH_SERVICES_PMI_"
+                                "FALLBACK_UNAVAILABLE"
+                            ),
+                        ),
+                    ],
+                }
+            fallback = (
+                fallback_config(self.cache, self.settings)
+                if isinstance(fallback_config, type)
+                else fallback_config
+            )
+            try:
+                fallback_result = asyncio.run(
+                    fallback.fetch(
+                        expected_period=expected_period,
+                        release_date=release_date.isoformat(),
+                        expected_release_at=release_timestamp,
+                    )
+                )
+            except Exception as fallback_exc:
+                return None, _flash_pmi_all_failed(
+                    primary_failure=failure,
+                    fallback_failure=(
+                        str(fallback_exc)
+                        or type(fallback_exc).__name__
+                    ),
+                    provider=spec.provider,
+                    source_series=spec.source_series_id,
+                )
+            return fallback_result, None
+
         try:
             if spec.provider == "CENSUS":
                 dataset = spec.source_series_id.split(":", 2)[1]
@@ -176,7 +238,10 @@ class DeterministicActualResolver:
             else:
                 result = asyncio.run(provider.fetch())
         except Exception as exc:
-            detail = str(exc)
+            detail = _redacted_provider_result(
+                str(exc)
+                or f"official_provider_unavailable:{type(exc).__name__}"
+            )
             primary_failure = (
                 detail
                 if detail
@@ -195,226 +260,316 @@ class DeterministicActualResolver:
                     provider=spec.provider,
                     source_series=spec.source_series_id,
                 )
-            fallback_config = self.providers.get(INVESTING_FLASH_SOURCE)
-            if fallback_config is None:
-                return {
-                    **_feed_delayed(
-                        primary_failure,
-                        provider=spec.provider,
-                        source_series=spec.source_series_id,
-                        provider_http_outcome=(
-                            "HTTP_403"
-                            if detail == "sp_global_public_release_access_restricted"
-                            else None
-                        ),
-                    ),
-                    "fallback_reason_code": (
-                        "investing_flash_services_pmi_fallback_unavailable"
-                    ),
-                }
-            fallback = (
-                fallback_config(self.cache, self.settings)
-                if isinstance(fallback_config, type)
-                else fallback_config
+            result, delayed = fetch_flash_pmi_fallback(
+                primary_failure
             )
-            try:
-                result = asyncio.run(
-                    fallback.fetch(
-                        expected_period=expected_period,
-                        release_date=release_date.isoformat(),
-                        expected_release_at=release_timestamp,
-                    )
-                )
-            except Exception as fallback_exc:
-                return {
-                    **_feed_delayed(
-                        primary_failure,
-                        provider=spec.provider,
-                        source_series=spec.source_series_id,
-                        provider_http_outcome=(
-                            "HTTP_403"
-                            if detail == "sp_global_public_release_access_restricted"
-                            else None
-                        ),
-                    ),
-                    "provider_call_count": 2,
-                    "fallback_reason_code": (
-                        f"all_flash_services_pmi_providers_failed:"
-                        f"{type(fallback_exc).__name__}"
-                    ),
-                    "provider_attempts": [
-                        {
-                            "provider": spec.provider,
-                            "attempts": 1,
-                            "result": (
-                                "HTTP_403"
-                                if detail == "sp_global_public_release_access_restricted"
-                                else primary_failure
-                            ),
-                        },
-                        {
-                            "provider": INVESTING_FLASH_SOURCE,
-                            "attempts": 1,
-                            "result": str(fallback_exc),
-                        },
-                    ],
-                }
+            if delayed is not None:
+                return delayed
             fallback_used = True
-        rows = result.data if isinstance(result.data, dict) else {}
-        series = rows.get(spec.source_series_id)
-        if not isinstance(series, dict):
-            return _feed_delayed("official_series_not_available")
-        expected_adapter = f"{spec.provider}_OFFICIAL_API"
-        official_adapter_valid = (
-            result.metadata.source == spec.provider
-            and series.get("official_adapter") is True
-            and series.get("provider_adapter") == expected_adapter
-        )
-        fallback_adapter_valid = (
-            fallback_used
-            and result.metadata.source == INVESTING_FLASH_SOURCE
-            and series.get("provider_adapter") == INVESTING_FLASH_SOURCE
-            and int(series.get("event_id") or 0) == 1062
-            and series.get("occurrence_id") is not None
-        )
-        if not official_adapter_valid and not fallback_adapter_valid:
-            return _feed_delayed(
-                f"official_adapter_required:observed={series.get('provider_adapter') or result.metadata.source}"
+
+        def retry_flash_pmi_after_result_failure(
+            failure: str,
+        ) -> tuple[bool, dict[str, Any] | None]:
+            nonlocal fallback_used, primary_failure, result
+            if spec.event_metric_id != "flash_services_pmi":
+                return False, None
+            if fallback_used:
+                return False, _flash_pmi_all_failed(
+                    primary_failure=(
+                        primary_failure
+                        or "SPGLOBAL_PROVIDER_RESULT_REJECTED"
+                    ),
+                    fallback_failure=failure,
+                    provider=spec.provider,
+                    source_series=spec.source_series_id,
+                )
+            primary_failure = failure
+            fallback_result, delayed = fetch_flash_pmi_fallback(
+                primary_failure
             )
-        source_adjustment = str(series.get("seasonal_adjustment") or "").upper()
-        if source_adjustment and source_adjustment != spec.seasonal_adjustment:
-            return {"status": "NO_DATA", "results": [], "error": "seasonal_adjustment_mismatch"}
-        retrieved_at = result.metadata.retrieved_at.isoformat()
-        try:
-            candidate = derive_official_actual(
-                spec,
-                series,
-                expected_period=expected_period,
-                retrieved_at=retrieved_at,
-                release_timestamp=release_timestamp,
+            if delayed is not None:
+                return False, delayed
+            result = fallback_result
+            fallback_used = True
+            return True, None
+
+        while True:
+            rows = result.data if isinstance(result.data, dict) else {}
+            series = rows.get(spec.source_series_id)
+            if not isinstance(series, dict):
+                failure = "official_series_not_available"
+                retried, delayed = (
+                    retry_flash_pmi_after_result_failure(failure)
+                )
+                if delayed is not None:
+                    return delayed
+                if retried:
+                    continue
+                return _feed_delayed(failure)
+            expected_adapter = f"{spec.provider}_OFFICIAL_API"
+            official_adapter_valid = (
+                result.metadata.source == spec.provider
+                and series.get("official_adapter") is True
+                and series.get("provider_adapter") == expected_adapter
             )
-        except ValueError as exc:
-            if str(exc) in {"period_mismatch", "insufficient_official_observations", "official_observations_missing"}:
-                return _feed_delayed(str(exc))
-            return {"status": "NO_DATA", "retryable": False, "results": [], "error": str(exc)}
-        source_url = str(series.get("source_url") or "")
-        canonical_url = str(series.get("canonical_url") or spec.canonical_url)
-        candidate.update({
-            "source": str(
-                series.get("source_originator")
-                or series.get("source")
-                or result.metadata.source
-            ),
-            "publisher": (
-                series.get("publisher")
-                or series.get("source_originator")
-                or result.metadata.source
-            ),
-            "distribution_source": series.get("distribution_source"),
-            "acquisition_provider": (
-                series.get("acquisition_provider") or result.metadata.source
-            ),
-            "source_url": source_url,
-            "canonical_url": canonical_url,
-            "source_domain": series.get("source_domain"),
-            "provider_adapter": series.get("provider_adapter"),
-            "evidence_text": (
-                f"Official {result.metadata.source} adapter {expected_adapter}, series {spec.source_series_id}; "
-                f"{spec.transformation} for {candidate['reference_period']}."
-            ),
-            "reliability": result.metadata.reliability,
-            "confidence": result.metadata.reliability,
-            "published_at": release_timestamp or datetime.now(UTC).replace(microsecond=0).isoformat(),
-            "released_at": series.get("release_timestamp") or release_timestamp,
-            "validation_timestamp": retrieved_at,
-            "raw_lineage_redacted": series.get("raw_lineage_redacted"),
-        })
-        if fallback_used:
-            xtb_forecast = event.get("consensus", event.get("forecast"))
-            investing_forecast = series.get("forecast")
+            fallback_adapter_valid = (
+                fallback_used
+                and result.metadata.source == INVESTING_FLASH_SOURCE
+                and series.get("provider_adapter")
+                == INVESTING_FLASH_SOURCE
+                and int(series.get("event_id") or 0) == 1062
+                and series.get("occurrence_id") is not None
+            )
+            if not official_adapter_valid and not fallback_adapter_valid:
+                failure = (
+                    "official_adapter_required:observed="
+                    f"{series.get('provider_adapter') or result.metadata.source}"
+                )
+                retried, delayed = (
+                    retry_flash_pmi_after_result_failure(failure)
+                )
+                if delayed is not None:
+                    return delayed
+                if retried:
+                    continue
+                return _feed_delayed(failure)
+            source_adjustment = str(
+                series.get("seasonal_adjustment") or ""
+            ).upper()
+            if (
+                source_adjustment
+                and source_adjustment != spec.seasonal_adjustment
+            ):
+                failure = "seasonal_adjustment_mismatch"
+                retried, delayed = (
+                    retry_flash_pmi_after_result_failure(failure)
+                )
+                if delayed is not None:
+                    return delayed
+                if retried:
+                    continue
+                return {
+                    "status": "NO_DATA",
+                    "results": [],
+                    "error": failure,
+                }
+            retrieved_at = result.metadata.retrieved_at.isoformat()
+            try:
+                candidate = derive_official_actual(
+                    spec,
+                    series,
+                    expected_period=expected_period,
+                    retrieved_at=retrieved_at,
+                    release_timestamp=release_timestamp,
+                )
+            except ValueError as exc:
+                failure = _redacted_provider_result(str(exc))
+                retried, delayed = (
+                    retry_flash_pmi_after_result_failure(failure)
+                )
+                if delayed is not None:
+                    return delayed
+                if retried:
+                    continue
+                if failure in {
+                    "period_mismatch",
+                    "insufficient_official_observations",
+                    "official_observations_missing",
+                }:
+                    return _feed_delayed(failure)
+                return {
+                    "status": "NO_DATA",
+                    "retryable": False,
+                    "results": [],
+                    "error": failure,
+                }
+            source_url = str(series.get("source_url") or "")
+            canonical_url = str(
+                series.get("canonical_url") or spec.canonical_url
+            )
             candidate.update(
                 {
-                    "actual_is_official": False,
-                    "event_id": series.get("event_id"),
-                    "occurrence_id": series.get("occurrence_id"),
-                    "forecast": investing_forecast,
-                    "consensus": investing_forecast,
-                    "previous": series.get("previous"),
-                    "field_lineage": series.get("field_lineage") or {},
-                    "forecast_observations": [
-                        {
-                            "value": xtb_forecast,
-                            "provider": "XTB",
-                            "occurrence_id": event.get("occurrence_id")
-                            or event.get("event_id"),
-                            "selected": False,
-                            "reason_code": "CONCURRENT_FORECAST_PRESERVED",
-                        },
-                        {
-                            "value": investing_forecast,
-                            "provider": INVESTING_FLASH_SOURCE,
-                            "event_id": series.get("event_id"),
-                            "occurrence_id": series.get("occurrence_id"),
-                            "selected": True,
-                            "reason_code": "EXACT_OCCURRENCE_MATCH_WITH_SELECTED_ACTUAL",
-                        },
-                    ],
-                    "canonical_forecast_selection_reason": (
-                        "EXACT_OCCURRENCE_MATCH_WITH_SELECTED_ACTUAL"
+                    "source": str(
+                        series.get("source_originator")
+                        or series.get("source")
+                        or result.metadata.source
                     ),
-                    "provider_accounting": {
-                        "primary": {
-                            "provider": spec.provider,
-                            "called": True,
-                            "attempts": 1,
-                            "result": (
-                                "HTTP_403"
-                                if primary_failure
-                                == "sp_global_public_release_access_restricted"
-                                else primary_failure
-                            ),
-                        },
-                        "fallbacks": [
-                            {
-                                "provider": INVESTING_FLASH_SOURCE,
-                                "called": True,
-                                "attempts": 1,
-                                "result": "SUCCESS",
-                            }
-                        ],
-                        "selected_source": INVESTING_FLASH_SOURCE,
-                        "reason_code": "FALLBACK_SELECTED_AFTER_PRIMARY_FAILURE",
-                    },
+                    "publisher": (
+                        series.get("publisher")
+                        or series.get("source_originator")
+                        or result.metadata.source
+                    ),
+                    "distribution_source": series.get(
+                        "distribution_source"
+                    ),
+                    "acquisition_provider": (
+                        series.get("acquisition_provider")
+                        or result.metadata.source
+                    ),
+                    "source_url": source_url,
+                    "canonical_url": canonical_url,
+                    "source_domain": series.get("source_domain"),
+                    "provider_adapter": series.get(
+                        "provider_adapter"
+                    ),
+                    "evidence_text": (
+                        f"Official {result.metadata.source} adapter "
+                        f"{expected_adapter}, series "
+                        f"{spec.source_series_id}; "
+                        f"{spec.transformation} for "
+                        f"{candidate['reference_period']}."
+                    ),
+                    "reliability": result.metadata.reliability,
+                    "confidence": result.metadata.reliability,
+                    "published_at": (
+                        release_timestamp
+                        or datetime.now(UTC)
+                        .replace(microsecond=0)
+                        .isoformat()
+                    ),
+                    "released_at": (
+                        series.get("release_timestamp")
+                        or release_timestamp
+                    ),
+                    "validation_timestamp": retrieved_at,
+                    "raw_lineage_redacted": series.get(
+                        "raw_lineage_redacted"
+                    ),
                 }
             )
-        restored = (
-            self.candidates.persist_candidate(
-                event_key=event_key,
-                candidate=candidate,
-                release_at=release_timestamp,
-                expected_metric_id=spec.event_metric_id,
-                expected_period=expected_period,
-                expected_unit=spec.unit,
+            if fallback_used:
+                xtb_forecast = event.get(
+                    "consensus", event.get("forecast")
+                )
+                investing_forecast = series.get("forecast")
+                candidate.update(
+                    {
+                        "actual_is_official": False,
+                        "event_id": series.get("event_id"),
+                        "occurrence_id": series.get("occurrence_id"),
+                        "forecast": investing_forecast,
+                        "consensus": investing_forecast,
+                        "previous": series.get("previous"),
+                        "field_lineage": (
+                            series.get("field_lineage") or {}
+                        ),
+                        "forecast_observations": [
+                            {
+                                "value": xtb_forecast,
+                                "provider": "XTB",
+                                "occurrence_id": (
+                                    event.get("occurrence_id")
+                                    or event.get("event_id")
+                                ),
+                                "selected": False,
+                                "reason_code": (
+                                    "CONCURRENT_FORECAST_PRESERVED"
+                                ),
+                            },
+                            {
+                                "value": investing_forecast,
+                                "provider": INVESTING_FLASH_SOURCE,
+                                "event_id": series.get("event_id"),
+                                "occurrence_id": series.get(
+                                    "occurrence_id"
+                                ),
+                                "selected": True,
+                                "reason_code": (
+                                    "EXACT_OCCURRENCE_MATCH_WITH_"
+                                    "SELECTED_ACTUAL"
+                                ),
+                            },
+                        ],
+                        "canonical_forecast_selection_reason": (
+                            "EXACT_OCCURRENCE_MATCH_WITH_"
+                            "SELECTED_ACTUAL"
+                        ),
+                        "provider_accounting": {
+                            "primary": _observed_provider_call(
+                                spec.provider,
+                                _primary_attempt_result(
+                                    primary_failure
+                                ),
+                            ),
+                            "fallbacks": [
+                                _observed_provider_call(
+                                    INVESTING_FLASH_SOURCE,
+                                    "SUCCESS",
+                                )
+                            ],
+                            "selected_source": (
+                                INVESTING_FLASH_SOURCE
+                            ),
+                            "reason_code": (
+                                "FALLBACK_SELECTED_AFTER_"
+                                "PRIMARY_FAILURE"
+                            ),
+                        },
+                    }
+                )
+            restored = (
+                self.candidates.persist_candidate(
+                    event_key=event_key,
+                    candidate=candidate,
+                    release_at=release_timestamp,
+                    expected_metric_id=spec.event_metric_id,
+                    expected_period=expected_period,
+                    expected_unit=spec.unit,
+                )
+                if persist_candidate
+                else _validate_unpersisted_candidate(
+                    self.candidates,
+                    candidate,
+                    release_at=release_timestamp,
+                    expected_metric_id=spec.event_metric_id,
+                    expected_period=expected_period,
+                    expected_unit=spec.unit,
+                )
             )
-            if persist_candidate
-            else _validate_unpersisted_candidate(
-                self.candidates,
-                candidate,
-                release_at=release_timestamp,
-                expected_metric_id=spec.event_metric_id,
-                expected_period=expected_period,
-                expected_unit=spec.unit,
+            if restored["validation_status"] != "accepted":
+                failure = "official_candidate_rejected"
+                retried, delayed = (
+                    retry_flash_pmi_after_result_failure(failure)
+                )
+                if delayed is not None:
+                    return delayed
+                if retried:
+                    continue
+                return {
+                    "status": "NO_DATA",
+                    "results": [],
+                    "error": failure,
+                    "candidate": restored,
+                }
+            accepted = (
+                self.candidates.accepted_official_actual(event_key)
+                if persist_candidate
+                else restored
             )
-        )
-        if restored["validation_status"] != "accepted":
-            return {"status": "NO_DATA", "results": [], "error": "official_candidate_rejected", "candidate": restored}
-        accepted = (
-            self.candidates.accepted_official_actual(event_key)
-            if persist_candidate
-            else restored
-        )
-        if accepted is None:
-            return {"status": "FAILED", "results": [], "error": "official_candidate_read_back_failed"}
+            if accepted is None:
+                failure = "official_candidate_read_back_failed"
+                retried, delayed = (
+                    retry_flash_pmi_after_result_failure(failure)
+                )
+                if delayed is not None:
+                    return delayed
+                if retried:
+                    continue
+                return {
+                    "status": "FAILED",
+                    "results": [],
+                    "error": failure,
+                    "provider": spec.provider,
+                    "source_series": spec.source_series_id,
+                    "provider_call_count": 1,
+                    "provider_attempts": [
+                        _observed_provider_call(
+                            spec.provider,
+                            "SUCCESS",
+                        )
+                    ],
+                }
+            break
         return {
             "status": "SUCCEEDED",
             "results": [accepted],
@@ -427,29 +582,21 @@ class DeterministicActualResolver:
             "provider_call_count": 2 if fallback_used else 1,
             "provider_attempts": (
                 [
-                    {
-                        "provider": spec.provider,
-                        "attempts": 1,
-                        "result": (
-                            "HTTP_403"
-                            if primary_failure
-                            == "sp_global_public_release_access_restricted"
-                            else primary_failure
-                        ),
-                    },
-                    {
-                        "provider": INVESTING_FLASH_SOURCE,
-                        "attempts": 1,
-                        "result": "SUCCESS",
-                    },
+                    _observed_provider_call(
+                        spec.provider,
+                        _primary_attempt_result(primary_failure),
+                    ),
+                    _observed_provider_call(
+                        INVESTING_FLASH_SOURCE,
+                        "SUCCESS",
+                    ),
                 ]
                 if fallback_used
                 else [
-                    {
-                        "provider": spec.provider,
-                        "attempts": 1,
-                        "result": "SUCCESS",
-                    }
+                    _observed_provider_call(
+                        spec.provider,
+                        "SUCCESS",
+                    )
                 ]
             ),
             "reason_code": (
@@ -507,6 +654,93 @@ def _feed_delayed(
         "provider_http_outcome": provider_http_outcome,
         "provider_call_count": 1,
     }
+
+
+def _observed_provider_call(
+    provider: str,
+    result: Any,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "called": True,
+        "attempts": 1,
+        "result": _redacted_provider_result(result),
+        "not_called_reason": None,
+        "execution_origin": "PROVIDER_CALL",
+    }
+
+
+def _observed_provider_skip(
+    provider: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "called": False,
+        "attempts": 0,
+        "result": "NOT_CALLED",
+        "not_called_reason": reason,
+        "execution_origin": "OBSERVED_SKIP",
+    }
+
+
+def _primary_attempt_result(value: Any) -> str:
+    reason = _redacted_provider_result(value)
+    if reason == "sp_global_public_release_access_restricted":
+        return "HTTP_403"
+    return reason
+
+
+def _flash_pmi_all_failed(
+    *,
+    primary_failure: Any,
+    fallback_failure: Any,
+    provider: str,
+    source_series: str,
+) -> dict[str, Any]:
+    primary_result = _primary_attempt_result(primary_failure)
+    fallback_result = _redacted_provider_result(fallback_failure)
+    return {
+        **_feed_delayed(
+            _redacted_provider_result(primary_failure),
+            provider=provider,
+            source_series=source_series,
+            provider_http_outcome=(
+                "HTTP_403"
+                if primary_result == "HTTP_403"
+                else None
+            ),
+        ),
+        "provider_call_count": 2,
+        "fallback_reason_code": (
+            "all_flash_services_pmi_providers_failed:"
+            f"{fallback_result}"
+        ),
+        "provider_attempts": [
+            _observed_provider_call(provider, primary_result),
+            _observed_provider_call(
+                INVESTING_FLASH_SOURCE,
+                fallback_result,
+            ),
+        ],
+    }
+
+
+def _redacted_provider_result(value: Any) -> str:
+    text = str(value or "UNKNOWN").strip()
+    upper = text.upper()
+    if any(
+        marker in upper
+        for marker in (
+            "TOKEN",
+            "API_KEY",
+            "AUTHORIZATION",
+            "PASSWORD",
+            "SECRET",
+        )
+    ):
+        return "REDACTED_PROVIDER_RESULT"
+    return text[:240]
 
 
 def _release_date(value: Any):

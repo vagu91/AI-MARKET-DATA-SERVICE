@@ -1188,7 +1188,8 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
             assert pmi_audit["provider_attempted"] == "SPGLOBAL"
             assert pmi_audit["provider_http_outcome"] == "HTTP_403"
             assert pmi_audit["reason_code"] == (
-                "all_flash_services_pmi_providers_failed:ProviderError"
+                "all_flash_services_pmi_providers_failed:"
+                "investing_flash_services_pmi_http_404"
             )
             assert pmi_audit["retryable"] is True
             assert pmi_audit["actual_still_missing"] is True
@@ -1238,7 +1239,10 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
             assert full_by_id[PMI_ID]["reference_period"] == "2026-07"
             assert full_by_id[PMI_ID]["actual_resolution"][
                 "reason_code"
-            ] == "all_flash_services_pmi_providers_failed:ProviderError"
+            ] == (
+                "all_flash_services_pmi_providers_failed:"
+                "investing_flash_services_pmi_http_404"
+            )
 
             assert (
                 after_first["market_context_snapshots"]
@@ -1270,22 +1274,34 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
             assert fixed.status_code == 200, fixed.text
             after_fixed = _counts(cfg)
 
-    assert len(sp_calls) == sp_before_fixed_point
+    assert len(sp_calls) == sp_before_fixed_point + 1
     fixed_audits = fixed.json()["data_quality"][
         "actual_reconciliation"
     ]["occurrences"]
-    assert any(
-        item["occurrence_id"] == PMI_ID
-        and item["provider_call_count"] == 0
-        and item["resolver_invoked"] is False
-        and item["reconciliation_outcome"]
-        == "DATABASE_SELECTED"
+    pmi_fixed_audit = next(
+        item
         for item in fixed_audits
+        if item["occurrence_id"] == PMI_ID
     )
+    assert pmi_fixed_audit["provider_call_count"] == 2
+    assert pmi_fixed_audit["resolver_invoked"] is True
+    assert pmi_fixed_audit["provider_negative_cache_bypassed"] is True
+    assert pmi_fixed_audit["reconciliation_outcome"] == "FAIL_CLOSED"
+    assert [
+        attempt["provider"]
+        for attempt in pmi_fixed_audit["provider_attempts"]
+    ] == ["SPGLOBAL", "INVESTING_EVENT_1062"]
     assert len(fred_calls) >= fred_before_fixed_point
-    assert _write_audit(cfg) == {}
+    assert _write_audit(cfg) == {
+        "datum_lifecycle_items": 3,
+        "economic_events_history": 1,
+        "market_context_snapshots": 1,
+    }
+    assert (
+        after_fixed["market_context_snapshots"]
+        == after_first["market_context_snapshots"] + 1
+    )
     for table in (
-        "market_context_snapshots",
         "market_context_outbox",
         "economic_events_history",
         "datum_lifecycle_items",
@@ -1724,7 +1740,7 @@ def test_real_senior_route_observes_expired_nasdaq_news_and_earnings_chains(
 
 @pytest.mark.parametrize(
     "lifecycle_state",
-    ("FRESH_NO_DATA", "BACKOFF", "EXHAUSTED_NO_DATA"),
+    ("FRESH_NO_DATA", "EXHAUSTED_NO_DATA"),
 )
 def test_real_route_skips_non_due_no_data_states_at_fixed_point(
     tmp_path: Path,
@@ -1795,7 +1811,6 @@ def test_real_route_skips_non_due_no_data_states_at_fixed_point(
         ]
     expected_eligibility = {
         "FRESH_NO_DATA": "FRESH_NO_DATA",
-        "BACKOFF": "BACKOFF_ACTIVE",
         "EXHAUSTED_NO_DATA": "EXHAUSTED_NO_DATA",
     }[lifecycle_state]
     assert len(telemetry) == 2
@@ -1810,7 +1825,7 @@ def test_real_route_skips_non_due_no_data_states_at_fixed_point(
     )
 
 
-def test_two_concurrent_force_routes_have_one_actual_claimant(
+def test_two_concurrent_force_routes_serialize_writes_and_retry_prior_backoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1869,18 +1884,21 @@ def test_two_concurrent_force_routes_have_one_actual_claimant(
 
     assert all(response.status_code == 200 for response in responses)
     assert resolver_calls.count(HOME_ID) == 1
-    assert resolver_calls.count(PMI_ID) == 1
+    # The first request resolves HOME permanently. PMI remains unresolved and
+    # writes a request-scoped negative-cache decision; the second, distinct
+    # force request must bypass that prior-request backoff exactly once.
+    assert resolver_calls.count(PMI_ID) == 2
     assert fred_calls.count("HSN1F") >= 1
-    assert len(sp_calls) == 1
+    assert len(sp_calls) == 2
     assert (
         after["market_context_snapshots"]
         - before["market_context_snapshots"]
-        == 1
+        == 2
     )
     assert (
         after["market_context_outbox"]
         - before["market_context_outbox"]
-        <= 1
+        <= 2
     )
     with sqlite3.connect(cfg.database_path) as connection:
         assert connection.execute(

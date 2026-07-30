@@ -19,6 +19,13 @@ ATTEMPT_EXECUTION_ORIGINS = {
     "OBSERVED_SKIP",
     "CACHE_DECISION",
 }
+OBSERVED_LIFECYCLE_SKIP_REASON_CODES = frozenset(
+    {
+        "NO_DATA_STILL_FRESH",
+        "OCCURRENCE_NOT_PUBLISHED",
+        "TERMINAL_NO_DATA",
+    }
+)
 
 
 class RequestProviderAccountingCollector:
@@ -436,6 +443,12 @@ def _provider_flow_valid(
             and attempt.get("execution_origin") == "CACHE_DECISION"
             for attempt in attempts
         )
+    if (
+        str(getattr(policy, "dataset_id", ""))
+        == "flash_services_pmi"
+        and _observed_lifecycle_skip_flow_valid(attempts)
+    ):
+        return True
 
     strategy = str(
         getattr(policy, "provider_strategy", "FALLBACK")
@@ -514,6 +527,30 @@ def _provider_flow_valid(
     return True
 
 
+def _observed_lifecycle_skip_flow_valid(
+    attempts: Iterable[Any],
+) -> bool:
+    observed = list(attempts)
+    if not observed:
+        return False
+    reasons = {
+        str(attempt.get("not_called_reason") or "").strip().upper()
+        for attempt in observed
+        if isinstance(attempt, dict)
+    }
+    return bool(
+        len(reasons) == 1
+        and reasons <= OBSERVED_LIFECYCLE_SKIP_REASON_CODES
+        and all(
+            isinstance(attempt, dict)
+            and attempt.get("called") is False
+            and attempt.get("attempts") == 0
+            and attempt.get("execution_origin") == "OBSERVED_SKIP"
+            for attempt in observed
+        )
+    )
+
+
 def _attempt_succeeded(attempt: dict[str, Any]) -> bool:
     if attempt.get("called") is not True:
         return False
@@ -537,6 +574,8 @@ def _attempt_succeeded(attempt: dict[str, Any]) -> bool:
                 "FAIL",
                 "ERROR",
                 "NO_DATA",
+                "NOT_AVAILABLE",
+                "UNAVAILABLE",
                 "NOT_FOUND",
                 "TIMEOUT",
             )

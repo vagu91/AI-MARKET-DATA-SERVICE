@@ -25,6 +25,7 @@ from app.services.official_actual_semantics import (
 )
 from app.services.request_provider_accounting import (
     RequestProviderAccountingCollector,
+    _observed_lifecycle_skip_flow_valid,
     provider_attempt,
 )
 
@@ -50,6 +51,7 @@ class ProviderForceActualReconciliationService:
         accounting_collector: (
             RequestProviderAccountingCollector | None
         ) = None,
+        force_refresh: bool = False,
     ) -> None:
         self.settings = settings
         self.lifecycle_resolver = lifecycle_resolver
@@ -63,6 +65,17 @@ class ProviderForceActualReconciliationService:
             0,
         )
         self.accounting_collector = accounting_collector
+        self.force_refresh = force_refresh
+        self.request_id = (
+            accounting_collector.request_id
+            if accounting_collector is not None
+            else None
+        )
+        self.correlation_id = (
+            accounting_collector.correlation_id
+            if accounting_collector is not None
+            else None
+        )
 
     def prepare(
         self,
@@ -163,6 +176,8 @@ class ProviderForceActualReconciliationService:
                             mapping_selected=mapping["metric_id"],
                             observed_at=now,
                             value_present=True,
+                            request_id=self.request_id,
+                            correlation_id=self.correlation_id,
                         )
                     )
                 continue
@@ -172,16 +187,21 @@ class ProviderForceActualReconciliationService:
                 or contract_event.get("time_utc")
             )
             if release is None or release > now:
-                self._emit_decision(
-                    occurrence_id=occurrence_id,
-                    lifecycle_before=lifecycle_before,
-                    eligibility="FUTURE_NOT_DUE",
-                    reclaim_reason="occurrence_not_published",
-                    resolver_invoked=False,
-                    provider_attempted=False,
-                    source_series=mapping["source_series"],
-                    reconciliation_outcome="SKIPPED",
-                    reason_code="OCCURRENCE_NOT_PUBLISHED",
+                audits.append(
+                    self._emit_decision(
+                        occurrence_id=occurrence_id,
+                        lifecycle_before=lifecycle_before,
+                        eligibility="FUTURE_NOT_DUE",
+                        reclaim_reason="occurrence_not_published",
+                        resolver_invoked=False,
+                        provider_attempted=False,
+                        provider=mapping["provider"],
+                        mapping_selected=mapping["metric_id"],
+                        source_series=mapping["source_series"],
+                        reconciliation_outcome="SKIPPED",
+                        reason_code="OCCURRENCE_NOT_PUBLISHED",
+                        observed_at=now,
+                    )
                 )
                 continue
             payload = dict(
@@ -205,38 +225,63 @@ class ProviderForceActualReconciliationService:
             eligibility, reclaim_reason = _eligibility(
                 existing,
                 now=now,
+                force_refresh=self.force_refresh,
+                request_id=self.request_id,
+                correlation_id=self.correlation_id,
             )
             if eligibility != "RECLAIMABLE":
                 persisted = payload.get("actual_resolution")
+                if _same_request_provider_audit(
+                    persisted,
+                    request_id=self.request_id,
+                    correlation_id=self.correlation_id,
+                ):
+                    reused_audit = {
+                        **dict(persisted),
+                        "occurrence_id": occurrence_id,
+                        "lifecycle_before": lifecycle_before,
+                        "eligibility": eligibility,
+                        "reclaim_reason": reclaim_reason,
+                        "mapping_selected": mapping["metric_id"],
+                        "reconciliation_outcome": (
+                            "SAME_REQUEST_PROVIDER_EVIDENCE_REUSED"
+                        ),
+                        "finalization_status": "NO_OP",
+                        "canonical_write_count": 0,
+                        "lifecycle_write_count": 0,
+                        "coverage_write_count": 0,
+                        "snapshot_write_count": 0,
+                        "outbox_write_count": 0,
+                    }
+                    output = _replace_occurrence(
+                        output,
+                        occurrence_id=occurrence_id,
+                        event=payload,
+                    )
+                    audits.append(reused_audit)
+                    self._emit_prepared(reused_audit)
+                    continue
                 if isinstance(persisted, dict):
                     output = _replace_occurrence(
                         output,
                         occurrence_id=occurrence_id,
                         event=payload,
                     )
-                    audits.append(
-                        _request_scoped_database_audit(
-                            persisted,
-                            occurrence_id=occurrence_id,
-                            lifecycle_before=lifecycle_before,
-                            mapping_selected=mapping["metric_id"],
-                            observed_at=now,
-                            value_present=(
-                                payload.get("actual")
-                                not in (None, "")
-                            ),
-                        )
+                audits.append(
+                    self._emit_decision(
+                        occurrence_id=occurrence_id,
+                        lifecycle_before=lifecycle_before,
+                        eligibility=eligibility,
+                        reclaim_reason=reclaim_reason,
+                        resolver_invoked=False,
+                        provider_attempted=False,
+                        provider=mapping["provider"],
+                        mapping_selected=mapping["metric_id"],
+                        source_series=mapping["source_series"],
+                        reconciliation_outcome="SKIPPED",
+                        reason_code=reclaim_reason,
+                        observed_at=now,
                     )
-                self._emit_decision(
-                    occurrence_id=occurrence_id,
-                    lifecycle_before=lifecycle_before,
-                    eligibility=eligibility,
-                    reclaim_reason=reclaim_reason,
-                    resolver_invoked=False,
-                    provider_attempted=False,
-                    source_series=mapping["source_series"],
-                    reconciliation_outcome="SKIPPED",
-                    reason_code=reclaim_reason,
                 )
                 continue
 
@@ -248,6 +293,9 @@ class ProviderForceActualReconciliationService:
                 "fields_attempted": ["actual"],
                 "payload": payload,
                 "resolution_mode": "prepare_atomic_provider_force",
+                "force_refresh": self.force_refresh,
+                "request_id": self.request_id,
+                "correlation_id": self.correlation_id,
             }
             result = self.lifecycle_resolver.resolve(item)
             status = str(result.get("status") or "NO_DATA").upper()
@@ -270,8 +318,16 @@ class ProviderForceActualReconciliationService:
                     else "OFFICIAL_ACTUAL_UNAVAILABLE"
                 )
             )
+            provider_attempts = _request_scoped_provider_attempts(
+                result.get("provider_attempts") or [],
+                request_id=self.request_id,
+                correlation_id=self.correlation_id,
+                observed_at=now,
+            )
             audit = {
                 "occurrence_id": occurrence_id,
+                "request_id": self.request_id,
+                "correlation_id": self.correlation_id,
                 "lifecycle_before": lifecycle_before,
                 "eligibility": eligibility,
                 "reclaim_reason": reclaim_reason,
@@ -295,11 +351,13 @@ class ProviderForceActualReconciliationService:
                 "provider_request_attempted": bool(
                     result.get("provider_request_attempted")
                 ),
-                "provider_attempts": [
-                    dict(item)
-                    for item in result.get("provider_attempts") or []
-                    if isinstance(item, dict)
-                ],
+                "provider_attempts": provider_attempts,
+                "provider_negative_cache_hit": bool(
+                    result.get("provider_negative_cache_hit")
+                ),
+                "provider_negative_cache_bypassed": bool(
+                    result.get("provider_negative_cache_bypassed")
+                ),
                 "provider_http_outcome": result.get(
                     "provider_http_outcome"
                 )
@@ -532,7 +590,17 @@ class ProviderForceActualReconciliationService:
             for item in audits
             if item.get("mapping_selected") == "flash_services_pmi"
         ]
-        target = _latest_flash_services_occurrence(occurrences)
+        observed_at = parse_datetime(
+            getattr(
+                self,
+                "clock",
+                lambda: datetime.now(UTC),
+            )()
+        ) or datetime.now(UTC)
+        target = _latest_flash_services_occurrence(
+            occurrences,
+            observed_at=observed_at,
+        )
         target_id = str(
             (target or {}).get("occurrence_id")
             or (target or {}).get("event_id")
@@ -545,7 +613,7 @@ class ProviderForceActualReconciliationService:
                 if str(item.get("occurrence_id") or "")
                 == target_id
             ),
-            relevant[0] if len(relevant) == 1 else None,
+            None,
         )
         raw_attempts = [
             dict(attempt)
@@ -606,11 +674,7 @@ class ProviderForceActualReconciliationService:
                 max_age=timedelta(days=45),
                 data_reference_mode="official_release",
             ),
-            observed_at=getattr(
-                self,
-                "clock",
-                lambda: datetime.now(UTC),
-            )(),
+            observed_at=observed_at,
         )
         database_valid = bool(
             db_found and database_decision.usable
@@ -659,18 +723,28 @@ class ProviderForceActualReconciliationService:
         evidence_complete = bool(
             target is not None
             and target_audit is not None
+            and _audit_correlated(
+                target_audit,
+                request_id=collector.request_id,
+                correlation_id=collector.correlation_id,
+            )
             and database_decision.complete
             and (
                 database_valid
                 or _actual_provider_chain_complete(
                     raw_attempts,
                     provider_calls=provider_calls,
+                    request_id=collector.request_id,
+                    correlation_id=collector.correlation_id,
                 )
             )
         )
         collector.record(
             "flash_services_pmi",
-            acquisition_id="flash_services_pmi_actual_resolution",
+            acquisition_id=(
+                "flash_services_pmi_actual_resolution:"
+                f"{target_id or 'NO_OCCURRENCE'}"
+            ),
             shared_dataset_ids=("flash_services_pmi",),
             database_lookup_performed=True,
             database_lookup_reason=(
@@ -717,8 +791,11 @@ class ProviderForceActualReconciliationService:
                 if selected
                 else "FLASH_SERVICES_PMI_NOT_DUE"
                 if target is None
+                else "FLASH_SERVICES_PMI_ALL_PROVIDERS_FAILED"
+                if _provider_chain_all_failed(raw_attempts)
                 else "FLASH_SERVICES_PMI_VALUE_NOT_AVAILABLE"
             ),
+            observed_at=observed_at,
             evidence_complete=evidence_complete,
         )
 
@@ -752,18 +829,46 @@ class ProviderForceActualReconciliationService:
         reclaim_reason: str,
         resolver_invoked: bool,
         provider_attempted: bool,
+        provider: str,
+        mapping_selected: str,
         source_series: str | None,
         reconciliation_outcome: str,
         reason_code: str,
+        observed_at: datetime,
     ) -> dict[str, Any]:
+        providers = [provider]
+        if mapping_selected == "flash_services_pmi":
+            providers.append("INVESTING_EVENT_1062")
+        provider_attempts = _request_scoped_provider_attempts(
+            [
+                {
+                    "provider": item,
+                    "called": False,
+                    "attempts": 0,
+                    "result": "NOT_CALLED",
+                    "not_called_reason": reason_code,
+                    "execution_origin": "OBSERVED_SKIP",
+                }
+                for item in providers
+            ],
+            request_id=self.request_id,
+            correlation_id=self.correlation_id,
+            observed_at=observed_at,
+        )
         audit = {
             "occurrence_id": occurrence_id,
+            "request_id": self.request_id,
+            "correlation_id": self.correlation_id,
             "lifecycle_before": lifecycle_before,
             "eligibility": eligibility,
             "reclaim_reason": reclaim_reason,
             "resolver_invoked": resolver_invoked,
+            "mapping_selected": mapping_selected,
             "provider_attempted": provider_attempted,
             "provider_call_count": 0,
+            "provider_request_attempted": False,
+            "provider_attempts": provider_attempts,
+            "provider_http_outcome": "NOT_CALLED",
             "source_series": source_series,
             "reconciliation_outcome": reconciliation_outcome,
             "generation_id": self.generation_id,
@@ -774,6 +879,9 @@ class ProviderForceActualReconciliationService:
             "snapshot_write_count": 0,
             "outbox_write_count": 0,
             "reason_code": reason_code,
+            "attempted_at": observed_at.replace(
+                microsecond=0
+            ).isoformat(),
         }
         self._emit_prepared(audit)
         return audit
@@ -955,7 +1063,7 @@ def _actual_attempt(
 ) -> dict[str, Any]:
     if raw is not None:
         if raw.get("called") is False:
-            return provider_attempt(
+            attempt = provider_attempt(
                 provider,
                 called=False,
                 attempts=0,
@@ -969,13 +1077,26 @@ def _actual_attempt(
                     or "OBSERVED_SKIP"
                 ),
             )
-        return provider_attempt(
-            provider,
-            called=True,
-            attempts=max(int(raw.get("attempts") or 0), 1),
-            result=str(raw.get("result") or "UNKNOWN"),
-            execution_origin="PROVIDER_CALL",
+        else:
+            attempt = provider_attempt(
+                provider,
+                called=True,
+                attempts=max(int(raw.get("attempts") or 0), 1),
+                result=str(raw.get("result") or "UNKNOWN"),
+                execution_origin="PROVIDER_CALL",
+            )
+        attempt.update(
+            {
+                key: raw.get(key)
+                for key in (
+                    "request_id",
+                    "correlation_id",
+                    "observed_at",
+                )
+                if raw.get(key) not in (None, "")
+            }
         )
+        return attempt
     return provider_attempt(
         provider,
         called=False,
@@ -986,13 +1107,94 @@ def _actual_attempt(
     )
 
 
+def _request_scoped_provider_attempts(
+    attempts: Any,
+    *,
+    request_id: str | None,
+    correlation_id: str | None,
+    observed_at: datetime,
+) -> list[dict[str, Any]]:
+    timestamp = observed_at.replace(microsecond=0).isoformat()
+    output: list[dict[str, Any]] = []
+    for raw in attempts if isinstance(attempts, (list, tuple)) else []:
+        if not isinstance(raw, dict) or not raw.get("provider"):
+            continue
+        attempt_count = max(int(raw.get("attempts") or 0), 0)
+        called = (
+            raw.get("called")
+            if type(raw.get("called")) is bool
+            else attempt_count > 0
+        )
+        execution_origin = str(
+            raw.get("execution_origin")
+            or ("PROVIDER_CALL" if called else "OBSERVED_SKIP")
+        )
+        normalized = provider_attempt(
+            str(raw["provider"]),
+            called=called,
+            attempts=max(attempt_count, 1) if called else 0,
+            result=str(raw.get("result") or "UNKNOWN"),
+            not_called_reason=(
+                None
+                if called
+                else str(
+                    raw.get("not_called_reason")
+                    or "PROVIDER_NOT_CALLED"
+                )
+            ),
+            execution_origin=execution_origin,
+        )
+        normalized.update(
+            {
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "observed_at": str(raw.get("observed_at") or timestamp),
+            }
+        )
+        output.append(normalized)
+    return output
+
+
 def _latest_flash_services_occurrence(
     occurrences: list[dict[str, Any]],
+    *,
+    observed_at: datetime,
 ) -> dict[str, Any] | None:
     if not occurrences:
         return None
     floor = datetime.min.replace(tzinfo=UTC)
-    return max(
+    ceiling = datetime.max.replace(tzinfo=UTC)
+    released = [
+        item
+        for item in occurrences
+        if (
+            parse_datetime(
+                item.get("release_at")
+                or item.get("scheduled_at_utc")
+                or item.get("time_utc")
+            )
+            or ceiling
+        )
+        <= observed_at
+    ]
+    if released:
+        return max(
+            released,
+            key=lambda item: (
+                parse_datetime(
+                    item.get("release_at")
+                    or item.get("scheduled_at_utc")
+                    or item.get("time_utc")
+                )
+                or floor,
+                str(
+                    item.get("occurrence_id")
+                    or item.get("event_id")
+                    or ""
+                ),
+            ),
+        )
+    return min(
         occurrences,
         key=lambda item: (
             parse_datetime(
@@ -1000,7 +1202,7 @@ def _latest_flash_services_occurrence(
                 or item.get("scheduled_at_utc")
                 or item.get("time_utc")
             )
-            or floor,
+            or ceiling,
             str(
                 item.get("occurrence_id")
                 or item.get("event_id")
@@ -1014,13 +1216,37 @@ def _actual_provider_chain_complete(
     attempts: list[dict[str, Any]],
     *,
     provider_calls: int,
+    request_id: str,
+    correlation_id: str,
 ) -> bool:
+    providers = [
+        str(item.get("provider") or "")
+        for item in attempts
+    ]
+    if providers not in (
+        ["SPGLOBAL"],
+        ["SPGLOBAL", "INVESTING_EVENT_1062"],
+    ):
+        return False
+    if any(
+        item.get("request_id") != request_id
+        or item.get("correlation_id") != correlation_id
+        or parse_datetime(item.get("observed_at")) is None
+        for item in attempts
+    ):
+        return False
+    if (
+        providers == ["SPGLOBAL", "INVESTING_EVENT_1062"]
+        and provider_calls == 0
+        and _observed_lifecycle_skip_flow_valid(attempts)
+    ):
+        return True
     by_provider = {
         str(item.get("provider") or ""): item
         for item in attempts
     }
     primary = by_provider.get("SPGLOBAL")
-    if primary is None or primary.get("called") is False:
+    if primary is None or primary.get("called") is not True:
         return False
     observed_calls = sum(
         max(int(item.get("attempts") or 0), 1)
@@ -1037,7 +1263,36 @@ def _actual_provider_chain_complete(
         return fallback is None or fallback.get("called") is False
     return bool(
         fallback is not None
-        and fallback.get("called") is not False
+        and fallback.get("called") is True
+    )
+
+
+def _provider_chain_all_failed(
+    attempts: list[dict[str, Any]],
+) -> bool:
+    return bool(
+        [
+            str(item.get("provider") or "")
+            for item in attempts
+        ]
+        == ["SPGLOBAL", "INVESTING_EVENT_1062"]
+        and all(
+            item.get("called") is True
+            and not _actual_result_succeeded(item.get("result"))
+            for item in attempts
+        )
+    )
+
+
+def _audit_correlated(
+    audit: dict[str, Any],
+    *,
+    request_id: str,
+    correlation_id: str,
+) -> bool:
+    return bool(
+        audit.get("request_id") == request_id
+        and audit.get("correlation_id") == correlation_id
     )
 
 
@@ -1050,7 +1305,14 @@ def _actual_result_succeeded(value: Any) -> bool:
         )
         and not any(
             token in result
-            for token in ("FAIL", "ERROR", "NO_DATA", "TIMEOUT")
+            for token in (
+                "FAIL",
+                "ERROR",
+                "NO_DATA",
+                "NOT_AVAILABLE",
+                "UNAVAILABLE",
+                "TIMEOUT",
+            )
         )
     )
 
@@ -1063,9 +1325,13 @@ def _request_scoped_database_audit(
     mapping_selected: str,
     observed_at: datetime,
     value_present: bool,
+    request_id: str | None,
+    correlation_id: str | None,
 ) -> dict[str, Any]:
     return {
         "occurrence_id": occurrence_id,
+        "request_id": request_id,
+        "correlation_id": correlation_id,
         "lifecycle_before": lifecycle_before,
         "eligibility": "VALID_DATABASE_RECORD",
         "reclaim_reason": "CANONICAL_ACTUAL_PRESENT",
@@ -1122,6 +1388,9 @@ def _eligibility(
     item: dict[str, Any] | None,
     *,
     now: datetime,
+    force_refresh: bool = False,
+    request_id: str | None = None,
+    correlation_id: str | None = None,
 ) -> tuple[str, str]:
     if not item:
         return "RECLAIMABLE", "MISSING_LIFECYCLE_INITIALIZATION"
@@ -1135,6 +1404,20 @@ def _eligibility(
     ):
         return "EXHAUSTED_NO_DATA", "TERMINAL_NO_DATA"
     if _negative_cache_active(item, now=now):
+        persisted = (
+            item.get("payload", {}).get("actual_resolution")
+            if isinstance(item.get("payload"), dict)
+            else None
+        )
+        if force_refresh and not _same_request_provider_audit(
+            persisted,
+            request_id=request_id,
+            correlation_id=correlation_id,
+        ):
+            return (
+                "RECLAIMABLE",
+                "FORCE_REFRESH_PRIOR_REQUEST_NEGATIVE_CACHE_BYPASSED",
+            )
         return "BACKOFF_ACTIVE", "NEXT_RETRY_IN_FUTURE"
     valid_until = parse_datetime(item.get("valid_until"))
     next_refresh = parse_datetime(item.get("next_refresh_at"))
@@ -1147,6 +1430,23 @@ def _eligibility(
     ):
         return "FRESH_NO_DATA", "NO_DATA_STILL_FRESH"
     return "RECLAIMABLE", "STALE_NO_DATA_RETRY_DUE"
+
+
+def _same_request_provider_audit(
+    value: Any,
+    *,
+    request_id: str | None,
+    correlation_id: str | None,
+) -> bool:
+    return bool(
+        request_id
+        and correlation_id
+        and isinstance(value, dict)
+        and value.get("request_id") == request_id
+        and value.get("correlation_id") == correlation_id
+        and isinstance(value.get("provider_attempts"), list)
+        and value.get("provider_attempts")
+    )
 
 
 def _lifecycle_before(
@@ -1335,6 +1635,7 @@ def _macro_actual_item(
         "awaiting_actual": False,
         "status": "RELEASED",
         "release_status": "RELEASED",
+        "field_lineage": field_lineage,
         "enrichment": {
             "actual": event.get("actual"),
             "forecast": (

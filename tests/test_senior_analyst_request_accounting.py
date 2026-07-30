@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.services.senior_analyst_projection_v1 import (
     DATASET_POLICIES,
+    _provider_accounting,
     build_senior_analyst_payload_v1,
     validate_senior_analyst_payload_v1,
 )
@@ -41,7 +42,11 @@ def _complete_row(policy) -> dict:
         "evidence_origin": "NORMAL_APPLICATION_REQUEST",
         "evidence_status": "ACQUISITION_COMPLETE",
         "observed_at": OBSERVED_AT,
-        "acquisition_id": f"observed:{policy.dataset_id}",
+        "acquisition_id": (
+            "flash_services_pmi_actual_resolution:controlled-pmi"
+            if policy.dataset_id == "flash_services_pmi"
+            else f"observed:{policy.dataset_id}"
+        ),
         "shared_acquisition_dataset_ids": [policy.dataset_id],
         "database_lookup_performed": True,
         "database_lookup_reason": "CONTROLLED_DATABASE_LOOKUP",
@@ -373,6 +378,107 @@ def test_flash_pmi_event_without_actual_has_null_delivery_evidence() -> None:
     assert row["selected_value_present"] is False
     assert row["delivered_value"] is None
     assert row["selected_source"] is None
+
+
+def test_flash_pmi_delivery_requires_matching_acquisition_occurrence() -> None:
+    occurrence_id = "controlled-released-pmi"
+    source = _source()
+    manifest = _manifest()
+    pmi = next(
+        item
+        for item in manifest["datasets"]
+        if item["dataset_id"] == "flash_services_pmi"
+    )
+    pmi["acquisition_id"] = (
+        f"flash_services_pmi_actual_resolution:{occurrence_id}"
+    )
+    source["request_scoped_provider_accounting"] = manifest
+    payload = _build(source)
+    payload["analytics"]["calendar"] = {
+        "status": "AVAILABLE",
+        "freshness": "CURRENT",
+        "latest_released_events": [
+            {
+                "occurrence_id": "controlled-older-pmi",
+                "event_id": "controlled-older-pmi",
+                "metric_id": "flash_services_pmi",
+                "name": "Flash Services PMI",
+                "release_at": (NOW - timedelta(days=30)).isoformat(),
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "freshness_state": "CURRENT_RELEASE",
+                "content_valid_until": (
+                    NOW + timedelta(days=1)
+                ).isoformat(),
+                "actual": 50.8,
+                "actual_source": "S&P Global",
+            },
+            {
+                "occurrence_id": occurrence_id,
+                "event_id": occurrence_id,
+                "metric_id": "flash_services_pmi",
+                "name": "Flash Services PMI",
+                "release_at": (NOW - timedelta(minutes=5)).isoformat(),
+                "reference_period": "2026-07",
+                "release_status": "RELEASED",
+                "freshness_state": "CURRENT_RELEASE",
+                "content_valid_until": (
+                    NOW + timedelta(days=1)
+                ).isoformat(),
+                "actual": 51.4,
+                "actual_source": "S&P Global",
+            }
+        ],
+        "active_event_windows": [],
+        "next_24h_events": [],
+        "next_7d_high_impact_events": [],
+    }
+    accounting = _provider_accounting(
+        payload["analytics"],
+        missing_data=payload["missing_data"],
+        source_payload=source,
+        request_id=REQUEST_ID,
+        refresh_mode="force",
+    )
+    payload["provider_accounting"] = accounting["rows"]
+    row = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == "flash_services_pmi"
+    )
+
+    assert row["evidence_status"] == "COMPLETE"
+    assert row["selected_value_present"] is True
+    assert len(row["delivered_value"]) == 1
+    assert row["delivered_value"][0]["occurrence_id"] == occurrence_id
+    assert _validate_live(payload)["checks"]["provider_accounting_valid"] is True
+
+    mismatched = deepcopy(source)
+    mismatched_pmi = next(
+        item
+        for item in mismatched["request_scoped_provider_accounting"][
+            "datasets"
+        ]
+        if item["dataset_id"] == "flash_services_pmi"
+    )
+    mismatched_pmi["acquisition_id"] = (
+        "flash_services_pmi_actual_resolution:different-occurrence"
+    )
+    accounting = _provider_accounting(
+        payload["analytics"],
+        missing_data=payload["missing_data"],
+        source_payload=mismatched,
+        request_id=REQUEST_ID,
+        refresh_mode="force",
+    )
+    payload["provider_accounting"] = accounting["rows"]
+    row = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == "flash_services_pmi"
+    )
+    assert row["evidence_status"] == "INCOMPLETE"
+    assert _validate_live(payload)["checks"]["provider_accounting_valid"] is False
 
 
 def test_vix_and_vvix_null_delivery_is_not_selected_from_metadata() -> None:

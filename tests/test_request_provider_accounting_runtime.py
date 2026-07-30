@@ -519,6 +519,8 @@ def test_flash_pmi_runtime_evidence_preserves_fallback_order_and_selection() -> 
         audits=[
             {
                 "occurrence_id": "xtb:146945:2026-07-24",
+                "request_id": collector.request_id,
+                "correlation_id": collector.correlation_id,
                 "mapping_selected": "flash_services_pmi",
                 "provider_call_count": 2,
                 "lifecycle_before": {
@@ -533,13 +535,21 @@ def test_flash_pmi_runtime_evidence_preserves_fallback_order_and_selection() -> 
                 "provider_attempts": [
                     {
                         "provider": "SPGLOBAL",
+                        "called": True,
                         "attempts": 1,
                         "result": "HTTP_403",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": datetime.now(UTC).isoformat(),
                     },
                     {
                         "provider": "INVESTING_EVENT_1062",
+                        "called": True,
                         "attempts": 1,
                         "result": "SUCCESS",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": datetime.now(UTC).isoformat(),
                     },
                 ],
             }
@@ -577,6 +587,8 @@ def test_flash_pmi_all_provider_failures_leave_value_null() -> None:
         audits=[
             {
                 "occurrence_id": "xtb:146945:2026-07-24",
+                "request_id": collector.request_id,
+                "correlation_id": collector.correlation_id,
                 "mapping_selected": "flash_services_pmi",
                 "provider_call_count": 2,
                 "lifecycle_before": {
@@ -591,13 +603,21 @@ def test_flash_pmi_all_provider_failures_leave_value_null() -> None:
                 "provider_attempts": [
                     {
                         "provider": "SPGLOBAL",
+                        "called": True,
                         "attempts": 1,
                         "result": "HTTP_403",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": datetime.now(UTC).isoformat(),
                     },
                     {
                         "provider": "INVESTING_EVENT_1062",
+                        "called": True,
                         "attempts": 1,
                         "result": "TIMEOUT",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": datetime.now(UTC).isoformat(),
                     },
                 ],
             }
@@ -612,5 +632,5 @@ def test_flash_pmi_all_provider_failures_leave_value_null() -> None:
     assert row["database_freshness_evaluation"] != "VALID"
     assert row["acquisition_selected_source"] is None
     assert row["acquisition_reason_code"] == (
-        "FLASH_SERVICES_PMI_VALUE_NOT_AVAILABLE"
+        "FLASH_SERVICES_PMI_ALL_PROVIDERS_FAILED"
     )

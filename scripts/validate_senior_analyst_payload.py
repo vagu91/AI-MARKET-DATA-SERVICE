@@ -54,6 +54,7 @@ def main() -> int:
         "expired_values_delivered",
         "available_without_substantive_value",
         "selected_value_presence_mismatches",
+        "readiness_section_classification_mismatches",
         "stale_values_presented_as_current",
         "invalid_temporal_mappings",
         "semantic_mapping_errors",
@@ -63,6 +64,7 @@ def main() -> int:
         "contradictory_nasdaq_drivers",
         "expired_current_news",
         "unexplained_omissions",
+        "required_dataset_omissions_without_reason",
     )
     passed = (
         result["checks"]["response_generated_recently"]

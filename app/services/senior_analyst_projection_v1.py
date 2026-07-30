@@ -24,6 +24,9 @@ from app.services.request_provider_accounting import (
 
 CONTRACT_NAME = "SeniorAnalystPayloadV1"
 SCHEMA_VERSION = "1.0"
+FLASH_PMI_ACQUISITION_PREFIX = (
+    "flash_services_pmi_actual_resolution:"
+)
 INVALID_ANALYTIC_STATES = {
     "EXPIRED",
     "REJECTED_FUTURE",
@@ -36,6 +39,37 @@ VALID_FRESHNESS_STATES = {
     "LAST_AVAILABLE_OFFICIAL_CLOSE",
 }
 REQUIRED_MEGA_CAPS = ("AAPL", "NVDA", "AMZN", "META", "TSLA", "AMD")
+TREASURY_RATE_SERIES = frozenset(
+    {"DGS2", "DGS10", "DGS30", "T10Y2Y", "T10Y3M", "NFCI"}
+)
+FED_FUNDS_RATE_SERIES = frozenset({"DFF", "FEDFUNDS", "SOFR"})
+TARGET_RANGE_SERIES = frozenset({"DFEDTARL", "DFEDTARU"})
+MACRO_DATASET_SERIES = {
+    "cpi": frozenset({"CUSR0000SA0", "CUSR0000SA0L1E"}),
+    "ppi": frozenset({"WPUFD4"}),
+    "pce": frozenset(
+        {
+            "BEA:PCE",
+            "BEA:PCE_PRICE_INDEX",
+            "BEA:CORE_PCE",
+        }
+    ),
+    "gdp": frozenset({"BEA:GDP", "GDP"}),
+    "employment": frozenset({"LNS14000000", "UNRATE"}),
+    "wages": frozenset({"CES0500000003"}),
+    "nfp": frozenset({"CES0000000001", "PAYEMS"}),
+    "jobless_claims": frozenset({"ICSA"}),
+}
+GENERIC_REQUIRED_OMISSION_REASON_CODES = frozenset(
+    {
+        "",
+        "FINAL_PAYLOAD_VALUE_NOT_AVAILABLE",
+        "NO_VALID_VALUES_AVAILABLE",
+        "ONE_OR_MORE_VALUES_UNAVAILABLE",
+        "UNSPECIFIED_OMISSION",
+        "VALUE_NOT_AVAILABLE",
+    }
+)
 SECTION_NAMES = (
     "macro",
     "calendar",
@@ -102,7 +136,7 @@ DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
     DatasetPolicy("fed_funds", "rates", "daily", timedelta(days=2), "FRED"),
     DatasetPolicy(
         "target_range",
-        "fomc",
+        "rates",
         "event",
         timedelta(days=45),
         "FEDERAL_RESERVE",
@@ -295,6 +329,11 @@ def build_senior_analyst_payload_v1(
             missing,
         ),
     }
+    missing = _ensure_required_dataset_missing_data(
+        analytics,
+        missing_data=missing,
+        source_payload=source_payload,
+    )
     missing = _deduplicate_missing(missing)
     readiness = _readiness(analytics)
     accounting = _provider_accounting(
@@ -341,6 +380,8 @@ def build_senior_analyst_payload_v1(
             "calculated_from_delivered_payload": True,
             "invalid_analytic_state_count": _invalid_state_count(analytics),
             "unexplained_omissions": 0,
+            "required_dataset_omissions_without_reason": 0,
+            "readiness_section_classification_mismatches": 0,
             "projection_is_not_live_acceptance": True,
         },
     }
@@ -414,14 +455,33 @@ def validate_senior_analyst_payload_v1(
             payload.get("provider_accounting") or []
         )
     )
+    readiness_section_classification_mismatches = (
+        _readiness_section_classification_mismatch_count(
+            payload.get("readiness"),
+            analytics,
+        )
+    )
     expired_values = _expired_or_future_delivered_value_count(
         analytics,
         now=clock,
     )
-    unexplained = sum(
+    required_omissions_without_reason = (
+        _required_dataset_omissions_without_reason(
+            analytics,
+            payload.get("missing_data") or [],
+        )
+    )
+    unexplained = len(required_omissions_without_reason) + sum(
         1
         for item in payload.get("missing_data") or []
         if not item.get("reason_code")
+        and not any(
+            _missing_matches_dataset(
+                dataset_id,
+                str(item.get("field") or item.get("path") or ""),
+            )
+            for dataset_id in required_omissions_without_reason
+        )
     )
     request = (
         payload.get("request")
@@ -453,6 +513,9 @@ def validate_senior_analyst_payload_v1(
         "selected_value_presence_mismatches": (
             selected_value_presence_mismatches
         ),
+        "readiness_section_classification_mismatches": (
+            readiness_section_classification_mismatches
+        ),
         "stale_values_presented_as_current": _stale_presented_current(analytics),
         "invalid_temporal_mappings": invalid_mappings,
         "semantic_mapping_errors": semantic_errors,
@@ -462,6 +525,9 @@ def validate_senior_analyst_payload_v1(
         "contradictory_nasdaq_drivers": contradictory_drivers,
         "expired_current_news": expired_news,
         "unexplained_omissions": unexplained,
+        "required_dataset_omissions_without_reason": len(
+            required_omissions_without_reason
+        ),
         "provider_accounting_valid": accounting_valid,
     }
     content_passed = (
@@ -472,6 +538,7 @@ def validate_senior_analyst_payload_v1(
                 "expired_values_delivered",
                 "available_without_substantive_value",
                 "selected_value_presence_mismatches",
+                "readiness_section_classification_mismatches",
                 "stale_values_presented_as_current",
                 "invalid_temporal_mappings",
                 "semantic_mapping_errors",
@@ -481,6 +548,7 @@ def validate_senior_analyst_payload_v1(
                 "contradictory_nasdaq_drivers",
                 "expired_current_news",
                 "unexplained_omissions",
+                "required_dataset_omissions_without_reason",
             )
         )
     )
@@ -1385,17 +1453,230 @@ def _project_rates(
                 assessment["refresh_due_at"],
                 ["macro_analysis"],
             )
-    valid = sum(item["value"] is not None for item in items)
-    status = _section_status(valid, len(items) or 1)
+    treasury_rates = [
+        deepcopy(item)
+        for item in items
+        if str(item.get("series_id") or "").upper()
+        in TREASURY_RATE_SERIES
+        and _finite_scalar_number_present(item.get("value"))
+    ]
+    fed_funds = [
+        deepcopy(item)
+        for item in items
+        if str(item.get("series_id") or "").upper()
+        in FED_FUNDS_RATE_SERIES
+        and _finite_scalar_number_present(item.get("value"))
+    ]
+    target_range = _project_target_range(items, missing)
+    complete_dataset_count = sum(
+        (
+            bool(treasury_rates),
+            bool(fed_funds),
+            target_range["status"] == "AVAILABLE",
+        )
+    )
+    status = _section_status(complete_dataset_count, 3)
+    if not complete_dataset_count and target_range["status"] == "PARTIAL":
+        status = "PARTIAL"
+    reason = (
+        None
+        if status == "AVAILABLE"
+        else "ONE_OR_MORE_RATE_DATASETS_UNAVAILABLE"
+        if status == "PARTIAL"
+        else "NO_SUBSTANTIVE_RATE_DATASET_AVAILABLE"
+    )
+    substantive_items = [
+        *treasury_rates,
+        *fed_funds,
+        *(
+            [target_range]
+            if target_range["status"] == "AVAILABLE"
+            else []
+        ),
+    ]
     return {
         **_section_metadata(
             status,
-            _section_reason(status),
-            _latest_value(items, "data_as_of"),
-            _latest_value(items, "content_valid_until"),
+            reason,
+            _latest_value(substantive_items, "data_as_of"),
+            _earliest_datetime_value(
+                substantive_items,
+                "content_valid_until",
+            ),
             source="FRED",
         ),
         "metrics": sorted(items, key=lambda item: item["series_id"]),
+        "treasury_rates": treasury_rates,
+        "fed_funds": fed_funds,
+        "target_range": target_range,
+    }
+
+
+def _project_target_range(
+    rate_metrics: list[dict[str, Any]],
+    missing: list[dict[str, Any]],
+) -> dict[str, Any]:
+    by_series = {
+        str(item.get("series_id") or "").upper(): item
+        for item in rate_metrics
+        if str(item.get("series_id") or "").upper()
+        in TARGET_RANGE_SERIES
+    }
+    lower_item = by_series.get("DFEDTARL")
+    upper_item = by_series.get("DFEDTARU")
+    lower = (
+        _number(lower_item.get("value"))
+        if lower_item
+        and _finite_scalar_number_present(lower_item.get("value"))
+        else None
+    )
+    upper = (
+        _number(upper_item.get("value"))
+        if upper_item
+        and _finite_scalar_number_present(upper_item.get("value"))
+        else None
+    )
+    missing_bounds: list[tuple[str, str]] = []
+    if lower is None:
+        missing_bounds.append(
+            (
+                "target_range_lower",
+                "TARGET_RANGE_LOWER_BOUND_NOT_AVAILABLE",
+            )
+        )
+    if upper is None:
+        missing_bounds.append(
+            (
+                "target_range_upper",
+                "TARGET_RANGE_UPPER_BOUND_NOT_AVAILABLE",
+            )
+        )
+    if lower is not None and upper is not None and lower > upper:
+        lower = upper = None
+        missing_bounds = [
+            (
+                "target_range",
+                "TARGET_RANGE_BOUNDS_INVALID_ORDER",
+            )
+        ]
+    for field, reason_code in missing_bounds:
+        _missing(
+            missing,
+            f"rates.target_range.{field}",
+            "PARTIAL" if len(missing_bounds) == 1 else "UNAVAILABLE",
+            reason_code,
+            _earliest_datetime_value(
+                [item for item in (lower_item, upper_item) if item],
+                "refresh_due_at",
+            ),
+            ["macro_analysis"],
+        )
+
+    bounds = [
+        item
+        for item in (lower_item, upper_item)
+        if isinstance(item, dict)
+    ]
+    complete = lower is not None and upper is not None
+    partial = (lower is None) != (upper is None)
+    status = "AVAILABLE" if complete else "PARTIAL" if partial else "UNAVAILABLE"
+    reason = (
+        None
+        if complete
+        else missing_bounds[0][1]
+        if len(missing_bounds) == 1
+        else "TARGET_RANGE_BOUNDS_NOT_AVAILABLE"
+        if missing_bounds
+        else "TARGET_RANGE_NOT_AVAILABLE"
+    )
+    source = None
+    sources = [
+        item.get("source")
+        for item in bounds
+        if item.get("source") is not None
+    ]
+    if sources:
+        common_source_fields = {
+            key: sources[0].get(key)
+            for key in (
+                "publisher",
+                "distributor",
+                "acquisition_provider",
+            )
+            if isinstance(sources[0], dict)
+            and all(
+                isinstance(item, dict)
+                and item.get(key) == sources[0].get(key)
+                for item in sources
+            )
+        }
+        source = (
+            deepcopy(sources[0])
+            if all(item == sources[0] for item in sources)
+            else {
+                **common_source_fields,
+                "source_url": None,
+                "bound_sources": {
+                    "lower": deepcopy(
+                        lower_item.get("source")
+                        if lower_item
+                        else None
+                    ),
+                    "upper": deepcopy(
+                        upper_item.get("source")
+                        if upper_item
+                        else None
+                    ),
+                },
+            }
+        )
+    lineage = [
+        {
+            "field": field,
+            "series_id": series_id,
+            "source": deepcopy(item.get("source")),
+            "data_as_of": item.get("data_as_of"),
+            "content_valid_until": item.get("content_valid_until"),
+            "upstream_lineage": deepcopy(item.get("lineage") or []),
+        }
+        for field, series_id, item in (
+            ("target_range_lower", "DFEDTARL", lower_item),
+            ("target_range_upper", "DFEDTARU", upper_item),
+        )
+        if isinstance(item, dict)
+    ]
+    freshness_values = {
+        str(item.get("freshness") or "")
+        for item in bounds
+        if item.get("freshness")
+    }
+    return {
+        "status": status,
+        "freshness": (
+            freshness_values.pop()
+            if complete and len(freshness_values) == 1
+            else "CURRENT"
+            if complete
+            else "UNAVAILABLE"
+        ),
+        "data_as_of": _latest_value(bounds, "data_as_of"),
+        "content_valid_until": _earliest_datetime_value(
+            bounds,
+            "content_valid_until",
+        ),
+        "snapshot_transport_valid_until": _earliest_datetime_value(
+            bounds,
+            "snapshot_transport_valid_until",
+        ),
+        "refresh_due_at": _earliest_datetime_value(
+            bounds,
+            "refresh_due_at",
+        ),
+        "source": source,
+        "reason_code": reason,
+        "lineage": lineage,
+        "target_range_lower": lower,
+        "target_range_upper": upper,
     }
 
 
@@ -2040,13 +2321,18 @@ def _provider_accounting(
                     "snapshot_revision"
                 ),
             }
-        if not _acquisition_accounting_row_complete(
-            raw,
-            policy=policy,
-            request_id=request_id,
-            correlation_id=correlation_id,
-            request_started_at=request_started_at,
-            request_completed_at=request_completed_at,
+        if (
+            not _acquisition_accounting_row_complete(
+                raw,
+                policy=policy,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                request_started_at=request_started_at,
+                request_completed_at=request_completed_at,
+            )
+            or not _acquisition_delivery_observation_link_complete(
+                candidate
+            )
         ):
             candidate["evidence_status"] = "INCOMPLETE"
             candidate["reason_code"] = (
@@ -2206,48 +2492,257 @@ def _delivery_evidence(
     }
 
 
+def _ensure_required_dataset_missing_data(
+    analytics: dict[str, Any],
+    *,
+    missing_data: list[dict[str, Any]],
+    source_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    output = list(missing_data)
+    envelope = source_payload.get("request_scoped_provider_accounting")
+    manifest = envelope if isinstance(envelope, dict) else {}
+    rows = manifest.get("datasets")
+    rows = rows if isinstance(rows, list) else []
+    acquisition_by_dataset = {
+        str(item.get("dataset_id") or ""): item
+        for item in rows
+        if isinstance(item, dict) and item.get("dataset_id")
+    }
+    for policy in DATASET_POLICIES:
+        if not policy.required_for_analysis:
+            continue
+        _, value = _dataset_delivery_value(
+            policy.dataset_id,
+            analytics,
+        )
+        if _substantive_delivery_present(policy.dataset_id, value):
+            continue
+        exact_field = f"datasets.{policy.dataset_id}"
+        if any(
+            isinstance(item, dict)
+            and str(item.get("field") or item.get("path") or "")
+            == exact_field
+            and _specific_required_omission_reason(
+                item.get("reason_code")
+            )
+            for item in output
+        ):
+            continue
+        acquisition = acquisition_by_dataset.get(policy.dataset_id)
+        reason_code = _required_dataset_omission_reason(
+            policy.dataset_id,
+            analytics=analytics,
+            acquisition=acquisition,
+            existing_missing=output,
+        )
+        _missing(
+            output,
+            exact_field,
+            (
+                "PARTIAL"
+                if policy.dataset_id == "target_range"
+                and str(
+                    ((analytics.get("rates") or {}).get("target_range") or {}).get(
+                        "status"
+                    )
+                    or ""
+                ).upper()
+                == "PARTIAL"
+                else "UNAVAILABLE"
+            ),
+            reason_code,
+            (
+                acquisition.get("database_refresh_due_at")
+                if isinstance(acquisition, dict)
+                else None
+            ),
+            ["senior_analyst_v1"],
+        )
+    return output
+
+
+def _required_dataset_omission_reason(
+    dataset_id: str,
+    *,
+    analytics: dict[str, Any],
+    acquisition: dict[str, Any] | None,
+    existing_missing: list[dict[str, Any]],
+) -> str:
+    if dataset_id == "target_range":
+        target = (analytics.get("rates") or {}).get("target_range")
+        target_reason = (
+            target.get("reason_code")
+            if isinstance(target, dict)
+            else None
+        )
+        if _specific_required_omission_reason(target_reason):
+            return str(target_reason)
+
+    matching_reasons = [
+        str(item.get("reason_code") or "")
+        for item in existing_missing
+        if isinstance(item, dict)
+        and _missing_matches_dataset(
+            dataset_id,
+            str(item.get("field") or item.get("path") or ""),
+        )
+        and _specific_required_omission_reason(
+            item.get("reason_code")
+        )
+    ]
+    if "INSUFFICIENT_VALID_HISTORY" in matching_reasons:
+        return "INSUFFICIENT_VALID_HISTORY"
+    if not isinstance(acquisition, dict):
+        return (
+            sorted(set(matching_reasons))[0]
+            if matching_reasons
+            else "REQUEST_SCOPED_ACQUISITION_EVIDENCE_NOT_AVAILABLE"
+        )
+
+    provider_observations = [
+        item
+        for item in (
+            acquisition.get("primary_provider"),
+            *(acquisition.get("fallbacks") or []),
+        )
+        if isinstance(item, dict)
+    ]
+    called = [
+        item
+        for item in provider_observations
+        if item.get("called") is True
+    ]
+    successful = [
+        item
+        for item in called
+        if str(item.get("result") or "").upper()
+        in {"FOUND", "OK", "SUCCESS", "VALUE_ACQUIRED"}
+    ]
+    not_called_reasons = {
+        str(item.get("not_called_reason") or "").upper()
+        for item in provider_observations
+    }
+    if not called and any(
+        "NOT_CONFIGURED" in reason
+        for reason in not_called_reasons
+    ):
+        return "REQUIRED_DATASET_PROVIDER_NOT_CONFIGURED"
+
+    database_expired = acquisition.get("database_record_expired") is True
+    lifecycle = str(
+        acquisition.get("database_lifecycle_status") or ""
+    ).upper()
+    freshness = str(
+        acquisition.get("database_freshness_evaluation") or ""
+    ).upper()
+
+    if (
+        _delivery_mapping_missing(dataset_id, analytics)
+        and (
+            successful
+            or acquisition.get("acquisition_selected_source")
+        )
+    ):
+        return "DELIVERY_MAPPING_MISSING"
+    if matching_reasons:
+        return sorted(set(matching_reasons))[0]
+    if successful:
+        return (
+            "PROVIDER_SUCCEEDED_REQUIRED_SERIES_ABSENT_AFTER_EXPIRED_DATABASE_RECORD"
+            if database_expired
+            else "PROVIDER_SUCCEEDED_REQUIRED_SERIES_ABSENT"
+        )
+    if lifecycle not in {"", "ACTIVE", "CURRENT", "VALID"} or (
+        freshness == "INVALID_LIFECYCLE"
+    ):
+        return "INVALID_DATABASE_LIFECYCLE_AND_NO_VALID_REPLACEMENT"
+    if database_expired:
+        return (
+            "DATABASE_RECORD_EXPIRED_AND_PROVIDER_CHAIN_FAILED"
+            if called
+            else "DATABASE_RECORD_EXPIRED_AND_PROVIDER_NOT_CALLED"
+        )
+    if called:
+        return "PROVIDER_CHAIN_FAILED_NO_VALID_VALUE"
+    if acquisition.get("database_record_found") is False:
+        return "DATABASE_RECORD_ABSENT_AND_NO_VALID_PROVIDER_VALUE"
+    if (
+        acquisition.get("database_record_found") is True
+        and freshness == "VALID"
+    ):
+        return "VALID_DATABASE_RECORD_MISSING_REQUIRED_SERIES"
+    return "OBSERVED_ACQUISITION_DID_NOT_PRODUCE_REQUIRED_VALUE"
+
+
+def _specific_required_omission_reason(value: Any) -> bool:
+    return (
+        str(value or "").strip().upper()
+        not in GENERIC_REQUIRED_OMISSION_REASON_CODES
+    )
+
+
+def _delivery_mapping_missing(
+    dataset_id: str,
+    analytics: dict[str, Any],
+) -> bool:
+    rates = analytics.get("rates")
+    if not isinstance(rates, dict):
+        return False
+    metrics = rates.get("metrics")
+    if not isinstance(metrics, list):
+        return False
+
+    valid_series = {
+        str(item.get("series_id") or "").upper()
+        for item in metrics
+        if isinstance(item, dict)
+        and _finite_scalar_number_present(item.get("value"))
+    }
+    if dataset_id == "treasury_rates":
+        return bool(
+            isinstance(rates.get("treasury_rates"), list)
+            and valid_series & TREASURY_RATE_SERIES
+        )
+    if dataset_id == "fed_funds":
+        return bool(
+            isinstance(rates.get("fed_funds"), list)
+            and valid_series & FED_FUNDS_RATE_SERIES
+        )
+    if dataset_id == "target_range":
+        return bool(
+            not isinstance(rates.get("target_range"), dict)
+            and TARGET_RANGE_SERIES <= valid_series
+        )
+    return False
+
+
 def _dataset_delivery_value(
     dataset_id: str,
     analytics: dict[str, Any],
 ) -> tuple[str, Any]:
-    macro_series = {
-        "cpi": {"CUSR0000SA0", "CUSR0000SA0L1E"},
-        "ppi": {"WPUFD4"},
-        "pce": {
-            "BEA:PCE",
-            "BEA:PCE_PRICE_INDEX",
-            "BEA:CORE_PCE",
-        },
-        "gdp": {"BEA:GDP", "GDP"},
-        "employment": {"LNS14000000", "UNRATE"},
-        "wages": {"CES0500000003"},
-        "nfp": {"CES0000000001", "PAYEMS"},
-        "jobless_claims": {"ICSA"},
-    }
-    if dataset_id in macro_series:
+    if dataset_id in MACRO_DATASET_SERIES:
         metrics = (analytics.get("macro") or {}).get("metrics") or []
         return "macro", [
             item
             for item in metrics
             if isinstance(item, dict)
             and str(item.get("series_id") or "").upper()
-            in macro_series[dataset_id]
+            in MACRO_DATASET_SERIES[dataset_id]
             and item.get("value") is not None
         ]
     if dataset_id in {"treasury_rates", "fed_funds"}:
         expected = (
-            {"DFF", "FEDFUNDS", "SOFR"}
+            FED_FUNDS_RATE_SERIES
             if dataset_id == "fed_funds"
-            else {
-                "DGS2",
-                "DGS10",
-                "DGS30",
-                "T10Y2Y",
-                "T10Y3M",
-                "NFCI",
-            }
+            else TREASURY_RATE_SERIES
         )
-        metrics = (analytics.get("rates") or {}).get("metrics") or []
+        rates = analytics.get("rates") or {}
+        dataset_metrics = rates.get(dataset_id)
+        metrics = (
+            dataset_metrics
+            if isinstance(dataset_metrics, list)
+            else rates.get("metrics") or []
+        )
         return "rates", [
             item
             for item in metrics
@@ -2302,10 +2797,10 @@ def _dataset_delivery_value(
             ("risk_sentiment", "risk_score"),
         )
     if dataset_id == "target_range":
-        return "fomc", _delivery_fields(
-            analytics.get("fomc") or {},
-            ("target_range_lower", "target_range_upper"),
+        rates_target = (analytics.get("rates") or {}).get(
+            "target_range"
         )
+        return "rates", deepcopy(rates_target)
     if dataset_id == "fomc_expectations":
         return "fomc", _delivery_fields(
             analytics.get("fomc") or {},
@@ -2338,26 +2833,8 @@ def _dataset_delivery_value(
             if isinstance(item, dict)
         ]
         if dataset_id == "flash_services_pmi":
-            events = [
-                {
-                    "value": item.get("actual"),
-                    "source": (
-                        item.get("actual_source")
-                        or item.get("publisher")
-                    ),
-                    "freshness": (
-                        item.get("freshness_state")
-                        or item.get("freshness")
-                    ),
-                    "data_as_of": (
-                        item.get("reference_period")
-                        or item.get("release_at")
-                    ),
-                    "content_valid_until": (
-                        item.get("content_valid_until")
-                        or item.get("valid_until")
-                    ),
-                }
+            pmi_events = [
+                item
                 for item in events
                 if (
                     "flash_services_pmi"
@@ -2366,7 +2843,61 @@ def _dataset_delivery_value(
                     in str(item.get("name") or "").lower()
                 )
                 and item.get("actual") not in (None, "")
+                and (
+                    item.get("occurrence_id")
+                    or item.get("event_id")
+                )
             ]
+            latest = (
+                max(
+                    pmi_events,
+                    key=lambda item: (
+                        parse_datetime(
+                            item.get("release_at")
+                            or item.get("scheduled_at_utc")
+                            or item.get("time_utc")
+                        )
+                        or datetime.min.replace(tzinfo=UTC),
+                        str(
+                            item.get("occurrence_id")
+                            or item.get("event_id")
+                            or ""
+                        ),
+                    ),
+                )
+                if pmi_events
+                else None
+            )
+            events = [
+                {
+                    "occurrence_id": (
+                        latest.get("occurrence_id")
+                        or latest.get("event_id")
+                    ),
+                    "value": latest.get("actual"),
+                    "source": (
+                        latest.get("actual_source")
+                        or latest.get("publisher")
+                    ),
+                    "freshness": (
+                        latest.get("freshness_state")
+                        or latest.get("freshness")
+                    ),
+                    "data_as_of": (
+                        latest.get("reference_period")
+                        or latest.get("release_at")
+                    ),
+                    "release_at": (
+                        latest.get("release_at")
+                        or latest.get("scheduled_at_utc")
+                        or latest.get("time_utc")
+                    ),
+                    "content_valid_until": (
+                        latest.get("content_valid_until")
+                        or latest.get("valid_until")
+                    ),
+                }
+            ] if latest is not None else []
         return "calendar", events
     if dataset_id == "earnings":
         return "earnings", (analytics.get("earnings") or {}).get(
@@ -2436,6 +2967,8 @@ def _meaningful_delivery(value: Any) -> bool:
 
 
 def _substantive_delivery_present(dataset_id: str, value: Any) -> bool:
+    if dataset_id == "target_range":
+        return _target_range_delivery_present(value)
     if dataset_id == "positioning":
         return _positioning_delivery_present(value)
     if dataset_id == "options_positioning":
@@ -2449,6 +2982,19 @@ def _substantive_delivery_present(dataset_id: str, value: Any) -> bool:
     if isinstance(value, dict) and "value" in value:
         return _meaningful_delivery(value.get("value"))
     return _meaningful_delivery(value)
+
+
+def _target_range_delivery_present(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and str(value.get("status") or "").upper() == "AVAILABLE"
+        and _finite_scalar_number_present(
+            value.get("target_range_lower")
+        )
+        and _finite_scalar_number_present(
+            value.get("target_range_upper")
+        )
+    )
 
 
 def _positioning_delivery_present(value: Any) -> bool:
@@ -2653,6 +3199,8 @@ def _first_delivery_field(value: Any, field: str) -> Any:
 
 def _missing_matches_dataset(dataset_id: str, field: str) -> bool:
     lowered = field.lower()
+    if lowered == f"datasets.{dataset_id.lower()}":
+        return True
     tokens = {
         "nasdaq_100": ("nasdaq.components",),
         "mega_cap_quotes": ("nasdaq.components", "nasdaq.drivers"),
@@ -2660,9 +3208,27 @@ def _missing_matches_dataset(dataset_id: str, field: str) -> bool:
         "vix": ("vix.vix",),
         "vvix": ("vix.vvix",),
         "risk": ("risk.",),
-        "treasury_rates": ("rates.",),
-        "fed_funds": ("rates.",),
-        "target_range": ("fomc.target_range",),
+        "treasury_rates": (
+            "rates.treasury_rates",
+            "rates.metrics.dgs2",
+            "rates.metrics.dgs10",
+            "rates.metrics.dgs30",
+            "rates.metrics.t10y2y",
+            "rates.metrics.t10y3m",
+            "rates.metrics.nfci",
+        ),
+        "fed_funds": (
+            "rates.fed_funds",
+            "rates.metrics.dff",
+            "rates.metrics.fedfunds",
+            "rates.metrics.sofr",
+        ),
+        "target_range": (
+            "rates.target_range",
+            "rates.metrics.dfedtarl",
+            "rates.metrics.dfedtaru",
+            "fomc.target_range",
+        ),
         "fomc_expectations": ("fomc.action", "fomc.pre_meeting"),
         "cpi": ("headline_cpi", "core_cpi",),
         "ppi": ("ppi", "wpufd4"),
@@ -2681,6 +3247,41 @@ def _missing_matches_dataset(dataset_id: str, field: str) -> bool:
         "market_schedule": ("market_schedule",),
     }
     return any(token in lowered for token in tokens.get(dataset_id, ()))
+
+
+def _required_dataset_omissions_without_reason(
+    analytics: dict[str, Any],
+    missing_data: Any,
+) -> set[str]:
+    missing_items = (
+        missing_data
+        if isinstance(missing_data, list)
+        else []
+    )
+    omissions: set[str] = set()
+    for policy in DATASET_POLICIES:
+        if not policy.required_for_analysis:
+            continue
+        _, value = _dataset_delivery_value(
+            policy.dataset_id,
+            analytics,
+        )
+        if _substantive_delivery_present(policy.dataset_id, value):
+            continue
+        has_specific_reason = any(
+            isinstance(item, dict)
+            and _missing_matches_dataset(
+                policy.dataset_id,
+                str(item.get("field") or item.get("path") or ""),
+            )
+            and _specific_required_omission_reason(
+                item.get("reason_code")
+            )
+            for item in missing_items
+        )
+        if not has_specific_reason:
+            omissions.add(policy.dataset_id)
+    return omissions
 
 
 def _acquisition_accounting_row_complete(
@@ -2706,6 +3307,11 @@ def _acquisition_accounting_row_complete(
         or not item.get("database_lookup_reason")
         or not item.get("database_freshness_evaluation")
         or not item.get("acquisition_reason_code")
+    ):
+        return False
+    if (
+        policy.dataset_id == "flash_services_pmi"
+        and _flash_pmi_acquisition_observation_id(item) is None
     ):
         return False
     observed = parse_datetime(item.get("observed_at"))
@@ -2803,49 +3409,332 @@ def _provider_attempt_complete(attempt: Any) -> bool:
     )
 
 
+def _flash_pmi_acquisition_observation_id(
+    item: Any,
+) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    acquisition_id = str(item.get("acquisition_id") or "")
+    if not acquisition_id.startswith(FLASH_PMI_ACQUISITION_PREFIX):
+        return None
+    observation_id = acquisition_id.removeprefix(
+        FLASH_PMI_ACQUISITION_PREFIX
+    ).strip()
+    if not observation_id or observation_id == "NO_OCCURRENCE":
+        return None
+    return observation_id
+
+
+def _acquisition_delivery_observation_link_complete(
+    item: Any,
+) -> bool:
+    if (
+        not isinstance(item, dict)
+        or item.get("dataset_id") != "flash_services_pmi"
+    ):
+        return True
+    observation_id = _flash_pmi_acquisition_observation_id(item)
+    if observation_id is None:
+        return False
+    if item.get("selected_value_present") is not True:
+        return True
+    delivered = item.get("delivered_value")
+    if not isinstance(delivered, list):
+        return False
+    return bool(
+        len(delivered) == 1
+        and isinstance(delivered[0], dict)
+        and str(delivered[0].get("occurrence_id") or "")
+        == observation_id
+    )
+
+
 def _readiness(analytics: dict[str, Any]) -> dict[str, Any]:
-    statuses = {
-        name: str((analytics.get(name) or {}).get("status") or "UNAVAILABLE")
-        for name in SECTION_NAMES
-    }
     value_counts = {
-        name: _analytic_section_value_count(analytics.get(name))
+        name: _readiness_section_value_count(name, analytics)
         for name in SECTION_NAMES
     }
-    usable = [
+    statuses = {
+        name: _readiness_section_status(
+            (analytics.get(name) or {}).get("status"),
+            value_count=value_counts[name],
+        )
+        for name in SECTION_NAMES
+    }
+    available = [
         name
         for name in SECTION_NAMES
-        if value_counts[name] > 0
-        and statuses[name] not in {"UNAVAILABLE", "NO_DATA", "UNAVAILABLE_AFTER_RELEASE"}
+        if statuses[name] == "AVAILABLE"
     ]
     degraded = [
         name
-        for name in usable
+        for name in SECTION_NAMES
         if statuses[name] in {"PARTIAL", "DEGRADED"}
     ]
-    unavailable = [name for name in SECTION_NAMES if name not in usable]
-    coverage = round(len(usable) / len(SECTION_NAMES), 4)
+    unavailable = [
+        name
+        for name in SECTION_NAMES
+        if statuses[name] == "UNAVAILABLE"
+    ]
+    usable_count = len(available) + len(degraded)
+    coverage = round(usable_count / len(SECTION_NAMES), 4)
     return {
         "status": (
             "READY"
-            if len(usable) == len(SECTION_NAMES) and not degraded
+            if len(available) == len(SECTION_NAMES)
             else "PARTIAL"
-            if usable
+            if usable_count
             else "UNAVAILABLE"
         ),
         "calculated_from_delivered_payload": True,
-        "available_section_count": len(usable),
+        "available_section_count": len(available),
         "degraded_section_count": len(degraded),
         "unavailable_section_count": len(unavailable),
         "section_count": len(SECTION_NAMES),
         "coverage_ratio": coverage,
-        "sections_available": usable,
+        "sections_available": available,
         "sections_degraded": degraded,
         "sections_unavailable": unavailable,
         "section_status": statuses,
         "delivered_value_counts": value_counts,
         "excluded_values_contribute": False,
     }
+
+
+def _readiness_section_value_count(
+    section_name: str,
+    analytics: dict[str, Any],
+) -> int:
+    count = 0
+    for policy in DATASET_POLICIES:
+        if policy.section != section_name:
+            continue
+        _, delivered = _dataset_delivery_value(
+            policy.dataset_id,
+            analytics,
+        )
+        count += _substantive_dataset_delivery_count(
+            policy.dataset_id,
+            delivered,
+        )
+    return count
+
+
+def _substantive_dataset_delivery_count(
+    dataset_id: str,
+    delivered: Any,
+) -> int:
+    if dataset_id == "target_range":
+        return int(
+            isinstance(delivered, dict)
+            and any(
+                _finite_scalar_number_present(delivered.get(field))
+                for field in (
+                    "target_range_lower",
+                    "target_range_upper",
+                )
+            )
+        )
+    if dataset_id == "market_schedule":
+        return int(_readiness_market_schedule_present(delivered))
+    if dataset_id == "macro_calendar":
+        return sum(
+            1
+            for item in delivered or []
+            if _readiness_calendar_event_present(item)
+        )
+    if dataset_id == "earnings":
+        return sum(
+            1
+            for item in delivered or []
+            if _readiness_earnings_event_present(item)
+        )
+    if not _substantive_delivery_present(dataset_id, delivered):
+        return 0
+    if isinstance(delivered, list):
+        return sum(
+            1
+            for item in delivered
+            if _substantive_delivery_present(
+                dataset_id,
+                [item] if dataset_id == "current_news" else item,
+            )
+        )
+    return 1
+
+
+def _readiness_market_schedule_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if _nonempty_text_present(value.get("market_session_status")):
+        return True
+    return any(
+        isinstance(session, dict)
+        and (
+            _nonempty_text_present(session.get("status"))
+            or type(session.get("is_open")) is bool
+        )
+        for session in (
+            value.get("nasdaq_cash_session"),
+            value.get("mnq_futures_session"),
+        )
+    )
+
+
+def _readiness_calendar_event_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if any(
+        _nonempty_text_present(value.get(field))
+        for field in ("name", "event_name", "title")
+    ):
+        return True
+    return any(
+        _finite_scalar_number_present(value.get(field))
+        for field in (
+            "actual",
+            "consensus",
+            "previous",
+            "previous_revised",
+            "surprise_absolute",
+            "surprise_percent",
+        )
+    )
+
+
+def _readiness_earnings_event_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if any(
+        _finite_scalar_number_present(value.get(field))
+        for field in (
+            "eps_actual",
+            "eps_estimate",
+            "revenue_actual",
+            "revenue_estimate",
+        )
+    ):
+        return True
+    issuer_present = any(
+        _nonempty_text_present(value.get(field))
+        for field in (
+            "symbol",
+            "issuer",
+            "issuer_name",
+            "company",
+            "company_name",
+        )
+    )
+    event_time_present = any(
+        _valid_timestamp_present(value.get(field))
+        for field in (
+            "event_at",
+            "release_at",
+            "earnings_date",
+            "scheduled_date",
+            "date",
+        )
+    )
+    return issuer_present and event_time_present
+
+
+def _readiness_section_status(
+    producer_status: Any,
+    *,
+    value_count: int,
+) -> str:
+    if value_count <= 0:
+        return "UNAVAILABLE"
+    normalized = str(producer_status or "").strip().upper()
+    if normalized in {"PARTIAL", "DEGRADED"}:
+        return normalized
+    return "AVAILABLE"
+
+
+def _readiness_section_classification_mismatch_count(
+    readiness: Any,
+    analytics: dict[str, Any],
+) -> int:
+    if not isinstance(readiness, dict):
+        return len(SECTION_NAMES)
+
+    expected = _readiness(analytics)
+    actual_lists = {
+        key: value if isinstance(value, list) else []
+        for key, value in (
+            ("available", readiness.get("sections_available")),
+            ("degraded", readiness.get("sections_degraded")),
+            ("unavailable", readiness.get("sections_unavailable")),
+        )
+    }
+    expected_lists = {
+        "available": expected["sections_available"],
+        "degraded": expected["sections_degraded"],
+        "unavailable": expected["sections_unavailable"],
+    }
+    actual_statuses = (
+        readiness.get("section_status")
+        if isinstance(readiness.get("section_status"), dict)
+        else {}
+    )
+    actual_counts = (
+        readiness.get("delivered_value_counts")
+        if isinstance(readiness.get("delivered_value_counts"), dict)
+        else {}
+    )
+
+    mismatches = 0
+    for classification, values in actual_lists.items():
+        declared_count = readiness.get(
+            f"{classification}_section_count"
+        )
+        if declared_count != len(values):
+            mismatches += 1
+        if (
+            any(not isinstance(item, str) for item in values)
+            or len(values) != len(set(values))
+        ):
+            mismatches += 1
+    for name in SECTION_NAMES:
+        if tuple(
+            name in actual_lists[classification]
+            for classification in ("available", "degraded", "unavailable")
+        ) != tuple(
+            name in expected_lists[classification]
+            for classification in ("available", "degraded", "unavailable")
+        ):
+            mismatches += 1
+        if actual_statuses.get(name) != expected["section_status"][name]:
+            mismatches += 1
+        if actual_counts.get(name) != expected["delivered_value_counts"][name]:
+            mismatches += 1
+
+    expected_names = set(SECTION_NAMES)
+    mismatches += sum(
+        len(
+            {
+                item
+                for item in values
+                if isinstance(item, str) and item not in expected_names
+            }
+        )
+        for values in actual_lists.values()
+    )
+    mismatches += len(set(actual_statuses) - expected_names)
+    mismatches += len(set(actual_counts) - expected_names)
+    for key in (
+        "status",
+        "calculated_from_delivered_payload",
+        "available_section_count",
+        "degraded_section_count",
+        "unavailable_section_count",
+        "section_count",
+        "coverage_ratio",
+        "excluded_values_contribute",
+    ):
+        if readiness.get(key) != expected[key]:
+            mismatches += 1
+    return mismatches
 
 
 def _missing(
@@ -3471,8 +4360,8 @@ def _request_accounting_row_complete(
         return False
     return bool(
         _provider_flow_valid(item, policy=policy)
-        and
-        item.get("payload_freshness")
+        and _acquisition_delivery_observation_link_complete(item)
+        and item.get("payload_freshness")
         and not (
             item["selected_value_present"]
             and not item.get("selected_source")
@@ -3618,6 +4507,21 @@ def _latest_value(values: Iterable[dict[str, Any]], key: str) -> Any:
     if parsed:
         return max(parsed, key=lambda item: item[0])[1]
     return raw_values[-1] if raw_values else None
+
+
+def _earliest_datetime_value(
+    values: Iterable[dict[str, Any]],
+    key: str,
+) -> Any:
+    parsed: list[tuple[datetime, Any]] = []
+    for item in values:
+        value = item.get(key)
+        if value in {None, ""}:
+            continue
+        timestamp = parse_datetime(value)
+        if timestamp:
+            parsed.append((_utc(timestamp), value))
+    return min(parsed, key=lambda item: item[0])[1] if parsed else None
 
 
 def _latest_datetime_string(value: Any) -> str | None:

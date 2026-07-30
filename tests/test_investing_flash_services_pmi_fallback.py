@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 
 from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import (
     ProviderCacheRepository,
 )
-from app.providers.base import ProviderError
+from app.models.common import (
+    Freshness,
+    ProviderResult,
+    ProviderType,
+)
+from app.providers.base import ProviderError, metadata
 from app.providers.investing_flash_services_pmi import (
     INVESTING_BROWSER_USER_AGENT,
     SOURCE,
@@ -158,6 +166,348 @@ class _FailingFallback:
     async def fetch(self, **kwargs):
         del kwargs
         raise ProviderError("investing_flash_services_pmi_timeout")
+
+
+def _sp_global_result(
+    failure: str | None = None,
+) -> ProviderResult:
+    series: dict[str, Any] = {
+        "official_adapter": True,
+        "provider_adapter": "SPGLOBAL_OFFICIAL_API",
+        "source": "SPGLOBAL",
+        "source_originator": "S&P Global Market Intelligence",
+        "publisher": "S&P Global Market Intelligence",
+        "source_url": (
+            "https://www.pmi.spglobal.com/Public/Home/"
+            "PressRelease/controlled"
+        ),
+        "canonical_url": (
+            "https://www.pmi.spglobal.com/Public/Home/PressRelease"
+        ),
+        "source_domain": "pmi.spglobal.com",
+        "seasonal_adjustment": "SA",
+        "observations": [
+            {"period": "2026-06", "value": "51.2"},
+            {"period": "2026-07", "value": "53.6"},
+        ],
+    }
+    data: dict[str, Any] = {SERIES_ID: series}
+    if failure == "series_missing":
+        data = {}
+    elif failure == "adapter_mismatch":
+        series["provider_adapter"] = "UNVERIFIED_ADAPTER"
+    elif failure == "period_mismatch":
+        series["observations"] = [
+            {"period": "2026-05", "value": "50.8"},
+            {"period": "2026-06", "value": "51.2"},
+        ]
+    return ProviderResult(
+        metadata=metadata(
+            source="SPGLOBAL",
+            provider_type=ProviderType.API,
+            reliability=0.98,
+            data_as_of=datetime(2026, 7, 24, tzinfo=UTC),
+            freshness=Freshness.RECENT,
+        ),
+        data=data,
+    )
+
+
+class _PostHttpPrimary:
+    def __init__(
+        self,
+        failure: str | None,
+        call_order: list[str],
+    ) -> None:
+        self.failure = failure
+        self.call_order = call_order
+
+    async def fetch(self, **kwargs: Any) -> ProviderResult:
+        del kwargs
+        self.call_order.append("SPGLOBAL")
+        return _sp_global_result(self.failure)
+
+
+class _PostHttpFallback:
+    def __init__(self, call_order: list[str]) -> None:
+        self.call_order = call_order
+
+    async def fetch(self, **kwargs: Any) -> ProviderResult:
+        del kwargs
+        self.call_order.append(SOURCE)
+        return ProviderResult(
+            metadata=metadata(
+                source=SOURCE,
+                provider_type=ProviderType.API,
+                reliability=0.8,
+                freshness=Freshness.RECENT,
+                is_fallback=True,
+            ),
+            data={},
+        )
+
+
+def _investing_provider(
+    settings: Settings,
+    call_order: list[str],
+) -> InvestingFlashServicesPmiProvider:
+    body = FIXTURE.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_order.append(SOURCE)
+        return httpx.Response(
+            200,
+            content=body,
+            request=request,
+        )
+
+    return InvestingFlashServicesPmiProvider(
+        ProviderCacheRepository(settings.database_path),
+        settings,
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def _pmi_event() -> dict[str, Any]:
+    return {
+        "occurrence_id": "xtb:146945:2026-07-24",
+        "name": "Flash Services PMI",
+        "reference_period": "2026-07",
+        "release_at": "2026-07-24T13:45:00Z",
+        "forecast": 51.5,
+        "previous": 51.2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_primary_result"),
+    (
+        ("series_missing", "official_series_not_available"),
+        (
+            "adapter_mismatch",
+            (
+                "official_adapter_required:"
+                "observed=UNVERIFIED_ADAPTER"
+            ),
+        ),
+        ("period_mismatch", "period_mismatch"),
+    ),
+)
+def test_post_http_primary_rejection_calls_investing_in_order(
+    tmp_path: Path,
+    failure: str,
+    expected_primary_result: str,
+) -> None:
+    settings = _settings(tmp_path)
+    call_order: list[str] = []
+    resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            "SPGLOBAL": _PostHttpPrimary(
+                failure,
+                call_order,
+            ),
+            SOURCE: _investing_provider(settings, call_order),
+        },
+    )
+
+    result = resolver.resolve_event(
+        event_key="xtb:146945:2026-07-24",
+        event=_pmi_event(),
+        temporal_state={
+            "release_at": "2026-07-24T13:45:00Z"
+        },
+        persist_candidate=False,
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["provider"] == SOURCE
+    assert result["provider_call_count"] == 2
+    assert call_order == ["SPGLOBAL", SOURCE]
+    assert [
+        (
+            item["provider"],
+            item["called"],
+            item["attempts"],
+            item["result"],
+            item["execution_origin"],
+        )
+        for item in result["provider_attempts"]
+    ] == [
+        (
+            "SPGLOBAL",
+            True,
+            1,
+            expected_primary_result,
+            "PROVIDER_CALL",
+        ),
+        (SOURCE, True, 1, "SUCCESS", "PROVIDER_CALL"),
+    ]
+    assert result["results"][0]["acquisition_provider"] == SOURCE
+
+
+class _RejectFirstCandidate:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.accepted: dict[str, Any] | None = None
+
+    def accepted_official_actual(
+        self,
+        _event_key: str,
+    ) -> dict[str, Any] | None:
+        return self.accepted
+
+    def persist_candidate(
+        self,
+        *,
+        candidate: dict[str, Any],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        self.calls += 1
+        restored = {
+            **candidate,
+            "validation_status": (
+                "rejected" if self.calls == 1 else "accepted"
+            ),
+            "warnings": (
+                ["controlled_primary_candidate_rejection"]
+                if self.calls == 1
+                else []
+            ),
+        }
+        if restored["validation_status"] == "accepted":
+            self.accepted = restored
+        return restored
+
+
+def test_rejected_primary_candidate_calls_investing_once(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    call_order: list[str] = []
+    resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            "SPGLOBAL": _PostHttpPrimary(None, call_order),
+            SOURCE: _investing_provider(settings, call_order),
+        },
+    )
+    candidates = _RejectFirstCandidate()
+    resolver.candidates = candidates  # type: ignore[assignment]
+
+    result = resolver.resolve_event(
+        event_key="xtb:146945:2026-07-24",
+        event=_pmi_event(),
+        temporal_state={
+            "release_at": "2026-07-24T13:45:00Z"
+        },
+        persist_candidate=True,
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert call_order == ["SPGLOBAL", SOURCE]
+    assert candidates.calls == 2
+    assert [
+        item["result"]
+        for item in result["provider_attempts"]
+    ] == ["official_candidate_rejected", "SUCCESS"]
+
+
+class _MissingCandidateReadback:
+    def accepted_official_actual(
+        self,
+        _event_key: str,
+    ) -> None:
+        return None
+
+    def persist_candidate(
+        self,
+        *,
+        candidate: dict[str, Any],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        return {
+            **candidate,
+            "validation_status": "accepted",
+            "warnings": [],
+        }
+
+
+def test_primary_and_fallback_readback_failures_keep_complete_chain(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    call_order: list[str] = []
+    resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            "SPGLOBAL": _PostHttpPrimary(None, call_order),
+            SOURCE: _investing_provider(settings, call_order),
+        },
+    )
+    resolver.candidates = _MissingCandidateReadback()  # type: ignore[assignment]
+
+    result = resolver.resolve_event(
+        event_key="xtb:146945:2026-07-24",
+        event=_pmi_event(),
+        temporal_state={
+            "release_at": "2026-07-24T13:45:00Z"
+        },
+        persist_candidate=True,
+    )
+
+    assert result["status"] == "OFFICIAL_FEED_DELAYED"
+    assert call_order == ["SPGLOBAL", SOURCE]
+    assert result["provider_call_count"] == 2
+    assert [
+        item["result"]
+        for item in result["provider_attempts"]
+    ] == [
+        "official_candidate_read_back_failed",
+        "official_candidate_read_back_failed",
+    ]
+
+
+def test_post_http_failures_on_both_providers_are_accounted(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    call_order: list[str] = []
+    resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            "SPGLOBAL": _PostHttpPrimary(
+                "series_missing",
+                call_order,
+            ),
+            SOURCE: _PostHttpFallback(call_order),
+        },
+    )
+
+    result = resolver.resolve_event(
+        event_key="xtb:146945:2026-07-24",
+        event=_pmi_event(),
+        temporal_state={
+            "release_at": "2026-07-24T13:45:00Z"
+        },
+        persist_candidate=False,
+    )
+
+    assert result["status"] == "OFFICIAL_FEED_DELAYED"
+    assert result["results"] == []
+    assert result["provider_call_count"] == 2
+    assert call_order == ["SPGLOBAL", SOURCE]
+    assert [
+        (item["provider"], item["called"], item["result"])
+        for item in result["provider_attempts"]
+    ] == [
+        ("SPGLOBAL", True, "official_series_not_available"),
+        (SOURCE, True, "official_series_not_available"),
+    ]
+    assert result["fallback_reason_code"] == (
+        "all_flash_services_pmi_providers_failed:"
+        "official_series_not_available"
+    )
 
 
 def test_resolver_orders_primary_then_investing_and_preserves_both_forecasts(
