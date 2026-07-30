@@ -71,6 +71,9 @@ async def test_investing_fallback_preserves_exact_occurrence_and_field_lineage(
     assert series["distribution_source"] == "Investing.com"
     assert series["acquisition_provider"] == SOURCE
     assert set(series["field_lineage"]) == {"actual", "forecast", "previous"}
+    assert series["field_lineage"]["actual"]["reference_period"] == "2026-07"
+    assert series["field_lineage"]["forecast"]["reference_period"] == "2026-07"
+    assert series["field_lineage"]["previous"]["reference_period"] == "2026-06"
 
 
 async def test_investing_fallback_uses_verified_endpoint_http_contract(

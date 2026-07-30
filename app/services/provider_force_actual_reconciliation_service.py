@@ -1585,6 +1585,8 @@ def _macro_actual_item(
         "occurrence_id": occurrence_id,
         "event_id": occurrence_id,
         "canonical_event_key": occurrence_id,
+        "provider_event_id": event.get("provider_event_id"),
+        "provider_occurrence_id": event.get("provider_occurrence_id"),
         "name": event.get("name") or event.get("event_name"),
         "country": event.get("country"),
         "category": event.get("category"),

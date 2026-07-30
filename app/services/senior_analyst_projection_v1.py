@@ -13,7 +13,10 @@ from app.services.data_integrity_service import (
     news_content_status,
     substantive_news_text,
 )
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    _INVALID_LIFECYCLE_STATES,
+    parse_datetime,
+)
 from app.services.market_context_sync_service import extract_sync_sections
 from app.services.official_actual_semantics import normalize_reference_period
 from app.services.request_provider_accounting import (
@@ -776,21 +779,30 @@ def _project_calendar(
                 ["event_risk_analysis"],
             )
         for event in values:
+            field_reason_codes = event.pop("_field_reason_codes", {})
             identity = str(
                 event.get("occurrence_id")
                 or f"{event.get('metric_id')}@{event.get('release_at')}"
             )
-            for field, reason_code in (
+            required_fields = [
                 ("actual", "ACTUAL_NOT_AVAILABLE"),
                 ("consensus", "CONSENSUS_NOT_AVAILABLE"),
                 ("previous", "PREVIOUS_NOT_AVAILABLE"),
-            ):
+            ]
+            if "previous_revised" in field_reason_codes:
+                required_fields.append(
+                    (
+                        "previous_revised",
+                        "PREVIOUS_REVISION_NOT_AVAILABLE",
+                    )
+                )
+            for field, reason_code in required_fields:
                 if event.get(field) is None:
                     _missing(
                         missing,
                         f"calendar.{name}.{identity}.{field}",
                         "UNAVAILABLE",
-                        reason_code,
+                        field_reason_codes.get(field, reason_code),
                         event.get("release_at"),
                         ["event_risk_analysis"],
                     )
@@ -848,9 +860,19 @@ def _canonical_events(
             metric_id = "fomc_decision"
             reference_period = release.date().isoformat()
         key = (metric_id, release.isoformat(), reference_period)
-        event = _project_event(raw, release, metric_id, release_status)
+        event = _project_event(
+            raw,
+            release,
+            metric_id,
+            release_status,
+            now=now,
+        )
         current = selected.get(key)
-        if current is None or _event_completeness(event) > _event_completeness(current):
+        if (
+            current is None
+            or _event_selection_rank(event, mode=mode)
+            > _event_selection_rank(current, mode=mode)
+        ):
             selected[key] = event
     return sorted(
         selected.values(),
@@ -866,22 +888,131 @@ def _project_event(
     release: datetime,
     metric_id: str,
     release_status: str,
+    *,
+    now: datetime,
 ) -> dict[str, Any]:
-    actual = _number(raw.get("actual"))
-    consensus = _number(raw.get("consensus", raw.get("forecast")))
-    previous = _number(raw.get("previous"))
-    occurrence_match = _occurrence_fields_reconciled(raw)
+    selected_fields = {
+        "actual": (
+            "actual"
+            if raw.get("actual") not in (None, "")
+            else None
+        ),
+        "consensus": (
+            "consensus"
+            if raw.get("consensus") not in (None, "")
+            else "forecast"
+            if raw.get("forecast") not in (None, "")
+            else None
+        ),
+        "previous": (
+            "previous"
+            if raw.get("previous") not in (None, "")
+            else None
+        ),
+        "previous_revised": (
+            "previous_revised"
+            if raw.get("previous_revised") not in (None, "")
+            else "revised_previous"
+            if raw.get("revised_previous") not in (None, "")
+            else None
+        ),
+    }
+    lineage, field_reason_codes = _usable_event_field_lineage(
+        raw,
+        selected_fields=selected_fields,
+        now=now,
+    )
+    record_reason = _event_lineage_rejection_reason(raw, now=now)
+    if record_reason:
+        lineage = []
+        field_reason_codes.update(
+            {
+                output_field: record_reason
+                for output_field, selected_field in selected_fields.items()
+                if selected_field is not None
+            }
+        )
+    actual = (
+        None
+        if "actual" in field_reason_codes
+        else _number(raw.get("actual"))
+    )
+    consensus = (
+        None
+        if "consensus" in field_reason_codes
+        else _number(
+            raw.get("consensus")
+            if selected_fields["consensus"] == "consensus"
+            else raw.get("forecast")
+        )
+    )
+    previous = (
+        None
+        if "previous" in field_reason_codes
+        else _number(raw.get("previous"))
+    )
+    previous_revised = (
+        None
+        if "previous_revised" in field_reason_codes
+        else _number(
+            raw.get("previous_revised")
+            if selected_fields["previous_revised"] == "previous_revised"
+            else raw.get("revised_previous")
+        )
+    )
+    occurrence_match = _occurrence_fields_reconciled(
+        lineage,
+        expected_occurrence_ids=(
+            raw.get("occurrence_id"),
+            raw.get("event_id"),
+            raw.get("canonical_event_key"),
+            raw.get("provider_occurrence_id"),
+            raw.get("source_occurrence_id"),
+            raw.get("source_event_id"),
+        ),
+    )
+    reference_period_match = _event_reference_periods_reconciled(
+        lineage,
+        event_reference_period=(
+            raw.get("reference_period")
+            or raw.get("period")
+        ),
+        frequency=str(raw.get("frequency") or "monthly"),
+        release=release,
+    )
     surprise = (
         actual - consensus
-        if actual is not None and consensus is not None and occurrence_match
+        if (
+            actual is not None
+            and consensus is not None
+            and occurrence_match
+            and reference_period_match
+        )
         else None
     )
-    reason = None
+    reason = field_reason_codes.get("actual")
     if not occurrence_match:
         reason = "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
-        actual = consensus = previous = surprise = None
+        actual = consensus = previous = previous_revised = surprise = None
+    elif not reference_period_match:
+        reason = "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH"
+        field_reason_codes.update(
+            {
+                "actual": reason,
+                "consensus": reason,
+            }
+        )
+        lineage = [
+            item
+            for item in lineage
+            if str(item.get("field") or "").strip().lower()
+            not in {"actual", "consensus", "forecast"}
+        ]
+        actual = consensus = surprise = None
     return {
         "occurrence_id": raw.get("occurrence_id") or raw.get("event_id"),
+        "provider_event_id": raw.get("provider_event_id"),
+        "provider_occurrence_id": raw.get("provider_occurrence_id"),
         "metric_id": metric_id,
         "name": raw.get("name") or raw.get("event_name"),
         "release_at": release.isoformat(),
@@ -891,9 +1022,7 @@ def _project_event(
         "actual": actual,
         "consensus": consensus,
         "previous": previous,
-        "previous_revised": _number(
-            raw.get("previous_revised", raw.get("revised_previous"))
-        ),
+        "previous_revised": previous_revised,
         "surprise_absolute": surprise,
         "surprise_percent": (
             round((surprise / abs(consensus)) * 100, 6)
@@ -931,7 +1060,8 @@ def _project_event(
         "invalid_period_mapping": False,
         "source": _source(raw),
         "reason_code": reason,
-        "lineage": _field_lineage(raw),
+        "lineage": lineage,
+        "_field_reason_codes": field_reason_codes,
     }
 
 
@@ -3798,17 +3928,65 @@ def _is_fomc(event: dict[str, Any]) -> bool:
     return "fomc" in text or "federal open market" in text
 
 
-def _occurrence_fields_reconciled(event: dict[str, Any]) -> bool:
-    occurrence_ids: set[str] = set()
-    for key in ("field_lineage", "lineage"):
-        raw = event.get(key)
-        if not isinstance(raw, dict):
+def _occurrence_fields_reconciled(
+    lineage: list[dict[str, Any]],
+    *,
+    expected_occurrence_ids: Iterable[Any],
+) -> bool:
+    occurrence_ids = {
+        str(item["occurrence_id"])
+        for item in lineage
+        if item.get("occurrence_id")
+    }
+    expected = {
+        str(item)
+        for item in expected_occurrence_ids
+        if item not in (None, "")
+    }
+    if not occurrence_ids:
+        return True
+    if not expected:
+        return len(occurrence_ids) <= 1
+    if not occurrence_ids <= expected:
+        return False
+    return len(expected) > 1 or len(occurrence_ids) <= 1
+
+
+def _event_reference_periods_reconciled(
+    lineage: list[dict[str, Any]],
+    *,
+    event_reference_period: Any,
+    frequency: str,
+    release: datetime,
+) -> bool:
+    expected = normalize_reference_period(
+        event_reference_period,
+        frequency=frequency,
+        release_date=release,
+    )
+    observed: set[str] = set()
+    for item in lineage:
+        field = str(item.get("field") or "").strip().lower()
+        if field not in {"actual", "consensus", "forecast"}:
             continue
-        for field in ("actual", "consensus", "forecast", "previous"):
-            item = raw.get(field)
-            if isinstance(item, dict) and item.get("occurrence_id"):
-                occurrence_ids.add(str(item["occurrence_id"]))
-    return len(occurrence_ids) <= 1
+        raw_period = item.get("reference_period") or item.get("period")
+        if raw_period in (None, ""):
+            continue
+        normalized = normalize_reference_period(
+            raw_period,
+            frequency=frequency,
+            release_date=release,
+        )
+        if normalized:
+            observed.add(normalized)
+    return bool(
+        len(observed) <= 1
+        and (
+            not observed
+            or expected is None
+            or observed == {expected}
+        )
+    )
 
 
 def _fomc_probabilities(context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3867,6 +4045,310 @@ def _field_lineage(value: Any) -> list[dict[str, Any]]:
         ]
     source = _source(value)
     return [{"field": "value", "source": source}] if source else []
+
+
+def _usable_event_field_lineage(
+    value: dict[str, Any],
+    *,
+    selected_fields: dict[str, str | None],
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    aliases = {
+        "actual": ("actual",),
+        "consensus": ("consensus", "forecast"),
+        "forecast": ("forecast", "consensus"),
+        "previous": ("previous",),
+        "previous_revised": (
+            "previous_revised",
+            "revised_previous",
+        ),
+        "revised_previous": (
+            "revised_previous",
+            "previous_revised",
+        ),
+    }
+    by_field: dict[str, list[dict[str, Any]]] = {}
+    generic: list[dict[str, Any]] = []
+    for raw in _field_lineage(value):
+        item = deepcopy(raw)
+        field = str(item.get("field") or "").strip().lower()
+        if field in {
+            "actual",
+            "consensus",
+            "forecast",
+            "previous",
+            "previous_revised",
+            "revised_previous",
+        }:
+            by_field.setdefault(field, []).append(item)
+        else:
+            generic.append(item)
+
+    usable: list[dict[str, Any]] = []
+    rejected_reasons: dict[str, str] = {}
+    for output_field, selected_field in selected_fields.items():
+        if selected_field is None:
+            continue
+        selected_value = value.get(selected_field)
+        selected_lineage = list(by_field.get(selected_field) or [])
+        if not selected_lineage:
+            alias_lineage: list[dict[str, Any]] = []
+            for alias in aliases[selected_field][1:]:
+                candidates = list(by_field.get(alias) or [])
+                if not candidates:
+                    continue
+                alias_value = value.get(alias)
+                alias_matches = (
+                    alias_value not in (None, "")
+                    and _event_values_equal(alias_value, selected_value)
+                )
+                evidence_matches = any(
+                    _event_lineage_value_matches(item, selected_value)
+                    for item in candidates
+                )
+                if alias_matches or evidence_matches:
+                    alias_lineage.extend(candidates)
+                else:
+                    rejected_reasons[output_field] = (
+                        "FIELD_LINEAGE_VALUE_NOT_RECONCILED"
+                    )
+            selected_lineage = alias_lineage
+        if not selected_lineage and output_field in rejected_reasons:
+            continue
+        candidates = selected_lineage or generic
+        if not candidates:
+            continue
+        using_generic_lineage = not selected_lineage
+        selected_usable, rejection_reason = (
+            _assess_event_lineage_candidates(
+                candidates,
+                selected_value=selected_value,
+                now=now,
+                require_all_consistent=using_generic_lineage,
+            )
+        )
+        if rejection_reason:
+            rejected_reasons[output_field] = rejection_reason
+        else:
+            usable.extend(selected_usable)
+
+    deduplicated: list[dict[str, Any]] = []
+    fingerprints: set[str] = set()
+    for item in usable:
+        fingerprint = json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if fingerprint not in fingerprints:
+            fingerprints.add(fingerprint)
+            deduplicated.append(item)
+    return deduplicated, rejected_reasons
+
+
+def _assess_event_lineage_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    selected_value: Any,
+    now: datetime,
+    require_all_consistent: bool,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if require_all_consistent:
+        rejected = [
+            reason
+            for item in candidates
+            if (reason := _event_lineage_rejection_reason(item, now=now))
+            is not None
+        ]
+        if rejected:
+            return [], _worst_event_lineage_reason(rejected)
+        explicit_values = [
+            evidence_value
+            for item in candidates
+            if (evidence_value := _event_lineage_value(item))
+            is not _MISSING
+        ]
+        if explicit_values and not all(
+            _event_values_equal(item, selected_value)
+            for item in explicit_values
+        ):
+            return [], "FIELD_LINEAGE_VALUE_NOT_RECONCILED"
+        return candidates, None
+
+    matching: list[dict[str, Any]] = []
+    unspecified: list[dict[str, Any]] = []
+    explicit_value_seen = False
+    for item in candidates:
+        evidence_value = _event_lineage_value(item)
+        if evidence_value is _MISSING:
+            unspecified.append(item)
+            continue
+        explicit_value_seen = True
+        if _event_values_equal(evidence_value, selected_value):
+            matching.append(item)
+    if matching:
+        relevant = [*matching, *unspecified]
+    elif explicit_value_seen:
+        return [], "FIELD_LINEAGE_VALUE_NOT_RECONCILED"
+    else:
+        relevant = unspecified
+    rejected = [
+        reason
+        for item in relevant
+        if (reason := _event_lineage_rejection_reason(item, now=now))
+        is not None
+    ]
+    if rejected:
+        return [], _worst_event_lineage_reason(rejected)
+    return relevant, None
+
+
+_MISSING = object()
+
+
+def _event_lineage_value(value: dict[str, Any]) -> Any:
+    if "value" in value and value.get("value") not in (None, ""):
+        return value["value"]
+    for field in (
+        "actual",
+        "consensus",
+        "forecast",
+        "previous",
+        "previous_revised",
+        "revised_previous",
+    ):
+        if value.get(field) not in (None, ""):
+            return value[field]
+    return _MISSING
+
+
+def _event_lineage_value_matches(
+    value: dict[str, Any],
+    expected: Any,
+) -> bool:
+    observed = _event_lineage_value(value)
+    return (
+        observed is not _MISSING
+        and _event_values_equal(observed, expected)
+    )
+
+
+def _event_values_equal(left: Any, right: Any) -> bool:
+    left_number = _number(left)
+    right_number = _number(right)
+    if left_number is not None and right_number is not None:
+        return left_number == right_number
+    return left == right
+
+
+def _event_lineage_rejection_reason(
+    value: dict[str, Any],
+    *,
+    now: datetime,
+) -> str | None:
+    reasons: list[str] = []
+    states = {
+        str(value.get(field) or "").strip().upper()
+        for field in (
+            "freshness",
+            "freshness_state",
+            "lifecycle_status",
+            "status",
+        )
+        if value.get(field) not in (None, "")
+    }
+    invalid_lifecycle_states = (
+        _INVALID_LIFECYCLE_STATES
+        | {"EXHAUSTED_NO_DATA"}
+    )
+    if "REJECTED_FUTURE" in states:
+        reasons.append("FIELD_LINEAGE_REJECTED_FUTURE")
+    if states & invalid_lifecycle_states:
+        reasons.append("FIELD_LINEAGE_CONTENT_NOT_CURRENT")
+
+    validation = (
+        value.get("validation")
+        if isinstance(value.get("validation"), dict)
+        else {}
+    )
+    validation_statuses = {
+        str(item).strip().upper()
+        for item in (
+            validation.get("status"),
+            value.get("validation_status"),
+        )
+        if item not in (None, "")
+    }
+    accepted_validation_states = {
+        "ACCEPTED",
+        "APPROVED",
+        "DETERMINISTIC_VERIFIED",
+        "FIELD_LEVEL_VALIDATED",
+        "PASSED",
+        "VALID",
+        "VERIFIED",
+    }
+    if (
+        validation_statuses
+        and not validation_statuses <= accepted_validation_states
+    ):
+        reasons.append("FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED")
+
+    for field in ("content_valid_until", "valid_until"):
+        raw_timestamp = value.get(field)
+        if raw_timestamp in (None, ""):
+            continue
+        content_valid_until = parse_datetime(raw_timestamp)
+        if content_valid_until is None:
+            reasons.append("FIELD_LINEAGE_TIMESTAMP_INVALID")
+            continue
+        if (
+            _utc(content_valid_until) < now
+        ):
+            reasons.append("FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED")
+
+    for field in ("data_as_of", "observed_at"):
+        raw_timestamp = value.get(field)
+        if raw_timestamp in (None, ""):
+            continue
+        data_as_of = parse_datetime(raw_timestamp)
+        if data_as_of is None:
+            reasons.append("FIELD_LINEAGE_TIMESTAMP_INVALID")
+            continue
+        if (
+            _utc(data_as_of) > now + timedelta(minutes=5)
+        ):
+            reasons.append("FIELD_LINEAGE_REJECTED_FUTURE")
+
+    for field in ("refresh_due_at", "next_refresh_at"):
+        raw_timestamp = value.get(field)
+        if raw_timestamp in (None, ""):
+            continue
+        refresh_due_at = parse_datetime(raw_timestamp)
+        if refresh_due_at is None:
+            reasons.append("FIELD_LINEAGE_TIMESTAMP_INVALID")
+            continue
+        if _utc(refresh_due_at) <= now:
+            reasons.append("FIELD_LINEAGE_REFRESH_DUE")
+    return _worst_event_lineage_reason(reasons) if reasons else None
+
+
+def _worst_event_lineage_reason(reasons: Iterable[str]) -> str:
+    priority = {
+        "FIELD_LINEAGE_REJECTED_FUTURE": 0,
+        "FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED": 1,
+        "FIELD_LINEAGE_TIMESTAMP_INVALID": 2,
+        "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED": 3,
+        "FIELD_LINEAGE_REFRESH_DUE": 4,
+        "FIELD_LINEAGE_CONTENT_NOT_CURRENT": 5,
+        "FIELD_LINEAGE_VALUE_NOT_RECONCILED": 6,
+    }
+    return min(
+        (str(reason) for reason in reasons),
+        key=lambda reason: (priority.get(reason, 99), reason),
+    )
 
 
 def _datum_has_value(value: dict[str, Any]) -> bool:
@@ -4388,6 +4870,17 @@ def _event_completeness(item: dict[str, Any]) -> int:
     return sum(
         item.get(key) is not None
         for key in ("actual", "consensus", "previous", "reference_period", "source")
+    )
+
+
+def _event_selection_rank(
+    item: dict[str, Any],
+    *,
+    mode: str,
+) -> tuple[int, int]:
+    return (
+        int(mode == "latest_release" and item.get("actual") is not None),
+        _event_completeness(item),
     )
 
 

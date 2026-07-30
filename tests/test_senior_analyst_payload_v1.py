@@ -322,6 +322,866 @@ def test_calendar_deduplicates_and_never_combines_occurrences_for_surprise() -> 
     assert event["reason_code"] == "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
 
 
+def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=5)
+    occurrence_id = "xtb:new-home-sales:2026-07"
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": occurrence_id,
+                "metric_id": "new_home_sales",
+                "name": "New Home Sales",
+                "release_at": release.isoformat(),
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "actual": 628.0,
+                "actual_is_official": True,
+                "actual_source": "FRED",
+                "consensus": 610.0,
+                "previous": 580.0,
+                "freshness": "CURRENT_RELEASE",
+                "source": "XTB Economic Calendar",
+                "field_lineage": {
+                    "consensus": {
+                        "source": "XTB Economic Calendar",
+                        "retrieved_at": (
+                            release - timedelta(days=2)
+                        ).isoformat(),
+                        "freshness": "STALE",
+                        "value": 610.0,
+                    },
+                    "previous": {
+                        "source": "XTB Economic Calendar",
+                        "retrieved_at": (
+                            release - timedelta(days=2)
+                        ).isoformat(),
+                        "freshness": "STALE",
+                        "value": 580.0,
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] == 628.0
+    assert event["actual_is_official"] is True
+    assert event["actual_source"] == "FRED"
+    assert event["consensus"] is None
+    assert event["previous"] is None
+    assert event["surprise_absolute"] is None
+    assert event["lineage"] == []
+    assert "_field_reason_codes" not in event
+    assert not _walk_invalid_states(payload["analytics"])
+    assert {
+        (
+            item["field"],
+            item["reason_code"],
+        )
+        for item in payload["missing_data"]
+        if occurrence_id in item["field"]
+    } >= {
+        (
+            "calendar.latest_released_events."
+            f"{occurrence_id}.consensus",
+            "FIELD_LINEAGE_CONTENT_NOT_CURRENT",
+        ),
+        (
+            "calendar.latest_released_events."
+            f"{occurrence_id}.previous",
+            "FIELD_LINEAGE_CONTENT_NOT_CURRENT",
+        ),
+    }
+    assert validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )["checks"]["expired_values_delivered"] == 0
+
+
+def test_released_event_excludes_field_with_expired_lineage_deadline() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=2)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "calendar:released:expired-consensus",
+                "metric_id": "consumer_confidence",
+                "name": "Consumer Confidence",
+                "release_at": release.isoformat(),
+                "reference_period": "2026-07",
+                "release_status": "RELEASED",
+                "actual": 97.2,
+                "consensus": 96.0,
+                "previous_revised": 95.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "consensus": {
+                        "source": "Market Calendar",
+                        "freshness": "CURRENT",
+                        "content_valid_until": (
+                            FIXED_NOW + timedelta(hours=1)
+                        ).isoformat(),
+                        "valid_until": (
+                            FIXED_NOW - timedelta(seconds=1)
+                        ).isoformat(),
+                        "value": 96.0,
+                    },
+                    "previous_revised": {
+                        "source": "Market Calendar",
+                        "freshness": "CURRENT",
+                        "valid_until": (
+                            FIXED_NOW - timedelta(seconds=1)
+                        ).isoformat(),
+                        "value": 95.0,
+                    }
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] == 97.2
+    assert event["consensus"] is None
+    assert event["previous_revised"] is None
+    assert event["surprise_absolute"] is None
+    assert event["lineage"] == []
+    assert any(
+        item["field"].endswith(".consensus")
+        and item["reason_code"]
+        == "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED"
+        for item in payload["missing_data"]
+    )
+    assert any(
+        item["field"].endswith(".previous_revised")
+        and item["reason_code"]
+        == "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED"
+        for item in payload["missing_data"]
+    )
+    assert validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )["checks"]["expired_values_delivered"] == 0
+
+
+def test_event_lineage_aliases_cannot_validate_a_different_raw_field() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "occurrence-a",
+                "metric_id": "new_home_sales",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 628.0,
+                "consensus": 610.0,
+                "forecast": 620.0,
+                "previous": 580.0,
+                "previous_revised": 590.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                    },
+                    "consensus": {
+                        "occurrence_id": "occurrence-b",
+                        "freshness": "STALE",
+                    },
+                    "forecast": {
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                    },
+                    "previous": {"freshness": "STALE"},
+                    "previous_revised": {
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] == 628.0
+    assert event["consensus"] is None
+    assert event["previous"] is None
+    assert event["previous_revised"] == 590.0
+    assert event["surprise_absolute"] is None
+    assert event["reason_code"] is None
+    assert {
+        item["field"]
+        for item in event["lineage"]
+    } == {"actual", "previous_revised"}
+    assert not _walk_invalid_states(payload["analytics"])
+
+
+def test_alias_lineage_requires_the_selected_raw_value_to_match() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "consensus": 90.0,
+                "forecast": 80.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 100.0,
+                    },
+                    "forecast": {
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 80.0,
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] == 100.0
+    assert event["consensus"] is None
+    assert event["surprise_absolute"] is None
+    assert [item["field"] for item in event["lineage"]] == ["actual"]
+    assert any(
+        item["field"].endswith(".consensus")
+        and item["reason_code"]
+        == "FIELD_LINEAGE_VALUE_NOT_RECONCILED"
+        for item in payload["missing_data"]
+    )
+
+
+def test_mixed_lineage_cannot_launder_the_selected_stale_value() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": [
+                    {
+                        "field": "actual",
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT",
+                        "value": 90.0,
+                    },
+                    {
+                        "field": "actual",
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "STALE",
+                        "value": 100.0,
+                    },
+                ],
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["reason_code"] == "FIELD_LINEAGE_CONTENT_NOT_CURRENT"
+    assert event["lineage"] == []
+    assert any(
+        item["field"].endswith(".actual")
+        and item["reason_code"] == "FIELD_LINEAGE_CONTENT_NOT_CURRENT"
+        for item in payload["missing_data"]
+    )
+
+
+def test_generic_stale_event_lineage_nulls_every_unproven_value() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW + timedelta(minutes=30)
+    source["sections"]["event_calendar"] = {
+        "next_24h_events": [
+            {
+                "occurrence_id": "calendar:generic-stale",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "SCHEDULED",
+                "actual": 97.2,
+                "consensus": 96.0,
+                "previous": 95.5,
+                "freshness": "CURRENT",
+                "lineage": [
+                    {
+                        "field": "value",
+                        "freshness": "STALE",
+                        "source": "Market Calendar",
+                    }
+                ],
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["next_24h_events"][0]
+
+    assert event["actual"] is None
+    assert event["consensus"] is None
+    assert event["previous"] is None
+    assert event["surprise_absolute"] is None
+    assert event["lineage"] == []
+    assert not _walk_invalid_states(payload["analytics"])
+    assert sum(
+        item["reason_code"] == "FIELD_LINEAGE_CONTENT_NOT_CURRENT"
+        for item in payload["missing_data"]
+        if "calendar.next_24h_events.calendar:generic-stale"
+        in item["field"]
+    ) == 3
+
+
+def test_mixed_generic_lineage_is_fail_closed_for_all_values() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW + timedelta(hours=1)
+    source["sections"]["event_calendar"] = {
+        "next_24h_events": [
+            {
+                "occurrence_id": "calendar:mixed-generic-lineage",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "SCHEDULED",
+                "consensus": 100.0,
+                "previous": 90.0,
+                "freshness": "CURRENT",
+                "lineage": [
+                    {
+                        "field": "value",
+                        "freshness": "CURRENT",
+                        "value": 100.0,
+                    },
+                    {
+                        "field": "value",
+                        "freshness": "STALE",
+                        "value": 90.0,
+                    },
+                ],
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["next_24h_events"][0]
+
+    assert event["consensus"] is None
+    assert event["previous"] is None
+    assert event["lineage"] == []
+    assert not _walk_invalid_states(payload["analytics"])
+
+
+def test_contradictory_lineage_markers_and_rejected_occurrence_are_ignored() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 97.2,
+                "forecast": 96.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": "occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                    },
+                    "forecast": {
+                        "occurrence_id": "occurrence-b",
+                        "freshness": "CURRENT",
+                        "freshness_state": "STALE",
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] == 97.2
+    assert event["consensus"] is None
+    assert event["surprise_absolute"] is None
+    assert event["reason_code"] is None
+    assert [item["field"] for item in event["lineage"]] == ["actual"]
+    assert not _walk_invalid_states(payload["analytics"])
+
+
+def test_usable_lineage_occurrence_must_match_the_event_occurrence() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "consensus": 90.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": "occurrence-b",
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 100.0,
+                    },
+                    "consensus": {
+                        "occurrence_id": "occurrence-b",
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 90.0,
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["consensus"] is None
+    assert event["surprise_absolute"] is None
+    assert event["reason_code"] == "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
+
+
+def test_explicit_provider_occurrence_crosswalk_is_accepted() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "provider_event_id": 1062,
+                "provider_occurrence_id": 552847,
+                "metric_id": "flash_services_pmi",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 53.6,
+                "forecast": 51.3,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": 552847,
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 53.6,
+                    },
+                    "forecast": {
+                        "occurrence_id": "canonical-occurrence-a",
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 51.3,
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["occurrence_id"] == "canonical-occurrence-a"
+    assert event["provider_event_id"] == 1062
+    assert event["provider_occurrence_id"] == 552847
+    assert event["actual"] == 53.6
+    assert event["consensus"] == 51.3
+    assert event["surprise_absolute"] == pytest.approx(2.3)
+    assert event["reason_code"] is None
+
+
+def test_latest_release_deduplication_prefers_a_valid_actual() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    common = {
+        "occurrence_id": "canonical-occurrence-a",
+        "metric_id": "consumer_confidence",
+        "release_at": release.isoformat(),
+        "reference_period": "2026-07",
+        "release_status": "RELEASED",
+        "actual": 100.0,
+        "freshness": "CURRENT_RELEASE",
+    }
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                **common,
+                "consensus": 90.0,
+                "previous": 89.0,
+                "source": "Stale Candidate",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": "STALE",
+                        "value": 100.0,
+                    },
+                    "consensus": {
+                        "freshness": "CURRENT",
+                        "value": 90.0,
+                    },
+                    "previous": {
+                        "freshness": "CURRENT",
+                        "value": 89.0,
+                    },
+                },
+            },
+            {
+                **common,
+                "source": "Current Candidate",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 100.0,
+                    }
+                },
+            },
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    events = payload["analytics"]["calendar"]["latest_released_events"]
+
+    assert len(events) == 1
+    assert events[0]["actual"] == 100.0
+    assert events[0]["source"]["publisher"] == "Current Candidate"
+
+
+@pytest.mark.parametrize(
+    ("lineage_patch", "reason_code"),
+    [
+        (
+            {"content_valid_until": "not-a-date"},
+            "FIELD_LINEAGE_TIMESTAMP_INVALID",
+        ),
+        (
+            {"data_as_of": "not-a-date"},
+            "FIELD_LINEAGE_TIMESTAMP_INVALID",
+        ),
+        (
+            {"validation": {"status": "rejected"}},
+            "FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED",
+        ),
+        (
+            {"validation": {"status": "quarantined"}},
+            "FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED",
+        ),
+    ],
+)
+def test_malformed_or_rejected_lineage_is_fail_closed(
+    lineage_patch: dict,
+    reason_code: str,
+) -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": "CURRENT",
+                        "value": 100.0,
+                        **lineage_patch,
+                    }
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["reason_code"] == reason_code
+    assert event["lineage"] == []
+    assert any(
+        item["field"].endswith(".actual")
+        and item["reason_code"] == reason_code
+        for item in payload["missing_data"]
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_patch",
+    [
+        {"lifecycle_status": "STALE"},
+        {
+            "content_valid_until": (
+                FIXED_NOW + timedelta(hours=1)
+            ).isoformat(),
+            "valid_until": (
+                FIXED_NOW - timedelta(seconds=1)
+            ).isoformat(),
+        },
+    ],
+)
+def test_raw_event_lifecycle_and_all_deadline_aliases_are_enforced(
+    raw_patch: dict,
+) -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "freshness": "CURRENT_RELEASE",
+                "source": "Market Calendar",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": "CURRENT",
+                        "value": 100.0,
+                    }
+                },
+                **raw_patch,
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["lineage"] == []
+    assert event["reason_code"] in {
+        "FIELD_LINEAGE_CONTENT_NOT_CURRENT",
+        "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED",
+    }
+
+
+def test_due_field_lineage_cannot_remain_selected() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": "CURRENT",
+                        "value": 100.0,
+                        "content_valid_until": (
+                            FIXED_NOW + timedelta(hours=1)
+                        ).isoformat(),
+                        "refresh_due_at": (
+                            FIXED_NOW - timedelta(seconds=1)
+                        ).isoformat(),
+                    }
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["reason_code"] == "FIELD_LINEAGE_REFRESH_DUE"
+
+
+def test_actual_and_consensus_reference_periods_must_reconcile() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "reference_period": "2026-07",
+                "frequency": "monthly",
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "consensus": 90.0,
+                "previous": 89.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": "canonical-occurrence-a",
+                        "reference_period": "2026-07",
+                        "freshness": "CURRENT",
+                        "value": 100.0,
+                    },
+                    "consensus": {
+                        "occurrence_id": "canonical-occurrence-a",
+                        "reference_period": "2026-06",
+                        "freshness": "CURRENT",
+                        "value": 90.0,
+                    },
+                    "previous": {
+                        "occurrence_id": "canonical-occurrence-a",
+                        "reference_period": "2026-06",
+                        "freshness": "CURRENT",
+                        "value": 89.0,
+                    },
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["consensus"] is None
+    assert event["previous"] == 89.0
+    assert event["surprise_absolute"] is None
+    assert event["reason_code"] == (
+        "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH"
+    )
+    assert [item["field"] for item in event["lineage"]] == ["previous"]
+
+
+@pytest.mark.parametrize(
+    "lifecycle_state",
+    [
+        "HISTORICAL",
+        "NOT_FOUND",
+        "NOT_CONFIGURED",
+        "DISABLED",
+        "RESTRICTED",
+        "NOT_CALLED",
+        "EXHAUSTED_NO_DATA",
+    ],
+)
+def test_canonical_invalid_lineage_states_are_fail_closed(
+    lifecycle_state: str,
+) -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": lifecycle_state,
+                        "value": 100.0,
+                    }
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] is None
+    assert event["reason_code"] == "FIELD_LINEAGE_CONTENT_NOT_CURRENT"
+
+
+def test_verified_field_lineage_is_accepted() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-occurrence-a",
+                "metric_id": "consumer_confidence",
+                "release_at": release.isoformat(),
+                "release_status": "RELEASED",
+                "actual": 100.0,
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "freshness": "CURRENT",
+                        "value": 100.0,
+                        "validation": {"status": "VERIFIED"},
+                    }
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["actual"] == 100.0
+    assert event["reason_code"] is None
+
+
+def test_lineage_rejection_reason_uses_deterministic_worst_state() -> None:
+    reasons: list[str | None] = []
+    for states in (
+        ("STALE", "REJECTED_FUTURE"),
+        ("REJECTED_FUTURE", "STALE"),
+    ):
+        source = _synthetic_sync()
+        release = FIXED_NOW - timedelta(days=1)
+        source["sections"]["event_calendar"] = {
+            "recently_released_events": [
+                {
+                    "occurrence_id": "canonical-occurrence-a",
+                    "metric_id": "consumer_confidence",
+                    "release_at": release.isoformat(),
+                    "release_status": "RELEASED",
+                    "actual": 100.0,
+                    "freshness": "CURRENT_RELEASE",
+                    "field_lineage": [
+                        {
+                            "field": "actual",
+                            "freshness": state,
+                            "value": 100.0,
+                        }
+                        for state in states
+                    ],
+                }
+            ]
+        }
+        payload = build_senior_analyst_payload_v1(
+            source,
+            now=FIXED_NOW,
+        )
+        reasons.append(
+            payload["analytics"]["calendar"][
+                "latest_released_events"
+            ][0]["reason_code"]
+        )
+
+    assert reasons == [
+        "FIELD_LINEAGE_REJECTED_FUTURE",
+        "FIELD_LINEAGE_REJECTED_FUTURE",
+    ]
+
+
 def test_past_awaiting_actual_and_invalid_period_mappings_are_excluded() -> None:
     source = _synthetic_sync()
     source["sections"]["event_calendar"]["next_24h_events"] = [

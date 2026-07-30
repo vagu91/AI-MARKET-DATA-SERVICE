@@ -148,6 +148,7 @@ class InvestingFlashServicesPmiProvider(BaseProvider):
                 "actual": {
                     "event_id": EVENT_ID,
                     "occurrence_id": occurrence.get("occurrence_id"),
+                    "reference_period": period,
                     "publisher": "S&P Global",
                     "distributor": "Investing.com",
                     "acquisition_provider": SOURCE,
@@ -156,6 +157,7 @@ class InvestingFlashServicesPmiProvider(BaseProvider):
                 "forecast": {
                     "event_id": EVENT_ID,
                     "occurrence_id": occurrence.get("occurrence_id"),
+                    "reference_period": period,
                     "publisher": "S&P Global",
                     "distributor": "Investing.com",
                     "acquisition_provider": SOURCE,
@@ -164,6 +166,7 @@ class InvestingFlashServicesPmiProvider(BaseProvider):
                 "previous": {
                     "event_id": EVENT_ID,
                     "occurrence_id": occurrence.get("occurrence_id"),
+                    "reference_period": _previous_month(period),
                     "publisher": "S&P Global",
                     "distributor": "Investing.com",
                     "acquisition_provider": SOURCE,
