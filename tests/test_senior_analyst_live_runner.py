@@ -57,3 +57,54 @@ def test_bat_compatible_runner_parses_under_windows_powershell_51() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "POWERSHELL_5_1_PARSE_PASS" in completed.stdout
+
+
+def test_runner_httpclient_smoke_under_windows_powershell_51_without_network(
+    tmp_path: Path,
+) -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "Add-Type -AssemblyName System.Net.Http -ErrorAction Stop" in source
+    assert "$client = [System.Net.Http.HttpClient]::new()" in source
+    assert (
+        "$body = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()"
+        in source
+    )
+    assert "[IO.File]::WriteAllBytes($BodyPath, $body)" in source
+    assert "$client.Dispose()" in source
+
+    output = tmp_path / "response-body.bin"
+    escaped_output = str(output).replace("'", "''")
+    command = (
+        "$ErrorActionPreference='Stop';"
+        "Add-Type -AssemblyName System.Net.Http -ErrorAction Stop;"
+        "$client=[System.Net.Http.HttpClient]::new();"
+        "$content=$null;"
+        "try{"
+        "$expected=[byte[]](0,1,2,13,10,255);"
+        "$content=[System.Net.Http.ByteArrayContent]::new($expected);"
+        "$body=$content.ReadAsByteArrayAsync().GetAwaiter().GetResult();"
+        f"[System.IO.File]::WriteAllBytes('{escaped_output}',$body);"
+        "}finally{"
+        "if($null-ne $content){$content.Dispose()};"
+        "$client.Dispose()"
+        "};"
+        "'WINDOWS_POWERSHELL_5_1_HTTPCLIENT_PASS'"
+    )
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "WINDOWS_POWERSHELL_5_1_HTTPCLIENT_PASS" in completed.stdout
+    assert output.read_bytes() == bytes((0, 1, 2, 13, 10, 255))

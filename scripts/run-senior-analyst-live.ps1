@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
 $ExpectedBranch = "codex/fix-senior-analyst-payload-quality"
 $ExpectedBase = "3d91f457ae67130a6481bdad59403068ab802bab"
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -209,7 +210,7 @@ try {
         "http://127.0.0.1:$Port/market-context/mnq" +
         "?refresh=force&view=consumer&audience=senior_analyst_v1"
     )
-    $client = [Net.Http.HttpClient]::new()
+    $client = [System.Net.Http.HttpClient]::new()
     try {
         $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSeconds)
         $response = $client.GetAsync($route).GetAwaiter().GetResult()
