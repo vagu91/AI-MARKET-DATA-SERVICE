@@ -335,6 +335,53 @@ def test_cot_valid_until_next_configured_publication(tmp_path: Path) -> None:
     ).isoformat()
 
 
+def test_monthly_actual_deadline_is_anchored_to_release_cadence(
+    tmp_path: Path,
+) -> None:
+    release = NOW - timedelta(days=4)
+    item = lifecycle(
+        cfg(tmp_path),
+        "macro_actual",
+        "flash-services-pmi:2026-07",
+        {
+            "actual": 53.6,
+            "release_at": release.isoformat(),
+            "retrieved_at": NOW.isoformat(),
+            "frequency": "monthly",
+            "source": "SPGLOBAL",
+        },
+    )
+
+    expected_deadline = (release + timedelta(days=45)).isoformat()
+    assert item.freshness_state == "FRESH"
+    assert item.valid_until == expected_deadline
+    assert item.next_refresh_at == expected_deadline
+
+
+def test_old_monthly_actual_is_not_refreshed_by_recent_retrieval(
+    tmp_path: Path,
+) -> None:
+    release = NOW - timedelta(days=60)
+    item = lifecycle(
+        cfg(tmp_path),
+        "macro_actual",
+        "flash-services-pmi:old-release",
+        {
+            "actual": 49.2,
+            "release_at": release.isoformat(),
+            "retrieved_at": NOW.isoformat(),
+            "frequency": "monthly",
+            "source": "SPGLOBAL",
+        },
+    )
+
+    assert item.freshness_state == "DUE"
+    assert item.valid_until == (
+        release + timedelta(days=45)
+    ).isoformat()
+    assert item.next_refresh_at == item.valid_until
+
+
 def test_cftc_holiday_delay_is_configurable(tmp_path: Path) -> None:
     base = cfg(tmp_path)
     delayed = cfg(

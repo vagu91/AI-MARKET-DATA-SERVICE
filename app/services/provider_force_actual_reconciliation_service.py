@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from app.core.config import Settings
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessPolicy,
+    evaluate_canonical_freshness,
+    parse_datetime,
+)
 from app.services.deterministic_actual_resolver import (
     official_actual_mapping,
 )
@@ -14,6 +18,7 @@ from app.services.event_driven_lifecycle_service import (
     LifecycleRepository,
     compute_datum_lifecycle,
 )
+from app.services.market_fact_repository import MarketFactRepository
 from app.services.observability_contract_service import TelemetryRepository
 from app.services.official_actual_semantics import (
     normalize_reference_period,
@@ -50,6 +55,7 @@ class ProviderForceActualReconciliationService:
         self.lifecycle_resolver = lifecycle_resolver
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lifecycle = LifecycleRepository(settings, clock=self.clock)
+        self.facts = MarketFactRepository(settings, clock=self.clock)
         self.telemetry = TelemetryRepository(settings)
         self.generation_id = generation_id
         self.coverage_write_count = max(
@@ -65,6 +71,9 @@ class ProviderForceActualReconciliationService:
         now = self.clock()
         output = dict(contract)
         events = _contract_occurrences(output)
+        canonical_events = _canonical_occurrences(
+            self.facts.economic_event_records(country="US")
+        )
         lifecycle_by_key = {
             str(item.get("entity_key") or ""): item
             for item in self.lifecycle.list_items()
@@ -78,10 +87,25 @@ class ProviderForceActualReconciliationService:
         audits: list[dict[str, Any]] = []
 
         for occurrence_id, contract_event in events.items():
+            canonical_event = canonical_events.get(occurrence_id)
+            if canonical_event is not None:
+                contract_event = _merge_canonical_occurrence(
+                    contract_event,
+                    canonical_event,
+                )
+                output = _replace_occurrence(
+                    output,
+                    occurrence_id=occurrence_id,
+                    event=contract_event,
+                )
             mapping = official_actual_mapping(contract_event)
             if mapping is None:
                 continue
-            existing = lifecycle_by_key.get(occurrence_id)
+            existing = _merge_canonical_lifecycle_evidence(
+                lifecycle_by_key.get(occurrence_id),
+                canonical_event,
+                observed_at=now,
+            )
             existing_payload = (
                 dict((existing or {}).get("payload") or {})
                 if isinstance((existing or {}).get("payload"), dict)
@@ -131,7 +155,16 @@ class ProviderForceActualReconciliationService:
                             "enrichment": enrichment,
                         },
                     )
-                    audits.append(dict(persisted_audit))
+                    audits.append(
+                        _request_scoped_database_audit(
+                            persisted_audit,
+                            occurrence_id=occurrence_id,
+                            lifecycle_before=lifecycle_before,
+                            mapping_selected=mapping["metric_id"],
+                            observed_at=now,
+                            value_present=True,
+                        )
+                    )
                 continue
             release = parse_datetime(
                 contract_event.get("release_at")
@@ -181,7 +214,19 @@ class ProviderForceActualReconciliationService:
                         occurrence_id=occurrence_id,
                         event=payload,
                     )
-                    audits.append(dict(persisted))
+                    audits.append(
+                        _request_scoped_database_audit(
+                            persisted,
+                            occurrence_id=occurrence_id,
+                            lifecycle_before=lifecycle_before,
+                            mapping_selected=mapping["metric_id"],
+                            observed_at=now,
+                            value_present=(
+                                payload.get("actual")
+                                not in (None, "")
+                            ),
+                        )
+                    )
                 self._emit_decision(
                     occurrence_id=occurrence_id,
                     lifecycle_before=lifecycle_before,
@@ -315,7 +360,7 @@ class ProviderForceActualReconciliationService:
                     or payload.get("source_url")
                 )
                 publisher = (
-                    result["datum"].get("actual_source")
+                    result["datum"].get("publisher")
                     or result["datum"].get("source")
                 )
                 datum = {
@@ -373,6 +418,13 @@ class ProviderForceActualReconciliationService:
                     reason_code=reason_code,
                     terminal=work_status == "EXHAUSTED_NO_DATA",
                 )
+            datum = {
+                **datum,
+                "valid_until": lifecycle.valid_until,
+                "next_refresh_at": lifecycle.next_refresh_at,
+                "content_valid_until": lifecycle.valid_until,
+                "refresh_due_at": lifecycle.next_refresh_at,
+            }
             resolved_items.append((lifecycle, datum, work_status))
             canonical_reconciliations.append(
                 {
@@ -462,118 +514,201 @@ class ProviderForceActualReconciliationService:
         collector = self.accounting_collector
         if collector is None:
             return
-        occurrences = [
-            event
-            for event in _contract_occurrences(contract).values()
+        occurrences_by_id = {
+            occurrence_id: event
+            for occurrence_id, event in _contract_occurrences(
+                contract
+            ).items()
             if (
-                (official_actual_mapping(event) or {}).get("metric_id")
+                (official_actual_mapping(event) or {}).get(
+                    "metric_id"
+                )
                 == "flash_services_pmi"
             )
-        ]
+        }
+        occurrences = list(occurrences_by_id.values())
         relevant = [
             item
             for item in audits
             if item.get("mapping_selected") == "flash_services_pmi"
         ]
+        target = _latest_flash_services_occurrence(occurrences)
+        target_id = str(
+            (target or {}).get("occurrence_id")
+            or (target or {}).get("event_id")
+            or ""
+        )
+        target_audit = next(
+            (
+                item
+                for item in relevant
+                if str(item.get("occurrence_id") or "")
+                == target_id
+            ),
+            relevant[0] if len(relevant) == 1 else None,
+        )
         raw_attempts = [
             dict(attempt)
-            for item in relevant
-            for attempt in item.get("provider_attempts") or []
+            for attempt in (
+                (target_audit or {}).get("provider_attempts")
+                or []
+            )
             if isinstance(attempt, dict)
         ]
         attempts_by_provider = {
             str(item.get("provider") or ""): item
             for item in raw_attempts
         }
-        primary = _actual_attempt(
-            "SPGLOBAL",
-            attempts_by_provider.get("SPGLOBAL"),
-            skipped_reason=(
-                "NO_FLASH_SERVICES_PMI_OCCURRENCE"
-                if not occurrences
-                else "OFFICIAL_ACTUAL_RESOLVER_NOT_DUE"
-                if not relevant
-                else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
-            ),
+        provider_calls = int(
+            (target_audit or {}).get("provider_call_count")
+            or 0
         )
-        fallback = _actual_attempt(
-            "INVESTING_EVENT_1062",
-            attempts_by_provider.get("INVESTING_EVENT_1062"),
-            skipped_reason=(
-                "NO_FLASH_SERVICES_PMI_OCCURRENCE"
-                if not occurrences
-                else "PRIMARY_SUCCEEDED_OR_RESOLVER_NOT_DUE"
-                if not relevant or attempts_by_provider.get("SPGLOBAL", {}).get(
-                    "result"
-                )
-                == "SUCCESS"
-                else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
-            ),
+        selected = (
+            target
+            if target
+            and target.get("actual") not in (None, "")
+            else None
         )
-        provider_calls = sum(
-            int(item.get("provider_call_count") or 0)
-            for item in relevant
+        lifecycle_before = (
+            (target_audit or {}).get("lifecycle_before")
+            if isinstance(
+                (target_audit or {}).get("lifecycle_before"),
+                dict,
+            )
+            else None
         )
-        evidence_complete = bool(
-            not provider_calls
-            or raw_attempts
-        )
-        selected = next(
-            (
-                event
-                for event in occurrences
-                if event.get("actual") not in (None, "")
-            ),
-            None,
-        )
-        db_lookup = bool(relevant)
-        db_found = bool(
-            relevant
-            and provider_calls == 0
-            and selected is not None
-        )
+        db_found = lifecycle_before is not None
         data_as_of = (
-            selected.get("reference_period")
-            or selected.get("release_at")
-            if selected
+            target.get("release_at")
+            or target.get("reference_period")
+            if target
             else None
         )
-        valid_until = (
-            selected.get("valid_until")
-            or selected.get("content_valid_until")
-            or selected.get("release_at")
-            if selected
+        database_row = (
+            {
+                "database_data_as_of": data_as_of,
+                "database_content_valid_until": (
+                    lifecycle_before.get("valid_until")
+                ),
+                "database_refresh_due_at": (
+                    lifecycle_before.get("next_refresh_at")
+                ),
+                "database_lifecycle_status": lifecycle_before.get(
+                    "freshness_state"
+                ),
+            }
+            if db_found and lifecycle_before
             else None
+        )
+        database_decision = evaluate_canonical_freshness(
+            database_row,
+            policy=CanonicalFreshnessPolicy(
+                max_age=timedelta(days=45),
+                data_reference_mode="official_release",
+            ),
+            observed_at=getattr(
+                self,
+                "clock",
+                lambda: datetime.now(UTC),
+            )(),
+        )
+        database_valid = bool(
+            db_found and database_decision.usable
+        )
+        if database_valid:
+            primary = provider_attempt(
+                "SPGLOBAL",
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="VALID_DATABASE_RECORD_SELECTED",
+                execution_origin="CACHE_DECISION",
+            )
+            fallback = provider_attempt(
+                "INVESTING_EVENT_1062",
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="VALID_DATABASE_RECORD_SELECTED",
+                execution_origin="CACHE_DECISION",
+            )
+        else:
+            primary = _actual_attempt(
+                "SPGLOBAL",
+                attempts_by_provider.get("SPGLOBAL"),
+                skipped_reason=(
+                    "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                    if not occurrences
+                    else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+                ),
+            )
+            fallback = _actual_attempt(
+                "INVESTING_EVENT_1062",
+                attempts_by_provider.get("INVESTING_EVENT_1062"),
+                skipped_reason=(
+                    "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                    if not occurrences
+                    else "PRIMARY_SUCCEEDED"
+                    if attempts_by_provider.get(
+                        "SPGLOBAL", {}
+                    ).get("result")
+                    == "SUCCESS"
+                    else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+                ),
+            )
+        evidence_complete = bool(
+            target is not None
+            and target_audit is not None
+            and database_decision.complete
+            and (
+                database_valid
+                or _actual_provider_chain_complete(
+                    raw_attempts,
+                    provider_calls=provider_calls,
+                )
+            )
         )
         collector.record(
             "flash_services_pmi",
             acquisition_id="flash_services_pmi_actual_resolution",
             shared_dataset_ids=("flash_services_pmi",),
-            database_lookup_performed=db_lookup,
+            database_lookup_performed=True,
             database_lookup_reason=(
                 "OFFICIAL_ACTUAL_CANDIDATE_DATABASE_LOOKUP"
-                if db_lookup
-                else "NO_DUE_FLASH_SERVICES_PMI_RESOLUTION"
             ),
-            database_record_found=db_found if db_lookup else None,
+            database_record_found=db_found,
             database_data_as_of=data_as_of if db_found else None,
             database_content_valid_until=(
-                valid_until if db_found else None
+                database_decision.content_valid_until
+                if db_found
+                else None
             ),
-            database_record_expired=False if db_lookup else None,
+            database_refresh_due_at=(
+                database_decision.refresh_due_at
+                if db_found
+                else None
+            ),
+            database_lifecycle_status=(
+                lifecycle_before.get("freshness_state")
+                if lifecycle_before
+                else None
+            ),
+            database_record_expired=(
+                database_decision.expired
+                if db_found
+                else False
+            ),
             database_freshness_evaluation=(
-                "VALID"
+                database_decision.evaluation
                 if db_found
                 else "NOT_FOUND"
-                if db_lookup
-                else "NOT_LOOKED_UP"
             ),
             primary_provider=primary,
             fallbacks=[fallback],
             acquisition_selected_source=(
-                selected.get("actual_source")
-                or selected.get("publisher")
-                or selected.get("source")
+                (target_audit or {}).get("provider_attempted")
+                or selected.get("actual_source")
+                or selected.get("acquisition_provider")
                 if selected
                 else None
             ),
@@ -581,7 +716,7 @@ class ProviderForceActualReconciliationService:
                 "FLASH_SERVICES_PMI_DELIVERABLE_ACQUIRED"
                 if selected
                 else "FLASH_SERVICES_PMI_NOT_DUE"
-                if not occurrences
+                if target is None
                 else "FLASH_SERVICES_PMI_VALUE_NOT_AVAILABLE"
             ),
             evidence_complete=evidence_complete,
@@ -667,6 +802,123 @@ def _contract_occurrences(
     return selected
 
 
+def _canonical_occurrences(
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        occurrence_id = str(
+            record.get("occurrence_id")
+            or record.get("event_id")
+            or ""
+        )
+        if occurrence_id:
+            selected[occurrence_id] = dict(record)
+    return selected
+
+
+def _merge_canonical_occurrence(
+    projected: dict[str, Any],
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(projected)
+    for field, value in canonical.items():
+        if value not in (None, "", [], {}):
+            merged[field] = value
+    projected_enrichment = (
+        dict(projected.get("enrichment") or {})
+        if isinstance(projected.get("enrichment"), dict)
+        else {}
+    )
+    canonical_enrichment = (
+        dict(canonical.get("enrichment") or {})
+        if isinstance(canonical.get("enrichment"), dict)
+        else {}
+    )
+    merged["enrichment"] = {
+        **projected_enrichment,
+        **{
+            field: value
+            for field, value in canonical_enrichment.items()
+            if value not in (None, "", [], {})
+        },
+    }
+    return merged
+
+
+def _merge_canonical_lifecycle_evidence(
+    lifecycle: dict[str, Any] | None,
+    canonical: dict[str, Any] | None,
+    *,
+    observed_at: datetime,
+) -> dict[str, Any] | None:
+    if canonical is None:
+        return lifecycle
+    output = dict(lifecycle or {})
+    prior_payload = (
+        dict(output.get("payload") or {})
+        if isinstance(output.get("payload"), dict)
+        else {}
+    )
+    payload = _merge_canonical_occurrence(
+        prior_payload,
+        canonical,
+    )
+    output["payload"] = payload
+    for target, candidates in {
+        "valid_until": (
+            "content_valid_until",
+            "valid_until",
+        ),
+        "next_refresh_at": (
+            "refresh_due_at",
+            "next_refresh_at",
+        ),
+        "next_retry_at": ("next_retry_at",),
+        "negative_cache_expires_at": (
+            "negative_cache_expires_at",
+        ),
+    }.items():
+        value = next(
+            (
+                payload.get(field)
+                for field in candidates
+                if payload.get(field) not in (None, "")
+            ),
+            None,
+        )
+        if value is not None:
+            output[target] = value
+    if (
+        not lifecycle
+        or str(lifecycle.get("work_status") or "").upper()
+        == "SUPERSEDED"
+    ):
+        actual = payload.get("actual")
+        audit = payload.get("actual_resolution")
+        valid_until = parse_datetime(output.get("valid_until"))
+        refresh_due_at = parse_datetime(
+            output.get("next_refresh_at")
+        )
+        if actual not in (None, ""):
+            output["freshness_state"] = "CURRENT_RELEASE"
+            output["work_status"] = "COMPLETED"
+        elif (
+            isinstance(audit, dict)
+            and audit.get("actual_still_missing") is True
+            and valid_until is not None
+            and refresh_due_at is not None
+            and valid_until > observed_at
+            and refresh_due_at > observed_at
+        ):
+            output["freshness_state"] = "FRESH_NO_DATA"
+            output["work_status"] = "COMPLETED"
+        output["superseded_by"] = None
+    return output
+
+
 def _replace_occurrence(
     contract: dict[str, Any],
     *,
@@ -702,6 +954,21 @@ def _actual_attempt(
     skipped_reason: str,
 ) -> dict[str, Any]:
     if raw is not None:
+        if raw.get("called") is False:
+            return provider_attempt(
+                provider,
+                called=False,
+                attempts=0,
+                result=str(raw.get("result") or "NOT_CALLED"),
+                not_called_reason=(
+                    str(raw.get("not_called_reason") or "")
+                    or skipped_reason
+                ),
+                execution_origin=str(
+                    raw.get("execution_origin")
+                    or "OBSERVED_SKIP"
+                ),
+            )
         return provider_attempt(
             provider,
             called=True,
@@ -717,6 +984,120 @@ def _actual_attempt(
         not_called_reason=skipped_reason,
         execution_origin="OBSERVED_SKIP",
     )
+
+
+def _latest_flash_services_occurrence(
+    occurrences: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not occurrences:
+        return None
+    floor = datetime.min.replace(tzinfo=UTC)
+    return max(
+        occurrences,
+        key=lambda item: (
+            parse_datetime(
+                item.get("release_at")
+                or item.get("scheduled_at_utc")
+                or item.get("time_utc")
+            )
+            or floor,
+            str(
+                item.get("occurrence_id")
+                or item.get("event_id")
+                or ""
+            ),
+        ),
+    )
+
+
+def _actual_provider_chain_complete(
+    attempts: list[dict[str, Any]],
+    *,
+    provider_calls: int,
+) -> bool:
+    by_provider = {
+        str(item.get("provider") or ""): item
+        for item in attempts
+    }
+    primary = by_provider.get("SPGLOBAL")
+    if primary is None or primary.get("called") is False:
+        return False
+    observed_calls = sum(
+        max(int(item.get("attempts") or 0), 1)
+        for item in attempts
+        if item.get("called") is not False
+    )
+    if provider_calls != observed_calls:
+        return False
+    primary_succeeded = _actual_result_succeeded(
+        primary.get("result")
+    )
+    fallback = by_provider.get("INVESTING_EVENT_1062")
+    if primary_succeeded:
+        return fallback is None or fallback.get("called") is False
+    return bool(
+        fallback is not None
+        and fallback.get("called") is not False
+    )
+
+
+def _actual_result_succeeded(value: Any) -> bool:
+    result = str(value or "").upper()
+    return bool(
+        any(
+            token in result
+            for token in ("SUCCESS", "FOUND", "AVAILABLE", "VALID")
+        )
+        and not any(
+            token in result
+            for token in ("FAIL", "ERROR", "NO_DATA", "TIMEOUT")
+        )
+    )
+
+
+def _request_scoped_database_audit(
+    _persisted: dict[str, Any],
+    *,
+    occurrence_id: str,
+    lifecycle_before: dict[str, Any] | None,
+    mapping_selected: str,
+    observed_at: datetime,
+    value_present: bool,
+) -> dict[str, Any]:
+    return {
+        "occurrence_id": occurrence_id,
+        "lifecycle_before": lifecycle_before,
+        "eligibility": "VALID_DATABASE_RECORD",
+        "reclaim_reason": "CANONICAL_ACTUAL_PRESENT",
+        "resolver_invoked": False,
+        "mapping_selected": mapping_selected,
+        "provider_attempted": False,
+        "provider_call_count": 0,
+        "provider_request_attempted": False,
+        "provider_attempts": [],
+        "provider_http_outcome": "NOT_CALLED_DATABASE_SELECTED",
+        "candidate_count": 0,
+        "candidate_validation": "NOT_REQUESTED",
+        "reconciliation_outcome": "DATABASE_SELECTED",
+        "reason_code": (
+            "VALID_CANONICAL_ACTUAL_SELECTED"
+            if value_present
+            else "CANONICAL_ACTUAL_NOT_AVAILABLE"
+        ),
+        "actual_still_missing": not value_present,
+        "attempted_at": observed_at.replace(
+            microsecond=0
+        ).isoformat(),
+        "canonical_write_count": 0,
+        "lifecycle_write_count": 0,
+        "coverage_write_count": 0,
+        "snapshot_write_count": 0,
+        "outbox_write_count": 0,
+        "finalization_status": "NO_OP",
+        "database_lookup_observed_at": observed_at.replace(
+            microsecond=0
+        ).isoformat(),
+    }
 
 
 def _negative_cache_active(
@@ -907,6 +1288,7 @@ def _macro_actual_item(
         "name": event.get("name") or event.get("event_name"),
         "country": event.get("country"),
         "category": event.get("category"),
+        "metric_id": event.get("metric_id"),
         "date": event.get("date"),
         "release_at": event.get("release_at") or event.get("time_utc"),
         "actual": event.get("actual"),
@@ -932,7 +1314,24 @@ def _macro_actual_item(
             event.get("actual_source_url")
             or actual_lineage.get("source_url")
         ),
-        "actual_is_official": True,
+        "actual_is_official": (
+            event.get("actual_is_official")
+            if event.get("actual_is_official") is not None
+            else True
+        ),
+        "freshness_state": event.get("freshness_state"),
+        "valid_until": (
+            event.get("valid_until")
+            or event.get("content_valid_until")
+        ),
+        "content_valid_until": (
+            event.get("content_valid_until")
+            or event.get("valid_until")
+        ),
+        "next_refresh_at": (
+            event.get("next_refresh_at")
+            or event.get("refresh_due_at")
+        ),
         "awaiting_actual": False,
         "status": "RELEASED",
         "release_status": "RELEASED",

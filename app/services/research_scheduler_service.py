@@ -1755,6 +1755,20 @@ class ResearchSchedulerService:
             "outbox_writes": 0,
             "materialization_deferred": not materialize_snapshot,
         }
+        preflight_matrices = {
+            provider_name: self.calendar_coverage.matrix(
+                start_date=previous_start,
+                end_date=next_end_date,
+                provider_name=provider_name,
+                query_scope=query_scope,
+                now=now,
+                policy_version=policy_version,
+            )
+            for provider_name, query_scope in missing_by_target
+        }
+        coverage["database_lookup_daily_matrix"] = {
+            "by_provider": preflight_matrices,
+        }
         if missing_days and schedule_acquire is None:
             coverage["status"] = "UNVERIFIED_EMPTY"
             coverage["reason"] = "schedule_acquirer_not_configured"
@@ -1784,6 +1798,16 @@ class ResearchSchedulerService:
                 }
                 if provider_name != "economic_calendar_composite":
                     call_kwargs["provider_names"] = [provider_name]
+                try:
+                    if (
+                        "force"
+                        in inspect.signature(
+                            schedule_acquire
+                        ).parameters
+                    ):
+                        call_kwargs["force"] = True
+                except (TypeError, ValueError):
+                    pass
                 try:
                     output = schedule_acquire(**call_kwargs)
                     if inspect.isawaitable(output):

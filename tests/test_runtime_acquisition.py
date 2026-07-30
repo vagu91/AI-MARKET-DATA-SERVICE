@@ -174,7 +174,10 @@ def test_pipeline_gap_only_when_db_saved_series_missing_from_snapshot():
 
 async def test_cot_refresh_force_persists_and_refresh_false_reads_db_without_network(tmp_path):
     cfg = Settings(_env_file=None, database_path=tmp_path / "market.sqlite")
-    service = PositioningRuntimeService(cfg)
+    service = PositioningRuntimeService(
+        cfg,
+        clock=lambda: datetime(2026, 7, 10, 12, tzinfo=UTC),
+    )
     fake = FakeCotProvider()
     service.cot_provider = fake
 

@@ -123,7 +123,16 @@ class NewsProvider(BaseProvider):
                         recency_days=recency_days,
                     )
                 )
-            batches = list(await asyncio.gather(*tasks)) if tasks else []
+            observed_batches = (
+                list(await asyncio.gather(*tasks))
+                if tasks
+                else []
+            )
+            batches = _complete_news_provider_batches(
+                observed_batches,
+                settings=self.settings,
+                limit=requested_limit,
+            )
             if self.network_observer is not None:
                 self.network_observer.register_provider_batches(batches)
             articles = [
@@ -1789,6 +1798,106 @@ def _partition_recency(
     return filtered, outside
 
 
+NEWS_PROVIDER_SPECS = (
+    (
+        "Alpha Vantage NEWS_SENTIMENT",
+        ProviderType.API,
+        0.74,
+        "alpha_vantage_api_key",
+        None,
+    ),
+    (
+        "GDELT Doc API",
+        ProviderType.API,
+        0.66,
+        "news_gdelt_enabled",
+        None,
+    ),
+    (
+        "Federal Reserve RSS",
+        ProviderType.RSS,
+        0.76,
+        "news_rss_enabled",
+        "federal_reserve_rss_url",
+    ),
+    (
+        "BLS RSS",
+        ProviderType.RSS,
+        0.86,
+        "news_rss_enabled",
+        "bls_rss_url",
+    ),
+    (
+        "BEA RSS",
+        ProviderType.RSS,
+        0.86,
+        "news_rss_enabled",
+        "bea_rss_url",
+    ),
+    (
+        "Yahoo Finance RSS",
+        ProviderType.RSS,
+        0.58,
+        "news_rss_enabled",
+        "yahoo_finance_rss_url",
+    ),
+    (
+        "MarketWatch RSS",
+        ProviderType.RSS,
+        0.56,
+        "news_rss_enabled",
+        "marketwatch_rss_url",
+    ),
+    (
+        "Google News RSS",
+        ProviderType.RSS,
+        0.64,
+        "news_rss_enabled",
+        "google_news_rss_url",
+    ),
+)
+
+
+def _complete_news_provider_batches(
+    batches: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    limit: int,
+) -> list[dict[str, Any]]:
+    output = list(batches)
+    observed = {str(batch.get("provider")) for batch in batches}
+    for (
+        provider,
+        provider_type,
+        reliability,
+        enabled_field,
+        url_field,
+    ) in NEWS_PROVIDER_SPECS:
+        if provider in observed:
+            continue
+        enabled = bool(getattr(settings, enabled_field, False))
+        url_configured = bool(
+            getattr(settings, url_field, None)
+        ) if url_field else True
+        reason = (
+            "PROVIDER_URL_NOT_CONFIGURED"
+            if enabled and not url_configured
+            else "PROVIDER_CREDENTIAL_NOT_CONFIGURED"
+            if provider == "Alpha Vantage NEWS_SENTIMENT"
+            else "PROVIDER_DISABLED_BY_CONFIGURATION"
+        )
+        output.append(
+            _not_called_provider_batch(
+                provider=provider,
+                provider_type=provider_type,
+                reliability=reliability,
+                limit=limit,
+                reason_code=reason,
+            )
+        )
+    return output
+
+
 def _provider_batch(
     *,
     provider: str,
@@ -1868,6 +1977,51 @@ def _provider_batch(
         "warnings": _dedupe_errors(warnings or []),
         "errors": [],
         "_articles": articles,
+    }
+
+
+def _not_called_provider_batch(
+    *,
+    provider: str,
+    provider_type: ProviderType,
+    reliability: float,
+    limit: int,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "provider_type": provider_type.value,
+        "status": "NOT_CONFIGURED",
+        "availability_status": "NOT_CONFIGURED",
+        "coverage_status": "NOT_CONFIGURED",
+        "reason_code": reason_code,
+        "temporary": False,
+        "reliability": reliability,
+        "calls": 0,
+        "pages": 0,
+        "retry_count": 0,
+        "metadata_enrichment_calls": 0,
+        "metadata_enrichment_required": False,
+        "metadata_enrichment_status": "NOT_REQUIRED",
+        "metadata_enrichment_results": [],
+        "per_provider_limit": limit,
+        "pagination_supported": False,
+        "pagination_complete": True,
+        "coverage_reason": reason_code,
+        "raw_capture_status": "NOT_ACQUIRED",
+        "raw_capture": [],
+        "raw_record_ids": [],
+        "raw_count": 0,
+        "parsed_record_ids": [],
+        "parsed_count": 0,
+        "technical_rejections": [],
+        "explicit_out_of_scope": [],
+        "persistence_rejections": [],
+        "exact_technical_duplicates": [],
+        "persisted_record_ids": [],
+        "warnings": [],
+        "errors": [],
+        "_articles": [],
     }
 
 

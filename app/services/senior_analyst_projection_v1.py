@@ -11,6 +11,10 @@ from typing import Any, Iterable
 from app.services.data_freshness_service import parse_datetime
 from app.services.market_context_sync_service import extract_sync_sections
 from app.services.official_actual_semantics import normalize_reference_period
+from app.services.request_provider_accounting import (
+    _canonical_database_evidence_valid,
+    _provider_flow_valid,
+)
 
 
 CONTRACT_NAME = "SeniorAnalystPayloadV1"
@@ -53,11 +57,32 @@ class DatasetPolicy:
     primary_provider: str
     fallback_providers: tuple[str, ...] = ()
     required_for_analysis: bool = True
+    canonical_repository_required: bool = True
+    provider_strategy: str = "FALLBACK"
 
 
 DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
-    DatasetPolicy("nasdaq_100", "nasdaq", "intraday", timedelta(hours=12), "NASDAQ"),
-    DatasetPolicy("mega_cap_quotes", "nasdaq", "intraday", timedelta(hours=12), "NASDAQ"),
+    DatasetPolicy(
+        "nasdaq_100",
+        "nasdaq",
+        "intraday",
+        timedelta(hours=12),
+        "INVESCO",
+        ("ALPHA_VANTAGE", "NASDAQ", "SEC"),
+        provider_strategy="CASCADE",
+    ),
+    DatasetPolicy(
+        "mega_cap_quotes",
+        "nasdaq",
+        "intraday",
+        timedelta(hours=12),
+        "YAHOO_FINANCE_CHART",
+        (
+            "STOOQ",
+            "ALPHA_VANTAGE",
+            "YAHOO_FINANCE_QUOTE",
+        ),
+    ),
     DatasetPolicy(
         "market_internals",
         "market_internals",
@@ -70,7 +95,14 @@ DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
     DatasetPolicy("risk", "risk", "intraday", timedelta(hours=2), "CBOE"),
     DatasetPolicy("treasury_rates", "rates", "daily", timedelta(days=2), "FRED"),
     DatasetPolicy("fed_funds", "rates", "daily", timedelta(days=2), "FRED"),
-    DatasetPolicy("target_range", "fomc", "event", timedelta(days=45), "FEDERAL_RESERVE"),
+    DatasetPolicy(
+        "target_range",
+        "fomc",
+        "event",
+        timedelta(days=45),
+        "FEDERAL_RESERVE",
+        ("FRED",),
+    ),
     DatasetPolicy(
         "fomc_expectations",
         "fomc",
@@ -92,6 +124,7 @@ DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
         "event",
         timedelta(days=7),
         "CANONICAL_EVENT_REPOSITORY",
+        ("INVESTING_ECONOMIC_CALENDAR", "XTB"),
     ),
     DatasetPolicy(
         "flash_services_pmi",
@@ -101,7 +134,14 @@ DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
         "SPGLOBAL",
         ("INVESTING_EVENT_1062",),
     ),
-    DatasetPolicy("earnings", "earnings", "event", timedelta(days=14), "NASDAQ"),
+    DatasetPolicy(
+        "earnings",
+        "earnings",
+        "event",
+        timedelta(days=14),
+        "NASDAQ",
+        ("FMP_EARNINGS_CALENDAR",),
+    ),
     DatasetPolicy(
         "options_positioning",
         "options_positioning",
@@ -110,7 +150,23 @@ DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
         "TRADIER",
     ),
     DatasetPolicy("positioning", "positioning", "weekly", timedelta(days=10), "CFTC"),
-    DatasetPolicy("current_news", "news", "intraday", timedelta(hours=24), "FINNHUB"),
+    DatasetPolicy(
+        "current_news",
+        "news",
+        "intraday",
+        timedelta(hours=24),
+        "ALPHA_VANTAGE_NEWS_SENTIMENT",
+        (
+            "GDELT_DOC_API",
+            "FEDERAL_RESERVE_RSS",
+            "BLS_RSS",
+            "BEA_RSS",
+            "YAHOO_FINANCE_RSS",
+            "MARKETWATCH_RSS",
+            "GOOGLE_NEWS_RSS",
+        ),
+        provider_strategy="FAN_IN",
+    ),
     DatasetPolicy(
         "market_schedule",
         "market_schedule",
@@ -193,6 +249,7 @@ def build_senior_analyst_payload_v1(
             sections.get("event_calendar") or {},
             clock,
             missing,
+            macro_actuals=sections.get("macro_actuals") or {},
         ),
         "fomc": _project_fomc(sections.get("fed") or {}, clock, missing),
         "nasdaq": _project_nasdaq(sections.get("nasdaq") or {}, clock, missing),
@@ -568,6 +625,8 @@ def _project_calendar(
     section: dict[str, Any],
     now: datetime,
     missing: list[dict[str, Any]],
+    *,
+    macro_actuals: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     window = section.get("window") if isinstance(section.get("window"), dict) else {}
     current_week = (
@@ -582,6 +641,11 @@ def _project_calendar(
         or section.get("next_7d_critical_events")
         or []
     )
+    released_candidates = [
+        *window_events,
+        *list(section.get("recently_released_events") or []),
+        *list((macro_actuals or {}).get("items") or []),
+    ]
     active = [
         event
         for event in [*window_events, *next_24_candidates]
@@ -607,6 +671,11 @@ def _project_calendar(
             next_7_candidates,
             now,
             mode="next_7d",
+        ),
+        "latest_released_events": _canonical_events(
+            released_candidates,
+            now,
+            mode="latest_release",
         ),
     }
     for name, values in lists.items():
@@ -671,6 +740,11 @@ def _canonical_events(
             continue
         if mode == "active" and not (
             release - timedelta(minutes=60) <= now <= release + timedelta(minutes=90)
+        ):
+            continue
+        if mode == "latest_release" and not (
+            now - timedelta(days=45) <= release <= now
+            and raw.get("actual") not in (None, "")
         ):
             continue
         release_status = str(
@@ -752,6 +826,20 @@ def _project_event(
             raw.get("actual_is_official")
             if actual is not None
             else None
+        ),
+        "actual_source": (
+            raw.get("actual_source")
+            or raw.get("publisher")
+            if actual is not None
+            else None
+        ),
+        "freshness": (
+            raw.get("freshness_state")
+            or raw.get("freshness")
+        ),
+        "content_valid_until": (
+            raw.get("content_valid_until")
+            or raw.get("valid_until")
         ),
         "invalid_period_mapping": False,
         "source": _source(raw),
@@ -1285,9 +1373,23 @@ def _project_earnings(
         if isinstance(section.get("corporate_events"), dict)
         else {}
     )
+    corporate_earnings = corporate.get("earnings")
+    if isinstance(corporate_earnings, dict):
+        corporate_candidates = [
+            *list(
+                corporate_earnings.get("relevant_upcoming")
+                or corporate_earnings.get("events")
+                or []
+            ),
+            *list(corporate_earnings.get("mega_cap") or []),
+        ]
+    elif isinstance(corporate_earnings, list):
+        corporate_candidates = list(corporate_earnings)
+    else:
+        corporate_candidates = []
     candidates = [
         *list(nasdaq.get("upcoming") or []),
-        *list(corporate.get("earnings") or []),
+        *corporate_candidates,
     ]
     selected: dict[tuple[str, str], dict[str, Any]] = {}
     for raw in candidates:
@@ -1723,7 +1825,8 @@ def _provider_accounting(
         and manifest.get("request_id") == request_id
         and correlation_id == request_id
         and evidence_origin == "NORMAL_APPLICATION_REQUEST"
-        and manifest.get("evidence_status") == "ACQUISITION_COMPLETE"
+        and manifest.get("evidence_status")
+        in {"ACQUISITION_COMPLETE", "INCOMPLETE"}
         and parse_datetime(request_started_at)
         and parse_datetime(request_completed_at)
     )
@@ -1778,6 +1881,12 @@ def _provider_accounting(
                 "database_content_valid_until": raw.get(
                     "database_content_valid_until"
                 ),
+                "database_refresh_due_at": raw.get(
+                    "database_refresh_due_at"
+                ),
+                "database_lifecycle_status": raw.get(
+                    "database_lifecycle_status"
+                ),
                 "database_record_expired": raw.get("database_record_expired"),
                 "database_freshness_evaluation": raw.get(
                     "database_freshness_evaluation"
@@ -1786,6 +1895,9 @@ def _provider_accounting(
                 "fallbacks": deepcopy(raw.get("fallbacks")),
                 "acquisition_selected_source": raw.get(
                     "acquisition_selected_source"
+                ),
+                "acquisition_reason_code": raw.get(
+                    "acquisition_reason_code"
                 ),
                 **delivery,
                 "refresh_mode": refresh_mode,
@@ -1801,15 +1913,23 @@ def _provider_accounting(
             request_started_at=request_started_at,
             request_completed_at=request_completed_at,
         ):
-            rows.append(
-                _incomplete_provider_accounting_row(
-                    policy,
-                    request_id=request_id,
-                    correlation_id=correlation_id,
-                    refresh_mode=refresh_mode,
-                    reason_code="REQUEST_ACQUISITION_EVIDENCE_INCOMPLETE",
-                )
+            candidate["evidence_status"] = "INCOMPLETE"
+            candidate["reason_code"] = (
+                "REQUEST_ACQUISITION_EVIDENCE_INCOMPLETE"
             )
+            observed_at = parse_datetime(raw.get("observed_at"))
+            if (
+                raw.get("database_lookup_performed") is True
+                and observed_at is not None
+                and not _canonical_database_evidence_valid(
+                    raw,
+                    policy=policy,
+                    observed_at=observed_at,
+                )
+            ):
+                candidate["database_record_expired"] = None
+                candidate["database_freshness_evaluation"] = None
+            rows.append(candidate)
             continue
         rows.append(
             candidate
@@ -1861,6 +1981,8 @@ def _incomplete_provider_accounting_row(
         "database_record_found": None,
         "database_data_as_of": None,
         "database_content_valid_until": None,
+        "database_refresh_due_at": None,
+        "database_lifecycle_status": None,
         "database_record_expired": None,
         "database_freshness_evaluation": None,
         "primary_provider": {
@@ -1878,6 +2000,8 @@ def _incomplete_provider_accounting_row(
             }
             for provider in policy.fallback_providers
         ],
+        "acquisition_selected_source": None,
+        "acquisition_reason_code": reason_code,
         "selected_source": None,
         "selected_value_present": None,
         "delivered_value": None,
@@ -2046,24 +2170,55 @@ def _dataset_delivery_value(
         )
     if dataset_id in {"macro_calendar", "flash_services_pmi"}:
         calendar = analytics.get("calendar") or {}
-        events = [
-            item
-            for key in (
+        delivery_keys = (
+            (
+                "latest_released_events",
                 "active_event_windows",
                 "next_24h_events",
                 "next_7d_high_impact_events",
             )
+            if dataset_id == "flash_services_pmi"
+            else (
+                "active_event_windows",
+                "next_24h_events",
+                "next_7d_high_impact_events",
+            )
+        )
+        events = [
+            item
+            for key in delivery_keys
             for item in calendar.get(key) or []
             if isinstance(item, dict)
         ]
         if dataset_id == "flash_services_pmi":
             events = [
-                item
+                {
+                    "value": item.get("actual"),
+                    "source": (
+                        item.get("actual_source")
+                        or item.get("publisher")
+                    ),
+                    "freshness": (
+                        item.get("freshness_state")
+                        or item.get("freshness")
+                    ),
+                    "data_as_of": (
+                        item.get("reference_period")
+                        or item.get("release_at")
+                    ),
+                    "content_valid_until": (
+                        item.get("content_valid_until")
+                        or item.get("valid_until")
+                    ),
+                }
                 for item in events
-                if "flash_services_pmi"
-                in str(item.get("metric_id") or "").lower()
-                or "flash services pmi"
-                in str(item.get("name") or "").lower()
+                if (
+                    "flash_services_pmi"
+                    in str(item.get("metric_id") or "").lower()
+                    or "flash services pmi"
+                    in str(item.get("name") or "").lower()
+                )
+                and item.get("actual") not in (None, "")
             ]
         return "calendar", events
     if dataset_id == "earnings":
@@ -2218,6 +2373,8 @@ def _acquisition_accounting_row_complete(
     ):
         return False
     lookup = item["database_lookup_performed"]
+    if policy.canonical_repository_required and not lookup:
+        return False
     if lookup:
         if (
             type(item.get("database_record_found")) is not bool
@@ -2227,6 +2384,13 @@ def _acquisition_accounting_row_complete(
         if item["database_record_found"] and (
             not item.get("database_data_as_of")
             or not item.get("database_content_valid_until")
+            or not item.get("database_refresh_due_at")
+        ):
+            return False
+        if not _canonical_database_evidence_valid(
+            item,
+            policy=policy,
+            observed_at=observed,
         ):
             return False
     elif any(
@@ -2235,6 +2399,8 @@ def _acquisition_accounting_row_complete(
             "database_record_found",
             "database_data_as_of",
             "database_content_valid_until",
+            "database_refresh_due_at",
+            "database_lifecycle_status",
             "database_record_expired",
         )
     ) or item.get("database_freshness_evaluation") != "NOT_LOOKED_UP":
@@ -2253,9 +2419,12 @@ def _acquisition_accounting_row_complete(
         != list(policy.fallback_providers)
     ):
         return False
-    return all(
-        _provider_attempt_complete(attempt)
-        for attempt in [primary, *fallbacks]
+    return bool(
+        all(
+            _provider_attempt_complete(attempt)
+            for attempt in [primary, *fallbacks]
+        )
+        and _provider_flow_valid(item, policy=policy)
     )
 
 
@@ -2739,10 +2908,14 @@ def _request_accounting_row_complete(
         "database_record_found",
         "database_data_as_of",
         "database_content_valid_until",
+        "database_refresh_due_at",
+        "database_lifecycle_status",
         "database_record_expired",
         "database_freshness_evaluation",
         "primary_provider",
         "fallbacks",
+        "acquisition_selected_source",
+        "acquisition_reason_code",
         "selected_source",
         "selected_value_present",
         "delivered_value",
@@ -2754,6 +2927,7 @@ def _request_accounting_row_complete(
         not isinstance(item, dict)
         or not required <= set(item)
         or not item.get("reason_code")
+        or not item.get("acquisition_reason_code")
         or item.get("request_id") != request_id
         or item.get("correlation_id") != correlation_id
         or item.get("evidence_origin") != "NORMAL_APPLICATION_REQUEST"
@@ -2801,6 +2975,11 @@ def _request_accounting_row_complete(
         or not item.get("database_lookup_reason")
     ):
         return False
+    if (
+        policy.canonical_repository_required
+        and item.get("database_lookup_performed") is not True
+    ):
+        return False
     primary = item.get("primary_provider")
     fallbacks = item.get("fallbacks")
     attempts = [primary, *fallbacks] if isinstance(fallbacks, list) else []
@@ -2838,6 +3017,13 @@ def _request_accounting_row_complete(
         if item["database_record_found"] and (
             not item.get("database_data_as_of")
             or not item.get("database_content_valid_until")
+            or not item.get("database_refresh_due_at")
+        ):
+            return False
+        if not _canonical_database_evidence_valid(
+            item,
+            policy=policy,
+            observed_at=observed_at,
         ):
             return False
     elif any(
@@ -2846,11 +3032,15 @@ def _request_accounting_row_complete(
             "database_record_found",
             "database_data_as_of",
             "database_content_valid_until",
+            "database_refresh_due_at",
+            "database_lifecycle_status",
             "database_record_expired",
         )
     ) or item.get("database_freshness_evaluation") != "NOT_LOOKED_UP":
         return False
     return bool(
+        _provider_flow_valid(item, policy=policy)
+        and
         item.get("payload_freshness")
         and not (
             item["selected_value_present"]

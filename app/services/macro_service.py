@@ -8,11 +8,30 @@ class MacroService:
     def __init__(self, providers: list[FredProvider | BlsProvider | BeaProvider]) -> None:
         self.providers = providers
 
-    async def latest(self) -> MacroLatestResponse:
+    async def latest(
+        self,
+        *,
+        force: bool = False,
+        requested_series: dict[str, tuple[str, ...]] | None = None,
+    ) -> MacroLatestResponse:
         output: list[MacroSeries] = []
         provider_results = []
         for provider in self.providers:
-            result = await provider.fetch_safe()
+            provider_series = (
+                requested_series.get(str(provider.source).upper(), ())
+                if requested_series is not None
+                else None
+            )
+            if requested_series is not None and not provider_series:
+                continue
+            result = await provider.fetch_safe(
+                force=force,
+                **(
+                    {"series_ids": provider_series}
+                    if provider_series is not None
+                    else {}
+                ),
+            )
             provider_results.append(result.metadata)
             if not isinstance(result.data, dict):
                 continue
@@ -31,4 +50,3 @@ class MacroService:
                     )
                 )
         return MacroLatestResponse(series=output, provider_results=provider_results)
-

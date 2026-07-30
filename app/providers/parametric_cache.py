@@ -60,6 +60,7 @@ class ParametricProviderCache:
         parameters: dict[str, Any],
         ttl_seconds: int,
         loader: Callable[[], Awaitable[Any]],
+        force_refresh: bool = False,
     ) -> CacheResolution:
         key = self.key(
             provider,
@@ -68,7 +69,11 @@ class ParametricProviderCache:
             parameters=parameters,
         )
         now = _aware(self.clock())
-        entry = self.cache.get_entry(key)
+        entry = (
+            None
+            if force_refresh
+            else self.cache.get_entry(key)
+        )
         if entry and _future(entry.get("valid_until"), now):
             negative = entry.get("status") == "negative_cache"
             return CacheResolution(

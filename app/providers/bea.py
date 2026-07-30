@@ -95,7 +95,11 @@ class BeaProvider(BaseProvider):
         super().__init__(cache)
         self.settings = settings
 
-    async def fetch(self) -> ProviderResult:
+    async def fetch(
+        self,
+        *,
+        series_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> ProviderResult:
         if not self.settings.bea_enabled:
             raise ProviderDisabled("BEA provider is disabled")
         if not self.settings.bea_api_key:
@@ -104,7 +108,18 @@ class BeaProvider(BaseProvider):
         series: dict[str, dict[str, object]] = {}
         errors: list[str] = []
         latest_as_of: datetime | None = None
-        specs = sorted(BEA_SERIES, key=itemgetter("table", "frequency"))
+        requested = set(series_ids or ())
+        specs = sorted(
+            [
+                spec
+                for spec in BEA_SERIES
+                if not requested
+                or str(spec["series_id"]) in requested
+            ],
+            key=itemgetter("table", "frequency"),
+        )
+        if not specs:
+            raise ProviderError("BEA requested series set is empty")
         async with httpx.AsyncClient(
             timeout=self.settings.bea_timeout_seconds,
             follow_redirects=False,

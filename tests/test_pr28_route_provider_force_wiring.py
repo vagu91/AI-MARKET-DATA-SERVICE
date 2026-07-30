@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -27,12 +28,23 @@ from app.providers.sp_global_pmi import SpGlobalPmiProvider
 from app.services.event_calendar_coverage_repository import (
     EventCalendarCoverageRepository,
 )
+from app.services.fed_expectations_repository import (
+    FedExpectationsRepository,
+)
 from app.services.market_fact_repository import MarketFactRepository
+from app.services.market_news_repository import MarketNewsRepository
+from app.services.risk_context_repository import (
+    RiskContextHistoryRepository,
+)
 from app.services.event_driven_lifecycle_service import (
     LifecycleRepository,
     compute_datum_lifecycle,
 )
 from app.services.temporal_domain_service import exact_occurrence_key
+from app.services.senior_analyst_projection_v1 import (
+    DATASET_POLICIES,
+    validate_senior_analyst_payload_v1,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -177,7 +189,7 @@ def _seed_route_state(
                 replace(
                     lifecycle,
                     valid_until=payload["valid_until"],
-                    next_refresh_at=None,
+                    next_refresh_at=payload["valid_until"],
                     next_retry_at=None,
                     freshness_state=str(
                         r3_stale["freshness_state"]
@@ -238,7 +250,518 @@ def _seed_route_state(
                     "redacted": True,
                 },
                 valid_until=now + timedelta(days=1),
+                policy_version=facts.source_policy.policy_version,
             )
+
+
+def _seed_senior_canonical_facts(cfg: Settings) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    valid_until = now + timedelta(hours=6)
+    facts = MarketFactRepository(cfg)
+    macro_series = (
+        ("DGS2", "FRED", "4.25"),
+        ("DFF", "FRED", "4.33"),
+        ("DFEDTARL", "FRED", "4.25"),
+        ("DFEDTARU", "FRED", "4.50"),
+        ("CUSR0000SA0", "BLS", "321.5"),
+        ("WPUFD4", "BLS", "258.4"),
+        ("BEA:PCE", "BEA", "0.3"),
+        ("BEA:GDP", "BEA", "2.8"),
+        ("LNS14000000", "BLS", "4.1"),
+        ("CES0500000003", "BLS", "0.3"),
+        ("CES0000000001", "BLS", "159500"),
+        ("ICSA", "FRED", "218000"),
+        ("VIXCLS", "FRED", "18.0"),
+    )
+    for series_id, source, value in macro_series:
+        facts.upsert_fact(
+            {
+                "fact_key": (
+                    f"US:{series_id}:latest:official_macro_latest"
+                ),
+                "fact_type": "official_macro_latest",
+                "country": "US",
+                "category": series_id,
+                "event_name": series_id,
+                "value": value,
+                "unit": "index",
+                "source": source,
+                "provider_type": "API",
+                "reliability": 0.95,
+                "confidence": 0.95,
+                "retrieved_at": now.isoformat(),
+                "release_at": now.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "next_refresh_at": valid_until.isoformat(),
+                "raw_payload_json": {
+                    "series_id": series_id,
+                    "data_as_of": now.isoformat(),
+                    "content_valid_until": valid_until.isoformat(),
+                    "refresh_due_at": valid_until.isoformat(),
+                },
+            }
+        )
+
+    decision_at = (now + timedelta(days=2)).replace(
+        hour=18,
+        minute=0,
+        second=0,
+    )
+    fomc_event = EconomicEvent(
+        event_id=f"fed:fomc:{decision_at.date().isoformat()}",
+        provider="Federal Reserve",
+        source_event_id=decision_at.date().isoformat(),
+        occurrence_id=(
+            f"fed:fomc:{decision_at.date().isoformat()}:decision"
+        ),
+        name="FOMC Rate Decision",
+        country="US",
+        category="FOMC",
+        metric_id="fomc_rate_decision",
+        date=decision_at.date().isoformat(),
+        time_utc=decision_at,
+        release_at=decision_at,
+        impact="HIGH",
+        source="Federal Reserve",
+        source_url=(
+            "https://www.federalreserve.gov/"
+            "monetarypolicy/fomccalendars.htm"
+        ),
+        retrieved_at=now,
+        reliability=0.98,
+        event_risk_level="HIGH",
+        enrichment={
+            "source": "Federal Reserve",
+            "source_url": (
+                "https://www.federalreserve.gov/"
+                "monetarypolicy/fomccalendars.htm"
+            ),
+            "retrieved_at": now,
+            "valid_until": valid_until,
+            "reliability": 0.98,
+            "confidence": 0.98,
+            "fomc_context": {
+                "meeting_date": decision_at.date().isoformat(),
+                "decision_time_utc": decision_at.isoformat(),
+                "current_target_range_lower": 4.25,
+                "current_target_range_upper": 4.50,
+                "expected_action": "hold",
+                "expected_change_bps": 0,
+                "probability_hold": 0.8,
+                "probability_cut_25bps": 0.15,
+                "probability_hike_25bps": 0.05,
+                "probability_source": (
+                    "Investing.com Fed Rate Monitor"
+                ),
+            },
+        },
+    )
+    assert facts.upsert_economic_event(
+        fomc_event,
+        event_key=exact_occurrence_key(fomc_event),
+    )
+
+    meeting = {
+        "meeting_date": decision_at.date().isoformat(),
+        "meeting_at": decision_at.isoformat(),
+        "expected_action": "hold",
+        "expected_change_bps": 0,
+        "probability_hold": 0.8,
+        "probability_cut_25bps": 0.15,
+        "probability_hike_25bps": 0.05,
+        "outcomes": [
+            {
+                "classification": "hold",
+                "probability": 0.8,
+                "target_lower_bound": 4.25,
+                "target_upper_bound": 4.50,
+            },
+            {
+                "classification": "cut",
+                "probability": 0.15,
+                "target_lower_bound": 4.00,
+                "target_upper_bound": 4.25,
+            },
+            {
+                "classification": "hike",
+                "probability": 0.05,
+                "target_lower_bound": 4.50,
+                "target_upper_bound": 4.75,
+            },
+        ],
+    }
+    fed_snapshot = {
+        "status": "available",
+        "data_as_of": now.isoformat(),
+        "retrieved_at": now.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "refresh_due_at": valid_until.isoformat(),
+        "current_fed_state": {
+            "current_target_lower_bound": 4.25,
+            "current_target_upper_bound": 4.50,
+            "current_target_midpoint": 4.375,
+            "effective_fed_funds_rate": 4.33,
+            "next_fomc_meeting_at": decision_at.isoformat(),
+        },
+        "next_meeting": dict(meeting),
+        "meetings": [dict(meeting)],
+        "repricing": {
+            "history_available": False,
+            "history_status": "history_insufficient",
+        },
+        "source_summary": {
+            "selected_source": (
+                "Investing.com Fed Rate Monitor"
+            ),
+            "selected_source_type": "secondary_monitor",
+            "ranking_class": "secondary_monitor",
+            "is_official_source": False,
+            "is_reconstructed": False,
+            "last_known_good_used": False,
+        },
+        "quality": {
+            "quality_score": 0.75,
+            "meeting_coverage_pct": 100.0,
+            "probability_distribution_coverage_pct": 100.0,
+        },
+        "diagnostics": {
+            "provider_calls": 0,
+            "browser_calls": 0,
+            "AI_called": False,
+            "cache_used": True,
+            "materialized_count": 1,
+        },
+        "warnings": [],
+        "errors": [],
+    }
+    FedExpectationsRepository(cfg).append(fed_snapshot)
+
+    for name, fact_type, source, raw in (
+        (
+            "investing_fed_rate_monitor",
+            "investing_fed_rate_monitor",
+            "Investing.com Fed Rate Monitor",
+            {
+                "status": "found",
+                "source": "Investing.com Fed Rate Monitor",
+                "source_url": (
+                    "https://www.investing.com/"
+                    "central-banks/fed-rate-monitor"
+                ),
+                "data_as_of": now.isoformat(),
+                "retrieved_at": now.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "next_refresh_at": valid_until.isoformat(),
+                "meetings": [dict(meeting)],
+                "warnings": [],
+                "errors": [],
+            },
+        ),
+        (
+            "nasdaq_market_info",
+            "nasdaq_market_info",
+            "Nasdaq Market Info",
+            {
+                "status": "found",
+                "source": "Nasdaq Market Info",
+                "provider": "Nasdaq Market Info",
+                "source_url": (
+                    "https://www.nasdaq.com/market-activity/"
+                    "stock-market-holiday-schedule"
+                ),
+                "data_as_of": now.isoformat(),
+                "retrieved_at": now.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "next_refresh_at": valid_until.isoformat(),
+                "validation": {
+                    "status": "accepted",
+                    "policy_version": "source-policy-v5",
+                },
+                "warnings": [],
+                "errors": [],
+            },
+        ),
+    ):
+        facts.upsert_fact(
+            {
+                "fact_key": (
+                    f"multi_source:{name}:{fact_type}:latest"
+                ),
+                "fact_type": fact_type,
+                "country": "US",
+                "category": fact_type,
+                "source": source,
+                "provider_type": "API",
+                "reliability": 0.9,
+                "confidence": 0.9,
+                "retrieved_at": now.isoformat(),
+                "release_at": now.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "next_refresh_at": valid_until.isoformat(),
+                "raw_payload_json": raw,
+            }
+        )
+
+    nasdaq_facts = (
+        (
+            "nasdaq_context:qqq_holdings",
+            "qqq_holdings",
+            {
+                "status": "AVAILABLE",
+                "source": "INVESCO",
+                "holdings_count": 2,
+                "holdings": [
+                    {
+                        "symbol": "NVDA",
+                        "weight": 9.0,
+                        "sector": "Technology",
+                    },
+                    {
+                        "symbol": "MSFT",
+                        "weight": 8.0,
+                        "sector": "Technology",
+                    },
+                ],
+            },
+        ),
+        (
+            "nasdaq_context:mega_cap_snapshot",
+            "mega_cap_snapshot",
+            {
+                "status": "AVAILABLE",
+                "source": "NASDAQ",
+                "stocks": [
+                    {
+                        "symbol": "NVDA",
+                        "price": 150.0,
+                        "change_pct": 1.2,
+                    },
+                    {
+                        "symbol": "MSFT",
+                        "price": 510.0,
+                        "change_pct": -0.2,
+                    },
+                ],
+                "data_quality": {
+                    "tracked_count": 2,
+                    "resolved_count": 2,
+                },
+            },
+        ),
+        (
+            "nasdaq_context:mega_cap_breadth",
+            "mega_cap_breadth",
+            {
+                "status": "AVAILABLE",
+                "source": "NASDAQ",
+                "positive_count": 1,
+                "negative_count": 1,
+                "weighted_average_change_pct": 0.5,
+            },
+        ),
+        (
+            "nasdaq_context:earnings",
+            "earnings_event",
+            {
+                "status": "AVAILABLE",
+                "source": "NASDAQ",
+                "events": [
+                    {
+                        "symbol": "NVDA",
+                        "date": (
+                            now.date() + timedelta(days=2)
+                        ).isoformat(),
+                    }
+                ],
+            },
+        ),
+    )
+    for fact_key, fact_type, raw in nasdaq_facts:
+        facts.upsert_fact(
+            {
+                "fact_key": fact_key,
+                "fact_type": fact_type,
+                "symbol": "QQQ",
+                "category": fact_type,
+                "source": raw["source"],
+                "provider_type": "API",
+                "reliability": 0.9,
+                "confidence": 0.9,
+                "retrieved_at": now.isoformat(),
+                "release_at": now.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "next_refresh_at": valid_until.isoformat(),
+                "raw_payload_json": {
+                    **raw,
+                    "data_as_of": now.isoformat(),
+                    "retrieved_at": now.isoformat(),
+                    "content_valid_until": valid_until.isoformat(),
+                    "refresh_due_at": valid_until.isoformat(),
+                },
+            }
+        )
+
+    deterministic_sections = {
+        "market_internals": {
+            "status": "AVAILABLE",
+            "provider": "TRADIER",
+            "advance_decline_ratio": 1.2,
+            "advancers": 60,
+            "decliners": 40,
+            "percent_advancers": 60.0,
+            "weighted_breadth": 0.2,
+            "stale_quote_count": 0,
+        },
+        "options_positioning": {
+            "status": "AVAILABLE",
+            "provider": "TRADIER",
+            "iv_atm": 0.2,
+            "open_interest": 1000,
+            "volume": 250,
+            "skew": -0.03,
+        },
+    }
+    for dataset_id, raw in deterministic_sections.items():
+        fact_type = f"deterministic_{dataset_id}"
+        facts.upsert_fact(
+            {
+                "fact_key": f"MNQ:{dataset_id}:{fact_type}",
+                "fact_type": fact_type,
+                "country": "US",
+                "symbol": "MNQ",
+                "category": dataset_id,
+                "event_name": dataset_id,
+                "source": "TRADIER",
+                "provider_type": "API",
+                "reliability": 0.85,
+                "confidence": 0.85,
+                "retrieved_at": now.isoformat(),
+                "release_at": now.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "next_refresh_at": valid_until.isoformat(),
+                "raw_payload_json": {
+                    **raw,
+                    "data_as_of": now.isoformat(),
+                    "retrieved_at": now.isoformat(),
+                    "content_valid_until": valid_until.isoformat(),
+                    "refresh_due_at": valid_until.isoformat(),
+                },
+            }
+        )
+
+    facts.upsert_fact(
+        {
+            "fact_key": "cot:nasdaq_100",
+            "fact_type": "cot_positioning",
+            "country": "US",
+            "symbol": "NQ",
+            "category": "cot_positioning",
+            "event_name": "CFTC",
+            "source": "CFTC",
+            "provider_type": "OFFICIAL_WEB",
+            "reliability": 0.95,
+            "confidence": 0.95,
+            "retrieved_at": now.isoformat(),
+            "release_at": now.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "next_refresh_at": valid_until.isoformat(),
+            "status": "active",
+            "raw_payload_json": {
+                "status": "found",
+                "report_date": now.date().isoformat(),
+                "publication_date": now.date().isoformat(),
+                "market_name": "NASDAQ-100 Consolidated",
+                "cftc_contract_market_code": "209742",
+                "report_type": "TFF",
+                "asset_managers": {
+                    "long": 100,
+                    "short": 80,
+                    "spreading": 10,
+                    "net": 20,
+                    "net_change_week": 2,
+                },
+                "leveraged_funds": {
+                    "long": 90,
+                    "short": 110,
+                    "spreading": 5,
+                    "net": -20,
+                    "net_change_week": -3,
+                },
+                "dealers": {
+                    "long": 70,
+                    "short": 65,
+                    "net": 5,
+                },
+                "open_interest": 500,
+                "source": "CFTC",
+                "data_as_of": now.isoformat(),
+                "retrieved_at": now.isoformat(),
+                "content_valid_until": valid_until.isoformat(),
+                "refresh_due_at": valid_until.isoformat(),
+                "reliability": 0.95,
+                "warnings": [],
+                "errors": [],
+            },
+        }
+    )
+
+    risk_metric_metadata = {
+        "status": "found",
+        "data_as_of": now.isoformat(),
+        "retrieved_at": now.isoformat(),
+        "content_valid_until": valid_until.isoformat(),
+        "refresh_due_at": valid_until.isoformat(),
+        "freshness": "CURRENT",
+        "source": "CBOE",
+    }
+    RiskContextHistoryRepository(cfg).append(
+        {
+            "status": "available",
+            "data_as_of": now.isoformat(),
+            "retrieved_at": now.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "content_valid_until": valid_until.isoformat(),
+            "next_refresh_at": valid_until.isoformat(),
+            "refresh_due_at": valid_until.isoformat(),
+            "vix": {
+                **risk_metric_metadata,
+                "value": 18.0,
+            },
+            "vvix": {
+                **risk_metric_metadata,
+                "value": 90.0,
+            },
+            "skew": {
+                **risk_metric_metadata,
+                "value": 125.0,
+            },
+            "derived_context": {
+                "risk_regime": "NEUTRAL",
+                "risk_score": 0.5,
+            },
+            "source_summary": {
+                "selected_sources": {
+                    "vix": "CBOE",
+                    "vvix": "CBOE",
+                    "risk": "CBOE",
+                },
+                "last_known_good_used": False,
+            },
+            "quality": {
+                "quality_score": 0.9,
+                "vix_available": True,
+                "vvix_available": True,
+                "skew_available": True,
+            },
+            "diagnostics": {
+                "provider_calls": 0,
+                "actual_network_calls": 0,
+                "cache_used": True,
+            },
+            "warnings": [],
+            "errors": [],
+        }
+    )
 
 
 def _counts(cfg: Settings) -> dict[str, int]:
@@ -341,6 +864,7 @@ def _install_controlled_application(
     *,
     fred_calls: list[str],
     sp_calls: list[str],
+    sp_success: bool = False,
 ) -> None:
     controlled = json.loads(FIXTURE.read_text(encoding="utf-8"))[
         "controlled_http_boundary"
@@ -362,6 +886,15 @@ def _install_controlled_application(
 
     def sp_http(request: httpx.Request) -> httpx.Response:
         sp_calls.append(str(request.url))
+        if sp_success:
+            return httpx.Response(
+                200,
+                text=(
+                    "Flash US Services PMI Business Activity Index: "
+                    "53.6 (June: 51.2)"
+                ),
+                request=request,
+            )
         return httpx.Response(
             int(controlled["sp_global"]["status_code"]),
             text=str(controlled["sp_global"]["body"]),
@@ -655,7 +1188,7 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
             assert pmi_audit["provider_attempted"] == "SPGLOBAL"
             assert pmi_audit["provider_http_outcome"] == "HTTP_403"
             assert pmi_audit["reason_code"] == (
-                "sp_global_public_release_access_restricted"
+                "all_flash_services_pmi_providers_failed:ProviderError"
             )
             assert pmi_audit["retryable"] is True
             assert pmi_audit["actual_still_missing"] is True
@@ -705,7 +1238,7 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
             assert full_by_id[PMI_ID]["reference_period"] == "2026-07"
             assert full_by_id[PMI_ID]["actual_resolution"][
                 "reason_code"
-            ] == "sp_global_public_release_access_restricted"
+            ] == "all_flash_services_pmi_providers_failed:ProviderError"
 
             assert (
                 after_first["market_context_snapshots"]
@@ -743,7 +1276,10 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
     ]["occurrences"]
     assert any(
         item["occurrence_id"] == PMI_ID
-        and item["provider_call_count"] == 1
+        and item["provider_call_count"] == 0
+        and item["resolver_invoked"] is False
+        and item["reconciliation_outcome"]
+        == "DATABASE_SELECTED"
         for item in fixed_audits
     )
     assert len(fred_calls) >= fred_before_fixed_point
@@ -760,6 +1296,400 @@ def test_real_app_route_wires_official_actuals_and_fixed_point(
         "research_backend_invocations",
     ):
         assert after_fixed[table] == after_first[table], table
+
+
+def test_real_senior_route_emits_request_scoped_accounting_on_two_force_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the production route twice without replacing application services."""
+
+    cfg = _settings(tmp_path)
+    fred_calls: list[str] = []
+    sp_calls: list[str] = []
+    _install_controlled_application(
+        monkeypatch,
+        cfg,
+        fred_calls=fred_calls,
+        sp_calls=sp_calls,
+        sp_success=True,
+    )
+
+    with respx.mock(
+        assert_all_mocked=False,
+        assert_all_called=False,
+    ) as network:
+        network.route().respond(404)
+        with TestClient(main_module.app) as client:
+            _seed_route_state(
+                cfg,
+                main_module.app.state.event_service,
+                seed_stale_lifecycle=True,
+            )
+            _seed_senior_canonical_facts(cfg)
+            now = datetime.now(UTC).replace(microsecond=0)
+            MarketNewsRepository(cfg).upsert_news(
+                {
+                    "title": "Federal Reserve controlled official release",
+                    "summary": (
+                        "Controlled current-news repository fixture for "
+                        "request-scoped accounting."
+                    ),
+                    "source": "Federal Reserve",
+                    "source_url": (
+                        "https://www.federalreserve.gov/newsevents/"
+                        "pressreleases/test.htm"
+                    ),
+                    "published_at": (
+                        now - timedelta(minutes=1)
+                    ).isoformat(),
+                    "retrieved_at": now.isoformat(),
+                    "valid_until": (
+                        now + timedelta(hours=6)
+                    ).isoformat(),
+                    "next_refresh_at": (
+                        now + timedelta(hours=6)
+                    ).isoformat(),
+                    "topics": ["Federal Reserve", "macro"],
+                    "provider_type": "RSS",
+                    "is_official": True,
+                    "source_verification_status": "VERIFIED",
+                    "reliability": 0.9,
+                }
+            )
+
+            first = client.get(
+                "/market-context/mnq"
+                "?refresh=force&view=consumer"
+                "&audience=senior_analyst_v1"
+            )
+            assert first.status_code == 200, first.text
+
+            fred_after_first = list(fred_calls)
+            sp_after_first = list(sp_calls)
+            network_calls_after_first = len(network.calls)
+            second = client.get(
+                "/market-context/mnq"
+                "?refresh=force&view=consumer"
+                "&audience=senior_analyst_v1"
+            )
+            assert second.status_code == 200, second.text
+            network_calls_after_second = len(network.calls)
+            second_request_urls = [
+                str(call.request.url)
+                for call in network.calls[
+                    network_calls_after_first:
+                ]
+            ]
+
+    expected = {
+        policy.dataset_id
+        for policy in DATASET_POLICIES
+    }
+    assert len(DATASET_POLICIES) == 25
+    assert len(expected) == 25
+    for response in (first, second):
+        payload = response.json()
+        rows = payload["provider_accounting"]
+        assert {
+            row["dataset_id"]
+            for row in rows
+        } == expected
+        assert len(rows) == len(expected)
+        assert len(rows) == 25
+        missing_database_lookup = [
+            row["dataset_id"]
+            for row in rows
+            if row["database_lookup_performed"] is not True
+        ]
+        missing_database_lookup_details = [
+            (
+                row["dataset_id"],
+                row.get("reason_code"),
+                row.get("evidence_status"),
+            )
+            for row in rows
+            if row["dataset_id"] in missing_database_lookup
+        ]
+        assert missing_database_lookup == [], (
+            "canonical repository lookup missing for "
+            f"{missing_database_lookup_details}"
+        )
+    second_payload = second.json()
+    incomplete_rows = [
+        (
+            row["dataset_id"],
+            row.get("reason_code"),
+            row.get("database_freshness_evaluation"),
+        )
+        for row in second_payload["provider_accounting"]
+        if row.get("evidence_status") != "COMPLETE"
+    ]
+    assert second_payload["request"][
+        "same_request_provider_accounting"
+    ] is True, incomplete_rows
+    validation = validate_senior_analyst_payload_v1(
+        second_payload,
+        require_recent_response=True,
+    )
+    assert validation["checks"][
+        "provider_accounting_valid"
+    ] is True
+    missing_one = deepcopy(second_payload)
+    missing_one["provider_accounting"] = [
+        row
+        for row in missing_one["provider_accounting"]
+        if row["dataset_id"] != "nasdaq_100"
+    ]
+    assert len(missing_one["provider_accounting"]) == 24
+    missing_validation = validate_senior_analyst_payload_v1(
+        missing_one,
+        require_recent_response=True,
+    )
+    assert missing_validation["status"] == "FAIL"
+    assert missing_validation["checks"][
+        "provider_accounting_valid"
+    ] is False
+
+    assert fred_calls == fred_after_first
+    assert sp_calls == sp_after_first
+    assert (
+        network_calls_after_second == network_calls_after_first
+    ), second_request_urls
+
+
+def test_real_senior_route_observes_expired_nasdaq_news_and_earnings_chains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control HTTP only while exercising the production route and services."""
+
+    cfg = _settings(tmp_path)
+    cfg.alpha_vantage_api_key = None
+    cfg.invesco_qqq_holdings_url = "https://invesco.test/qqq.csv"
+    cfg.nasdaq_100_constituents_url = (
+        "https://nasdaq.test/constituents"
+    )
+    cfg.news_gdelt_enabled = True
+    cfg.news_rss_enabled = False
+    cfg.gdelt_doc_api_url = "https://gdelt.test/api"
+    cfg.enable_nasdaq_earnings = True
+    cfg.enable_fmp_earnings = True
+    cfg.fmp_api_key = "controlled-test-key"
+    cfg.nasdaq_earnings_calendar_url = (
+        "https://nasdaq.test/earnings"
+    )
+    cfg.fmp_earnings_calendar_url = "https://fmp.test/earnings"
+    fred_calls: list[str] = []
+    sp_calls: list[str] = []
+    _install_controlled_application(
+        monkeypatch,
+        cfg,
+        fred_calls=fred_calls,
+        sp_calls=sp_calls,
+        sp_success=True,
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    event_date = (now.date() + timedelta(days=2)).isoformat()
+    gdelt_seen = now.strftime("%Y%m%dT%H%M%SZ")
+
+    with respx.mock(
+        assert_all_mocked=False,
+        assert_all_called=False,
+    ) as network:
+        invesco = network.get(
+            cfg.invesco_qqq_holdings_url
+        ).mock(
+            return_value=httpx.Response(403, text="Forbidden")
+        )
+        nasdaq_holdings = network.get(
+            cfg.nasdaq_100_constituents_url
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rows": [
+                            {
+                                "symbol": "MSFT",
+                                "companyName": "Microsoft",
+                                "sector": "Technology",
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+        gdelt = network.get(cfg.gdelt_doc_api_url).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "articles": [
+                        {
+                            "id": "gdelt-route-1",
+                            "title": (
+                                "Microsoft reports a material Nasdaq "
+                                "business update"
+                            ),
+                            "url": (
+                                "https://publisher.test/"
+                                "gdelt-route-1"
+                            ),
+                            "seendate": gdelt_seen,
+                            "domain": "Reuters",
+                            "description": (
+                                "Controlled current news for the "
+                                "production route."
+                            ),
+                        }
+                    ]
+                },
+            )
+        )
+        nasdaq_earnings = network.get(
+            cfg.nasdaq_earnings_calendar_url
+        ).mock(return_value=httpx.Response(503, text="unavailable"))
+        fmp_earnings = network.get(
+            cfg.fmp_earnings_calendar_url
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "symbol": "AAPL",
+                        "name": "Apple",
+                        "date": event_date,
+                        "epsEstimated": 1.25,
+                        "revenueEstimated": 100_000,
+                    }
+                ],
+            )
+        )
+        network.route().respond(404)
+
+        with TestClient(main_module.app) as client:
+            _seed_route_state(
+                cfg,
+                main_module.app.state.event_service,
+                seed_stale_lifecycle=True,
+            )
+            _seed_senior_canonical_facts(cfg)
+            expired_at = (
+                datetime.now(UTC) - timedelta(minutes=1)
+            ).isoformat()
+            with sqlite3.connect(cfg.database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE market_facts
+                    SET valid_until=?, next_refresh_at=?
+                    WHERE fact_type IN ('qqq_holdings','earnings_event')
+                    """,
+                    (expired_at, expired_at),
+                )
+                connection.commit()
+
+            response = client.get(
+                "/market-context/mnq"
+                "?refresh=force&view=consumer"
+                "&audience=senior_analyst_v1"
+            )
+
+    assert response.status_code == 200, response.text
+    rows = {
+        row["dataset_id"]: row
+        for row in response.json()["provider_accounting"]
+    }
+
+    qqq = rows["nasdaq_100"]
+    assert qqq["database_lookup_performed"] is True
+    assert qqq["database_record_found"] is True
+    assert qqq["database_record_expired"] is True
+    assert qqq["database_freshness_evaluation"] != "VALID"
+    assert [
+        (
+            item["provider"],
+            item["called"],
+            item["execution_origin"],
+        )
+        for item in [
+            qqq["primary_provider"],
+            *qqq["fallbacks"],
+        ]
+    ] == [
+        ("INVESCO", True, "PROVIDER_CALL"),
+        ("ALPHA_VANTAGE", False, "OBSERVED_SKIP"),
+        ("NASDAQ", True, "PROVIDER_CALL"),
+        ("SEC", False, "OBSERVED_SKIP"),
+    ]
+    assert qqq["evidence_status"] == "COMPLETE"
+
+    mega = rows["mega_cap_quotes"]
+    assert mega["database_lookup_performed"] is True
+    assert mega["database_record_found"] is True
+    assert mega["database_record_expired"] is False
+    assert all(
+        item["called"] is False
+        and item["execution_origin"] == "CACHE_DECISION"
+        for item in [
+            mega["primary_provider"],
+            *mega["fallbacks"],
+        ]
+    )
+
+    news = rows["current_news"]
+    assert news["database_lookup_performed"] is True
+    assert news["database_record_found"] is False
+    news_attempts = [
+        news["primary_provider"],
+        *news["fallbacks"],
+    ]
+    assert [
+        item["provider"]
+        for item in news_attempts
+    ] == [
+        "ALPHA_VANTAGE_NEWS_SENTIMENT",
+        "GDELT_DOC_API",
+        "FEDERAL_RESERVE_RSS",
+        "BLS_RSS",
+        "BEA_RSS",
+        "YAHOO_FINANCE_RSS",
+        "MARKETWATCH_RSS",
+        "GOOGLE_NEWS_RSS",
+    ]
+    assert news_attempts[0]["called"] is False
+    assert news_attempts[1]["called"] is True
+    assert all(
+        item["called"] is False
+        for item in news_attempts[2:]
+    )
+    assert news["evidence_status"] == "COMPLETE"
+
+    earnings = rows["earnings"]
+    assert earnings["database_lookup_performed"] is True
+    assert earnings["database_record_found"] is True
+    assert earnings["database_record_expired"] is True
+    assert earnings["primary_provider"]["called"] is True
+    assert earnings["fallbacks"][0]["called"] is True
+    assert (
+        earnings["fallbacks"][0]["provider"]
+        == "FMP_EARNINGS_CALENDAR"
+    )
+    assert earnings["acquisition_selected_source"] == (
+        "Financial Modeling Prep Earnings Calendar"
+    )
+    assert earnings["selected_value_present"] is False
+    assert earnings["delivered_value"] is None
+    assert earnings["reason_code"] == "NO_CURRENT_EARNINGS_EVENTS"
+    assert earnings["delivery_missing_reason_codes"] == [
+        "NO_CURRENT_EARNINGS_EVENTS"
+    ]
+    assert earnings["evidence_status"] == "COMPLETE"
+
+    assert invesco.call_count == 1
+    assert nasdaq_holdings.call_count == 1
+    assert gdelt.call_count == 1
+    assert nasdaq_earnings.call_count == 14
+    assert fmp_earnings.call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -788,6 +1718,7 @@ def test_real_route_skips_non_due_no_data_states_at_fixed_point(
                 main_module.app.state.event_service,
             )
             _baseline_missing_actual_snapshot(client, cfg)
+            _seed_senior_canonical_facts(cfg)
             expected_retry = _seed_no_data_state(
                 cfg,
                 lifecycle_state,

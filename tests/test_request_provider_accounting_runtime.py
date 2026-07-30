@@ -119,22 +119,55 @@ def _macro_fact(*, valid_until: datetime) -> dict:
         "retrieved_at": datetime.now(UTC).isoformat(),
         "release_at": "2026-06",
         "valid_until": valid_until.isoformat(),
+        "next_refresh_at": valid_until.isoformat(),
+        "lifecycle_status": "CURRENT",
         "raw_payload": {
             "series_id": "CUSR0000SA0",
             "data_as_of": "2026-06",
+            "next_refresh_at": valid_until.isoformat(),
         },
     }
+
+
+def _valid_macro_facts(*, valid_until: datetime) -> list[dict]:
+    series = (
+        ("DGS2", "FRED"),
+        ("DFF", "FRED"),
+        ("DFEDTARL", "FEDERAL_RESERVE"),
+        ("CUSR0000SA0", "BLS"),
+        ("WPUFD4", "BLS"),
+        ("BEA:PCE", "BEA"),
+        ("BEA:GDP", "BEA"),
+        ("LNS14000000", "BLS"),
+        ("CES0500000003", "BLS"),
+        ("CES0000000001", "BLS"),
+        ("ICSA", "FRED"),
+    )
+    return [
+        {
+            **_macro_fact(valid_until=valid_until),
+            "fact_key": (
+                f"US:{series_id}:latest:official_macro_latest"
+            ),
+            "category": series_id,
+            "source": source,
+            "raw_payload": {
+                "series_id": series_id,
+                "data_as_of": "2026-07-29",
+                "next_refresh_at": valid_until.isoformat(),
+            },
+        }
+        for series_id, source in series
+    ]
 
 
 def test_valid_db_record_observably_skips_provider(tmp_path) -> None:
     settings = _settings(tmp_path)
     service = _macro_service(
         settings,
-        rows=[
-            _macro_fact(
-                valid_until=datetime.now(UTC) + timedelta(hours=1)
-            )
-        ],
+        rows=_valid_macro_facts(
+            valid_until=datetime.now(UTC) + timedelta(hours=1)
+        ),
         response=MacroLatestResponse(),
     )
     collector = _collector(
@@ -162,6 +195,7 @@ def test_valid_db_record_observably_skips_provider(tmp_path) -> None:
 
     asyncio.run(
         service._macro_db_first(
+            force=True,
             accounting_collector=collector,
         )
     )
@@ -173,6 +207,7 @@ def test_valid_db_record_observably_skips_provider(tmp_path) -> None:
         if row["dataset_id"] == "cpi"
     )
     assert cpi["database_freshness_evaluation"] == "VALID"
+    assert cpi["database_lifecycle_status"] == "CURRENT"
     assert cpi["primary_provider"]["called"] is False
     assert (
         cpi["primary_provider"]["not_called_reason"]
@@ -236,6 +271,7 @@ def test_expired_db_record_calls_primary_provider(tmp_path) -> None:
 
     asyncio.run(
         service._macro_db_first(
+            force=True,
             accounting_collector=collector,
         )
     )
@@ -246,7 +282,9 @@ def test_expired_db_record_calls_primary_provider(tmp_path) -> None:
         for row in collector.manifest()["datasets"]
         if row["dataset_id"] == "cpi"
     )
-    assert cpi["database_freshness_evaluation"] == "EXPIRED"
+    assert cpi["database_freshness_evaluation"] == (
+        "EXPIRED_CONTENT_VALID_UNTIL"
+    )
     assert cpi["primary_provider"]["called"] is True
     assert cpi["primary_provider"]["execution_origin"] == "PROVIDER_CALL"
 
@@ -300,7 +338,7 @@ def _record_observed_call(
     )
 
 
-def test_productive_route_emits_complete_manifest_without_source_injection(
+def test_route_plumbing_cannot_pass_with_provider_only_manual_accounting(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -399,7 +437,7 @@ def test_productive_route_emits_complete_manifest_without_source_injection(
 
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert payload["request"]["same_request_provider_accounting"] is True
+    assert payload["request"]["same_request_provider_accounting"] is False
     assert len(payload["provider_accounting"]) == len(DATASET_POLICIES)
     assert set(provider.calls) == {
         policy.dataset_id for policy in DATASET_POLICIES
@@ -408,7 +446,7 @@ def test_productive_route_emits_complete_manifest_without_source_injection(
         payload,
         require_recent_response=True,
     )
-    assert validation["checks"]["provider_accounting_valid"] is True
+    assert validation["checks"]["provider_accounting_valid"] is False
 
 
 def test_one_missing_dataset_keeps_live_gate_closed() -> None:
@@ -467,6 +505,11 @@ def test_flash_pmi_runtime_evidence_preserves_fallback_order_and_selection() -> 
     collector = _collector([policy])
     service = object.__new__(ProviderForceActualReconciliationService)
     service.accounting_collector = collector
+    service.lifecycle = type(
+        "EmptyLifecycleRepository",
+        (),
+        {"list_items": lambda _self: []},
+    )()
 
     service._record_flash_pmi_accounting(
         contract=_flash_contract(
@@ -475,8 +518,18 @@ def test_flash_pmi_runtime_evidence_preserves_fallback_order_and_selection() -> 
         ),
         audits=[
             {
+                "occurrence_id": "xtb:146945:2026-07-24",
                 "mapping_selected": "flash_services_pmi",
                 "provider_call_count": 2,
+                "lifecycle_before": {
+                    "freshness_state": "STALE",
+                    "valid_until": (
+                        datetime.now(UTC) - timedelta(minutes=5)
+                    ).isoformat(),
+                    "next_refresh_at": (
+                        datetime.now(UTC) - timedelta(minutes=5)
+                    ).isoformat(),
+                },
                 "provider_attempts": [
                     {
                         "provider": "SPGLOBAL",
@@ -513,13 +566,28 @@ def test_flash_pmi_all_provider_failures_leave_value_null() -> None:
     collector = _collector([policy])
     service = object.__new__(ProviderForceActualReconciliationService)
     service.accounting_collector = collector
+    service.lifecycle = type(
+        "EmptyLifecycleRepository",
+        (),
+        {"list_items": lambda _self: []},
+    )()
 
     service._record_flash_pmi_accounting(
         contract=_flash_contract(),
         audits=[
             {
+                "occurrence_id": "xtb:146945:2026-07-24",
                 "mapping_selected": "flash_services_pmi",
                 "provider_call_count": 2,
+                "lifecycle_before": {
+                    "freshness_state": "STALE",
+                    "valid_until": (
+                        datetime.now(UTC) - timedelta(minutes=5)
+                    ).isoformat(),
+                    "next_refresh_at": (
+                        datetime.now(UTC) - timedelta(minutes=5)
+                    ).isoformat(),
+                },
                 "provider_attempts": [
                     {
                         "provider": "SPGLOBAL",
@@ -539,6 +607,9 @@ def test_flash_pmi_all_provider_failures_leave_value_null() -> None:
     row = collector.manifest()["datasets"][0]
     assert row["primary_provider"]["called"] is True
     assert row["fallbacks"][0]["called"] is True
+    assert row["database_record_found"] is True
+    assert row["database_record_expired"] is True
+    assert row["database_freshness_evaluation"] != "VALID"
     assert row["acquisition_selected_source"] is None
     assert row["acquisition_reason_code"] == (
         "FLASH_SERVICES_PMI_VALUE_NOT_AVAILABLE"

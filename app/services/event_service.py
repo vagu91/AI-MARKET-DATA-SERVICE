@@ -1,3 +1,4 @@
+import inspect
 from datetime import UTC, date, datetime, timedelta
 
 from app.models.events import EconomicEvent
@@ -56,6 +57,7 @@ class EventService:
         end: datetime | None = None,
         enrich: bool = True,
         provider_names: list[str] | None = None,
+        force: bool = False,
     ) -> list[EconomicEvent]:
         events: list[EconomicEvent] = []
         self.last_provider_results = []
@@ -69,7 +71,21 @@ class EventService:
             if not provider_names or provider.source in set(provider_names)
         ]
         for provider in selected:
-            result = await provider.fetch_safe()
+            fetch_call = provider.fetch_safe
+            parameters = inspect.signature(fetch_call).parameters
+            fetch_kwargs = (
+                {"force": force}
+                if (
+                    "force" in parameters
+                    or any(
+                        parameter.kind
+                        == inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters.values()
+                    )
+                )
+                else {}
+            )
+            result = await fetch_call(**fetch_kwargs)
             self.last_provider_results.append(result.metadata)
             if not isinstance(result.data, list):
                 continue

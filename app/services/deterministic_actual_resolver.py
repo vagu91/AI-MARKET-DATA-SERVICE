@@ -237,9 +237,7 @@ class DeterministicActualResolver:
                             else None
                         ),
                     ),
-                    # Compatibility count remains the official-primary call.
-                    # Per-provider attempts below account for the fallback.
-                    "provider_call_count": 1,
+                    "provider_call_count": 2,
                     "fallback_reason_code": (
                         f"all_flash_services_pmi_providers_failed:"
                         f"{type(fallback_exc).__name__}"

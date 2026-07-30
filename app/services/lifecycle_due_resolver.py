@@ -586,13 +586,21 @@ class MacroActualLifecycleProviderAdapter:
         if status == "OFFICIAL_FEED_DELAYED" or resolution.get(
             "retryable"
         ) is True:
+            fallback_reason = resolution.get(
+                "fallback_reason_code"
+            )
             return {
                 "status": "DEFERRED",
                 "reason": str(
-                    resolution.get("error")
+                    fallback_reason
+                    or resolution.get("error")
                     or "official_macro_actual_feed_delayed"
                 ),
-                "reason_code": resolution.get("reason_code"),
+                "reason_code": (
+                    fallback_reason
+                    or resolution.get("reason_code")
+                ),
+                "fallback_reason_code": fallback_reason,
                 "provider": resolution.get("provider"),
                 "source_series": resolution.get("source_series"),
                 "provider_http_outcome": resolution.get(
@@ -601,6 +609,14 @@ class MacroActualLifecycleProviderAdapter:
                 "provider_call_count": int(
                     resolution.get("provider_call_count") or 0
                 ),
+                "provider_attempts": [
+                    dict(item)
+                    for item in resolution.get(
+                        "provider_attempts"
+                    )
+                    or []
+                    if isinstance(item, dict)
+                ],
                 "retryable": True,
                 "provider_request_attempted": True,
                 "provider_request_completed": False,
@@ -643,6 +659,10 @@ class MacroActualLifecycleProviderAdapter:
         return {
             "status": "PARTIAL" if missing_fields else "RESOLVED",
             "reason": "official_macro_actual_resolved",
+            "reason_code": resolution.get("reason_code"),
+            "fallback_reason_code": resolution.get(
+                "fallback_reason_code"
+            ),
             "datum": datum,
             "missing_fields": missing_fields,
             "provider_request_attempted": True,
@@ -655,6 +675,11 @@ class MacroActualLifecycleProviderAdapter:
             "provider_call_count": int(
                 resolution.get("provider_call_count") or 0
             ),
+            "provider_attempts": [
+                dict(item)
+                for item in resolution.get("provider_attempts") or []
+                if isinstance(item, dict)
+            ],
             "candidate_validation": resolution.get(
                 "candidate_validation"
             ),
@@ -853,6 +878,7 @@ class DeterministicLifecycleDueResolver:
                         "source_series",
                         "provider_http_outcome",
                         "provider_call_count",
+                        "provider_attempts",
                         "retryable",
                     )
                     if result.get(key) is not None
@@ -864,11 +890,27 @@ class DeterministicLifecycleDueResolver:
                 telemetry=failure_telemetry,
             )
         if status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA", "NOT_CONFIGURED"}:
+            exhausted_telemetry = {
+                **telemetry,
+                **{
+                    key: result.get(key)
+                    for key in (
+                        "reason_code",
+                        "provider",
+                        "source_series",
+                        "provider_http_outcome",
+                        "provider_call_count",
+                        "provider_attempts",
+                        "retryable",
+                    )
+                    if result.get(key) is not None
+                },
+            }
             return self._exhausted(
                 item,
                 status="NO_DATA" if status == "NO_DATA" else "EXHAUSTED",
                 reason=str(result.get("reason") or "deterministic_provider_exhausted"),
-                telemetry=telemetry,
+                telemetry=exhausted_telemetry,
             )
         if status not in {"RESOLVED", "FRESH", "SUCCEEDED", "PARTIAL"}:
             return self._temporary_failure(
@@ -903,14 +945,10 @@ class DeterministicLifecycleDueResolver:
             entity_type == "macro_actual"
             and provider_datum.get("actual") not in (None, "")
         ):
-            # An admitted official release is a completed occurrence, not an
-            # expiring quote. Its historical release timestamp must not make a
-            # newly resolved actual fail the generic TTL freshness gate.
+            # Keep the cadence-derived content and refresh deadlines.  A
+            # recent retrieval must never make an old official release fresh.
             lifecycle = replace(
                 lifecycle,
-                freshness_state="FRESH",
-                valid_until=None,
-                next_refresh_at=None,
                 next_retry_at=None,
                 retry_class=None,
                 negative_cache_key=None,
@@ -1410,8 +1448,25 @@ def _official_actual_datum(
         candidate.get("source_url")
         or candidate.get("canonical_url")
     )
-    distributor = event.get("source") or event.get("provider")
-    distributor_url = event.get("source_url")
+    distributor = (
+        candidate.get("distribution_source")
+        or candidate.get("acquisition_provider")
+        or event.get("source")
+        or event.get("provider")
+    )
+    distributor_url = (
+        candidate.get("distribution_source_url")
+        or candidate.get("source_url")
+        or event.get("source_url")
+    )
+    acquisition_source = (
+        candidate.get("acquisition_provider")
+        or candidate.get("distribution_source")
+        or source
+    )
+    actual_is_official = bool(
+        candidate.get("actual_is_official", True)
+    )
     actual_lineage = {
         "source": source,
         "publisher": candidate.get("publisher"),
@@ -1421,7 +1476,12 @@ def _official_actual_datum(
         "canonical_url": candidate.get("canonical_url"),
         "source_tier": candidate.get("source_tier") or 1,
         "source_classification": (
-            candidate.get("source_classification") or "official_source"
+            candidate.get("source_classification")
+            or (
+                "official_source"
+                if actual_is_official
+                else "secondary_market_source"
+            )
         ),
         "provider_adapter": candidate.get("provider_adapter"),
         "metric_id": (
@@ -1543,10 +1603,12 @@ def _official_actual_datum(
         "frequency": candidate.get("frequency"),
         "unit": candidate.get("unit"),
         "source": source,
+        "publisher": candidate.get("publisher") or source,
         "source_url": source_url,
         "distributor": distributor,
         "distributor_url": distributor_url,
-        "actual_source": source,
+        "acquisition_provider": acquisition_source,
+        "actual_source": acquisition_source,
         "actual_source_url": source_url,
         "source_lineage": [actual_lineage],
         "comparison_lineage": {
@@ -1561,7 +1623,7 @@ def _official_actual_datum(
             ),
         },
         "acquisition_method": "api_provider",
-        "actual_is_official": True,
+        "actual_is_official": actual_is_official,
         "awaiting_actual": False,
         "status": "RELEASED",
         "release_status": "RELEASED",

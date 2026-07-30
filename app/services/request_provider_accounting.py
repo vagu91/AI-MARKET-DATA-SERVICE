@@ -4,7 +4,11 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, Callable, Iterable
 
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessPolicy,
+    evaluate_canonical_freshness,
+    parse_datetime,
+)
 
 
 EVIDENCE_ORIGIN = "NORMAL_APPLICATION_REQUEST"
@@ -62,6 +66,8 @@ class RequestProviderAccountingCollector:
         fallbacks: Iterable[dict[str, Any]],
         acquisition_selected_source: Any,
         acquisition_reason_code: str,
+        database_refresh_due_at: Any = None,
+        database_lifecycle_status: Any = None,
         observed_at: datetime | str | None = None,
         evidence_complete: bool = True,
     ) -> None:
@@ -92,6 +98,8 @@ class RequestProviderAccountingCollector:
             "database_record_found": database_record_found,
             "database_data_as_of": database_data_as_of,
             "database_content_valid_until": database_content_valid_until,
+            "database_refresh_due_at": database_refresh_due_at,
+            "database_lifecycle_status": database_lifecycle_status,
             "database_record_expired": database_record_expired,
             "database_freshness_evaluation": (
                 database_freshness_evaluation
@@ -192,12 +200,24 @@ class RequestProviderAccountingCollector:
         expired = row.get("database_record_expired")
         if type(lookup_performed) is not bool:
             return False
+        if (
+            getattr(policy, "canonical_repository_required", False)
+            and lookup_performed is not True
+        ):
+            return False
         if lookup_performed:
             if type(found) is not bool or type(expired) is not bool:
                 return False
             if found and (
                 not row.get("database_data_as_of")
                 or not row.get("database_content_valid_until")
+                or not row.get("database_refresh_due_at")
+            ):
+                return False
+            if not _canonical_database_evidence_valid(
+                row,
+                policy=policy,
+                observed_at=observed,
             ):
                 return False
         elif (
@@ -205,6 +225,8 @@ class RequestProviderAccountingCollector:
             or expired is not None
             or row.get("database_data_as_of") is not None
             or row.get("database_content_valid_until") is not None
+            or row.get("database_refresh_due_at") is not None
+            or row.get("database_lifecycle_status") is not None
             or row.get("database_freshness_evaluation")
             != "NOT_LOOKED_UP"
         ):
@@ -223,9 +245,15 @@ class RequestProviderAccountingCollector:
             != list(policy.fallback_providers)
         ):
             return False
-        return all(
-            _attempt_valid(item)
-            for item in [primary, *fallbacks]
+        return bool(
+            all(
+                _attempt_valid(item)
+                for item in [primary, *fallbacks]
+            )
+            and _provider_flow_valid(
+                row,
+                policy=policy,
+            )
         )
 
     def _missing_row(self, dataset_id: str) -> dict[str, Any]:
@@ -246,6 +274,8 @@ class RequestProviderAccountingCollector:
             "database_record_found": None,
             "database_data_as_of": None,
             "database_content_valid_until": None,
+            "database_refresh_due_at": None,
+            "database_lifecycle_status": None,
             "database_record_expired": None,
             "database_freshness_evaluation": None,
             "primary_provider": {
@@ -319,6 +349,196 @@ def _attempt_valid(value: Any) -> bool:
         attempts == 0
         and value.get("not_called_reason")
         and origin in {"OBSERVED_SKIP", "CACHE_DECISION"}
+    )
+
+
+def _canonical_database_evidence_valid(
+    row: dict[str, Any],
+    *,
+    policy: Any,
+    observed_at: datetime,
+) -> bool:
+    if row.get("database_lookup_performed") is not True:
+        return not getattr(
+            policy,
+            "canonical_repository_required",
+            False,
+        )
+    found = row.get("database_record_found")
+    expired = row.get("database_record_expired")
+    evaluation = str(
+        row.get("database_freshness_evaluation") or ""
+    )
+    if found is False:
+        return bool(
+            expired is False
+            and evaluation == "NOT_FOUND"
+            and row.get("database_data_as_of") is None
+            and row.get("database_content_valid_until") is None
+            and row.get("database_refresh_due_at") is None
+            and row.get("database_lifecycle_status") is None
+        )
+    if found is not True:
+        return False
+    result = evaluate_canonical_freshness(
+        row,
+        policy=CanonicalFreshnessPolicy(
+            max_age=policy.max_age,
+            data_reference_mode=_data_reference_mode(policy),
+        ),
+        observed_at=observed_at,
+    )
+    return bool(
+        result.complete
+        and result.expired is expired
+        and result.evaluation == evaluation
+        and result.usable is (not expired)
+    )
+
+
+def _data_reference_mode(policy: Any) -> str:
+    dataset_id = str(getattr(policy, "dataset_id", ""))
+    if dataset_id == "macro_calendar":
+        return "event_occurrence"
+    if dataset_id in {
+        "nasdaq_100",
+        "mega_cap_quotes",
+        "market_internals",
+        "vix",
+        "vvix",
+        "risk",
+        "fomc_expectations",
+        "earnings",
+        "options_positioning",
+        "market_schedule",
+    }:
+        return "point_in_time"
+    return "official_release"
+
+
+def _provider_flow_valid(
+    row: dict[str, Any],
+    *,
+    policy: Any,
+) -> bool:
+    attempts = [
+        row.get("primary_provider"),
+        *(row.get("fallbacks") or []),
+    ]
+    database_valid = bool(
+        row.get("database_record_found")
+        and not row.get("database_record_expired")
+        and row.get("database_freshness_evaluation") == "VALID"
+    )
+    if database_valid:
+        return all(
+            attempt.get("called") is False
+            and attempt.get("execution_origin") == "CACHE_DECISION"
+            for attempt in attempts
+        )
+
+    strategy = str(
+        getattr(policy, "provider_strategy", "FALLBACK")
+    ).upper()
+    if strategy == "FAN_IN":
+        return all(
+            attempt.get("called") is True
+            or (
+                attempt.get("called") is False
+                and attempt.get("execution_origin")
+                == "OBSERVED_SKIP"
+            )
+            for attempt in attempts
+        )
+    if strategy == "CASCADE":
+        called_seen = False
+        for attempt in attempts:
+            if attempt.get("called") is True:
+                called_seen = True
+                continue
+            reason = str(
+                attempt.get("not_called_reason") or ""
+            ).upper()
+            if not called_seen and not any(
+                token in reason
+                for token in (
+                    "NOT_CONFIGURED",
+                    "NEGATIVE_CACHE",
+                )
+            ):
+                return False
+            if called_seen and not any(
+                token in reason
+                for token in (
+                    "PRIOR_PROVIDER_SUCCEEDED",
+                    "NOT_REQUIRED",
+                    "NOT_CONFIGURED",
+                    "NEGATIVE_CACHE",
+                )
+            ):
+                return False
+        return called_seen or all(
+            "NOT_CONFIGURED"
+            in str(
+                attempt.get("not_called_reason") or ""
+            ).upper()
+            for attempt in attempts
+        )
+
+    prior_succeeded = False
+    prior_called_and_failed = False
+    for index, attempt in enumerate(attempts):
+        called = attempt.get("called") is True
+        if index == 0:
+            if not called:
+                reason = str(
+                    attempt.get("not_called_reason") or ""
+                ).upper()
+                if (
+                    not policy.fallback_providers
+                    or "NOT_CONFIGURED" not in reason
+                ):
+                    return False
+                prior_called_and_failed = True
+                continue
+        elif prior_succeeded:
+            if called:
+                return False
+            continue
+        elif not prior_called_and_failed or not called:
+            return False
+
+        succeeded = _attempt_succeeded(attempt)
+        prior_succeeded = succeeded
+        prior_called_and_failed = called and not succeeded
+    return True
+
+
+def _attempt_succeeded(attempt: dict[str, Any]) -> bool:
+    if attempt.get("called") is not True:
+        return False
+    result = str(attempt.get("result") or "").upper()
+    return bool(
+        any(
+            token in result
+            for token in (
+                "SUCCESS",
+                "FOUND",
+                "AVAILABLE",
+                "VALID",
+                "PARTIAL",
+            )
+        )
+        and not any(
+            token in result
+            for token in (
+                "FAIL",
+                "ERROR",
+                "NO_DATA",
+                "NOT_FOUND",
+                "TIMEOUT",
+            )
+        )
     )
 
 

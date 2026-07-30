@@ -51,7 +51,9 @@ def history(count: int = 260, *, start: float = 80.0, step: float = 0.1) -> list
 def risk_indices_payload() -> dict:
     return {
         "status": "found",
+        "attempted": True,
         "provider_calls": 1,
+        "cache_used": False,
         "indices": {
             "vvix": {
                 "current_price": 90.0,
@@ -165,7 +167,9 @@ def qqq_payload(*, complete: bool = True) -> dict:
     }
     return {
         "status": "found" if complete else "partial",
+        "attempted": True,
         "provider_calls": 1,
+        "cache_used": False,
         "source_url": "https://nasdaq.test/qqq",
         "retrieved_at": "2026-07-11T12:00:00Z",
         "valid_until": "2099-01-01T00:00:00Z",
@@ -605,13 +609,40 @@ async def test_restart_refresh_false_is_zero_network_browser_ai_and_same_data(tm
 
 
 @pytest.mark.asyncio
-async def test_auto_uses_valid_cache_and_force_bypasses_it(tmp_path) -> None:
+async def test_auto_uses_valid_cache_after_forced_acquisition(tmp_path) -> None:
     cfg = settings(tmp_path)
-    service = RiskContextRuntimeService(cfg)
+
+    def clock() -> datetime:
+        return datetime(2026, 7, 10, 18, 0, tzinfo=UTC)
+
+    service = RiskContextRuntimeService(cfg, clock=clock)
     service.vix_futures_provider.fetch = lambda: _async_value(futures_payload())
     service.put_call_provider.fetch = lambda: _async_value(cboe_ratios_payload())
-    await service.snapshot(refresh="force", macro_snapshot=macro_snapshot(), preloaded_risk_indices=risk_indices_payload(), preloaded_qqq_options=qqq_payload())
-    restarted = RiskContextRuntimeService(cfg)
+    risk_indices = risk_indices_payload()
+    risk_indices.update(
+        {
+            "data_as_of": "2026-07-10T17:00:00Z",
+            "retrieved_at": "2026-07-10T17:05:00Z",
+            "content_valid_until": "2026-07-10T19:00:00Z",
+            "refresh_due_at": "2026-07-10T19:00:00Z",
+        }
+    )
+    qqq_options = qqq_payload()
+    qqq_options.update(
+        {
+            "data_as_of": "2026-07-10T17:00:00Z",
+            "retrieved_at": "2026-07-10T17:05:00Z",
+            "content_valid_until": "2026-07-10T19:00:00Z",
+            "refresh_due_at": "2026-07-10T19:00:00Z",
+        }
+    )
+    await service.snapshot(
+        refresh="force",
+        macro_snapshot=macro_snapshot(),
+        preloaded_risk_indices=risk_indices,
+        preloaded_qqq_options=qqq_options,
+    )
+    restarted = RiskContextRuntimeService(cfg, clock=clock)
     restarted.vix_futures_provider.fetch = _fail_network
     cached, _ = await restarted.snapshot(refresh="auto", macro_snapshot={})
     assert cached["status"] == "available"

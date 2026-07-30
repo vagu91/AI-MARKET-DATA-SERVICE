@@ -4,10 +4,15 @@ import asyncio
 import copy
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Mapping
+from uuid import uuid4
 
 from app.core.config import Settings
 from app.models.common import ProviderType
 from app.providers.parametric_cache import ParametricProviderCache
+from app.services.data_freshness_service import (
+    CanonicalFreshnessResult,
+    DataFreshnessService,
+)
 from app.services.deterministic_market_context_service import (
     compute_cross_asset_context,
     compute_market_internals,
@@ -17,6 +22,14 @@ from app.services.request_provider_accounting import (
     RequestProviderAccountingCollector,
     provider_attempt,
 )
+from app.services.market_fact_repository import MarketFactRepository
+
+
+DETERMINISTIC_FACT_TYPES = {
+    "market_internals": "deterministic_market_internals",
+    "options_positioning": "deterministic_options_positioning",
+}
+DETERMINISTIC_MAX_AGE = timedelta(hours=2)
 
 
 class DeterministicProviderRuntimeService:
@@ -34,6 +47,8 @@ class DeterministicProviderRuntimeService:
         self.providers = dict(providers)
         self.cache = ParametricProviderCache(cache, clock=clock)
         self.clock = clock
+        self.facts = MarketFactRepository(settings, clock=clock)
+        self.freshness = DataFreshnessService(settings, clock=clock)
         self.last_run: dict[str, Any] = {}
 
     async def enrich_market_context(
@@ -58,16 +73,48 @@ class DeterministicProviderRuntimeService:
             "warnings": [],
         }
 
-        official = await self._official_context(output, telemetry)
+        official = await self._official_context(
+            output,
+            telemetry,
+            force=refresh == "force",
+        )
         fred_series = official["fred"]
         output["rates_context"] = _rates_context(fred_series, self.clock())
         output["macro_actuals"] = await self._macro_actuals(
             output,
             official=official,
             telemetry=telemetry,
+            force=refresh == "force",
         )
 
+        database_rows: dict[str, dict[str, Any] | None] = {}
+        database_lookups: dict[str, CanonicalFreshnessResult] = {}
+        for dataset_id, fact_type in DETERMINISTIC_FACT_TYPES.items():
+            rows = self.facts.get_valid_facts_by_type(
+                fact_type,
+                allow_stale=True,
+            )
+            row = rows[0] if rows else None
+            database_rows[dataset_id] = row
+            database_lookups[dataset_id] = (
+                self.freshness.evaluate_canonical(
+                    row,
+                    max_age=DETERMINISTIC_MAX_AGE,
+                    data_reference_mode="point_in_time",
+                )
+            )
+
         tradier = self.providers.get("tradier")
+        tradier_correlation_id = (
+            accounting_collector.correlation_id
+            if accounting_collector is not None
+            else f"deterministic-tradier-{uuid4()}"
+        )
+        tradier_scope_token = _begin_tradier_request_scope(
+            tradier,
+            correlation_id=tradier_correlation_id,
+        )
+        tradier_details: dict[str, dict[str, Any]] = {}
         holdings = _holdings(output)
         constituent_symbols = [str(item.get("symbol") or "") for item in holdings]
         cross_symbols = _csv(self.settings.tradier_cross_asset_symbols)
@@ -75,33 +122,79 @@ class DeterministicProviderRuntimeService:
             dict.fromkeys([*cross_symbols, *constituent_symbols, "QQQ"])
         )
         quotes: list[dict[str, Any]] = []
-        if (
-            tradier is not None
-            and self.settings.tradier_enabled
-            and self.settings.tradier_market_data_enabled
-        ):
-            try:
-                quotes = await tradier.quotes(quote_symbols)
-            except Exception as exc:
-                telemetry["warnings"].append(f"tradier_quotes_partial:{type(exc).__name__}")
+        providers_due = any(
+            not decision.usable
+            for decision in database_lookups.values()
+        )
+        try:
+            if (
+                providers_due
+                and tradier is not None
+                and self.settings.tradier_enabled
+                and self.settings.tradier_market_data_enabled
+            ):
+                try:
+                    quotes = await tradier.quotes(
+                        quote_symbols,
+                        force=refresh == "force",
+                    )
+                except Exception as exc:
+                    telemetry["warnings"].append(
+                        "tradier_quotes_partial:"
+                        f"{type(exc).__name__}"
+                    )
 
-        output["options_positioning"] = await self._options(
-            tradier,
-            quotes,
+            output["options_positioning"] = (
+                _canonical_section(
+                    database_rows["options_positioning"]
+                )
+                if database_lookups["options_positioning"].usable
+                else await self._options(
+                    tradier,
+                    quotes,
+                    telemetry,
+                    force=refresh == "force",
+                )
+            )
+        finally:
+            tradier_details = _end_tradier_request_scope(
+                tradier,
+                tradier_scope_token,
+            )
+        _merge_tradier_telemetry(
             telemetry,
+            tradier_details,
+            correlation_id=tradier_correlation_id,
         )
-        if tradier is not None:
-            _merge_tradier_telemetry(telemetry, tradier)
-        output["market_internals"] = self._internals(
-            holdings,
-            quotes,
-            telemetry,
+        output["market_internals"] = (
+            _canonical_section(database_rows["market_internals"])
+            if database_lookups["market_internals"].usable
+            else self._internals(
+                holdings,
+                quotes,
+                telemetry,
+            )
         )
+        for dataset_id in DETERMINISTIC_FACT_TYPES:
+            if (
+                not database_lookups[dataset_id].usable
+                and str(
+                    output[dataset_id].get("status") or ""
+                ).upper()
+                == "AVAILABLE"
+            ):
+                self._persist_deterministic_section(
+                    dataset_id,
+                    output[dataset_id],
+                )
         self._record_tradier_accounting(
             accounting_collector,
             tradier=tradier,
+            tradier_details=tradier_details,
+            correlation_id=tradier_correlation_id,
             market_internals=output["market_internals"],
             options_positioning=output["options_positioning"],
+            database_lookups=database_lookups,
         )
         output["cross_asset_context"] = self._cross_asset(
             quotes,
@@ -111,6 +204,7 @@ class DeterministicProviderRuntimeService:
         output["earnings_intelligence"] = await self._earnings(
             output,
             telemetry,
+            force=refresh == "force",
         )
         output["current_company_news"] = _verified_current_news(output)
 
@@ -189,24 +283,35 @@ class DeterministicProviderRuntimeService:
         collector: RequestProviderAccountingCollector | None,
         *,
         tradier: Any,
+        tradier_details: dict[str, dict[str, Any]],
+        correlation_id: str,
         market_internals: dict[str, Any],
         options_positioning: dict[str, Any],
+        database_lookups: dict[
+            str,
+            CanonicalFreshnessResult,
+        ],
     ) -> None:
         if collector is None:
             return
-        details = getattr(tradier, "last_telemetry", {})
-        details = details if isinstance(details, dict) else {}
+        details = _correlated_tradier_details(
+            tradier_details,
+            correlation_id=correlation_id,
+        )
         quote_details = [
             value
-            for key, value in details.items()
-            if key == "quotes" and isinstance(value, dict)
+            for value in details.values()
+            if (
+                str(value.get("endpoint_category") or "")
+                == "quotes"
+            )
         ]
         option_details = [
             value
-            for key, value in details.items()
+            for value in details.values()
             if (
-                key.startswith("option_")
-                and isinstance(value, dict)
+                str(value.get("endpoint_category") or "")
+                in {"option_expirations", "option_chain"}
             )
         ]
         self._record_tradier_dataset(
@@ -221,6 +326,7 @@ class DeterministicProviderRuntimeService:
                 and self.settings.tradier_market_data_enabled
                 and self.settings.deterministic_market_internals_enabled
             ),
+            database_lookup=database_lookups["market_internals"],
         )
         self._record_tradier_dataset(
             collector,
@@ -234,6 +340,9 @@ class DeterministicProviderRuntimeService:
                 and self.settings.tradier_market_data_enabled
                 and self.settings.deterministic_options_positioning_enabled
             ),
+            database_lookup=database_lookups[
+                "options_positioning"
+            ],
         )
 
     def _record_tradier_dataset(
@@ -245,6 +354,7 @@ class DeterministicProviderRuntimeService:
         endpoint_details: list[dict[str, Any]],
         section: dict[str, Any],
         enabled: bool,
+        database_lookup: CanonicalFreshnessResult,
     ) -> None:
         calls = sum(
             int(item.get("actual_provider_requests") or 0)
@@ -254,7 +364,17 @@ class DeterministicProviderRuntimeService:
             int(item.get("cache_hit") or 0)
             for item in endpoint_details
         )
-        if calls:
+        if database_lookup.usable:
+            attempt = provider_attempt(
+                "TRADIER",
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="VALID_DATABASE_RECORD_SELECTED",
+                execution_origin="CACHE_DECISION",
+            )
+            complete = True
+        elif calls:
             attempt = provider_attempt(
                 "TRADIER",
                 called=True,
@@ -291,13 +411,23 @@ class DeterministicProviderRuntimeService:
             dataset_id,
             acquisition_id=acquisition_id,
             shared_dataset_ids=(dataset_id,),
-            database_lookup_performed=False,
-            database_lookup_reason="DETERMINISTIC_PROVIDER_ONLY_STAGE",
-            database_record_found=None,
-            database_data_as_of=None,
-            database_content_valid_until=None,
-            database_record_expired=None,
-            database_freshness_evaluation="NOT_LOOKED_UP",
+            database_lookup_performed=True,
+            database_lookup_reason=(
+                "DETERMINISTIC_DOMAIN_CANONICAL_DATABASE_LOOKUP"
+            ),
+            database_record_found=database_lookup.found,
+            database_data_as_of=database_lookup.data_as_of,
+            database_content_valid_until=(
+                database_lookup.content_valid_until
+            ),
+            database_refresh_due_at=(
+                database_lookup.refresh_due_at
+            ),
+            database_lifecycle_status=database_lookup.lifecycle,
+            database_record_expired=database_lookup.expired,
+            database_freshness_evaluation=(
+                database_lookup.evaluation
+            ),
             primary_provider=attempt,
             fallbacks=[],
             acquisition_selected_source=(
@@ -313,10 +443,51 @@ class DeterministicProviderRuntimeService:
             evidence_complete=complete,
         )
 
+    def _persist_deterministic_section(
+        self,
+        dataset_id: str,
+        section: dict[str, Any],
+    ) -> None:
+        observed_at = self.clock().astimezone(UTC)
+        valid_until = (
+            observed_at + DETERMINISTIC_MAX_AGE
+        ).isoformat()
+        payload = {
+            **copy.deepcopy(section),
+            "data_as_of": observed_at.isoformat(),
+            "content_valid_until": valid_until,
+            "refresh_due_at": valid_until,
+        }
+        self.facts.upsert_fact(
+            {
+                "fact_key": (
+                    f"MNQ:{dataset_id}:"
+                    f"{DETERMINISTIC_FACT_TYPES[dataset_id]}"
+                ),
+                "fact_type": DETERMINISTIC_FACT_TYPES[dataset_id],
+                "country": "US",
+                "symbol": "MNQ",
+                "category": dataset_id,
+                "event_name": dataset_id,
+                "source": section.get("provider") or "TRADIER",
+                "provider_type": "API",
+                "reliability": 0.85,
+                "confidence": 0.85,
+                "retrieved_at": observed_at.isoformat(),
+                "release_at": observed_at.isoformat(),
+                "valid_until": valid_until,
+                "next_refresh_at": valid_until,
+                "status": "active",
+                "raw_payload_json": payload,
+            }
+        )
+
     async def _official_context(
         self,
         contract: dict[str, Any],
         telemetry: dict[str, Any],
+        *,
+        force: bool,
     ) -> dict[str, dict[str, Any]]:
         existing = _macro_series(contract)
         output: dict[str, dict[str, Any]] = {"fred": {}, "bls": {}, "bea": {}}
@@ -334,7 +505,7 @@ class DeterministicProviderRuntimeService:
             if provider is None:
                 continue
             try:
-                result = await provider.fetch_safe()
+                result = await provider.fetch_safe(force=force)
             except Exception as exc:
                 telemetry["warnings"].append(
                     f"{provider_name}_provider_partial:{type(exc).__name__}"
@@ -353,6 +524,7 @@ class DeterministicProviderRuntimeService:
         *,
         official: dict[str, dict[str, Any]],
         telemetry: dict[str, Any],
+        force: bool,
     ) -> dict[str, Any]:
         items = _released_events(contract)
         for provider_name in ("bls", "bea"):
@@ -374,7 +546,11 @@ class DeterministicProviderRuntimeService:
                         },
                     }
                 )
-        census_items = await self._census_due(contract, telemetry)
+        census_items = await self._census_due(
+            contract,
+            telemetry,
+            force=force,
+        )
         items.extend(census_items)
         return _section(
             items,
@@ -387,6 +563,8 @@ class DeterministicProviderRuntimeService:
         self,
         contract: dict[str, Any],
         telemetry: dict[str, Any],
+        *,
+        force: bool,
     ) -> list[dict[str, Any]]:
         provider = self.providers.get("census")
         if provider is None or not self.settings.census_enabled:
@@ -416,6 +594,7 @@ class DeterministicProviderRuntimeService:
                     dataset=d,
                     period=p,
                 ),
+                force_refresh=force,
             )
             _merge_cache_telemetry(telemetry, resolution)
             data = dict(resolution.value or {})
@@ -445,6 +624,8 @@ class DeterministicProviderRuntimeService:
         tradier,
         quotes: list[dict[str, Any]],
         telemetry: dict[str, Any],
+        *,
+        force: bool,
     ) -> dict[str, Any]:
         if not self.settings.deterministic_options_positioning_enabled:
             return _disabled("TRADIER", "REFRESH_ON_TRIGGER")
@@ -452,7 +633,11 @@ class DeterministicProviderRuntimeService:
         if tradier is None or not quote:
             return _no_data("TRADIER", "REFRESH_ON_TRIGGER", "qqq_quote_unavailable")
         try:
-            chain_set = await tradier.relevant_option_chains("QQQ", max_expirations=3)
+            chain_set = await tradier.relevant_option_chains(
+                "QQQ",
+                max_expirations=3,
+                force=force,
+            )
             result = compute_options_positioning(
                 quote=quote,
                 chains=chain_set.get("chains") or {},
@@ -514,6 +699,8 @@ class DeterministicProviderRuntimeService:
         self,
         contract: dict[str, Any],
         telemetry: dict[str, Any],
+        *,
+        force: bool,
     ) -> dict[str, Any]:
         if not self.settings.deterministic_earnings_intelligence_enabled:
             return _disabled("FINNHUB", "TRIGGER")
@@ -537,6 +724,7 @@ class DeterministicProviderRuntimeService:
                 },
                 ttl_seconds=self.settings.finnhub_cache_ttl_seconds,
                 loader=lambda: provider.earnings_calendar(start=start, end=end),
+                force_refresh=force,
             )
             _merge_cache_telemetry(telemetry, resolution)
             earnings = list(resolution.value or [])
@@ -570,6 +758,7 @@ class DeterministicProviderRuntimeService:
                         start=news_start,
                         end=start,
                     ),
+                    force_refresh=force,
                 )
                 _merge_cache_telemetry(telemetry, resolution)
                 candidates.extend(list(resolution.value or []))
@@ -610,6 +799,15 @@ def _complete(value: dict[str, Any]) -> dict[str, Any]:
         else "NO_DATA"
     )
     return output
+
+
+def _canonical_section(
+    row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not row:
+        return {}
+    raw = row.get("raw_payload")
+    return copy.deepcopy(raw) if isinstance(raw, dict) else {}
 
 
 def _section(
@@ -797,18 +995,68 @@ def _merge_cache_telemetry(telemetry: dict[str, Any], resolution) -> None:
     telemetry["stale_grace_hits"] += int(resolution.cache_status == "STALE_GRACE")
 
 
-def _merge_tradier_telemetry(telemetry: dict[str, Any], tradier) -> None:
-    details = getattr(tradier, "last_telemetry", {})
+def _begin_tradier_request_scope(
+    tradier: Any,
+    *,
+    correlation_id: str,
+) -> Any:
+    begin = getattr(tradier, "begin_request_telemetry", None)
+    if not callable(begin):
+        return None
+    return begin(correlation_id)
+
+
+def _end_tradier_request_scope(
+    tradier: Any,
+    token: Any,
+) -> dict[str, dict[str, Any]]:
+    if token is None:
+        return {}
+    end = getattr(tradier, "end_request_telemetry", None)
+    if not callable(end):
+        return {}
+    details = end(token)
     if not isinstance(details, dict):
-        return
-    # Each endpoint entry is overwritten by the most recent resolution, so count
-    # only the snapshot visible at this point.
-    telemetry["tradier"] = copy.deepcopy(details)
+        return {}
+    return {
+        str(key): value
+        for key, value in details.items()
+        if isinstance(value, dict)
+    }
+
+
+def _correlated_tradier_details(
+    details: dict[str, dict[str, Any]],
+    *,
+    correlation_id: str,
+) -> dict[str, dict[str, Any]]:
+    return {
+        key: copy.deepcopy(value)
+        for key, value in details.items()
+        if value.get("correlation_id") == correlation_id
+    }
+
+
+def _merge_tradier_telemetry(
+    telemetry: dict[str, Any],
+    details: dict[str, dict[str, Any]],
+    *,
+    correlation_id: str,
+) -> None:
+    correlated = _correlated_tradier_details(
+        details,
+        correlation_id=correlation_id,
+    )
+    telemetry["tradier"] = copy.deepcopy(correlated)
     telemetry["actual_provider_requests"] += sum(
         int(item.get("actual_provider_requests") or 0)
-        for item in details.values()
+        for item in correlated.values()
     )
-    telemetry["cache_hits"] += sum(int(item.get("cache_hit") or 0) for item in details.values())
+    telemetry["cache_hits"] += sum(
+        int(item.get("cache_hit") or 0)
+        for item in correlated.values()
+    )
     telemetry["negative_cache_hits"] += sum(
-        int(item.get("negative_cache_hit") or 0) for item in details.values()
+        int(item.get("negative_cache_hit") or 0)
+        for item in correlated.values()
     )

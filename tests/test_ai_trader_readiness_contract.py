@@ -442,13 +442,19 @@ def test_ai_event_and_field_counts_are_semantically_distinct_and_attempts_are_pr
 
 
 def _event() -> EconomicEvent:
+    release = (datetime.now(UTC) + timedelta(days=1)).replace(
+        hour=12,
+        minute=30,
+        second=0,
+        microsecond=0,
+    )
     return EconomicEvent(
         event_id="evt-cpi",
         name="Consumer Price Index",
         country="US",
         category="CPI",
-        date="2099-07-14",
-        time_utc=datetime(2099, 7, 14, 12, 30, tzinfo=UTC),
+        date=release.date().isoformat(),
+        time_utc=release,
         impact=Impact.HIGH,
         source="BLS",
         source_url="https://bls.test",

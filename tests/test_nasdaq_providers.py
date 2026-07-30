@@ -127,6 +127,22 @@ async def test_qqq_equal_weight_proxy_is_runtime_only_after_upstream_failures(tm
     assert quality["alpha_vantage_rate_limited"] is True
     assert quality["nasdaq_proxy_used"] is True
     assert len(quality["warnings"]) == 1
+    accounting = quality["provider_accounting"]
+    assert [
+        item["provider"]
+        for item in accounting
+    ] == ["INVESCO", "ALPHA_VANTAGE", "NASDAQ", "SEC"]
+    assert [
+        (item["called"], item["calls"])
+        for item in accounting
+    ] == [(True, 1), (True, 1), (True, 1), (False, 0)]
+    assert accounting[0]["status"] == "ACCESS_RESTRICTED"
+    assert accounting[1]["status"] == "RATE_LIMITED"
+    assert accounting[2]["status"] == "PARTIAL"
+    assert (
+        accounting[3]["reason_code"]
+        == "SEC_NOT_REQUIRED_FOR_CONSTITUENT_SET"
+    )
 
 
 @pytest.mark.asyncio
@@ -161,6 +177,72 @@ async def test_qqq_holdings_no_retry_when_alpha_negative_cache_is_open(tmp_path)
     assert alpha.call_count == 0
     assert result.data["data_quality"]["alpha_vantage_status"] == "rate_limited"
     assert "alpha_vantage_negative_cache" in result.data["data_quality"]["provider_attempts"]
+
+
+@pytest.mark.asyncio
+async def test_qqq_force_bypasses_alpha_negative_cache(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ALPHA_VANTAGE_API_KEY=test-key\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        _env_file=env_file,
+        alpha_vantage_base_url="https://alpha.test/query",
+        invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
+        nasdaq_100_constituents_url=(
+            "https://nasdaq.test/constituents"
+        ),
+    )
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
+    provider = QQQHoldingsProvider(cache, settings)
+    cache.set(
+        provider.alpha_negative_cache_key,
+        {
+            "status": "rate_limited",
+            "negative_cache_reason": "provider_daily_rate_limit",
+            "next_retry_at": (
+                datetime.now(UTC) + timedelta(hours=2)
+            ).isoformat(),
+        },
+    )
+
+    with respx.mock(
+        assert_all_mocked=True,
+        assert_all_called=False,
+    ) as router:
+        router.get(
+            "https://invesco.test/qqq.csv"
+        ).mock(return_value=httpx.Response(403, text="Forbidden"))
+        alpha = router.get(
+            "https://alpha.test/query"
+        ).mock(return_value=httpx.Response(503, text="unavailable"))
+        router.get(
+            "https://nasdaq.test/constituents"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rows": [
+                            {
+                                "symbol": "AAPL",
+                                "companyName": "Apple",
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+        result = await provider.fetch_safe(force=True)
+
+    assert alpha.call_count == 1
+    assert "alpha_vantage" in result.data[
+        "data_quality"
+    ]["provider_attempts"]
+    assert "alpha_vantage_negative_cache" not in result.data[
+        "data_quality"
+    ]["provider_attempts"]
 
 
 @pytest.mark.asyncio
@@ -534,6 +616,31 @@ async def test_snapshot_uses_yahoo_chart_without_stooq_noise(tmp_path) -> None:
     assert result.data["data_quality"]["errors"] == []
     assert result.data["data_quality"]["warnings"] == []
     assert not any("Stooq" in error for error in result.metadata.errors)
+    accounting = result.data["data_quality"][
+        "provider_accounting"
+    ]
+    assert [
+        item["provider"]
+        for item in accounting
+    ] == [
+        "YAHOO_FINANCE_CHART",
+        "STOOQ",
+        "ALPHA_VANTAGE",
+        "YAHOO_FINANCE_QUOTE",
+    ]
+    assert accounting[0] == {
+        "provider": "YAHOO_FINANCE_CHART",
+        "called": True,
+        "calls": len(MEGA_CAP_TICKERS),
+        "status": "SUCCESS",
+        "reason_code": None,
+    }
+    assert all(
+        item["called"] is False
+        and item["calls"] == 0
+        and item["reason_code"] == "PRIOR_PROVIDER_SUCCEEDED"
+        for item in accounting[1:]
+    )
 
 
 def test_news_topic_tagging_is_keyword_based() -> None:

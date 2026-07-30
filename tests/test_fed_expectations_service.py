@@ -477,8 +477,89 @@ def test_auto_uses_fresh_cache_and_does_not_replace_it(tmp_path) -> None:
     )
 
     assert cached["status"] == "available"
-    assert cached["diagnostics"]["cache_used"] is False
+    assert cached["diagnostics"]["cache_used"] is True
+    assert cached["diagnostics"]["provider_calls"] == 0
     assert FedExpectationsRepository(cfg).count() == 1
+
+
+def test_force_uses_fresh_canonical_record_before_provider_payload(
+    tmp_path,
+) -> None:
+    cfg = settings(tmp_path)
+    service = FedExpectationsService(
+        cfg,
+        clock=lambda: NOW,
+    )
+    first = service.snapshot(
+        refresh="force",
+        provider_payload=provider_payload(),
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+    )
+
+    cached = service.snapshot(
+        refresh="force",
+        provider_payload={
+            "status": "provider_failed",
+            "meetings": [{"must_not_be_used": True}],
+        },
+        macro_snapshot={},
+        event_calendar={},
+    )
+
+    assert (
+        cached["meetings"][0]["outcomes"]
+        == first["meetings"][0]["outcomes"]
+    )
+    assert cached["retrieved_at"] == first["retrieved_at"]
+    assert cached["diagnostics"]["cache_used"] is True
+    assert cached["diagnostics"]["provider_calls"] == 0
+    assert service.last_database_lookup["freshness"] == "VALID"
+    assert (
+        service.last_database_lookup["lifecycle_status"]
+        == "AVAILABLE"
+    )
+    assert FedExpectationsRepository(cfg).count() == 1
+
+
+def test_force_uses_provider_after_canonical_record_expires(
+    tmp_path,
+) -> None:
+    cfg = settings(tmp_path)
+    observed_at = [NOW]
+    service = FedExpectationsService(
+        cfg,
+        clock=lambda: observed_at[0],
+    )
+    service.snapshot(
+        refresh="force",
+        provider_payload=provider_payload(),
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+    )
+    observed_at[0] = NOW + timedelta(hours=2)
+    refreshed_payload = provider_payload(
+        retrieved_at=observed_at[0].isoformat(),
+    )
+    refreshed_payload["valid_until"] = (
+        observed_at[0] + timedelta(hours=1)
+    ).isoformat()
+
+    refreshed = service.snapshot(
+        refresh="force",
+        provider_payload=refreshed_payload,
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+    )
+
+    assert refreshed["retrieved_at"] == observed_at[0].isoformat()
+    assert service.last_database_lookup["found"] is True
+    assert service.last_database_lookup["expired"] is True
+    assert (
+        service.last_database_lookup["reason_code"]
+        == "CANONICAL_CONTENT_VALID_UNTIL_EXPIRED"
+    )
+    assert FedExpectationsRepository(cfg).count() == 2
 
 
 def test_failure_does_not_overwrite_last_known_good(tmp_path) -> None:

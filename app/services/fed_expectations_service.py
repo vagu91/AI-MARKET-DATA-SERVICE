@@ -6,15 +6,20 @@ import logging
 import math
 import re
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessResult,
+    DataFreshnessService,
+    parse_datetime,
+)
 from app.services.fed_expectations_repository import FedExpectationsRepository
 
 
 logger = logging.getLogger(__name__)
 CALCULATION_VERSION = "fed_expectations_v1"
+FED_EXPECTATIONS_MAX_AGE = timedelta(hours=2)
 SOURCE_RANK = {
     "not_found": 0,
     "last_known_good_vendor": 1,
@@ -27,9 +32,35 @@ SOURCE_RANK = {
 
 
 class FedExpectationsService:
-    def __init__(self, settings: Settings, repository: FedExpectationsRepository | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: FedExpectationsRepository | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.repository = repository or FedExpectationsRepository(settings)
+        self.freshness = DataFreshnessService(
+            settings,
+            clock=self.clock,
+        )
+        self.last_database_lookup: dict[str, Any] | None = None
+
+    def lookup_canonical(
+        self,
+    ) -> tuple[dict[str, Any] | None, CanonicalFreshnessResult]:
+        latest = self.repository.latest()
+        freshness = self.freshness.evaluate_canonical(
+            latest,
+            max_age=FED_EXPECTATIONS_MAX_AGE,
+            data_reference_mode="point_in_time",
+        )
+        self.last_database_lookup = _database_lookup_evidence(
+            freshness
+        )
+        return latest, freshness
 
     def snapshot(
         self,
@@ -39,14 +70,39 @@ class FedExpectationsService:
         macro_snapshot: dict[str, Any],
         event_calendar: dict[str, Any],
         legacy_block: dict[str, Any] | None = None,
+        canonical_preflight: (
+            tuple[
+                dict[str, Any] | None,
+                CanonicalFreshnessResult,
+            ]
+            | None
+        ) = None,
     ) -> dict[str, Any]:
         logger.info("fed_expectations_lookup_started", extra={"refresh": refresh})
-        latest = self.repository.latest()
-        if refresh == "false" or (refresh == "auto" and latest and not _is_stale(latest)):
-            return _runtime_view(latest, refresh=refresh) if latest else not_found_snapshot(
+        latest, freshness = (
+            canonical_preflight
+            if canonical_preflight is not None
+            else self.lookup_canonical()
+        )
+        self.last_database_lookup = _database_lookup_evidence(
+            freshness
+        )
+        if freshness.usable and latest:
+            return _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            )
+        if refresh == "false":
+            return _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            ) if latest else not_found_snapshot(
                 refresh=refresh,
                 legacy_block=legacy_block,
-                warning="fed_expectations_not_in_db_refresh_false" if refresh == "false" else "fed_expectations_not_in_db",
+                warning="fed_expectations_not_in_db_refresh_false",
+                now=self.clock(),
             )
 
         provider_payload = provider_payload or {}
@@ -56,6 +112,7 @@ class FedExpectationsService:
             event_calendar=event_calendar,
             legacy_block=legacy_block,
             history=self.repository.history(),
+            now=self.clock(),
         )
         expected_history_depth = self.repository.count() + (1 if candidate.get("status") == "available" else 0)
         candidate.setdefault("diagnostics", {})["history_snapshot_count"] = expected_history_depth
@@ -63,8 +120,16 @@ class FedExpectationsService:
         candidate_rank = SOURCE_RANK.get((candidate.get("source_summary") or {}).get("ranking_class"), 0)
         latest_rank = SOURCE_RANK.get((latest or {}).get("source_summary", {}).get("ranking_class"), 0)
         if latest and (candidate.get("status") != "available" or candidate_rank < latest_rank):
-            fallback = _runtime_view(latest, refresh=refresh)
-            fallback["status"] = "stale_acceptable" if _is_stale(latest) else "available"
+            fallback = _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            )
+            fallback["status"] = (
+                "stale_acceptable"
+                if not freshness.usable
+                else "available"
+            )
             fallback["source_summary"]["last_known_good_used"] = True
             fallback["diagnostics"]["last_known_good_used"] = True
             fallback["diagnostics"]["source_failure_count"] = 1
@@ -87,7 +152,12 @@ class FedExpectationsService:
         )
         logger.info("fed_expectations_persisted", extra={"source": read_back.get("source_summary", {}).get("selected_source")})
         logger.info("fed_expectations_read_back", extra={"meeting_count": len(read_back.get("meetings") or [])})
-        return _runtime_view(read_back, refresh=refresh, force_read_back=True)
+        return _runtime_view(
+            read_back,
+            refresh=refresh,
+            force_read_back=True,
+            now=self.clock(),
+        )
 
 
 def canonicalize_investing_monitor(
@@ -730,29 +800,59 @@ def classify_change(change_bps: float | None) -> str:
     return "cut" if change_bps < 0 else "hike"
 
 
-def not_found_snapshot(*, refresh: str, legacy_block: dict[str, Any] | None, warning: str) -> dict[str, Any]:
-    now = _iso(datetime.now(UTC))
+def not_found_snapshot(
+    *,
+    refresh: str,
+    legacy_block: dict[str, Any] | None,
+    warning: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    observed = _iso(now or datetime.now(UTC))
     return {
         "status": "not_found", "current_fed_state": {}, "next_meeting": None, "meetings": [],
         "repricing": {"history_available": False, "history_status": "history_insufficient"},
         "source_summary": {"selected_source": None, "selected_source_type": "not_found", "ranking_class": "not_found", "is_official_source": False, "is_reconstructed": False, "last_known_good_used": False},
         "quality": {"meeting_coverage_pct": 0.0, "probability_distribution_coverage_pct": 0.0, "official_source_coverage_pct": 0.0, "current_state_completeness_pct": 0.0, "mapping_valid_pct": 0.0, "history_depth": 0, "stale_snapshot_count": 0, "missing_contract_count": 0, "quality_score": 0.0},
         "diagnostics": {"source_attempt_count": 0, "source_success_count": 0, "source_failure_count": 0, "official_source_success": False, "vendor_source_success": False, "reconstruction_used": False, "last_known_good_used": False, "meeting_count": 0, "contract_count": 0, "valid_distribution_count": 0, "invalid_distribution_count": 0, "missing_contract_count": 0, "probability_normalization_count": 0, "history_snapshot_count": 0, "provider_calls": 0, "browser_calls": 0, "AI_called": False, "cache_used": refresh == "false"},
-        "retrieved_at": now, "valid_until": None, "stale": False, "warnings": [warning], "errors": [],
+        "retrieved_at": observed, "valid_until": None, "stale": False, "warnings": [warning], "errors": [],
         "fed_funds_futures": copy.deepcopy(legacy_block or {}), "service_role": "data provider only",
     }
 
 
-def _runtime_view(payload: dict[str, Any], *, refresh: str, force_read_back: bool = False) -> dict[str, Any]:
+def _runtime_view(
+    payload: dict[str, Any],
+    *,
+    refresh: str,
+    force_read_back: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(UTC)
     output = copy.deepcopy(payload)
     diagnostics = output.setdefault("diagnostics", {})
-    diagnostics["provider_calls"] = 0 if refresh == "false" else diagnostics.get("provider_calls", 0)
+    diagnostics["provider_calls"] = (
+        0
+        if not force_read_back
+        else diagnostics.get("provider_calls", 0)
+    )
     diagnostics["browser_calls"] = 0
     diagnostics["AI_called"] = False
-    diagnostics["cache_used"] = refresh == "false" or force_read_back
+    diagnostics["cache_used"] = True
     output["cache_status"] = "DB_READ_BACK" if force_read_back else "DB"
-    output["stale"] = _is_stale(output)
-    output["age_minutes"] = max(0.0, round((datetime.now(UTC) - (_date_or_none(output.get("retrieved_at")) or datetime.now(UTC))).total_seconds() / 60, 2))
+    output["stale"] = _is_stale(output, now=current)
+    output["age_minutes"] = max(
+        0.0,
+        round(
+            (
+                current
+                - (
+                    _date_or_none(output.get("retrieved_at"))
+                    or current
+                )
+            ).total_seconds()
+            / 60,
+            2,
+        ),
+    )
     for meeting in output.get("meetings") or []:
         meeting["cache_status"] = output["cache_status"]
     return output
@@ -801,9 +901,48 @@ def _date_or_none(value: Any) -> datetime | None:
     return parsed
 
 
-def _is_stale(payload: dict[str, Any]) -> bool:
-    valid_until = _date_or_none(payload.get("valid_until"))
-    return bool(valid_until and datetime.now(UTC) >= valid_until)
+def _is_stale(
+    payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = now or datetime.now(UTC)
+    valid_until = _date_or_none(
+        payload.get("content_valid_until")
+        or payload.get("valid_until")
+    )
+    refresh_due_at = _date_or_none(
+        payload.get("refresh_due_at")
+        or payload.get("next_refresh_at")
+    )
+    data_as_of = _date_or_none(
+        payload.get("data_as_of")
+        or payload.get("retrieved_at")
+    )
+    return bool(
+        valid_until is None
+        or refresh_due_at is None
+        or data_as_of is None
+        or current >= valid_until
+        or current >= refresh_due_at
+        or current - data_as_of > FED_EXPECTATIONS_MAX_AGE
+    )
+
+
+def _database_lookup_evidence(
+    result: CanonicalFreshnessResult,
+) -> dict[str, Any]:
+    return {
+        "performed": True,
+        "found": result.found,
+        "data_as_of": result.data_as_of,
+        "content_valid_until": result.content_valid_until,
+        "refresh_due_at": result.refresh_due_at,
+        "lifecycle_status": result.lifecycle,
+        "expired": result.expired,
+        "freshness": result.evaluation,
+        "reason_code": result.reason_code,
+    }
 
 
 def _delta(current: Any, previous: Any) -> float | None:

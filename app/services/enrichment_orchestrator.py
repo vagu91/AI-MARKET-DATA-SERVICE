@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import uuid
 import logging
 from datetime import UTC, datetime, timedelta
@@ -106,29 +107,15 @@ class EnrichmentOrchestrator:
                     metrics=metrics,
                 )
                 if fact:
-                    if freshness.usable and force:
-                        metrics["db_bypassed_force"] += 1
-                        logger.info(
-                            "event_enrichment_cache_bypassed_force",
-                            extra={"event_id": event.event_id, "fact_key": fact_key, "fact_status": fact.get("status")},
-                        )
-                        self.observations.record(
-                            run_id=run_id,
-                            provider_name="market_facts",
-                            provider_type="DB",
-                            status="cache_bypassed_force",
-                            country=event.country,
-                            category=event.category,
-                            query=fact_key,
-                            item_count=1,
-                        )
-                    elif freshness.usable:
+                    if freshness.usable:
                         updated = self.event_materializer.apply_fact(
                             event,
                             fact,
                             cache_status=freshness.cache_status,
                             warnings=freshness.warnings,
-                            refresh_mode="auto",
+                            refresh_mode=(
+                                "force" if force else "auto"
+                            ),
                             metrics=metrics,
                         )
                         enriched_by_id[event.event_id] = updated
@@ -159,13 +146,29 @@ class EnrichmentOrchestrator:
             provider_missing: list[EconomicEvent] = []
             if missing and self.event_enrichment_service:
                 try:
+                    enrich_call = (
+                        self.event_enrichment_service.enrich_events
+                    )
+                    enrich_kwargs = {
+                        "events": missing,
+                        "country": country,
+                        "start": start,
+                        "end": end,
+                    }
+                    parameters = inspect.signature(
+                        enrich_call
+                    ).parameters
+                    if (
+                        "force" in parameters
+                        or any(
+                            parameter.kind
+                            == inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        )
+                    ):
+                        enrich_kwargs["force"] = force
                     provider_events, provider_metadata = await asyncio.wait_for(
-                        self.event_enrichment_service.enrich_events(
-                            events=missing,
-                            country=country,
-                            start=start,
-                            end=end,
-                        ),
+                        enrich_call(**enrich_kwargs),
                         timeout=max(float(self.settings.timeout_events_seconds), 1.0),
                     )
                 except TimeoutError:

@@ -3,15 +3,21 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.providers.cboe_put_call_provider import CboePutCallProvider
 from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
 from app.providers.cboe_vix_futures_provider import CboeVixFuturesProvider
 from app.providers.nasdaq_qqq_option_chain_provider import NasdaqQQQOptionChainProvider
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessPolicy,
+    CanonicalFreshnessResult,
+    DataFreshnessService,
+    evaluate_canonical_freshness,
+    parse_datetime,
+)
 from app.services.risk_context_normalization_service import (
     RiskContextNormalizationService,
     build_legacy_risk_sentiment,
@@ -20,18 +26,44 @@ from app.services.risk_context_repository import RiskContextHistoryRepository
 
 
 logger = logging.getLogger(__name__)
+RISK_CONTEXT_MAX_AGE = timedelta(hours=2)
 
 
 class RiskContextRuntimeService:
-    def __init__(self, settings: Settings, repository: RiskContextHistoryRepository | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: RiskContextHistoryRepository | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.repository = repository or RiskContextHistoryRepository(settings)
+        self.freshness = DataFreshnessService(
+            settings,
+            clock=self.clock,
+        )
         self.normalizer = RiskContextNormalizationService(settings)
         self.risk_indices_provider = CboeRiskIndicesProvider(settings)
         self.vix_futures_provider = CboeVixFuturesProvider(settings)
         self.put_call_provider = CboePutCallProvider(settings)
         self.qqq_options_provider = NasdaqQQQOptionChainProvider(settings)
         self.last_database_lookup: dict[str, Any] | None = None
+
+    def lookup_canonical(
+        self,
+    ) -> tuple[dict[str, Any] | None, CanonicalFreshnessResult]:
+        latest = self.repository.latest()
+        freshness = self.freshness.evaluate_canonical(
+            latest,
+            max_age=RISK_CONTEXT_MAX_AGE,
+            data_reference_mode="point_in_time",
+        )
+        self.last_database_lookup = _database_lookup_evidence(
+            freshness
+        )
+        return latest, freshness
 
     async def snapshot(
         self,
@@ -41,25 +73,43 @@ class RiskContextRuntimeService:
         preloaded_risk_indices: dict[str, Any] | None = None,
         preloaded_qqq_options: dict[str, Any] | None = None,
         existing_legacy: dict[str, Any] | None = None,
+        canonical_preflight: (
+            tuple[
+                dict[str, Any] | None,
+                CanonicalFreshnessResult,
+            ]
+            | None
+        ) = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         logger.info("risk_context_lookup_started", extra={"refresh": refresh})
-        latest = self.repository.latest()
-        self.last_database_lookup = {
-            "performed": True,
-            "found": bool(latest),
-            "data_as_of": (latest or {}).get("data_as_of"),
-            "content_valid_until": (latest or {}).get("valid_until"),
-            "expired": bool(latest and _is_stale(latest)),
-            "freshness": (
-                "EXPIRED"
-                if latest and _is_stale(latest)
-                else "VALID"
+        latest, freshness = (
+            canonical_preflight
+            if canonical_preflight is not None
+            else self.lookup_canonical()
+        )
+        self.last_database_lookup = _database_lookup_evidence(
+            freshness
+        )
+        if freshness.usable and latest:
+            canonical = _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            )
+            return canonical, build_legacy_risk_sentiment(
+                canonical,
+                existing_legacy,
+            )
+        if refresh == "false":
+            canonical = (
+                _runtime_view(
+                    latest,
+                    refresh=refresh,
+                    now=self.clock(),
+                )
                 if latest
-                else "NOT_FOUND"
-            ),
-        }
-        if refresh == "false" or (refresh == "auto" and latest and not _is_stale(latest)):
-            canonical = _runtime_view(latest, refresh=refresh) if latest else empty_risk_context(refresh=refresh)
+                else empty_risk_context(refresh=refresh)
+            )
             return canonical, build_legacy_risk_sentiment(canonical, existing_legacy)
 
         risk_indices = preloaded_risk_indices or {}
@@ -67,8 +117,20 @@ class RiskContextRuntimeService:
         for source in ("Cboe Futures Exchange", "Cboe Daily Market Statistics"):
             logger.info("risk_source_attempted", extra={"source": source, "metric": "risk_context"})
         tasks: list[Any] = [self.vix_futures_provider.fetch(), self.put_call_provider.fetch()]
-        fetch_indices = not risk_indices or risk_indices.get("status") in {None, "not_found"} or _is_stale(risk_indices)
-        fetch_options = not qqq_options or qqq_options.get("status") in {None, "not_found"} or _is_stale(qqq_options)
+        fetch_indices = (
+            not risk_indices
+            or _preloaded_requires_provider_call(
+                risk_indices,
+                now=self.clock(),
+            )
+        )
+        fetch_options = (
+            not qqq_options
+            or _preloaded_requires_provider_call(
+                qqq_options,
+                now=self.clock(),
+            )
+        )
         if fetch_indices:
             tasks.append(self.risk_indices_provider.fetch())
         if fetch_options:
@@ -95,6 +157,7 @@ class RiskContextRuntimeService:
             qqq_options=qqq_options,
             macro_snapshot=macro_snapshot,
             snapshot_history=history,
+            now=self.clock(),
         )
         candidate["diagnostics"]["provider_calls"] += int(fetch_indices) + int(fetch_options)
         expected_depth = self.repository.count() + (1 if candidate.get("status") != "not_found" else 0)
@@ -103,8 +166,16 @@ class RiskContextRuntimeService:
         current_score = float((candidate.get("quality") or {}).get("quality_score") or 0)
         previous_score = float(((latest or {}).get("quality") or {}).get("quality_score") or 0)
         if latest and (candidate.get("status") == "not_found" or current_score + 0.1 < previous_score):
-            canonical = _runtime_view(latest, refresh=refresh)
-            canonical["status"] = "stale_acceptable" if _is_stale(latest) else latest.get("status")
+            canonical = _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            )
+            canonical["status"] = (
+                "stale_acceptable"
+                if not freshness.usable
+                else latest.get("status")
+            )
             canonical["source_summary"]["last_known_good_used"] = True
             canonical["quality"]["last_known_good_penalty"] = 0.05
             canonical["quality"]["quality_score"] = round(max(previous_score - 0.05, 0), 3)
@@ -128,7 +199,12 @@ class RiskContextRuntimeService:
         logger.info("risk_snapshot_read_back", extra={"quality_score": canonical.get("quality", {}).get("quality_score")})
         logger.info("risk_snapshot_materialized", extra={"status": canonical.get("status")})
         logger.info("risk_history_updated", extra={"metric": "risk_context", "value": self.repository.count(), "data_as_of": canonical.get("data_as_of")})
-        canonical = _runtime_view(canonical, refresh=refresh, force_read_back=True)
+        canonical = _runtime_view(
+            canonical,
+            refresh=refresh,
+            force_read_back=True,
+            now=self.clock(),
+        )
         return canonical, build_legacy_risk_sentiment(canonical, existing_legacy)
 
 
@@ -157,17 +233,37 @@ def empty_risk_context(*, refresh: str) -> dict[str, Any]:
     }
 
 
-def _runtime_view(payload: dict[str, Any] | None, *, refresh: str, force_read_back: bool = False) -> dict[str, Any]:
+def _runtime_view(
+    payload: dict[str, Any] | None,
+    *,
+    refresh: str,
+    force_read_back: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     if not payload:
         return empty_risk_context(refresh=refresh)
+    current = now or datetime.now(UTC)
     output = copy.deepcopy(payload)
+    selected_sources = (
+        (output.get("source_summary") or {}).get(
+            "selected_sources"
+        )
+        or {}
+    )
+    if not output.get("source") and isinstance(
+        selected_sources,
+        dict,
+    ):
+        output["source"] = selected_sources.get("risk")
     diagnostics = output.setdefault("diagnostics", {})
     if refresh == "false":
         diagnostics["provider_calls"] = 0
         diagnostics["actual_network_calls"] = 0
     diagnostics["browser_calls"] = 0
     diagnostics["AI_called"] = False
-    diagnostics["cache_used"] = refresh in {"false", "auto"} or force_read_back
+    # Every payload handled here came from the canonical history repository,
+    # including a just-persisted read-back after provider acquisition.
+    diagnostics["cache_used"] = True
     cache_status = "DB_READ_BACK" if force_read_back else "DB"
     for key in ("vix", "vvix", "skew"):
         output.setdefault(key, {})["cache_status"] = cache_status
@@ -183,9 +279,13 @@ def _runtime_view(payload: dict[str, Any] | None, *, refresh: str, force_read_ba
     for ratio in ((output.get("put_call") or {}).get("by_id") or {}).values():
         if isinstance(ratio, dict):
             ratio["cache_status"] = cache_status
-    output["stale"] = _is_stale(output)
+    output["stale"] = _is_stale(output, now=current)
     retrieved = parse_datetime(output.get("retrieved_at"))
-    output["age_minutes"] = round(max((datetime.now(UTC) - retrieved).total_seconds() / 60, 0), 2) if retrieved else None
+    output["age_minutes"] = (
+        round(max((current - retrieved).total_seconds() / 60, 0), 2)
+        if retrieved
+        else None
+    )
     return output
 
 
@@ -197,6 +297,53 @@ def _provider_result(value: Any, source: str) -> dict[str, Any]:
     return {"status": "not_found", "source": source, "warnings": ["empty_payload"], "errors": [], "diagnostics": {"actual_network_calls": 0}}
 
 
-def _is_stale(payload: dict[str, Any]) -> bool:
-    valid_until = parse_datetime(payload.get("valid_until"))
-    return bool(valid_until and datetime.now(UTC) >= valid_until)
+def _is_stale(
+    payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = now or datetime.now(UTC)
+    decision = evaluate_canonical_freshness(
+        payload,
+        policy=CanonicalFreshnessPolicy(
+            max_age=RISK_CONTEXT_MAX_AGE,
+            data_reference_mode="point_in_time",
+        ),
+        observed_at=current,
+    )
+    return not decision.usable
+
+
+def _preloaded_requires_provider_call(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    # A provider execution already observed in this request must not be
+    # repeated here. Cached preloads, however, must pass the canonical
+    # freshness policy before they can suppress a provider call.
+    if (
+        payload.get("attempted") is True
+        and int(payload.get("provider_calls") or 0) > 0
+        and payload.get("cache_used") is not True
+    ):
+        return False
+    if payload.get("status") in {None, "not_found"}:
+        return True
+    return _is_stale(payload, now=now)
+
+
+def _database_lookup_evidence(
+    result: CanonicalFreshnessResult,
+) -> dict[str, Any]:
+    return {
+        "performed": True,
+        "found": result.found,
+        "data_as_of": result.data_as_of,
+        "content_valid_until": result.content_valid_until,
+        "refresh_due_at": result.refresh_due_at,
+        "lifecycle_status": result.lifecycle,
+        "expired": result.expired,
+        "freshness": result.evaluation,
+        "reason_code": result.reason_code,
+    }

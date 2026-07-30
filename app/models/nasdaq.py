@@ -161,6 +161,9 @@ class QQQHoldingsQuality(DataQuality):
     normalization_applied: bool = False
     fallback_chain: list[dict[str, Any]] = Field(default_factory=list)
     alternative_sources: list[dict[str, Any]] = Field(default_factory=list)
+    provider_accounting: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
     failure_breakdown: dict[str, int] = Field(default_factory=dict)
     multi_class_issuer_count: int = 0
     multi_class_security_count: int = 0
@@ -220,6 +223,9 @@ class MegaCapSnapshotQuality(DataQuality):
     tracked_count: int
     resolved_count: int = 0
     missing_prices: list[str] = Field(default_factory=list)
+    provider_accounting: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
 
 
 class MegaCapSnapshotResponse(BaseModel):

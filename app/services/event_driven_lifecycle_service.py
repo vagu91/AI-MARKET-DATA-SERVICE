@@ -204,6 +204,31 @@ def compute_datum_lifecycle(
             else:
                 next_retry_at = None
                 next_refresh_at = event_at
+        elif (
+            entity_type == "macro_actual"
+            and event_at is not None
+            and not actual_missing
+        ):
+            cadence_deadline = _official_release_deadline(
+                event_at,
+                frequency=value.get("frequency"),
+            )
+            if cadence_deadline is not None:
+                valid_until = min(
+                    deadline
+                    for deadline in (valid_until, cadence_deadline)
+                    if deadline is not None
+                )
+                next_refresh_at = min(
+                    deadline
+                    for deadline in (
+                        next_refresh_at,
+                        valid_until,
+                        cadence_deadline,
+                    )
+                    if deadline is not None
+                )
+            next_retry_at = None
     elif entity_type in {"cot", "cot_positioning", "cot_publication"}:
         report_date = _date_value(value.get("report_date") or value.get("data_as_of"))
         if report_date is not None:
@@ -1427,6 +1452,24 @@ def _default_ttl(entity_type: str, settings: Settings) -> timedelta:
     if entity_type in {"market_schedule", "macro_schedule"}:
         return timedelta(hours=24)
     return timedelta(hours=int(settings.default_fact_ttl_hours))
+
+
+def _official_release_deadline(
+    release_at: datetime,
+    *,
+    frequency: Any,
+) -> datetime | None:
+    cadence = str(frequency or "").strip().lower()
+    max_ages = {
+        "daily": timedelta(days=2),
+        "weekly": timedelta(days=10),
+        "monthly": timedelta(days=45),
+        "quarterly": timedelta(days=120),
+        "annual": timedelta(days=400),
+        "yearly": timedelta(days=400),
+    }
+    max_age = max_ages.get(cadence)
+    return release_at + max_age if max_age is not None else None
 
 
 def _has_material_data(value: Any) -> bool:

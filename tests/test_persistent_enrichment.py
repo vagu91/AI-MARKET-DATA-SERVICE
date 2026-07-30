@@ -180,7 +180,7 @@ def test_orchestrator_db_hit_does_not_call_provider(tmp_path):
     assert metadata["data_quality"]["db_hits"] == 1
 
 
-def test_orchestrator_force_bypasses_negative_cache_without_authorizing_ai(tmp_path):
+def test_orchestrator_force_reuses_valid_negative_fact_without_authorizing_ai(tmp_path):
     cfg = settings(tmp_path, enable_ai_researcher=True)
     event = make_event()
     provider = CountingEnrichmentService()
@@ -204,16 +204,16 @@ def test_orchestrator_force_bypasses_negative_cache_without_authorizing_ai(tmp_p
             events=[event], country="US", start=datetime.now(UTC), end=datetime.now(UTC) + timedelta(days=7), trigger="test", force=True
         )
     )
-    assert forced["data_quality"]["db_hits"] == 0
-    assert forced["data_quality"]["history_event_count"] == 0
-    assert forced["data_quality"]["db_bypassed_force"] == 1
+    assert forced["data_quality"]["db_hits"] == 1
+    assert forced["data_quality"]["db_bypassed_force"] == 0
     assert forced["data_quality"]["ai_research_requests"] == 0
+    assert provider.calls == 0
     assert ai.calls == 0
     assert enriched[0].enrichment.previous is None
     assert "ai_enrichment_pending" not in enriched[0].enrichment.warnings
 
 
-def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
+def test_orchestrator_force_selects_valid_positive_fact(tmp_path):
     cfg = settings(tmp_path, enable_ai_researcher=True)
     event = make_event()
     provider = CountingEnrichmentService()
@@ -228,14 +228,15 @@ def test_orchestrator_force_bypasses_valid_positive_fact(tmp_path):
         )
     )
 
-    assert metadata["data_quality"]["db_hits"] == 0
-    assert metadata["data_quality"]["db_bypassed_force"] == 1
+    assert metadata["data_quality"]["db_hits"] == 1
+    assert metadata["data_quality"]["db_bypassed_force"] == 0
     assert metadata["data_quality"]["ai_research_requests"] == 0
     assert ai.calls == 0
-    assert enriched[0].enrichment.previous is None
+    assert provider.calls == 0
+    assert enriched[0].enrichment.previous == "0.3"
 
 
-def test_orchestrator_force_batches_five_valid_negative_caches(tmp_path):
+def test_orchestrator_force_selects_five_valid_negative_facts(tmp_path):
     cfg = settings(tmp_path, enable_ai_researcher=True, ai_researcher_max_events=5)
     events = [
         make_event(event_id="evt-cpi", category="CPI", name="Consumer Price Index"),
@@ -258,10 +259,10 @@ def test_orchestrator_force_batches_five_valid_negative_caches(tmp_path):
     )
 
     quality = metadata["data_quality"]
-    assert quality["db_hits"] == 0
-    assert quality["db_bypassed_force"] == 5
+    assert quality["db_hits"] == 5
+    assert quality["db_bypassed_force"] == 0
     assert quality["ai_research_requests"] == 0
-    assert quality["ai_events_requested"] == 5
+    assert quality["ai_events_requested"] == 0
     assert ai.calls == 0
     assert all("ai_enrichment_pending" not in item.enrichment.warnings for item in enriched)
     assert all(repo.get_fact(orchestrator.fact_key(event))["status"] == "no_data_available" for event in events)

@@ -63,6 +63,24 @@ async def test_provider_does_not_report_cache_fallback_when_cache_is_empty(tmp_p
     assert result.metadata.errors == ["Flaky failed: upstream is down"]
 
 
+@pytest.mark.asyncio
+async def test_force_does_not_select_provider_stale_cache(tmp_path) -> None:
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
+    provider = FlakyProvider(cache)
+
+    first = await provider.fetch_safe()
+    original_retrieved_at = first.metadata.retrieved_at
+    provider.fail = True
+    forced = await provider.fetch_safe(force=True)
+    cached = await provider.fetch_safe()
+
+    assert forced.data == {}
+    assert forced.metadata.provider_type == ProviderType.API
+    assert cached.data == first.data
+    assert cached.metadata.provider_type == ProviderType.CACHE
+    assert cached.metadata.retrieved_at == original_retrieved_at
+
+
 def test_provider_error_redaction_removes_api_keys() -> None:
     message = (
         "https://api.stlouisfed.org/fred/series/observations?"

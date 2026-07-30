@@ -7,6 +7,9 @@ from typing import Any
 
 from app.core.config import Settings
 from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
+from app.providers.fmp_earnings_calendar_provider import (
+    FmpEarningsCalendarProvider,
+)
 from app.providers.cme_market_schedule_provider import CmeMarketScheduleProvider
 from app.providers.investing_economic_calendar_provider import InvestingEconomicCalendarProvider
 from app.providers.investing_fed_rate_monitor_provider import InvestingFedRateMonitorProvider
@@ -20,8 +23,15 @@ from app.providers.nasdaq_qqq_option_chain_provider import NasdaqQQQOptionChainP
 from app.providers.polymarket_prediction_provider import PolymarketPredictionProvider
 from app.providers.xtb_economic_calendar_provider import XtbEconomicCalendarProvider
 from app.services.market_fact_repository import MarketFactRepository, now_iso
+from app.services.data_freshness_service import (
+    CanonicalFreshnessResult,
+    DataFreshnessService,
+)
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.provider_observation_repository import ProviderObservationRepository
+from app.infrastructure.persistence.provider_cache_repository import (
+    ProviderCacheRepository,
+)
 
 
 FetchCallable = Callable[[], Awaitable[dict[str, Any]]]
@@ -35,7 +45,8 @@ FACT_TYPES = {
     "cme_market_schedule": "cme_market_schedule",
     "investing_fed_rate_monitor": "investing_fed_rate_monitor",
     "cboe_risk_indices": "cboe_risk_indices",
-    "nasdaq_earnings": "nasdaq_earnings_calendar",
+    "nasdaq_earnings": "earnings_event",
+    "fmp_earnings": "fmp_earnings_calendar",
     "nasdaq_100": "nasdaq_100_constituents",
     "nasdaq_market_info": "nasdaq_market_info",
     "nasdaq_qqq_options": "nasdaq_qqq_options",
@@ -44,12 +55,31 @@ FACT_TYPES = {
     "polymarket_prediction_markets": "polymarket_prediction_markets",
     "quikstrike_review": "quikstrike_review",
 }
+PROVIDER_CACHE_MAX_AGE = {
+    "investing_economic_calendar": timedelta(days=7),
+    "xtb_economic_calendar": timedelta(days=7),
+    "investing_holidays": timedelta(days=370),
+    "marketbeat_holidays": timedelta(days=370),
+    "cme_market_schedule": timedelta(days=370),
+    "investing_fed_rate_monitor": timedelta(hours=2),
+    "cboe_risk_indices": timedelta(hours=2),
+    "nasdaq_earnings": timedelta(days=14),
+    "fmp_earnings": timedelta(days=14),
+    "nasdaq_100": timedelta(hours=12),
+    "nasdaq_market_info": timedelta(days=370),
+    "nasdaq_qqq_options": timedelta(hours=2),
+    "aaii_sentiment": timedelta(days=10),
+    "macromicro_aaii_crosscheck": timedelta(days=10),
+    "polymarket_prediction_markets": timedelta(hours=6),
+    "quikstrike_review": timedelta(days=30),
+}
 
 
 class MultiSourceRuntimeService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.facts = MarketFactRepository(settings)
+        self.freshness = DataFreshnessService(settings)
         self.observations = ProviderObservationRepository(settings)
         self.investing_calendar = InvestingEconomicCalendarProvider(settings)
         self.xtb_calendar = XtbEconomicCalendarProvider(settings)
@@ -59,6 +89,10 @@ class MultiSourceRuntimeService:
         self.investing_fed_rate_monitor = InvestingFedRateMonitorProvider(settings)
         self.cboe = CboeRiskIndicesProvider(settings)
         self.nasdaq_earnings = NasdaqEarningsProvider(settings)
+        self.fmp_earnings = FmpEarningsCalendarProvider(
+            ProviderCacheRepository(settings.database_path),
+            settings,
+        )
         self.nasdaq_100 = Nasdaq100ConstituentsProvider(settings)
         self.nasdaq_market_info = NasdaqMarketInfoProvider(settings)
         self.nasdaq_options = NasdaqQQQOptionChainProvider(settings)
@@ -73,6 +107,18 @@ class MultiSourceRuntimeService:
         preloaded_blocks: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         preloaded_blocks = preloaded_blocks or {}
+        earnings_blocks = await self._earnings_chain(
+            refresh=refresh,
+            preloaded_primary=preloaded_blocks.get(
+                "nasdaq_earnings"
+            ),
+            preloaded_fallback=preloaded_blocks.get(
+                "fmp_earnings"
+            ),
+        )
+        schedule_blocks = await self._market_schedule_chain(
+            refresh=refresh,
+        )
         blocks = {
             "investing_economic_calendar": preloaded_blocks.get("investing_economic_calendar") or await self._run_provider(
                 "investing_economic_calendar",
@@ -83,25 +129,12 @@ class MultiSourceRuntimeService:
                 source="Investing Economic Calendar",
                 refresh=refresh,
             ),
-            "investing_holidays": await self._run_provider(
-                "investing_holidays",
-                FACT_TYPES["investing_holidays"],
-                self.investing_holidays.fetch,
-                item_count=lambda payload: len(payload.get("holidays") or []),
-                enabled=self.settings.enable_investing_holidays,
-                source="Investing Holiday Calendar",
-                refresh=refresh,
-            ),
-            "marketbeat_holidays": await self._run_provider(
-                "marketbeat_holidays",
-                FACT_TYPES["marketbeat_holidays"],
-                self.marketbeat_holidays.fetch,
-                item_count=lambda payload: len(payload.get("holidays") or []),
-                enabled=self.settings.enable_marketbeat_holidays,
-                source="MarketBeat Stock Market Holidays",
-                refresh=refresh,
-                persist_unmaterialized=False,
-            ),
+            "investing_holidays": schedule_blocks[
+                "investing_holidays"
+            ],
+            "marketbeat_holidays": schedule_blocks[
+                "marketbeat_holidays"
+            ],
             "xtb_economic_calendar": preloaded_blocks.get("xtb_economic_calendar") or await self._run_provider(
                 "xtb_economic_calendar",
                 FACT_TYPES["xtb_economic_calendar"],
@@ -111,17 +144,12 @@ class MultiSourceRuntimeService:
                 source="XTB Economic Calendar",
                 refresh=refresh,
             ),
-            "cme_market_schedule": await self._run_provider(
-                "cme_market_schedule",
-                FACT_TYPES["cme_market_schedule"],
-                self.cme_market_schedule.fetch,
-                item_count=lambda payload: 1 if payload.get("calendar_verified") else 0,
-                enabled=self.settings.enable_cme_market_schedule,
-                source="CME Group Trading Hours",
-                refresh=refresh,
-                persist_unmaterialized=False,
-            ),
-            "investing_fed_rate_monitor": await self._run_provider(
+            "cme_market_schedule": schedule_blocks[
+                "cme_market_schedule"
+            ],
+            "investing_fed_rate_monitor": preloaded_blocks.get(
+                "investing_fed_rate_monitor"
+            ) or await self._run_provider(
                 "investing_fed_rate_monitor",
                 FACT_TYPES["investing_fed_rate_monitor"],
                 self.investing_fed_rate_monitor.fetch,
@@ -131,7 +159,9 @@ class MultiSourceRuntimeService:
                 refresh=refresh,
                 persist_unmaterialized=False,
             ),
-            "cboe_risk_indices": await self._run_provider(
+            "cboe_risk_indices": preloaded_blocks.get(
+                "cboe_risk_indices"
+            ) or await self._run_provider(
                 "cboe_risk_indices",
                 FACT_TYPES["cboe_risk_indices"],
                 self.cboe.fetch,
@@ -140,15 +170,7 @@ class MultiSourceRuntimeService:
                 source="CBOE",
                 refresh=refresh,
             ),
-            "nasdaq_earnings": await self._run_provider(
-                "nasdaq_earnings",
-                FACT_TYPES["nasdaq_earnings"],
-                self.nasdaq_earnings.fetch,
-                item_count=lambda payload: len(payload.get("events") or []),
-                enabled=self.settings.enable_nasdaq_earnings,
-                source="Nasdaq Earnings Calendar",
-                refresh=refresh,
-            ),
+            **earnings_blocks,
             "nasdaq_100": await self._run_provider(
                 "nasdaq_100",
                 FACT_TYPES["nasdaq_100"],
@@ -158,16 +180,12 @@ class MultiSourceRuntimeService:
                 source="Nasdaq-100 Constituents",
                 refresh=refresh,
             ),
-            "nasdaq_market_info": await self._run_provider(
-                "nasdaq_market_info",
-                FACT_TYPES["nasdaq_market_info"],
-                self.nasdaq_market_info.fetch,
-                item_count=lambda payload: 1 if payload.get("status") == "found" else 0,
-                enabled=self.settings.enable_nasdaq_market_info,
-                source="Nasdaq Market Info",
-                refresh=refresh,
-            ),
-            "nasdaq_qqq_options": await self._run_provider(
+            "nasdaq_market_info": schedule_blocks[
+                "nasdaq_market_info"
+            ],
+            "nasdaq_qqq_options": preloaded_blocks.get(
+                "nasdaq_qqq_options"
+            ) or await self._run_provider(
                 "nasdaq_qqq_options",
                 FACT_TYPES["nasdaq_qqq_options"],
                 self.nasdaq_options.fetch,
@@ -206,6 +224,143 @@ class MultiSourceRuntimeService:
             "data_quality": quality,
             "service_role": "data provider only",
         }
+
+    async def _market_schedule_chain(
+        self,
+        *,
+        refresh: str,
+    ) -> dict[str, dict[str, Any]]:
+        specs = (
+            (
+                "nasdaq_market_info",
+                self.nasdaq_market_info.fetch,
+                lambda payload: (
+                    1 if payload.get("status") == "found" else 0
+                ),
+                self.settings.enable_nasdaq_market_info,
+                "Nasdaq Market Info",
+                True,
+            ),
+            (
+                "cme_market_schedule",
+                self.cme_market_schedule.fetch,
+                lambda payload: (
+                    1 if payload.get("calendar_verified") else 0
+                ),
+                self.settings.enable_cme_market_schedule,
+                "CME Group Trading Hours",
+                False,
+            ),
+            (
+                "investing_holidays",
+                self.investing_holidays.fetch,
+                lambda payload: len(payload.get("holidays") or []),
+                self.settings.enable_investing_holidays,
+                "Investing Holiday Calendar",
+                True,
+            ),
+            (
+                "marketbeat_holidays",
+                self.marketbeat_holidays.fetch,
+                lambda payload: len(payload.get("holidays") or []),
+                self.settings.enable_marketbeat_holidays,
+                "MarketBeat Stock Market Holidays",
+                False,
+            ),
+        )
+        output: dict[str, dict[str, Any]] = {}
+        selected = False
+        for (
+            name,
+            fetcher,
+            counter,
+            enabled,
+            source,
+            persist_unmaterialized,
+        ) in specs:
+            if selected:
+                output[name] = _skipped_runtime_block(
+                    source=source,
+                    reason="PRIOR_SCHEDULE_PROVIDER_SUCCEEDED",
+                )
+                continue
+            block = await self._run_provider(
+                name,
+                FACT_TYPES[name],
+                fetcher,
+                item_count=counter,
+                enabled=enabled,
+                source=source,
+                refresh=refresh,
+                persist_unmaterialized=persist_unmaterialized,
+            )
+            output[name] = block
+            selected = _runtime_block_succeeded(block)
+        return output
+
+    async def _earnings_chain(
+        self,
+        *,
+        refresh: str,
+        preloaded_primary: dict[str, Any] | None = None,
+        preloaded_fallback: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        primary = (
+            preloaded_primary
+            if preloaded_primary is not None
+            else await self._run_provider(
+                "nasdaq_earnings",
+                FACT_TYPES["nasdaq_earnings"],
+                self.nasdaq_earnings.fetch,
+                item_count=lambda payload: len(
+                    payload.get("events") or []
+                ),
+                enabled=self.settings.enable_nasdaq_earnings,
+                source="Nasdaq Earnings Calendar",
+                refresh=refresh,
+            )
+        )
+        if _runtime_block_succeeded(primary):
+            fallback = _skipped_runtime_block(
+                source="Financial Modeling Prep Earnings Calendar",
+                reason="PRIOR_EARNINGS_PROVIDER_SUCCEEDED",
+            )
+        else:
+            fallback = (
+                preloaded_fallback
+                if preloaded_fallback is not None
+                else await self._run_provider(
+                    "fmp_earnings",
+                    FACT_TYPES["fmp_earnings"],
+                    self._fetch_fmp_earnings,
+                    item_count=lambda payload: len(
+                        payload.get("events") or []
+                    ),
+                    enabled=self.settings.enable_fmp_earnings,
+                    source=(
+                        "Financial Modeling Prep Earnings Calendar"
+                    ),
+                    refresh=refresh,
+                )
+            )
+        return {
+            "nasdaq_earnings": primary,
+            "fmp_earnings": fallback,
+        }
+
+    async def _fetch_fmp_earnings(self) -> dict[str, Any]:
+        result = await self.fmp_earnings.fetch()
+        payload = dict(result.data or {})
+        payload.setdefault("source", result.metadata.source)
+        payload.setdefault(
+            "retrieved_at",
+            result.metadata.retrieved_at.isoformat(),
+        )
+        payload.setdefault(
+            "errors",
+            list(result.metadata.errors or []),
+        )
+        return payload
 
     def persist_provider_result(self, name: str, result: dict[str, Any], *, source: str) -> int:
         return self._save_fact(name, FACT_TYPES[name], result, source=source)
@@ -363,16 +518,60 @@ class MultiSourceRuntimeService:
         persist_unmaterialized: bool = True,
     ) -> dict[str, Any]:
         refresh_mode = refresh or "auto"
-        cached = [] if refresh_mode == "force" else self.facts.get_valid_facts_by_type(fact_type)
-        if cached:
-            raw = cached[0].get("raw_payload") if isinstance(cached[0].get("raw_payload"), dict) else {}
-            return _with_runtime_fields(raw, enabled=enabled, cache_used=True, provider_calls=0, attempted=False, persisted_count=1, read_back_count=1, materialized_count=1)
+        cached = self.facts.get_valid_facts_by_type(
+            fact_type,
+            allow_stale=True,
+        )
+        cached_row = cached[0] if cached else None
+        database_lookup = self.freshness.evaluate_canonical(
+            cached_row,
+            max_age=PROVIDER_CACHE_MAX_AGE[name],
+            data_reference_mode="point_in_time",
+        )
+        lookup_evidence = _database_lookup_evidence(database_lookup)
+        if database_lookup.usable and cached_row:
+            raw = (
+                cached_row.get("raw_payload")
+                if isinstance(cached_row.get("raw_payload"), dict)
+                else {}
+            )
+            return _with_runtime_fields(
+                raw,
+                enabled=enabled,
+                cache_used=True,
+                provider_calls=0,
+                attempted=False,
+                persisted_count=1,
+                read_back_count=1,
+                materialized_count=1,
+                database_lookup=lookup_evidence,
+            )
+        if not enabled:
+            return {
+                **_missing_payload(
+                    name,
+                    source,
+                    enabled=False,
+                    reason=f"{name}_disabled",
+                ),
+                "status": "disabled",
+                "database_lookup": lookup_evidence,
+            }
         if refresh_mode == "false":
-            return _missing_payload(name, source, enabled, reason=f"{fact_type}_not_in_db_refresh_false")
+            return {
+                **_missing_payload(
+                    name,
+                    source,
+                    enabled,
+                    reason=f"{fact_type}_not_in_db_refresh_false",
+                ),
+                "database_lookup": lookup_evidence,
+            }
         try:
             result = await fetcher()
         except Exception as exc:
             result = _provider_exception(name, source, exc)
+        result = _canonical_runtime_result(name, result)
         count = item_count(result)
         self._record(name, fact_type, result, count)
         materialized = _materialized(result, count)
@@ -389,6 +588,7 @@ class MultiSourceRuntimeService:
             read_back_count=read_back_count,
             materialized_count=materialized_count,
             item_count=count,
+            database_lookup=lookup_evidence,
         )
 
     async def _run_aaii(self, *, refresh: str) -> dict[str, Any]:
@@ -406,12 +606,27 @@ class MultiSourceRuntimeService:
             read_back_count=found,
             materialized_count=found,
             item_count=found,
+            database_lookup=result.get("database_lookup"),
         )
 
     def _quikstrike_review(self, *, refresh: str) -> dict[str, Any]:
-        cached = [] if refresh == "force" else self.facts.get_valid_facts_by_type(FACT_TYPES["quikstrike_review"])
-        if cached:
-            raw = cached[0].get("raw_payload") if isinstance(cached[0].get("raw_payload"), dict) else {}
+        cached = self.facts.get_valid_facts_by_type(
+            FACT_TYPES["quikstrike_review"],
+            allow_stale=True,
+        )
+        cached_row = cached[0] if cached else None
+        database_lookup = self.freshness.evaluate_canonical(
+            cached_row,
+            max_age=PROVIDER_CACHE_MAX_AGE["quikstrike_review"],
+            data_reference_mode="point_in_time",
+        )
+        lookup_evidence = _database_lookup_evidence(database_lookup)
+        if database_lookup.usable and cached_row:
+            raw = (
+                cached_row.get("raw_payload")
+                if isinstance(cached_row.get("raw_payload"), dict)
+                else {}
+            )
             return _with_runtime_fields(
                 raw,
                 enabled=True,
@@ -422,6 +637,7 @@ class MultiSourceRuntimeService:
                 read_back_count=1,
                 materialized_count=1,
                 item_count=1,
+                database_lookup=lookup_evidence,
             )
         payload = {
             "status": "reviewed_excluded",
@@ -458,10 +674,29 @@ class MultiSourceRuntimeService:
             read_back_count=read_back,
             materialized_count=1,
             item_count=1,
+            database_lookup=lookup_evidence,
         )
 
     def _save_fact(self, name: str, fact_type: str, result: dict[str, Any], *, source: str) -> int:
-        valid_until = result.get("valid_until") or (datetime.now(UTC) + timedelta(hours=self.settings.default_fact_ttl_hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        retrieved_at = result.get("retrieved_at") or now_iso()
+        data_as_of = result.get("data_as_of") or retrieved_at
+        valid_until = result.get("valid_until") or (
+            datetime.now(UTC)
+            + PROVIDER_CACHE_MAX_AGE[name]
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        refresh_due_at = (
+            result.get("refresh_due_at")
+            or result.get("next_refresh_at")
+            or valid_until
+        )
+        persisted_payload = dict(result)
+        persisted_payload.update(
+            {
+                "data_as_of": data_as_of,
+                "content_valid_until": valid_until,
+                "refresh_due_at": refresh_due_at,
+            }
+        )
         self.facts.upsert_fact(
             {
                 "fact_key": _fact_key(name, fact_type),
@@ -475,11 +710,12 @@ class MultiSourceRuntimeService:
                 "provider_type": "PUBLIC_HTTP",
                 "reliability": result.get("reliability") or _reliability(result),
                 "confidence": result.get("reliability") or _reliability(result),
-                "retrieved_at": result.get("retrieved_at") or now_iso(),
+                "retrieved_at": retrieved_at,
+                "release_at": data_as_of,
                 "valid_until": valid_until,
-                "next_refresh_at": valid_until,
+                "next_refresh_at": refresh_due_at,
                 "status": "active",
-                "raw_payload_json": result,
+                "raw_payload_json": persisted_payload,
                 "warnings_json": result.get("warnings") or [],
                 "errors_json": result.get("errors") or [],
             }
@@ -516,7 +752,15 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
     cme_market_schedule = blocks.get("cme_market_schedule") or {}
     fed_rate_monitor = blocks.get("investing_fed_rate_monitor") or {}
     cboe = blocks.get("cboe_risk_indices") or {}
-    earnings = blocks.get("nasdaq_earnings") or {}
+    earnings_primary = blocks.get("nasdaq_earnings") or {}
+    earnings_fallback = blocks.get("fmp_earnings") or {}
+    earnings = (
+        earnings_primary
+        if _runtime_block_succeeded(earnings_primary)
+        else earnings_fallback
+        if _runtime_block_succeeded(earnings_fallback)
+        else earnings_primary
+    )
     nasdaq_100 = blocks.get("nasdaq_100") or {}
     market_info = blocks.get("nasdaq_market_info") or {}
     options = blocks.get("nasdaq_qqq_options") or {}
@@ -589,9 +833,43 @@ def build_multi_source_context_blocks(blocks: dict[str, dict[str, Any]]) -> dict
         "corporate_events": {
             "earnings": {
                 "status": earnings.get("status"),
-                "relevant_upcoming": earnings.get("relevant_upcoming") or [],
-                "mega_cap": _filter_symbols(earnings.get("relevant_upcoming") or [], {"NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "GOOG", "AVGO", "TSLA"}),
-                "semiconductors": _filter_symbols(earnings.get("relevant_upcoming") or [], {"NVDA", "AVGO", "AMD", "QCOM", "INTC", "MU", "AMAT", "ASML", "ARM"}),
+                "relevant_upcoming": (
+                    earnings.get("relevant_upcoming")
+                    or earnings.get("events")
+                    or []
+                ),
+                "mega_cap": _filter_symbols(
+                    earnings.get("relevant_upcoming")
+                    or earnings.get("events")
+                    or [],
+                    {
+                        "NVDA",
+                        "AAPL",
+                        "MSFT",
+                        "AMZN",
+                        "META",
+                        "GOOGL",
+                        "GOOG",
+                        "AVGO",
+                        "TSLA",
+                    },
+                ),
+                "semiconductors": _filter_symbols(
+                    earnings.get("relevant_upcoming")
+                    or earnings.get("events")
+                    or [],
+                    {
+                        "NVDA",
+                        "AVGO",
+                        "AMD",
+                        "QCOM",
+                        "INTC",
+                        "MU",
+                        "AMAT",
+                        "ASML",
+                        "ARM",
+                    },
+                ),
                 "coverage": earnings.get("diagnostics") or {},
             }
         },
@@ -693,6 +971,7 @@ def _with_runtime_fields(
     read_back_count: int,
     materialized_count: int,
     item_count: int | None = None,
+    database_lookup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output = dict(payload)
     fetched = item_count if item_count is not None else _generic_item_count(output)
@@ -722,9 +1001,100 @@ def _with_runtime_fields(
             "materialized_count": materialized_count,
             "excluded_count": _excluded_count(output),
             "exclusion_reasons": _exclusion_reasons(output),
+            "database_lookup": database_lookup,
         }
     )
     return output
+
+
+def _database_lookup_evidence(
+    result: CanonicalFreshnessResult,
+) -> dict[str, Any]:
+    return {
+        "performed": True,
+        "found": result.found,
+        "data_as_of": result.data_as_of,
+        "content_valid_until": result.content_valid_until,
+        "refresh_due_at": result.refresh_due_at,
+        "lifecycle_status": result.lifecycle,
+        "expired": result.expired,
+        "freshness": result.evaluation,
+        "reason_code": result.reason_code,
+    }
+
+
+def _runtime_block_succeeded(block: dict[str, Any]) -> bool:
+    status = str(block.get("status") or "").lower()
+    return bool(
+        status in {"found", "available", "valid", "partial"}
+        and (
+            int(block.get("fetched_count") or 0) > 0
+            or int(block.get("materialized_count") or 0) > 0
+        )
+    )
+
+
+def _canonical_runtime_result(
+    name: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    output = dict(result)
+    retrieved_at = output.get("retrieved_at") or now_iso()
+    data_as_of = output.get("data_as_of") or retrieved_at
+    valid_until = output.get("valid_until") or (
+        datetime.now(UTC) + PROVIDER_CACHE_MAX_AGE[name]
+    ).replace(microsecond=0).isoformat()
+    refresh_due_at = (
+        output.get("refresh_due_at")
+        or output.get("next_refresh_at")
+        or valid_until
+    )
+    output.update(
+        {
+            "retrieved_at": retrieved_at,
+            "data_as_of": data_as_of,
+            "content_valid_until": valid_until,
+            "valid_until": valid_until,
+            "refresh_due_at": refresh_due_at,
+            "next_refresh_at": refresh_due_at,
+        }
+    )
+    return output
+
+
+def _skipped_runtime_block(
+    *,
+    source: str,
+    reason: str,
+) -> dict[str, Any]:
+    return _with_runtime_fields(
+        {
+            "status": "not_called",
+            "provider": source,
+            "source": source,
+            "retrieved_at": now_iso(),
+            "warnings": [reason],
+            "errors": [],
+            "reason": reason,
+        },
+        enabled=True,
+        cache_used=False,
+        provider_calls=0,
+        attempted=False,
+        persisted_count=0,
+        read_back_count=0,
+        materialized_count=0,
+        database_lookup={
+            "performed": False,
+            "found": None,
+            "data_as_of": None,
+            "content_valid_until": None,
+            "refresh_due_at": None,
+            "expired": None,
+            "freshness": "NOT_LOOKED_UP",
+            "reason_code": reason,
+        },
+    )
 
 
 def _missing_payload(name: str, source: str, enabled: bool, *, reason: str) -> dict[str, Any]:
@@ -824,7 +1194,11 @@ def _exclusion_reasons(payload: dict[str, Any]) -> dict[str, int]:
 
 
 def _materialized(payload: dict[str, Any], item_count: int) -> bool:
-    return item_count > 0 or payload.get("status") in {"not_found", "disabled", "restricted", "reviewed_excluded"}
+    return bool(
+        item_count > 0
+        or payload.get("status")
+        in {"found", "valid", "partial", "reviewed_excluded"}
+    )
 
 
 def _fact_key(name: str, fact_type: str) -> str:
@@ -878,9 +1252,18 @@ def _merge_calendar_events(primary: list[dict[str, Any]], secondary: list[dict[s
 
 
 def _should_persist(payload: dict[str, Any], item_count: int, persist_unmaterialized: bool) -> bool:
-    if persist_unmaterialized:
-        return True
-    return item_count > 0 or payload.get("status") in {"found", "valid", "anomalous", "partial", "reviewed_excluded"}
+    accepted_status = payload.get("status") in {
+        "found",
+        "valid",
+        "anomalous",
+        "partial",
+        "reviewed_excluded",
+    }
+    return bool(
+        item_count > 0
+        or accepted_status
+        and persist_unmaterialized
+    )
 
 
 def assert_fetcher_shape(fetcher: FetchCallable) -> None:

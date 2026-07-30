@@ -159,6 +159,7 @@ def test_resolver_orders_primary_then_investing_and_preserves_both_forecasts(
     )
     assert result["status"] == "SUCCEEDED"
     assert result["provider"] == SOURCE
+    assert result["provider_call_count"] == 2
     assert result["reason_code"] == "FALLBACK_SELECTED_AFTER_PRIMARY_FAILURE"
     assert [item["result"] for item in result["provider_attempts"]] == [
         "HTTP_403",
@@ -166,6 +167,8 @@ def test_resolver_orders_primary_then_investing_and_preserves_both_forecasts(
     ]
     candidate = result["results"][0]
     assert candidate["value"] == "53.6"
+    assert candidate["actual_is_official"] is False
+    assert candidate["acquisition_provider"] == SOURCE
     assert candidate["forecast_observations"] == [
         {
             "value": 51.5,
@@ -275,6 +278,7 @@ def test_all_provider_failures_return_null_and_account_for_order(
     )
     assert result["status"] == "OFFICIAL_FEED_DELAYED"
     assert result["results"] == []
+    assert result["provider_call_count"] == 2
     assert [item["provider"] for item in result["provider_attempts"]] == [
         "SPGLOBAL",
         SOURCE,

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -119,7 +120,10 @@ class NasdaqDataService:
             return cached
         holdings = await self.qqq_holdings(run_cache=run_cache, force=force)
         weights = {item.symbol: item for item in holdings.holdings}
-        result = await self.mega_cap_snapshot_provider.fetch_safe()
+        result = await _fetch_safe_with_force(
+            self.mega_cap_snapshot_provider,
+            force=force,
+        )
         data = result.data if isinstance(result.data, dict) else {}
         stocks = []
         for item in data.get("stocks", []):
@@ -270,8 +274,17 @@ class NasdaqDataService:
             ),
         )
 
-    async def earnings(self, days: int = 14, tickers: list[str] | None = None) -> EarningsResponse:
-        result = await self.earnings_provider.fetch_safe()
+    async def earnings(
+        self,
+        days: int = 14,
+        tickers: list[str] | None = None,
+        *,
+        force: bool = False,
+    ) -> EarningsResponse:
+        result = await _fetch_safe_with_force(
+            self.earnings_provider,
+            force=force,
+        )
         data = result.data if isinstance(result.data, dict) else {}
         ticker_set = {symbol.upper() for symbol in tickers} if tickers else None
         events = data.get("events", [])
@@ -302,6 +315,8 @@ class NasdaqDataService:
         symbols: list[str],
         limit: int = 20,
         recency_days: int = 14,
+        *,
+        force: bool = False,
     ) -> NewsResponse:
         try:
             result = await self.news_provider.fetch_for_symbols(
@@ -311,7 +326,10 @@ class NasdaqDataService:
             )
             self.news_provider.cache.set(self.news_provider.cache_key, result.model_dump(mode="json"))
         except Exception:
-            result = await self.news_provider.fetch_safe()
+            result = await _fetch_safe_with_force(
+                self.news_provider,
+                force=force,
+            )
         data = result.data if isinstance(result.data, dict) else {}
         quality_data = data.get("data_quality", {})
         quality_data["fallback_used"] = bool(quality_data.get("fallback_used") or result.metadata.is_fallback)
@@ -327,46 +345,129 @@ class NasdaqDataService:
             data_quality=NewsQuality.model_validate(quality_data),
         )
 
-    async def context(self, *, force: bool = False) -> NasdaqContextResponse:
+    async def context(
+        self,
+        *,
+        force: bool = False,
+        fetch_news: bool = True,
+        fetch_holdings: bool = True,
+        fetch_mega_cap: bool = True,
+        fetch_earnings: bool = True,
+        preloaded_holdings: dict[str, Any] | None = None,
+    ) -> NasdaqContextResponse:
         critical_errors: list[str] = []
         warnings: list[str] = []
         fallback_notes: list[str] = []
         fallback_used = False
         run_cache: dict[str, Any] = {}
-        holdings = await _timed_section(
-            "qqq_holdings",
-            self.qqq_holdings(run_cache=run_cache, force=force),
-            timeout=_provider_timeout(self.qqq_holdings_provider, "timeout_nasdaq_seconds", 45.0),
-            fallback=lambda error: _empty_holdings(error),
-            warnings=warnings,
+        holdings = (
+            _canonical_holdings_response(preloaded_holdings)
+            if preloaded_holdings
+            else await _timed_section(
+                "qqq_holdings",
+                self.qqq_holdings(
+                    run_cache=run_cache,
+                    force=force,
+                ),
+                timeout=_provider_timeout(
+                    self.qqq_holdings_provider,
+                    "timeout_nasdaq_seconds",
+                    45.0,
+                ),
+                fallback=lambda error: _empty_holdings(error),
+                warnings=warnings,
+            )
+            if fetch_holdings
+            else _empty_holdings(
+                "canonical_holdings_not_required_for_this_batch"
+            )
         )
-        snapshot = await _timed_section(
-            "mega_cap_snapshot",
-            self.mega_cap_snapshot(run_cache=run_cache, force=force),
-            timeout=_provider_timeout(self.mega_cap_snapshot_provider, "timeout_nasdaq_seconds", 45.0),
-            fallback=lambda error: _empty_snapshot(error),
-            warnings=warnings,
+        if preloaded_holdings:
+            run_cache[
+                f"qqq_holdings:QQQ:force={force}"
+            ] = holdings
+        snapshot = (
+            await _timed_section(
+                "mega_cap_snapshot",
+                self.mega_cap_snapshot(
+                    run_cache=run_cache,
+                    force=force,
+                ),
+                timeout=_provider_timeout(
+                    self.mega_cap_snapshot_provider,
+                    "timeout_nasdaq_seconds",
+                    45.0,
+                ),
+                fallback=lambda error: _empty_snapshot(error),
+                warnings=warnings,
+            )
+            if fetch_mega_cap
+            else _empty_snapshot(
+                "canonical_mega_cap_snapshot_selected"
+            )
         )
-        breadth = await _timed_section(
-            "mega_cap_breadth",
-            self.mega_cap_breadth(run_cache=run_cache, force=force),
-            timeout=_provider_timeout(self.mega_cap_snapshot_provider, "timeout_nasdaq_seconds", 45.0),
-            fallback=lambda error: _empty_breadth(error),
-            warnings=warnings,
+        breadth = (
+            await _timed_section(
+                "mega_cap_breadth",
+                self.mega_cap_breadth(
+                    run_cache=run_cache,
+                    force=force,
+                ),
+                timeout=_provider_timeout(
+                    self.mega_cap_snapshot_provider,
+                    "timeout_nasdaq_seconds",
+                    45.0,
+                ),
+                fallback=lambda error: _empty_breadth(error),
+                warnings=warnings,
+            )
+            if fetch_mega_cap
+            else _empty_breadth(
+                "canonical_mega_cap_breadth_selected"
+            )
         )
-        earnings = await _timed_section(
-            "upcoming_earnings",
-            self.earnings(days=14),
-            timeout=_provider_timeout(self.earnings_provider, "timeout_earnings_seconds", 12.0),
-            fallback=lambda error: _empty_earnings(error, days=14),
-            warnings=warnings,
+        earnings = (
+            await _timed_section(
+                "upcoming_earnings",
+                self.earnings(days=14, force=force),
+                timeout=_provider_timeout(
+                    self.earnings_provider,
+                    "timeout_earnings_seconds",
+                    12.0,
+                ),
+                fallback=lambda error: _empty_earnings(
+                    error,
+                    days=14,
+                ),
+                warnings=warnings,
+            )
+            if fetch_earnings
+            else _empty_earnings(
+                "dedicated_earnings_runtime_owns_acquisition",
+                days=14,
+            )
         )
-        news = await _timed_section(
-            "latest_news",
-            self.latest_news(symbols=["NVDA", "AAPL", "MSFT", "QQQ"], limit=20, recency_days=14),
-            timeout=_provider_timeout(self.news_provider, "timeout_news_seconds", 12.0),
-            fallback=lambda error: _empty_news(error),
-            warnings=warnings,
+        news = (
+            await _timed_section(
+                "latest_news",
+                self.latest_news(
+                    symbols=["NVDA", "AAPL", "MSFT", "QQQ"],
+                    limit=20,
+                    recency_days=14,
+                    force=force,
+                ),
+                timeout=_provider_timeout(
+                    self.news_provider,
+                    "timeout_news_seconds",
+                    12.0,
+                ),
+                fallback=lambda error: _empty_news(error),
+                warnings=warnings,
+            )
+            if fetch_news
+            else _empty_news(
+                "valid_canonical_news_selected_before_nasdaq_batch"
+            )
         )
         for label, quality in [
             ("qqq_holdings", holdings.data_quality),
@@ -431,6 +532,26 @@ def _set_provider_runtime(quality: dict[str, Any], provider_type: ProviderType) 
     quality.setdefault("cache_used", cache_used)
 
 
+async def _fetch_safe_with_force(
+    provider: Any,
+    *,
+    force: bool,
+) -> Any:
+    fetch_call = provider.fetch_safe
+    parameters = inspect.signature(fetch_call).parameters
+    supports_force = bool(
+        "force" in parameters
+        or any(
+            parameter.kind
+            == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+    return await fetch_call(
+        **({"force": force} if supports_force else {})
+    )
+
+
 def _provider_timeout(provider, name: str, default: float) -> float:
     return float(getattr(getattr(provider, "settings", None), name, default))
 
@@ -484,6 +605,90 @@ async def _timed_section(label: str, awaitable, *, timeout: float, fallback, war
         message = f"{label}: provider_failed: {exc or type(exc).__name__}"
         warnings.append(message)
         return fallback(message)
+
+
+def _canonical_holdings_response(
+    payload: dict[str, Any],
+) -> QQQHoldingsResponse:
+    holdings = [
+        QQQHolding.model_validate(item)
+        for item in payload.get("holdings") or []
+        if isinstance(item, dict)
+    ]
+    quality_payload = {
+        **(
+            payload.get("data_quality")
+            if isinstance(payload.get("data_quality"), dict)
+            else {}
+        ),
+        "count": len(holdings),
+        "holdings_count": len(holdings),
+        "final_data_available": bool(holdings),
+        "no_data_found": not holdings,
+        "provider_calls": 0,
+        "actual_network_calls": 0,
+        "cache_used": True,
+        "provider_attempts": [],
+        "provider_accounting": [],
+    }
+    source = str(
+        payload.get("source")
+        or payload.get("weight_source")
+        or "CANONICAL_DATABASE"
+    )
+    retrieved_at = (
+        payload.get("retrieved_at")
+        or payload.get("data_as_of")
+        or datetime.now(UTC)
+    )
+    return QQQHoldingsResponse(
+        status=str(
+            payload.get("status")
+            or ("found" if holdings else "not_found")
+        ),
+        as_of=payload.get("as_of")
+        or payload.get("weight_as_of"),
+        source=source,
+        provider_type=ProviderType.DB,
+        retrieved_at=retrieved_at,
+        reliability=float(payload.get("reliability") or 0.9),
+        is_fallback=bool(payload.get("is_fallback")),
+        is_proxy=bool(payload.get("is_proxy")),
+        proxy_for=payload.get("proxy_for"),
+        holdings_count=int(
+            payload.get("holdings_count") or len(holdings)
+        ),
+        weight_data_available=bool(
+            payload.get(
+                "weight_data_available",
+                all(item.weight is not None for item in holdings),
+            )
+        ),
+        official_etf_holdings=bool(
+            payload.get("official_etf_holdings", True)
+        ),
+        weight_method=payload.get("weight_method"),
+        weight_source=payload.get("weight_source") or source,
+        weight_source_url=payload.get("weight_source_url"),
+        weight_as_of=payload.get("weight_as_of")
+        or payload.get("as_of"),
+        weight_valid_until=payload.get("weight_valid_until")
+        or payload.get("content_valid_until"),
+        weight_verified=bool(payload.get("weight_verified")),
+        weight_is_official=bool(
+            payload.get("weight_is_official")
+        ),
+        weight_is_reconstructed=bool(
+            payload.get("weight_is_reconstructed")
+        ),
+        weight_confidence=float(
+            payload.get("weight_confidence") or 0.0
+        ),
+        holdings=holdings,
+        data_quality=QQQHoldingsQuality.model_validate(
+            quality_payload
+        ),
+    )
 
 
 def _empty_holdings(error: str) -> QQQHoldingsResponse:

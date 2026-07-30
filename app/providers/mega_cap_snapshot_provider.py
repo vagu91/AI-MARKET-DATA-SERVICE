@@ -27,9 +27,23 @@ class MegaCapSnapshotProvider(BaseProvider):
 
     async def fetch(self) -> ProviderResult:
         errors: list[str] = []
+        provider_accounting: list[dict[str, object]] = []
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
             stocks, chart_errors = await self._fetch_yahoo_chart(client)
             errors.extend(chart_errors)
+            provider_accounting.append(
+                _provider_observation(
+                    "YAHOO_FINANCE_CHART",
+                    calls=len(MEGA_CAP_TICKERS),
+                    status=(
+                        "SUCCESS"
+                        if stocks and not chart_errors
+                        else "PARTIAL"
+                        if stocks
+                        else "FAILED"
+                    ),
+                )
+            )
             if stocks:
                 return _snapshot_result(
                     source="Yahoo Finance Chart",
@@ -38,6 +52,12 @@ class MegaCapSnapshotProvider(BaseProvider):
                     stocks=stocks,
                     errors=errors,
                     fallback_used=False,
+                    provider_accounting=_complete_provider_accounting(
+                        provider_accounting,
+                        alpha_configured=bool(
+                            self.settings.alpha_vantage_api_key
+                        ),
+                    ),
                 )
 
             try:
@@ -45,6 +65,19 @@ class MegaCapSnapshotProvider(BaseProvider):
                 response.raise_for_status()
                 stocks, stooq_errors = parse_stooq_quotes(response.text)
                 errors.extend(stooq_errors)
+                provider_accounting.append(
+                    _provider_observation(
+                        "STOOQ",
+                        calls=1,
+                        status=(
+                            "SUCCESS"
+                            if stocks and not stooq_errors
+                            else "PARTIAL"
+                            if stocks
+                            else "NO_DATA"
+                        ),
+                    )
+                )
                 if stocks:
                     return _snapshot_result(
                         source="Stooq Quote CSV",
@@ -53,13 +86,47 @@ class MegaCapSnapshotProvider(BaseProvider):
                         stocks=stocks,
                         errors=errors,
                         fallback_used=True,
+                        provider_accounting=(
+                            _complete_provider_accounting(
+                                provider_accounting,
+                                alpha_configured=bool(
+                                    self.settings.alpha_vantage_api_key
+                                ),
+                            )
+                        ),
                     )
             except Exception as exc:
                 errors.append(f"Stooq quote provider_failed: {exc or 'empty error detail'}")
+                provider_accounting.append(
+                    _provider_observation(
+                        "STOOQ",
+                        calls=1,
+                        status="FAILED",
+                        reason_code=(
+                            str(exc) or type(exc).__name__
+                        ),
+                    )
+                )
 
             if self.settings.alpha_vantage_api_key:
                 stocks, av_errors = await self._fetch_alpha_vantage_fallback(client)
                 errors.extend(av_errors)
+                provider_accounting.append(
+                    _provider_observation(
+                        "ALPHA_VANTAGE",
+                        calls=1,
+                        status=(
+                            "SUCCESS"
+                            if stocks
+                            else "FAILED"
+                            if av_errors
+                            else "NO_DATA"
+                        ),
+                        reason_code=(
+                            "; ".join(av_errors) or None
+                        ),
+                    )
+                )
                 if stocks:
                     return _snapshot_result(
                         source="Alpha Vantage GLOBAL_QUOTE",
@@ -68,7 +135,22 @@ class MegaCapSnapshotProvider(BaseProvider):
                         stocks=stocks,
                         errors=errors,
                         fallback_used=True,
+                        provider_accounting=(
+                            _complete_provider_accounting(
+                                provider_accounting,
+                                alpha_configured=True,
+                            )
+                        ),
                     )
+            else:
+                provider_accounting.append(
+                    _provider_observation(
+                        "ALPHA_VANTAGE",
+                        calls=0,
+                        status="NOT_CALLED",
+                        reason_code="ALPHA_VANTAGE_NOT_CONFIGURED",
+                    )
+                )
 
             try:
                 response = await client.get(
@@ -80,6 +162,19 @@ class MegaCapSnapshotProvider(BaseProvider):
                 payload = response.json()
                 stocks, yahoo_errors = parse_yahoo_quotes(payload)
                 errors.extend(yahoo_errors)
+                provider_accounting.append(
+                    _provider_observation(
+                        "YAHOO_FINANCE_QUOTE",
+                        calls=1,
+                        status=(
+                            "SUCCESS"
+                            if stocks and not yahoo_errors
+                            else "PARTIAL"
+                            if stocks
+                            else "NO_DATA"
+                        ),
+                    )
+                )
                 if stocks:
                     return _snapshot_result(
                         source="Yahoo Finance Quote",
@@ -88,9 +183,27 @@ class MegaCapSnapshotProvider(BaseProvider):
                         stocks=stocks,
                         errors=errors,
                         fallback_used=True,
+                        provider_accounting=(
+                            _complete_provider_accounting(
+                                provider_accounting,
+                                alpha_configured=bool(
+                                    self.settings.alpha_vantage_api_key
+                                ),
+                            )
+                        ),
                     )
             except Exception as exc:
                 errors.append(f"Yahoo Finance quote provider_failed: {exc or 'empty error detail'}")
+                provider_accounting.append(
+                    _provider_observation(
+                        "YAHOO_FINANCE_QUOTE",
+                        calls=1,
+                        status="FAILED",
+                        reason_code=(
+                            str(exc) or type(exc).__name__
+                        ),
+                    )
+                )
 
         return _snapshot_result(
             source=self.source,
@@ -98,6 +211,12 @@ class MegaCapSnapshotProvider(BaseProvider):
             reliability=0.0,
             stocks=[],
             errors=errors or ["No quote provider returned data"],
+            provider_accounting=_complete_provider_accounting(
+                provider_accounting,
+                alpha_configured=bool(
+                    self.settings.alpha_vantage_api_key
+                ),
+            ),
         )
 
     async def _fetch_yahoo_chart(
@@ -294,6 +413,68 @@ def parse_stooq_quotes(text: str) -> tuple[list[dict[str, object]], list[str]]:
     return stocks, errors
 
 
+MEGA_CAP_PROVIDER_ORDER = (
+    "YAHOO_FINANCE_CHART",
+    "STOOQ",
+    "ALPHA_VANTAGE",
+    "YAHOO_FINANCE_QUOTE",
+)
+
+
+def _provider_observation(
+    provider: str,
+    *,
+    calls: int,
+    status: str,
+    reason_code: str | None = None,
+) -> dict[str, object]:
+    return {
+        "provider": provider,
+        "called": calls > 0,
+        "calls": calls,
+        "status": status,
+        "reason_code": reason_code,
+    }
+
+
+def _complete_provider_accounting(
+    observations: list[dict[str, object]],
+    *,
+    alpha_configured: bool,
+) -> list[dict[str, object]]:
+    by_provider = {
+        str(item.get("provider")): dict(item)
+        for item in observations
+    }
+    prior_succeeded = False
+    output: list[dict[str, object]] = []
+    for provider in MEGA_CAP_PROVIDER_ORDER:
+        observed = by_provider.get(provider)
+        if observed is not None:
+            output.append(observed)
+            prior_succeeded = prior_succeeded or str(
+                observed.get("status") or ""
+            ).upper() in {"SUCCESS", "PARTIAL"}
+            continue
+        reason = (
+            "PRIOR_PROVIDER_SUCCEEDED"
+            if prior_succeeded
+            else "ALPHA_VANTAGE_NOT_CONFIGURED"
+            if provider == "ALPHA_VANTAGE"
+            and not alpha_configured
+            else "PROVIDER_EXECUTION_EVIDENCE_MISSING"
+        )
+        output.append(
+            _provider_observation(
+                provider,
+                calls=0,
+                status="NOT_CALLED",
+                reason_code=reason,
+            )
+        )
+    return output
+
+
 def _snapshot_result(
     source: str,
     provider_type: ProviderType,
@@ -301,6 +482,7 @@ def _snapshot_result(
     stocks: list[dict[str, object]],
     errors: list[str],
     fallback_used: bool = False,
+    provider_accounting: list[dict[str, object]] | None = None,
 ) -> ProviderResult:
     errors = _dedupe_errors([error for error in errors if error])
     missing_prices = [stock["symbol"] for stock in stocks if stock.get("last_price") is None]
@@ -327,6 +509,9 @@ def _snapshot_result(
                 "fallback_used": fallback_used,
                 "errors": quality_errors,
                 "warnings": warnings,
+                "provider_accounting": list(
+                    provider_accounting or []
+                ),
                 "final_data_available": bool(stocks),
                 "no_data_found": not bool(stocks),
                 "provider_failed": any("provider_failed" in error for error in quality_errors),

@@ -45,8 +45,15 @@ class QQQHoldingsProvider(BaseProvider):
         self.sec_class_shares = SecClassSharesProvider(settings)
 
     async def fetch_safe(self, *, force: bool = False) -> ProviderResult:
-        valid_cached = self._cached_result(max_age_hours=self.settings.qqq_holdings_ttl_hours)
-        if valid_cached and not force:
+        valid_cached = (
+            None
+            if force
+            else self._cached_result(
+                max_age_hours=self.settings.qqq_holdings_ttl_hours,
+                require_current=True,
+            )
+        )
+        if valid_cached:
             return _with_quality_updates(
                 valid_cached,
                 cache_used=True,
@@ -54,12 +61,23 @@ class QQQHoldingsProvider(BaseProvider):
                 final_status="found",
                 actual_network_calls=0,
                 provider_attempts=["db_valid_cache"],
-            )
+                provider_accounting=(
+                    _qqq_cache_provider_accounting()
+                ),
+        )
         try:
-            result = await self.fetch()
+            result = await self.fetch(force=force)
         except Exception as exc:
-            stale = self._cached_result(
-                max_age_hours=self.settings.qqq_holdings_ttl_hours + self.settings.qqq_holdings_stale_tolerance_hours
+            stale = (
+                None
+                if force
+                else self._cached_result(
+                    max_age_hours=(
+                        self.settings.qqq_holdings_ttl_hours
+                        + self.settings.qqq_holdings_stale_tolerance_hours
+                    ),
+                    require_current=False,
+                )
             )
             if stale:
                 return _with_quality_updates(
@@ -89,8 +107,16 @@ class QQQHoldingsProvider(BaseProvider):
                     total_weight_pct=quality.get("total_weight_pct"),
                 )
             return result
-        stale = self._cached_result(
-            max_age_hours=self.settings.qqq_holdings_ttl_hours + self.settings.qqq_holdings_stale_tolerance_hours
+        stale = (
+            None
+            if force
+            else self._cached_result(
+                max_age_hours=(
+                    self.settings.qqq_holdings_ttl_hours
+                    + self.settings.qqq_holdings_stale_tolerance_hours
+                ),
+                require_current=False,
+            )
         )
         if stale:
             return _with_quality_updates(
@@ -100,6 +126,9 @@ class QQQHoldingsProvider(BaseProvider):
                 final_status="stale_acceptable",
                 actual_network_calls=int(quality.get("actual_network_calls") or 0),
                 provider_attempts=list(quality.get("provider_attempts") or []),
+                provider_accounting=list(
+                    quality.get("provider_accounting") or []
+                ),
                 warnings=list(quality.get("warnings") or []),
                 alpha_vantage_status=quality.get("alpha_vantage_status"),
                 alpha_vantage_rate_limited=bool(quality.get("alpha_vantage_rate_limited")),
@@ -109,7 +138,11 @@ class QQQHoldingsProvider(BaseProvider):
             )
         return result
 
-    async def fetch(self) -> ProviderResult:
+    async def fetch(
+        self,
+        *,
+        force: bool = False,
+    ) -> ProviderResult:
         diagnostics = _diagnostics()
         log_weight_event("qqq_weight_lookup_started", method="ranked_source_cascade")
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
@@ -190,7 +223,11 @@ class QQQHoldingsProvider(BaseProvider):
                 )
 
             if self.settings.alpha_vantage_api_key:
-                negative = self._alpha_negative_cache()
+                negative = (
+                    None
+                    if force
+                    else self._alpha_negative_cache()
+                )
                 if negative:
                     diagnostics["provider_attempts"].append("alpha_vantage_negative_cache")
                     diagnostics["alpha_vantage_status"] = str(negative.get("status") or "rate_limited")
@@ -298,6 +335,7 @@ class QQQHoldingsProvider(BaseProvider):
                         continue
                     diagnostics["provider_attempts"].append(f"sec_class_shares:{issuer_group}")
                     diagnostics["source_attempt_count"] += 1
+                    diagnostics["sec_attempt_count"] += 1
                     log_multi_class_event(
                         "class_shares_lookup_started",
                         issuer=group.get("issuer_name"),
@@ -312,8 +350,12 @@ class QQQHoldingsProvider(BaseProvider):
                         },
                     )
                     diagnostics["actual_network_calls"] += int(shares.get("network_calls") or 0)
+                    diagnostics["sec_network_calls"] += int(
+                        shares.get("network_calls") or 0
+                    )
                     shares_by_issuer[issuer_group] = shares
                     if shares.get("verified"):
+                        diagnostics["sec_success_count"] += 1
                         diagnostics["source_success_count"] += 1
                         log_multi_class_event(
                             "class_shares_lookup_succeeded",
@@ -367,6 +409,7 @@ class QQQHoldingsProvider(BaseProvider):
                         reason="verified_class_shares_unavailable",
                     )
                 if candidate["validation"]["valid"]:
+                    diagnostics["nasdaq_status"] = "found"
                     diagnostics["source_success_count"] += 1
                     diagnostics["reconstruction_used"] = True
                     diagnostics["nasdaq_proxy_used"] = True
@@ -380,6 +423,7 @@ class QQQHoldingsProvider(BaseProvider):
                     )
                     return _candidate_result(candidate, diagnostics, ProviderType.API, 0.76)
                 diagnostics["failure_breakdown"][_validation_failure(candidate)] += 1
+                diagnostics["nasdaq_status"] = "partial"
                 equal_candidate = _equal_weight_candidate(
                     rows,
                     source="Nasdaq-100 constituents",
@@ -389,6 +433,7 @@ class QQQHoldingsProvider(BaseProvider):
                 )
                 return _candidate_result(equal_candidate, diagnostics, ProviderType.API, 0.35)
             except Exception as exc:
+                diagnostics["nasdaq_status"] = "provider_failed"
                 diagnostics["source_failure_count"] += 1
                 diagnostics["failure_breakdown"]["official_unavailable"] += 1
                 diagnostics["errors"].append(f"Nasdaq-100 fallback request failed: {exc or 'empty error detail'}")
@@ -416,12 +461,23 @@ class QQQHoldingsProvider(BaseProvider):
                     },
                 )
 
-    def _cached_result(self, *, max_age_hours: int | float) -> ProviderResult | None:
+    def _cached_result(
+        self,
+        *,
+        max_age_hours: int | float,
+        require_current: bool,
+    ) -> ProviderResult | None:
         entry = self.cache.get_entry(self.cache_key)
         if not entry:
             return None
+        now = datetime.now(UTC)
         updated_at = _parse_dt(entry.get("updated_at"))
-        if updated_at is None or datetime.now(UTC) - updated_at > timedelta(hours=float(max_age_hours)):
+        age = now - updated_at if updated_at is not None else None
+        if (
+            age is None
+            or age < timedelta(minutes=-5)
+            or age > timedelta(hours=float(max_age_hours))
+        ):
             return None
         try:
             result = ProviderResult.model_validate(entry["payload"])
@@ -430,9 +486,35 @@ class QQQHoldingsProvider(BaseProvider):
         data = result.data if isinstance(result.data, dict) else {}
         if not data.get("holdings"):
             return None
+        if require_current:
+            reference = (
+                data.get("as_of")
+                or result.metadata.data_as_of
+                or next(
+                    (
+                        item.get("weight_as_of")
+                        or item.get("as_of")
+                        for item in data.get("holdings") or []
+                        if isinstance(item, dict)
+                        and (
+                            item.get("weight_as_of")
+                            or item.get("as_of")
+                        )
+                    ),
+                    None,
+                )
+            )
+            deadline = _qqq_cache_deadline(entry, data)
+            if (
+                _parse_as_of(reference) is None
+                or deadline is None
+                or deadline <= now
+            ):
+                return None
         result.metadata.provider_type = ProviderType.CACHE
         result.metadata.is_fallback = True
-        result.metadata.retrieved_at = datetime.now(UTC)
+        if not require_current:
+            result.metadata.freshness = Freshness.STALE
         log_weight_event(
             "qqq_weight_read_back",
             source=data.get("source") or result.metadata.source,
@@ -616,12 +698,19 @@ def _parse_float(value: str | None) -> float | None:
         return None
 
 
-def _parse_as_of(value: str | None) -> datetime | None:
+def _parse_as_of(value: Any) -> datetime | None:
     if not value:
         return None
+    if isinstance(value, datetime):
+        return (
+            value.astimezone(UTC)
+            if value.tzinfo
+            else value.replace(tzinfo=UTC)
+        )
+    text = str(value)
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d-%b-%Y", "%b %d, %Y"):
         try:
-            parsed = datetime.strptime(value, fmt)
+            parsed = datetime.strptime(text, fmt)
             return parsed.replace(tzinfo=UTC)
         except ValueError:
             continue
@@ -636,6 +725,36 @@ def _parse_dt(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _qqq_cache_deadline(
+    entry: dict[str, Any],
+    data: dict[str, Any],
+) -> datetime | None:
+    quality = (
+        data.get("data_quality")
+        if isinstance(data.get("data_quality"), dict)
+        else {}
+    )
+    candidates = [
+        entry.get("valid_until"),
+        data.get("weight_valid_until"),
+        quality.get("next_weight_refresh_at"),
+    ]
+    for holding in data.get("holdings") or []:
+        if isinstance(holding, dict):
+            candidates.extend(
+                (
+                    holding.get("weight_valid_until"),
+                    holding.get("valid_until"),
+                )
+            )
+    deadlines = [
+        parsed
+        for value in candidates
+        if (parsed := _parse_dt(value)) is not None
+    ]
+    return min(deadlines) if deadlines else None
 
 
 def _next_utc_midnight() -> str:
@@ -869,6 +988,9 @@ def _preserve_better_cached_result(cached: ProviderResult, attempted: ProviderRe
     quality.update(
         {
             "provider_attempts": attempted_quality.get("provider_attempts") or [],
+            "provider_accounting": (
+                attempted_quality.get("provider_accounting") or []
+            ),
             "actual_network_calls": int(attempted_quality.get("actual_network_calls") or 0),
             "source_attempt_count": int(attempted_quality.get("source_attempt_count") or 0),
             "source_success_count": int(attempted_quality.get("source_success_count") or 0),
@@ -923,6 +1045,10 @@ def _diagnostics() -> dict[str, Any]:
         "source_attempt_count": 0,
         "source_success_count": 0,
         "source_failure_count": 0,
+        "nasdaq_status": None,
+        "sec_attempt_count": 0,
+        "sec_network_calls": 0,
+        "sec_success_count": 0,
         "official_source_success": False,
         "vendor_source_success": False,
         "reconstruction_used": False,
@@ -940,6 +1066,169 @@ def _diagnostics() -> dict[str, Any]:
             "price_missing": 0,
         },
         "errors": [],
+    }
+
+
+QQQ_PROVIDER_ORDER = (
+    "INVESCO",
+    "ALPHA_VANTAGE",
+    "NASDAQ",
+    "SEC",
+)
+
+
+def _qqq_cache_provider_accounting() -> list[dict[str, Any]]:
+    return [
+        {
+            "provider": provider,
+            "called": False,
+            "calls": 0,
+            "status": "NOT_CALLED",
+            "reason_code": "AGGREGATE_PROVIDER_CACHE_SELECTED",
+        }
+        for provider in QQQ_PROVIDER_ORDER
+    ]
+
+
+def _qqq_provider_accounting(
+    diagnostics: dict[str, Any],
+    *,
+    final_source: str | None,
+    final_status: str,
+) -> list[dict[str, Any]]:
+    raw_attempts = [
+        str(item)
+        for item in diagnostics.get("provider_attempts") or []
+    ]
+    invesco_called = "invesco" in raw_attempts
+    alpha_called = "alpha_vantage" in raw_attempts
+    alpha_negative_cache = (
+        "alpha_vantage_negative_cache" in raw_attempts
+    )
+    nasdaq_called = "nasdaq_100_market_cap" in raw_attempts
+    sec_attempt_count = int(
+        diagnostics.get("sec_attempt_count") or 0
+    )
+    sec_calls = int(diagnostics.get("sec_network_calls") or 0)
+    sec_success_count = int(
+        diagnostics.get("sec_success_count") or 0
+    )
+
+    invesco_status = str(
+        diagnostics.get("invesco_status") or ""
+    ).upper()
+    alpha_status = str(
+        diagnostics.get("alpha_vantage_status") or ""
+    ).upper()
+    nasdaq_status = str(
+        diagnostics.get("nasdaq_status") or ""
+    ).upper()
+    final_source_upper = str(final_source or "").upper()
+
+    observations: list[dict[str, Any]] = []
+    observations.append(
+        _qqq_provider_observation(
+            "INVESCO",
+            called=invesco_called,
+            calls=1 if invesco_called else 0,
+            status=(
+                "SUCCESS"
+                if invesco_status == "FOUND"
+                else invesco_status or "NOT_CALLED"
+            ),
+            reason_code=(
+                None
+                if invesco_called
+                else "INVESCO_EXECUTION_NOT_OBSERVED"
+            ),
+        )
+    )
+    observations.append(
+        _qqq_provider_observation(
+            "ALPHA_VANTAGE",
+            called=alpha_called,
+            calls=1 if alpha_called else 0,
+            status=(
+                "SUCCESS"
+                if alpha_status == "FOUND"
+                else alpha_status or "NOT_CALLED"
+            ),
+            reason_code=(
+                None
+                if alpha_called
+                else "ALPHA_VANTAGE_NEGATIVE_CACHE"
+                if alpha_negative_cache
+                else "ALPHA_VANTAGE_NOT_CONFIGURED"
+                if alpha_status == "NOT_CONFIGURED"
+                else "PRIOR_PROVIDER_SUCCEEDED"
+                if "INVESCO" in final_source_upper
+                else "ALPHA_VANTAGE_EXECUTION_NOT_OBSERVED"
+            ),
+        )
+    )
+    observations.append(
+        _qqq_provider_observation(
+            "NASDAQ",
+            called=nasdaq_called,
+            calls=1 if nasdaq_called else 0,
+            status=(
+                "SUCCESS"
+                if nasdaq_status == "FOUND"
+                else nasdaq_status or "NOT_CALLED"
+            ),
+            reason_code=(
+                None
+                if nasdaq_called
+                else "PRIOR_PROVIDER_SUCCEEDED"
+                if final_status == "found"
+                else "NASDAQ_EXECUTION_NOT_OBSERVED"
+            ),
+        )
+    )
+    observations.append(
+        _qqq_provider_observation(
+            "SEC",
+            called=sec_calls > 0,
+            calls=sec_calls,
+            status=(
+                "SUCCESS"
+                if sec_attempt_count
+                and sec_success_count == sec_attempt_count
+                else "PARTIAL"
+                if sec_success_count
+                else "FAILED"
+                if sec_attempt_count
+                else "NOT_CALLED"
+            ),
+            reason_code=(
+                None
+                if sec_calls > 0
+                else "PRIOR_PROVIDER_SUCCEEDED"
+                if not nasdaq_called
+                and final_status == "found"
+                else "SEC_NOT_REQUIRED_FOR_CONSTITUENT_SET"
+                if nasdaq_called
+                else "NASDAQ_CONSTITUENT_ACQUISITION_FAILED"
+            ),
+        )
+    )
+    return observations
+
+
+def _qqq_provider_observation(
+    provider: str,
+    *,
+    called: bool,
+    calls: int,
+    status: str,
+    reason_code: str | None,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "called": called,
+        "calls": calls,
+        "status": status,
+        "reason_code": reason_code,
     }
 
 
@@ -985,6 +1274,11 @@ def _quality(
         "provider_failed": provider_failed,
         "rate_limited": bool(diagnostics.get("alpha_vantage_rate_limited")),
         "provider_attempts": list(diagnostics.get("provider_attempts") or []),
+        "provider_accounting": _qqq_provider_accounting(
+            diagnostics,
+            final_source=final_source,
+            final_status=final_status,
+        ),
         "actual_network_calls": int(diagnostics.get("actual_network_calls") or 0),
         "run_deduplicated_calls": int(diagnostics.get("run_deduplicated_calls") or 0),
         "run_cache_used": bool(diagnostics.get("run_cache_used")),
@@ -1039,6 +1333,7 @@ def _with_quality_updates(
     final_status: str,
     actual_network_calls: int,
     provider_attempts: list[str] | None = None,
+    provider_accounting: list[dict[str, Any]] | None = None,
     warnings: list[str] | None = None,
     alpha_vantage_status: Any = None,
     alpha_vantage_rate_limited: bool = False,
@@ -1064,6 +1359,11 @@ def _with_quality_updates(
             "final_source": data.get("source") or result.metadata.source,
             "actual_network_calls": actual_network_calls,
             "provider_attempts": provider_attempts or ["db_cache"],
+            "provider_accounting": (
+                provider_accounting
+                or quality.get("provider_accounting")
+                or []
+            ),
             "alpha_vantage_status": alpha_vantage_status if alpha_vantage_status is not None else quality.get("alpha_vantage_status"),
             "alpha_vantage_rate_limited": alpha_vantage_rate_limited or bool(quality.get("alpha_vantage_rate_limited")),
             "alpha_vantage_next_retry_at": alpha_vantage_next_retry_at or quality.get("alpha_vantage_next_retry_at"),

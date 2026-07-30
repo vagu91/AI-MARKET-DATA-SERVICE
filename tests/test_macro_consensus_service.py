@@ -443,7 +443,7 @@ def test_dynamic_ttl_tightens_near_release_and_retains_post_release_baseline():
     assert released - now == timedelta(days=30)
 
 
-async def test_runtime_auto_cache_force_bypass_and_false_zero_network(tmp_path):
+async def test_runtime_force_rechecks_valid_database_before_provider(tmp_path):
     runtime = MultiSourceRuntimeService(settings(tmp_path))
     calls = 0
 
@@ -467,10 +467,13 @@ async def test_runtime_auto_cache_force_bypass_and_false_zero_network(tmp_path):
     forced = await runtime.provider("investing_economic_calendar", refresh="force")
     cache_only = await runtime.provider("investing_economic_calendar", refresh="false")
 
-    assert calls == 2
+    assert calls == 1
     assert first["provider_calls"] == 1
     assert second["provider_calls"] == 0
-    assert forced["provider_calls"] == 1
+    assert forced["provider_calls"] == 0
+    assert forced["cache_used"] is True
+    assert forced["database_lookup"]["performed"] is True
+    assert forced["database_lookup"]["freshness"] == "VALID"
     assert cache_only["provider_calls"] == 0
     assert cache_only["cache_used"] is True
 

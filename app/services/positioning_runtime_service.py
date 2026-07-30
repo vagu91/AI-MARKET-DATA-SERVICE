@@ -1,40 +1,84 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.providers.aaii_sentiment_provider import AaiiSentimentProvider
 from app.providers.cftc_cot_provider import CftcCotProvider
+from app.services.data_freshness_service import (
+    CanonicalFreshnessResult,
+    DataFreshnessService,
+)
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.provider_observation_repository import ProviderObservationRepository
 
 
+COT_MAX_AGE = timedelta(days=10)
+
+
 class PositioningRuntimeService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.facts = MarketFactRepository(settings)
+        self.freshness = DataFreshnessService(
+            settings,
+            clock=self.clock,
+        )
         self.observations = ProviderObservationRepository(settings)
         self.cot_provider = CftcCotProvider(settings)
         self.aaii_provider = AaiiSentimentProvider(settings)
 
     async def cot(self, *, refresh: str = "false", run_id: str | None = None) -> dict[str, Any]:
-        cached = [] if refresh == "force" else self.facts.get_valid_facts_by_type("cot_positioning")
-        if cached:
-            raw = cached[0].get("raw_payload")
-            if isinstance(raw, dict):
-                return _with_runtime_metadata(
-                    raw,
-                    cache_status="hit",
-                    cache_used=True,
-                    provider_calls=0,
-                    attempted=False,
-                    persisted_count=1,
-                    read_back_count=1,
-                    materialized_count=1,
-                )
+        cached = self.facts.get_valid_facts_by_type(
+            "cot_positioning",
+            allow_stale=True,
+        )
+        cached_row = cached[0] if cached else None
+        freshness = self.freshness.evaluate_canonical(
+            cached_row,
+            max_age=COT_MAX_AGE,
+        )
+        database_lookup = _database_lookup_evidence(freshness)
+        raw = (
+            cached_row.get("raw_payload")
+            if isinstance(cached_row, dict)
+            else None
+        )
+        if freshness.usable and isinstance(raw, dict):
+            return _with_runtime_metadata(
+                raw,
+                cache_status="hit",
+                cache_used=True,
+                provider_calls=0,
+                attempted=False,
+                persisted_count=1,
+                read_back_count=1,
+                materialized_count=1,
+                database_lookup=database_lookup,
+            )
+        if freshness.usable:
+            database_lookup.update(
+                {
+                    "expired": True,
+                    "freshness": "INVALID_PAYLOAD",
+                    "reason_code": "CANONICAL_RECORD_PAYLOAD_NOT_AVAILABLE",
+                }
+            )
         if refresh == "false":
-            return _cot_status("not_found", "cot_not_in_db_refresh_false")
+            return {
+                **_cot_status(
+                    "not_found",
+                    "cot_not_in_db_refresh_false",
+                ),
+                "database_lookup": database_lookup,
+            }
         result = await self.cot_provider.fetch_nasdaq()
         self._record("cftc_cot", result, run_id=run_id)
         persisted_count = 0
@@ -55,6 +99,7 @@ class PositioningRuntimeService:
             persisted_count=persisted_count,
             read_back_count=read_back_count,
             materialized_count=materialized_count,
+            database_lookup=database_lookup,
         )
 
     async def aaii(self, *, refresh: str = "false", run_id: str | None = None) -> dict[str, Any]:
@@ -72,8 +117,20 @@ class PositioningRuntimeService:
         return {**result, "cache_status": "miss"}
 
     def _save(self, fact_key: str, fact_type: str, result: dict[str, Any], *, source: str) -> None:
-        now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        valid_until = result.get("valid_until") or (datetime.now(UTC) + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        now_value = self.clock()
+        now = (
+            now_value.replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        valid_until = (
+            result.get("content_valid_until")
+            or result.get("valid_until")
+            or (now_value + timedelta(hours=6))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         self.facts.upsert_fact(
             {
                 "fact_key": fact_key,
@@ -89,7 +146,12 @@ class PositioningRuntimeService:
                 "confidence": result.get("reliability") or 0.0,
                 "retrieved_at": result.get("retrieved_at") or now,
                 "valid_until": valid_until,
-                "next_refresh_at": result.get("next_retry_at") or valid_until,
+                "next_refresh_at": (
+                    result.get("refresh_due_at")
+                    or result.get("next_refresh_at")
+                    or result.get("next_retry_at")
+                    or valid_until
+                ),
                 "status": "active",
                 "raw_payload_json": result,
                 "warnings_json": result.get("warnings") or [],
@@ -159,8 +221,9 @@ def _with_runtime_metadata(
     persisted_count: int,
     read_back_count: int,
     materialized_count: int,
+    database_lookup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    output = {
         **payload,
         "cache_status": cache_status,
         "cache_used": cache_used,
@@ -170,6 +233,25 @@ def _with_runtime_metadata(
         "persisted_count": persisted_count,
         "read_back_count": read_back_count,
         "materialized_count": materialized_count,
+    }
+    if database_lookup is not None:
+        output["database_lookup"] = dict(database_lookup)
+    return output
+
+
+def _database_lookup_evidence(
+    result: CanonicalFreshnessResult,
+) -> dict[str, Any]:
+    return {
+        "performed": True,
+        "found": result.found,
+        "data_as_of": result.data_as_of,
+        "content_valid_until": result.content_valid_until,
+        "refresh_due_at": result.refresh_due_at,
+        "lifecycle_status": result.lifecycle,
+        "expired": result.expired,
+        "freshness": result.evaluation,
+        "reason_code": result.reason_code,
     }
 
 

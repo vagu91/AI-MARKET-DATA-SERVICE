@@ -48,15 +48,17 @@ def _complete_row(policy) -> dict:
         "database_record_found": False,
         "database_data_as_of": None,
         "database_content_valid_until": None,
+        "database_refresh_due_at": None,
+        "database_lifecycle_status": None,
         "database_record_expired": False,
         "database_freshness_evaluation": "NOT_FOUND",
         "primary_provider": {
             "provider": policy.primary_provider,
-            "called": False,
-            "attempts": 0,
-            "result": "NOT_CALLED",
-            "not_called_reason": "CONTROLLED_PROVIDER_SKIP",
-            "execution_origin": "OBSERVED_SKIP",
+            "called": True,
+            "attempts": 1,
+            "result": "SUCCESS",
+            "not_called_reason": None,
+            "execution_origin": "PROVIDER_CALL",
         },
         "fallbacks": [
             {
@@ -64,13 +66,17 @@ def _complete_row(policy) -> dict:
                 "called": False,
                 "attempts": 0,
                 "result": "NOT_CALLED",
-                "not_called_reason": "CONTROLLED_PROVIDER_SKIP",
+                "not_called_reason": (
+                    "PRIOR_PROVIDER_SUCCEEDED"
+                    if policy.provider_strategy == "CASCADE"
+                    else "PRIMARY_PROVIDER_SUCCEEDED"
+                ),
                 "execution_origin": "OBSERVED_SKIP",
             }
             for provider in policy.fallback_providers
         ],
-        "acquisition_selected_source": None,
-        "acquisition_reason_code": "CONTROLLED_NO_VALUE_AVAILABLE",
+        "acquisition_selected_source": policy.primary_provider,
+        "acquisition_reason_code": "CONTROLLED_PROVIDER_VALUE_ACQUIRED",
     }
 
 
@@ -120,11 +126,21 @@ def test_heuristic_looking_payload_never_becomes_request_accounting() -> None:
 def test_incomplete_request_manifest_fails_live_gate() -> None:
     source = _source()
     manifest = _manifest()
+    missing_dataset_id = manifest["datasets"][-1]["dataset_id"]
     manifest["datasets"].pop()
     source["request_scoped_provider_accounting"] = manifest
     payload = _build(source)
+
     assert payload["request"]["same_request_provider_accounting"] is False
-    assert _validate_live(payload)["checks"]["provider_accounting_valid"] is False
+    missing_row = next(
+        row
+        for row in payload["provider_accounting"]
+        if row["dataset_id"] == missing_dataset_id
+    )
+    assert missing_row["evidence_status"] == "INCOMPLETE"
+    result = _validate_live(payload)
+    assert result["status"] == "FAIL"
+    assert result["checks"]["provider_accounting_valid"] is False
 
 
 def test_uncorrelated_request_manifest_fails_live_gate() -> None:
@@ -161,6 +177,140 @@ def test_inferred_provider_attempt_fails_live_gate() -> None:
     assert _validate_live(payload)["checks"]["provider_accounting_valid"] is False
 
 
+def test_canonical_dataset_without_database_lookup_fails_live_gate() -> None:
+    source = _source()
+    manifest = _manifest()
+    row = manifest["datasets"][0]
+    dataset_id = row["dataset_id"]
+    row.update(
+        {
+            "database_lookup_performed": False,
+            "database_lookup_reason": "PROVIDER_ONLY_PATH",
+            "database_record_found": None,
+            "database_data_as_of": None,
+            "database_content_valid_until": None,
+            "database_refresh_due_at": None,
+            "database_record_expired": None,
+            "database_freshness_evaluation": "NOT_LOOKED_UP",
+        }
+    )
+    source["request_scoped_provider_accounting"] = manifest
+
+    payload = _build(source)
+
+    assert payload["request"]["same_request_provider_accounting"] is False
+    incomplete = [
+        item
+        for item in payload["provider_accounting"]
+        if item["evidence_status"] == "INCOMPLETE"
+    ]
+    assert [item["dataset_id"] for item in incomplete] == [dataset_id]
+    result = _validate_live(payload)
+    assert result["status"] == "FAIL"
+    assert result["checks"]["provider_accounting_valid"] is False
+
+
+def test_expired_cache_hit_cannot_be_claimed_as_valid() -> None:
+    source = _source()
+    manifest = _manifest()
+    row = manifest["datasets"][0]
+    dataset_id = row["dataset_id"]
+    row.update(
+        {
+            "database_record_found": True,
+            "database_data_as_of": (
+                NOW - timedelta(minutes=30)
+            ).isoformat(),
+            "database_content_valid_until": (
+                NOW - timedelta(seconds=11)
+            ).isoformat(),
+            "database_refresh_due_at": (
+                NOW + timedelta(hours=1)
+            ).isoformat(),
+            "database_record_expired": False,
+            "database_freshness_evaluation": "VALID",
+            "primary_provider": {
+                "provider": row["primary_provider"]["provider"],
+                "called": False,
+                "attempts": 0,
+                "result": "CACHE_HIT",
+                "not_called_reason": "VALID_DATABASE_RECORD_SELECTED",
+                "execution_origin": "CACHE_DECISION",
+            },
+            "fallbacks": [
+                {
+                    "provider": attempt["provider"],
+                    "called": False,
+                    "attempts": 0,
+                    "result": "CACHE_HIT",
+                    "not_called_reason": "VALID_DATABASE_RECORD_SELECTED",
+                    "execution_origin": "CACHE_DECISION",
+                }
+                for attempt in row["fallbacks"]
+            ],
+        }
+    )
+    source["request_scoped_provider_accounting"] = manifest
+
+    payload = _build(source)
+
+    emitted = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == dataset_id
+    )
+    assert emitted["evidence_status"] == "INCOMPLETE"
+    assert emitted["database_freshness_evaluation"] is None
+    result = _validate_live(payload)
+    assert result["status"] == "FAIL"
+    assert result["checks"]["provider_accounting_valid"] is False
+
+
+def test_expired_database_record_is_labeled_and_refreshes_provider() -> None:
+    source = _source()
+    manifest = _manifest()
+    row = manifest["datasets"][0]
+    dataset_id = row["dataset_id"]
+    row.update(
+        {
+            "database_record_found": True,
+            "database_data_as_of": (
+                NOW - timedelta(minutes=30)
+            ).isoformat(),
+            "database_content_valid_until": (
+                NOW - timedelta(seconds=11)
+            ).isoformat(),
+            "database_refresh_due_at": (
+                NOW + timedelta(hours=1)
+            ).isoformat(),
+            "database_record_expired": True,
+            "database_freshness_evaluation": (
+                "EXPIRED_CONTENT_VALID_UNTIL"
+            ),
+        }
+    )
+    source["request_scoped_provider_accounting"] = manifest
+
+    payload = _build(source)
+
+    assert payload["request"]["same_request_provider_accounting"] is True
+    emitted = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == dataset_id
+    )
+    assert emitted["database_record_expired"] is True
+    assert (
+        emitted["database_freshness_evaluation"]
+        == "EXPIRED_CONTENT_VALID_UNTIL"
+    )
+    assert emitted["database_freshness_evaluation"] != "VALID"
+    assert emitted["primary_provider"]["called"] is True
+    assert _validate_live(payload)["checks"][
+        "provider_accounting_valid"
+    ] is True
+
+
 def test_row_outside_request_window_fails_live_gate() -> None:
     source = _source()
     manifest = _manifest()
@@ -191,3 +341,35 @@ def test_fabricated_origin_cannot_pass_shape_validation() -> None:
     payload = _build(source)
     assert payload["request"]["same_request_provider_accounting"] is False
     assert _validate_live(payload)["status"] == "FAIL"
+
+
+def test_flash_pmi_event_without_actual_has_null_delivery_evidence() -> None:
+    source = _source()
+    source["sections"]["event_calendar"] = {
+        "next_24h_events": [
+            {
+                "occurrence_id": "flash-pmi-no-data",
+                "metric_id": "flash_services_pmi",
+                "name": "Flash Services PMI",
+                "release_at": (
+                    NOW + timedelta(minutes=30)
+                ).isoformat(),
+                "reference_period": "2026-07",
+                "release_status": "PROVIDER_UNAVAILABLE",
+                "actual": None,
+                "source": "calendar-distributor",
+            }
+        ]
+    }
+    source["request_scoped_provider_accounting"] = _manifest()
+
+    payload = _build(source)
+
+    row = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == "flash_services_pmi"
+    )
+    assert row["selected_value_present"] is False
+    assert row["delivered_value"] is None
+    assert row["selected_source"] is None

@@ -544,7 +544,34 @@ async def market_context_mnq(
                         reason_code="FORCE_FIXED_POINT",
                     )
                     if view == "debug":
-                        return previous["debug_payload"]
+                        debug_payload = dict(
+                            previous["debug_payload"]
+                        )
+                        current_quality = (
+                            dict(contract.get("data_quality") or {})
+                            if isinstance(
+                                contract.get("data_quality"),
+                                dict,
+                            )
+                            else {}
+                        )
+                        if current_quality.get(
+                            "actual_reconciliation"
+                        ):
+                            debug_payload["data_quality"] = {
+                                **dict(
+                                    debug_payload.get(
+                                        "data_quality"
+                                    )
+                                    or {}
+                                ),
+                                "actual_reconciliation": (
+                                    current_quality[
+                                        "actual_reconciliation"
+                                    ]
+                                ),
+                            }
+                        return debug_payload
                     if audience == "senior_analyst_v1":
                         current = dict(contract)
                         current["snapshot_id"] = previous[

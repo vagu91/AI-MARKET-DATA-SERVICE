@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
 import respx
@@ -16,6 +18,7 @@ from app.providers.marketbeat_holidays_provider import (
     parse_marketbeat_holidays_html,
     parse_marketbeat_holidays_json_ld,
 )
+from app.services.market_fact_repository import MarketFactRepository
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, build_multi_source_context_blocks
 
 
@@ -177,6 +180,8 @@ async def test_investing_fed_monitor_provider_fetches_secondary_probabilities(tm
 async def test_multi_source_refresh_false_uses_db_for_new_providers_without_network(monkeypatch, tmp_path) -> None:
     cfg = settings(tmp_path)
     service = MultiSourceRuntimeService(cfg)
+    now = datetime.now(UTC).replace(microsecond=0)
+    valid_until = now + timedelta(hours=1)
 
     async def marketbeat_ok():
         return {
@@ -196,8 +201,10 @@ async def test_multi_source_refresh_false_uses_db_for_new_providers_without_netw
             "status": "found",
             "source": "Investing.com",
             "source_url": "https://investing.test/fed",
-            "retrieved_at": "2026-07-10T12:00:00Z",
-            "valid_until": "2099-01-01T00:00:00Z",
+            "data_as_of": now.isoformat(),
+            "retrieved_at": now.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "next_refresh_at": valid_until.isoformat(),
             "meetings": [{"meeting_date": "2026-07-29"}],
             "warnings": [],
             "errors": [],
@@ -222,6 +229,72 @@ async def test_multi_source_refresh_false_uses_db_for_new_providers_without_netw
     assert fed["cache_used"] is True
     assert marketbeat["provider_calls"] == 0
     assert fed["provider_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_force_rejects_expired_multi_source_cache_and_calls_provider(
+    tmp_path,
+) -> None:
+    cfg = settings(tmp_path)
+    now = datetime.now(UTC).replace(microsecond=0)
+    expired_at = now - timedelta(minutes=1)
+    MarketFactRepository(cfg).upsert_fact(
+        {
+            "fact_key": (
+                "provider:investing_fed_rate_monitor:"
+                "investing_fed_rate_monitor"
+            ),
+            "fact_type": "investing_fed_rate_monitor",
+            "country": "US",
+            "category": "investing_fed_rate_monitor",
+            "source": "Investing Fed Rate Monitor",
+            "provider_type": "SCRAPER",
+            "reliability": 0.7,
+            "retrieved_at": now.isoformat(),
+            "valid_until": expired_at.isoformat(),
+            "next_refresh_at": expired_at.isoformat(),
+            "raw_payload_json": {
+                "status": "found",
+                "source": "Investing Fed Rate Monitor",
+                "data_as_of": now.isoformat(),
+                "retrieved_at": now.isoformat(),
+                "valid_until": expired_at.isoformat(),
+                "next_refresh_at": expired_at.isoformat(),
+                "meetings": [{"meeting_date": "2026-07-29"}],
+            },
+        }
+    )
+    service = MultiSourceRuntimeService(cfg)
+    calls = 0
+
+    async def refreshed():
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "found",
+            "source": "Investing Fed Rate Monitor",
+            "data_as_of": now.isoformat(),
+            "retrieved_at": now.isoformat(),
+            "valid_until": (now + timedelta(hours=1)).isoformat(),
+            "next_refresh_at": (now + timedelta(hours=1)).isoformat(),
+            "meetings": [{"meeting_date": "2026-09-16"}],
+            "warnings": [],
+            "errors": [],
+        }
+
+    service.investing_fed_rate_monitor.fetch = refreshed
+
+    result = await service.provider(
+        "investing_fed_rate_monitor",
+        refresh="force",
+    )
+
+    assert calls == 1
+    assert result["cache_used"] is False
+    assert result["provider_calls"] == 1
+    assert result["database_lookup"]["found"] is True
+    assert result["database_lookup"]["expired"] is True
+    assert result["database_lookup"]["freshness"] != "VALID"
 
 
 def test_market_context_blocks_include_secondary_calendar_and_fed_monitor() -> None:

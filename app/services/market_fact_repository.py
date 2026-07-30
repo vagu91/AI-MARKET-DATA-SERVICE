@@ -271,6 +271,8 @@ def _merge_event_payload(existing: dict[str, Any], incoming: dict[str, Any], row
         summary.pop("temporal_domain", None)
     if summary:
         enrichment["summary"] = summary
+    elif "summary" in existing_enrichment:
+        enrichment["summary"] = existing_enrichment["summary"]
     else:
         enrichment.pop("summary", None)
     merged["enrichment"] = enrichment
@@ -912,6 +914,12 @@ class MarketFactRepository:
             actual = (payload.get("enrichment") or {}).get("actual")
         temporal = temporal_event_state(payload)
         actual = temporal["actual"]
+        incoming_actual_missing = actual in (None, "")
+        incoming_actual_resolution = (
+            dict(payload.get("actual_resolution") or {})
+            if isinstance(payload.get("actual_resolution"), dict)
+            else None
+        )
         release_datetime = parse_datetime(
             payload.get("release_at")
             or payload.get("time_utc")
@@ -1020,6 +1028,28 @@ class MarketFactRepository:
                     conn.rollback()
                     return False
                 payload = _merge_event_payload(existing_raw, payload, existing)
+                if (
+                    existing["actual"] not in (None, "")
+                    and isinstance(existing_raw.get("actual_resolution"), dict)
+                    and (
+                        incoming_actual_missing
+                        or incoming_actual_resolution is None
+                        or incoming_actual_resolution
+                        == existing_raw["actual_resolution"]
+                    )
+                ):
+                    for field in (
+                        "source",
+                        "source_url",
+                        "publisher",
+                        "distributor",
+                        "distributor_url",
+                        "actual_source",
+                        "actual_source_url",
+                    ):
+                        if existing_raw.get(field) not in (None, ""):
+                            payload[field] = existing_raw[field]
+                    payload["actual"] = existing["actual"]
                 merged_enrichment = dict(payload.get("enrichment") or {})
                 forecast = merged_enrichment.get("forecast")
                 previous = merged_enrichment.get("previous")
