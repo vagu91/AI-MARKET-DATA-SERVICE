@@ -176,7 +176,9 @@ def test_full_contract_has_quality_legacy_views_and_metric_based_enrichment():
         symbol="MNQ",
         macro=macro,
         events_today=[],
-        upcoming_events=[event("CPI", "Consumer Price Index", "cpi")],
+        upcoming_events=[
+            event("CPI", "Consumer Price Index M/M", "cpi")
+        ],
         event_windows=EventWindowsResponse(symbol="MNQ", checked_at_utc=datetime.now(UTC).isoformat()),
         nasdaq_context={"qqq_holdings": {"holdings_count": 1}, "mega_cap_breadth": {}, "earnings": {}},
         news_items=[{"title": "QQQ news", "summary": "Reuters reports a material development affecting QQQ and Nasdaq markets.", "source": "Reuters", "source_url": "https://news.test", "published_at": datetime.now(UTC).isoformat(), "symbols": ["QQQ"], "topics": ["macro"]}],

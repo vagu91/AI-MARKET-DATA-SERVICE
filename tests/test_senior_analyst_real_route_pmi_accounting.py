@@ -566,10 +566,12 @@ def test_pmi_accounting_selects_latest_released_not_future_occurrence(
         "valid_until": (now + timedelta(hours=2)).isoformat(),
         "next_refresh_at": (now + timedelta(hours=2)).isoformat(),
         "payload": {
-            **past,
-            "actual_resolution": {
-                "reason_code": "CONTROLLED_DATABASE_ACTUAL",
-            },
+                **past,
+                "actual_resolution": {
+                    "occurrence_id": PMI_ID,
+                    "mapping_selected": "flash_services_pmi",
+                    "reason_code": "CONTROLLED_DATABASE_ACTUAL",
+                },
         },
     }
     service = _accounting_service(
@@ -883,9 +885,9 @@ def test_real_force_route_bypasses_prior_request_negative_cache(
         item["field"]: item.get("occurrence_id")
         for item in pmi_event["lineage"]
     } == {
-        "actual": 552847,
-        "forecast": 552847,
-        "previous": 552847,
+        "actual": PMI_ID,
+        "forecast": PMI_ID,
+        "previous": PMI_ID,
     }
 
 

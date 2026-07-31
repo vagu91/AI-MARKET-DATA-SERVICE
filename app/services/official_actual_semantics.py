@@ -21,6 +21,171 @@ class OfficialMetricSpec:
     canonical_url: str
 
 
+def _metric_change_basis_markers(value: Any) -> set[str]:
+    text = " ".join(
+        re.findall(
+            r"[a-z0-9]+",
+            str(value or "").casefold(),
+        )
+    )
+    tokens = set(text.split())
+    detected: set[str] = set()
+    if (
+        tokens & {"yoy", "annuale"}
+        or re.search(r"\b(?:a|y)\s+(?:a|y)\b", text)
+        or "anno su anno" in text
+        or "year over year" in text
+    ):
+        detected.add("yoy")
+    if (
+        tokens & {"mom", "mensile"}
+        or re.search(r"\bm\s+m\b", text)
+        or "mese su mese" in text
+        or "month over month" in text
+    ):
+        detected.add("mom")
+    if (
+        tokens & {"qoq"}
+        or re.search(r"\b(?:q\s+q|t\s+t)\b", text)
+        or "trimestre su trimestre" in text
+        or "quarter over quarter" in text
+    ):
+        detected.add("qoq")
+    return detected
+
+
+def metric_change_basis_from_text(value: Any) -> str | None:
+    detected = _metric_change_basis_markers(value)
+    return next(iter(detected)) if len(detected) == 1 else None
+
+
+def metric_semantics_mismatch_reason(
+    metric_id: Any,
+    *,
+    name: Any,
+    frequency_hint: Any = None,
+) -> str | None:
+    metric = str(metric_id or "").strip().lower()
+    if not metric:
+        return None
+    observed_markers = _metric_change_basis_markers(
+        " ".join(
+            str(item or "")
+            for item in (name, frequency_hint)
+        )
+    )
+    if len(observed_markers) > 1:
+        return "EVENT_METRIC_FREQUENCY_AMBIGUOUS"
+    expected_basis = next(
+        (
+            basis
+            for basis in ("mom", "yoy", "qoq")
+            if metric.endswith(f"_{basis}")
+        ),
+        None,
+    )
+    observed_basis = (
+        next(iter(observed_markers))
+        if observed_markers
+        else None
+    )
+    if (
+        expected_basis is not None
+        and observed_basis is not None
+        and expected_basis != observed_basis
+    ):
+        return "EVENT_METRIC_FREQUENCY_MISMATCH"
+
+    expected_family = next(
+        (
+            family
+            for family in ("cpi", "ppi", "pce")
+            if re.search(rf"(?:^|_){family}(?:_|$)", metric)
+        ),
+        None,
+    )
+    normalized_name = " ".join(
+        re.findall(r"[a-z0-9]+", str(name or "").casefold())
+    )
+    family_markers = {
+        "cpi": (
+            "cpi",
+            "consumer price index",
+            "prezzi al consumo",
+        ),
+        "ppi": (
+            "ppi",
+            "producer price index",
+            "prezzi alla produzione",
+        ),
+        "pce": (
+            "pce",
+            "personal consumption expenditure",
+            "personal consumption expenditures",
+        ),
+    }
+    observed_family = next(
+        (
+            family
+            for family, markers in family_markers.items()
+            if any(
+                re.search(rf"\b{re.escape(marker)}\b", normalized_name)
+                for marker in markers
+            )
+        ),
+        None,
+    )
+    if (
+        expected_family is not None
+        and observed_family is not None
+        and expected_family != observed_family
+    ):
+        return "EVENT_METRIC_FAMILY_MISMATCH"
+    expected_variant = next(
+        (
+            variant
+            for variant in ("core", "headline")
+            if metric.startswith(f"{variant}_")
+        ),
+        None,
+    )
+    core_markers = (
+        "core",
+        "base",
+        "di base",
+        "di fondo",
+        "excluding food and energy",
+        "ex food and energy",
+    )
+    headline_markers = ("headline",)
+    observed_variant = (
+        "core"
+        if any(
+            re.search(
+                rf"\b{re.escape(marker)}\b",
+                normalized_name,
+            )
+            for marker in core_markers
+        )
+        else "headline"
+        if any(
+            re.search(
+                rf"\b{re.escape(marker)}\b",
+                normalized_name,
+            )
+            for marker in headline_markers
+        )
+        else None
+    )
+    if (
+        expected_variant is not None
+        and observed_variant is not None
+        and expected_variant != observed_variant
+    ):
+        return "EVENT_METRIC_VARIANT_MISMATCH"
+    return None
+
+
 OFFICIAL_METRICS: dict[str, OfficialMetricSpec] = {
     "headline_cpi_mom": OfficialMetricSpec(
         "headline_cpi_mom", "BLS", "CUSR0000SA0", "pct_change_mom", "SA",

@@ -420,6 +420,15 @@ def test_real_wiring_routes_bea_metric_to_official_bea_provider(
 ) -> None:
     settings = cfg(tmp_path)
     event = occurrence(metric_id="headline_pce_mom")
+    event.update(
+        {
+            "provider": "BEA Release Calendar",
+            "name": "PCE M/M",
+            "category": "PCE",
+            "source": "BEA Release Calendar",
+            "source_url": "https://www.bea.gov/news/schedule",
+        }
+    )
     official = _ControlledBeaProvider()
     resolver, _ = wired_resolver(
         settings,

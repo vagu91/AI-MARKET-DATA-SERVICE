@@ -13,6 +13,7 @@ from app.services.macro_consensus_service import (
     MacroConsensusService,
     _consensus_valid_until,
     _log_context,
+    _primary_metric_id,
     candidate_metric_id,
     match_consensus_candidate,
     merge_consensus_provider_payloads,
@@ -127,6 +128,27 @@ def test_pce_does_not_match_personal_spending():
         official_event("PCE", "Personal Income and Outlays (June 2099)"),
         occurrence("Personal Spending (MoM)"),
     ).accepted is False
+
+
+def test_candidate_internal_frequency_mismatch_is_rejected() -> None:
+    candidate = {
+        **occurrence("PCE A/A"),
+        "metric_id": "headline_pce_mom",
+    }
+
+    match = match_consensus_candidate(
+        official_event("PCE", "PCE M/M (June 2099)"),
+        candidate,
+    )
+
+    assert match.accepted is False
+    assert match.rejection_reason == (
+        "event_metric_frequency_mismatch"
+    )
+
+
+def test_inflation_primary_metric_requires_explicit_change_basis() -> None:
+    assert _primary_metric_id(official_event("PCE", "PCE")) is None
 
 
 @pytest.mark.parametrize(

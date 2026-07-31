@@ -18,7 +18,12 @@ from app.services.data_freshness_service import (
     parse_datetime,
 )
 from app.services.market_context_sync_service import extract_sync_sections
-from app.services.official_actual_semantics import normalize_reference_period
+from app.services.official_actual_semantics import (
+    OFFICIAL_METRICS,
+    metric_change_basis_from_text,
+    metric_semantics_mismatch_reason,
+    normalize_reference_period,
+)
 from app.services.request_provider_accounting import (
     _canonical_database_evidence_valid,
     _provider_flow_valid,
@@ -442,7 +447,10 @@ def validate_senior_analyst_payload_v1(
         for item in (analytics.get("news") or {}).get("current_news") or []
         if str(item.get("freshness") or "").upper() in INVALID_ANALYTIC_STATES
     )
-    semantic_errors = _semantic_error_count(analytics.get("macro") or {})
+    semantic_errors = (
+        _semantic_error_count(analytics.get("macro") or {})
+        + _calendar_semantic_error_count(calendar, now=clock)
+    )
     invalid_mappings = sum(
         1
         for items in calendar_lists
@@ -891,6 +899,33 @@ def _project_event(
     *,
     now: datetime,
 ) -> dict[str, Any]:
+    raw_metric_id = str(
+        raw.get("metric_id")
+        or raw.get("normalized_event_family")
+        or metric_id
+    ).strip().lower()
+    semantic_reason = metric_semantics_mismatch_reason(
+        raw_metric_id,
+        name=raw.get("name") or raw.get("event_name"),
+        frequency_hint=" ".join(
+            str(item or "")
+            for item in (
+                raw.get("frequency"),
+                raw.get("evaluation_method"),
+            )
+        ),
+    )
+    requires_official_evidence = _requires_official_event_evidence(
+        raw,
+        metric_id,
+    )
+    if (
+        requires_official_evidence
+        and metric_id not in OFFICIAL_METRICS
+        and semantic_reason is None
+    ):
+        semantic_reason = "EVENT_METRIC_ID_NOT_PROVEN"
+    expected_occurrence_ids = _event_expected_occurrence_ids(raw)
     selected_fields = {
         "actual": (
             "actual"
@@ -921,7 +956,39 @@ def _project_event(
         raw,
         selected_fields=selected_fields,
         now=now,
+        require_field_specific=requires_official_evidence,
+        expected_occurrence_ids=expected_occurrence_ids,
+        metric_id=metric_id,
+        reference_period=(
+            raw.get("reference_period")
+            or raw.get("period")
+        ),
+        release=release,
     )
+    if semantic_reason:
+        lineage = []
+        field_reason_codes.update(
+            {
+                output_field: semantic_reason
+                for output_field, selected_field in selected_fields.items()
+                if selected_field is not None
+            }
+        )
+    if (
+        requires_official_evidence
+        and selected_fields["actual"] is not None
+        and (
+            raw.get("actual_is_official") is None
+            or not (
+                raw.get("actual_source")
+                or raw.get("publisher")
+            )
+        )
+    ):
+        field_reason_codes.setdefault(
+            "actual",
+            "ACTUAL_OFFICIAL_STATUS_NOT_PROVEN",
+        )
     record_reason = _event_lineage_rejection_reason(raw, now=now)
     if record_reason:
         lineage = []
@@ -962,14 +1029,7 @@ def _project_event(
     )
     occurrence_match = _occurrence_fields_reconciled(
         lineage,
-        expected_occurrence_ids=(
-            raw.get("occurrence_id"),
-            raw.get("event_id"),
-            raw.get("canonical_event_key"),
-            raw.get("provider_occurrence_id"),
-            raw.get("source_occurrence_id"),
-            raw.get("source_event_id"),
-        ),
+        expected_occurrence_ids=expected_occurrence_ids,
     )
     reference_period_match = _event_reference_periods_reconciled(
         lineage,
@@ -991,7 +1051,13 @@ def _project_event(
         else None
     )
     reason = field_reason_codes.get("actual")
-    if not occurrence_match:
+    if "OCCURRENCE_FIELD_LINEAGE_MISMATCH" in set(
+        field_reason_codes.values()
+    ):
+        reason = "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
+        lineage = []
+        actual = consensus = previous = previous_revised = surprise = None
+    elif not occurrence_match:
         reason = "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
         actual = consensus = previous = previous_revised = surprise = None
     elif not reference_period_match:
@@ -1050,8 +1116,12 @@ def _project_event(
             else None
         ),
         "freshness": (
-            raw.get("freshness_state")
-            or raw.get("freshness")
+            None
+            if semantic_reason
+            else (
+                raw.get("freshness_state")
+                or raw.get("freshness")
+            )
         ),
         "content_valid_until": (
             raw.get("content_valid_until")
@@ -3899,7 +3969,42 @@ def _deduplicate_missing(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _event_metric_id(event: dict[str, Any]) -> str:
     explicit = event.get("metric_id") or event.get("normalized_event_family")
     if explicit:
-        return str(explicit).strip().lower()
+        metric_id = str(explicit).strip().lower()
+        mismatch = metric_semantics_mismatch_reason(
+            metric_id,
+            name=event.get("name") or event.get("event_name"),
+            frequency_hint=" ".join(
+                str(item or "")
+                for item in (
+                    event.get("frequency"),
+                    event.get("evaluation_method"),
+                )
+            ),
+        )
+        if mismatch == "EVENT_METRIC_FREQUENCY_MISMATCH":
+            basis = metric_change_basis_from_text(
+                " ".join(
+                    str(item or "")
+                    for item in (
+                        event.get("name"),
+                        event.get("event_name"),
+                        event.get("frequency"),
+                        event.get("evaluation_method"),
+                    )
+                )
+            )
+            if basis:
+                candidate = re.sub(
+                    r"_(?:mom|yoy|qoq)$",
+                    f"_{basis}",
+                    metric_id,
+                )
+                if candidate in OFFICIAL_METRICS:
+                    return candidate
+        return metric_id
+    implicit_official = _implicit_official_inflation_metric_id(event)
+    if implicit_official is not None:
+        return implicit_official
     name = str(event.get("name") or event.get("event_name") or "").lower()
     if "employment situation" in name:
         return "employment_situation"
@@ -3907,6 +4012,133 @@ def _event_metric_id(event: dict[str, Any]) -> str:
         return "flash_services_pmi"
     normalized = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
     return normalized or "unknown_event"
+
+
+def _implicit_official_inflation_metric_id(
+    event: dict[str, Any],
+) -> str | None:
+    families = _event_inflation_families(event)
+    if len(families) != 1:
+        return None
+    basis = metric_change_basis_from_text(
+        " ".join(
+            str(item or "")
+            for item in (
+                event.get("name"),
+                event.get("event_name"),
+                event.get("frequency"),
+                event.get("evaluation_method"),
+            )
+        )
+    )
+    if basis not in {"mom", "yoy"}:
+        return None
+    normalized_name = " ".join(
+        re.findall(
+            r"[a-z0-9]+",
+            str(
+                event.get("name")
+                or event.get("event_name")
+                or ""
+            ).casefold(),
+        )
+    )
+    core_markers = (
+        "core",
+        "base",
+        "di base",
+        "di fondo",
+        "excluding food and energy",
+        "ex food and energy",
+    )
+    variant = (
+        "core"
+        if any(
+            re.search(
+                rf"\b{re.escape(marker)}\b",
+                normalized_name,
+            )
+            for marker in core_markers
+        )
+        else "headline"
+    )
+    metric_id = f"{variant}_{next(iter(families))}_{basis}"
+    return metric_id if metric_id in OFFICIAL_METRICS else None
+
+
+def _requires_official_event_evidence(
+    event: dict[str, Any],
+    metric_id: str,
+) -> bool:
+    return (
+        metric_id in OFFICIAL_METRICS
+        or bool(_event_inflation_families(event))
+    )
+
+
+def _event_inflation_families(event: dict[str, Any]) -> set[str]:
+    normalized = " ".join(
+        re.findall(
+            r"[a-z0-9]+",
+            " ".join(
+                str(event.get(key) or "")
+                for key in (
+                    "name",
+                    "event_name",
+                    "category",
+                    "metric_id",
+                    "normalized_event_family",
+                )
+            ).casefold(),
+        )
+    )
+    markers = {
+        "cpi": (
+            "cpi",
+            "consumer price index",
+            "prezzi al consumo",
+        ),
+        "ppi": (
+            "ppi",
+            "producer price index",
+            "prezzi alla produzione",
+        ),
+        "pce": (
+            "pce",
+            "personal consumption expenditure",
+            "personal consumption expenditures",
+        ),
+    }
+    return {
+        family
+        for family, family_markers in markers.items()
+        if any(
+            re.search(rf"\b{re.escape(marker)}\b", normalized)
+            for marker in family_markers
+        )
+    }
+
+
+def _event_expected_occurrence_ids(
+    event: dict[str, Any],
+) -> tuple[Any, ...]:
+    occurrence_ids = tuple(
+        event.get(key)
+        for key in (
+            "occurrence_id",
+            "canonical_event_key",
+            "provider_occurrence_id",
+            "source_occurrence_id",
+        )
+        if event.get(key) not in (None, "")
+    )
+    if occurrence_ids:
+        return occurrence_ids
+    return tuple(
+        event.get(key)
+        for key in ("event_id", "source_event_id")
+        if event.get(key) not in (None, "")
+    )
 
 
 def _event_release(event: dict[str, Any]) -> datetime | None:
@@ -4052,6 +4284,11 @@ def _usable_event_field_lineage(
     *,
     selected_fields: dict[str, str | None],
     now: datetime,
+    require_field_specific: bool = False,
+    expected_occurrence_ids: Iterable[Any] = (),
+    metric_id: str | None = None,
+    reference_period: Any = None,
+    release: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     aliases = {
         "actual": ("actual",),
@@ -4115,6 +4352,11 @@ def _usable_event_field_lineage(
             selected_lineage = alias_lineage
         if not selected_lineage and output_field in rejected_reasons:
             continue
+        if not selected_lineage and require_field_specific:
+            rejected_reasons[output_field] = (
+                "FIELD_SPECIFIC_LINEAGE_NOT_AVAILABLE"
+            )
+            continue
         candidates = selected_lineage or generic
         if not candidates:
             continue
@@ -4130,7 +4372,40 @@ def _usable_event_field_lineage(
         if rejection_reason:
             rejected_reasons[output_field] = rejection_reason
         else:
-            usable.extend(selected_usable)
+            if require_field_specific:
+                binding_reasons = [
+                    _event_field_lineage_binding_reason(
+                        item,
+                        output_field=output_field,
+                        selected_value=selected_value,
+                        expected_occurrence_ids=expected_occurrence_ids,
+                        metric_id=metric_id,
+                        reference_period=reference_period,
+                        release=release,
+                    )
+                    for item in selected_usable
+                ]
+                bound = [
+                    item
+                    for item, reason in zip(
+                        selected_usable,
+                        binding_reasons,
+                        strict=True,
+                    )
+                    if reason is None
+                ]
+                if not bound:
+                    rejected_reasons[output_field] = (
+                        _worst_event_lineage_reason(
+                            reason
+                            for reason in binding_reasons
+                            if reason is not None
+                        )
+                    )
+                    continue
+                usable.extend(bound)
+            else:
+                usable.extend(selected_usable)
 
     deduplicated: list[dict[str, Any]] = []
     fingerprints: set[str] = set()
@@ -4146,6 +4421,166 @@ def _usable_event_field_lineage(
             fingerprints.add(fingerprint)
             deduplicated.append(item)
     return deduplicated, rejected_reasons
+
+
+def _event_field_lineage_binding_reason(
+    lineage: dict[str, Any],
+    *,
+    output_field: str,
+    selected_value: Any,
+    expected_occurrence_ids: Iterable[Any],
+    metric_id: str | None,
+    reference_period: Any,
+    release: datetime | None,
+) -> str | None:
+    expected_occurrences = {
+        str(item)
+        for item in expected_occurrence_ids
+        if item not in (None, "")
+    }
+    observed_occurrences = {
+        str(lineage[key])
+        for key in (
+            "occurrence_id",
+            "canonical_event_key",
+            "provider_occurrence_id",
+            "source_occurrence_id",
+        )
+        if lineage.get(key) not in (None, "")
+    }
+    if not observed_occurrences:
+        observed_occurrences = {
+            str(lineage[key])
+            for key in ("event_id", "source_event_id")
+            if lineage.get(key) not in (None, "")
+        }
+    if not observed_occurrences:
+        return "FIELD_LINEAGE_OCCURRENCE_NOT_PROVEN"
+    if (
+        expected_occurrences
+        and not observed_occurrences <= expected_occurrences
+    ):
+        return "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
+
+    expected_metric_id = str(metric_id or "").strip().lower()
+    observed_metric_id = str(
+        lineage.get("metric_id")
+        or lineage.get("event_metric_id")
+        or ""
+    ).strip().lower()
+    if not observed_metric_id:
+        return "FIELD_LINEAGE_METRIC_NOT_PROVEN"
+    if (
+        expected_metric_id
+        and observed_metric_id != expected_metric_id
+    ):
+        return "FIELD_LINEAGE_METRIC_MISMATCH"
+
+    evidence_value = _event_lineage_value(lineage)
+    if evidence_value is _MISSING:
+        return "FIELD_LINEAGE_VALUE_NOT_PROVEN"
+    if not _event_values_equal(evidence_value, selected_value):
+        return "FIELD_LINEAGE_VALUE_NOT_RECONCILED"
+
+    source = (
+        lineage.get("source")
+        or lineage.get("publisher")
+        or lineage.get("originator")
+        or lineage.get("source_originator")
+    )
+    if not source:
+        return "FIELD_LINEAGE_SOURCE_NOT_PROVEN"
+
+    spec = OFFICIAL_METRICS.get(expected_metric_id)
+    frequency = spec.frequency if spec is not None else "monthly"
+    expected_period = normalize_reference_period(
+        reference_period,
+        frequency=frequency,
+        release_date=release,
+    )
+    observed_period = normalize_reference_period(
+        lineage.get("reference_period") or lineage.get("period"),
+        frequency=frequency,
+        release_date=release,
+    )
+    if not expected_period:
+        return "EVENT_REFERENCE_PERIOD_NOT_PROVEN"
+    if not observed_period:
+        return "FIELD_LINEAGE_REFERENCE_PERIOD_NOT_PROVEN"
+    if output_field in {"previous", "previous_revised"}:
+        expected_previous_period = _previous_reference_period(
+            expected_period,
+            frequency=frequency,
+        )
+        if (
+            expected_previous_period is None
+            or observed_period != expected_previous_period
+        ):
+            return "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH"
+    elif observed_period != expected_period:
+        return "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH"
+
+    expected_basis = metric_change_basis_from_text(expected_metric_id)
+    observed_basis = metric_change_basis_from_text(
+        " ".join(
+            str(item or "")
+            for item in (
+                lineage.get("frequency"),
+                lineage.get("transformation"),
+            )
+        )
+    )
+    if expected_basis:
+        if observed_basis is None:
+            return "FIELD_LINEAGE_FREQUENCY_NOT_PROVEN"
+        if expected_basis != observed_basis:
+            return "FIELD_LINEAGE_FREQUENCY_MISMATCH"
+    if (
+        output_field == "actual"
+        and spec is not None
+        and spec.transformation != "level"
+    ):
+        if lineage.get("source_series_id") != spec.source_series_id:
+            return "FIELD_LINEAGE_SOURCE_SERIES_NOT_PROVEN"
+        if lineage.get("transformation") != spec.transformation:
+            return "FIELD_LINEAGE_TRANSFORMATION_NOT_PROVEN"
+    return None
+
+
+def _previous_reference_period(
+    current_period: str,
+    *,
+    frequency: str,
+) -> str | None:
+    if frequency == "monthly":
+        match = re.fullmatch(r"(20\d{2})-(0[1-9]|1[0-2])", current_period)
+        if not match:
+            return None
+        year = int(match.group(1))
+        month = int(match.group(2)) - 1
+        if month == 0:
+            year -= 1
+            month = 12
+        return f"{year:04d}-{month:02d}"
+    if frequency == "quarterly":
+        match = re.fullmatch(r"(20\d{2})-Q([1-4])", current_period)
+        if not match:
+            return None
+        year = int(match.group(1))
+        quarter = int(match.group(2)) - 1
+        if quarter == 0:
+            year -= 1
+            quarter = 4
+        return f"{year:04d}-Q{quarter}"
+    if frequency in {"daily", "weekly"}:
+        parsed = parse_datetime(current_period)
+        if parsed is None:
+            return None
+        previous = _utc(parsed) - timedelta(
+            days=7 if frequency == "weekly" else 1
+        )
+        return previous.date().isoformat()
+    return None
 
 
 def _assess_event_lineage_candidates(
@@ -4344,6 +4779,20 @@ def _worst_event_lineage_reason(reasons: Iterable[str]) -> str:
         "FIELD_LINEAGE_REFRESH_DUE": 4,
         "FIELD_LINEAGE_CONTENT_NOT_CURRENT": 5,
         "FIELD_LINEAGE_VALUE_NOT_RECONCILED": 6,
+        "OCCURRENCE_FIELD_LINEAGE_MISMATCH": 7,
+        "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH": 8,
+        "FIELD_LINEAGE_METRIC_MISMATCH": 9,
+        "FIELD_LINEAGE_FREQUENCY_MISMATCH": 10,
+        "FIELD_LINEAGE_OCCURRENCE_NOT_PROVEN": 11,
+        "FIELD_LINEAGE_METRIC_NOT_PROVEN": 12,
+        "EVENT_REFERENCE_PERIOD_NOT_PROVEN": 13,
+        "FIELD_LINEAGE_REFERENCE_PERIOD_NOT_PROVEN": 14,
+        "FIELD_LINEAGE_FREQUENCY_NOT_PROVEN": 15,
+        "FIELD_LINEAGE_VALUE_NOT_PROVEN": 16,
+        "FIELD_LINEAGE_SOURCE_NOT_PROVEN": 17,
+        "FIELD_LINEAGE_SOURCE_SERIES_NOT_PROVEN": 18,
+        "FIELD_LINEAGE_TRANSFORMATION_NOT_PROVEN": 19,
+        "FIELD_SPECIFIC_LINEAGE_NOT_AVAILABLE": 20,
     }
     return min(
         (str(reason) for reason in reasons),
@@ -4597,6 +5046,160 @@ def _semantic_error_count(macro: dict[str, Any]) -> int:
             if item.get(key) != expected[key]:
                 errors += 1
     return errors
+
+
+def _calendar_semantic_error_count(
+    calendar: dict[str, Any],
+    *,
+    now: datetime,
+) -> int:
+    invalid_occurrences: set[tuple[str, ...]] = set()
+    for list_name in (
+        "active_event_windows",
+        "next_24h_events",
+        "next_7d_high_impact_events",
+        "latest_released_events",
+    ):
+        for event in calendar.get(list_name) or []:
+            if not isinstance(event, dict):
+                continue
+            identity = _calendar_event_identity(event)
+            metric_id = str(event.get("metric_id") or "").strip().lower()
+            if metric_semantics_mismatch_reason(
+                metric_id,
+                name=event.get("name") or event.get("event_name"),
+                frequency_hint=" ".join(
+                    str(item or "")
+                    for item in (
+                        event.get("frequency"),
+                        event.get("evaluation_method"),
+                    )
+                ),
+            ):
+                invalid_occurrences.add(identity)
+                continue
+            requires_official_evidence = (
+                _requires_official_event_evidence(
+                    event,
+                    metric_id,
+                )
+            )
+            if (
+                requires_official_evidence
+                and metric_id not in OFFICIAL_METRICS
+            ):
+                if any(
+                    event.get(field) not in (None, "")
+                    for field in (
+                        "actual",
+                        "consensus",
+                        "previous",
+                        "previous_revised",
+                    )
+                ):
+                    invalid_occurrences.add(identity)
+                continue
+            if metric_id not in OFFICIAL_METRICS:
+                continue
+            release = _event_release(event)
+            event_lineage = _field_lineage(event)
+            for output_field, aliases in (
+                ("actual", {"actual"}),
+                ("consensus", {"consensus", "forecast"}),
+                ("previous", {"previous"}),
+                (
+                    "previous_revised",
+                    {"previous_revised", "revised_previous"},
+                ),
+            ):
+                selected_value = event.get(output_field)
+                if selected_value in (None, ""):
+                    continue
+                candidates = [
+                    item
+                    for item in event_lineage
+                    if str(item.get("field") or "").strip().lower()
+                    in aliases
+                ]
+                matched_candidates = [
+                    item
+                    for item in candidates
+                    if (
+                        _event_lineage_rejection_reason(item, now=now)
+                        is None
+                        and _event_field_lineage_binding_reason(
+                            item,
+                            output_field=output_field,
+                            selected_value=selected_value,
+                            expected_occurrence_ids=(
+                                _event_expected_occurrence_ids(
+                                    event
+                                )
+                            ),
+                            metric_id=metric_id,
+                            reference_period=event.get(
+                                "reference_period"
+                            ),
+                            release=release,
+                        )
+                        is None
+                    )
+                ]
+                if not matched_candidates:
+                    invalid_occurrences.add(identity)
+                    break
+                if (
+                    output_field == "actual"
+                    and (
+                        event.get("actual_is_official") is None
+                        or not event.get("actual_source")
+                        or not any(
+                            _event_lineage_source_matches(
+                                item,
+                                event.get("actual_source"),
+                            )
+                            for item in matched_candidates
+                        )
+                    )
+                ):
+                    invalid_occurrences.add(identity)
+                    break
+    return len(invalid_occurrences)
+
+
+def _calendar_event_identity(event: dict[str, Any]) -> tuple[str, ...]:
+    occurrence_id = event.get("occurrence_id")
+    if occurrence_id not in (None, ""):
+        return ("occurrence", str(occurrence_id))
+    return (
+        "event",
+        str(event.get("metric_id") or ""),
+        str(event.get("release_at") or ""),
+        str(event.get("reference_period") or ""),
+        str(event.get("name") or event.get("event_name") or ""),
+    )
+
+
+def _event_lineage_source_matches(
+    lineage: dict[str, Any],
+    expected_source: Any,
+) -> bool:
+    expected = str(expected_source or "").strip().casefold()
+    if not expected:
+        return False
+    observed = {
+        str(lineage.get(field) or "").strip().casefold()
+        for field in (
+            "source",
+            "publisher",
+            "originator",
+            "source_originator",
+            "acquisition_provider",
+            "distributor",
+        )
+        if lineage.get(field) not in (None, "")
+    }
+    return expected in observed
 
 
 def _post_release_probability_count(fomc: dict[str, Any], now: datetime) -> int:
@@ -4877,9 +5480,14 @@ def _event_selection_rank(
     item: dict[str, Any],
     *,
     mode: str,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
+    actual_lineage = any(
+        str(lineage.get("field") or "").strip().lower() == "actual"
+        for lineage in _field_lineage(item)
+    )
     return (
         int(mode == "latest_release" and item.get("actual") is not None),
+        int(item.get("actual") is not None and actual_lineage),
         _event_completeness(item),
     )
 

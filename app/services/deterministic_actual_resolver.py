@@ -23,6 +23,7 @@ from app.services.official_actual_semantics import (
     OFFICIAL_METRICS,
     UNSUPPORTED_OFFICIAL_METRICS,
     derive_official_actual,
+    metric_semantics_mismatch_reason,
     normalize_reference_period,
 )
 
@@ -626,16 +627,51 @@ def _semantic_metric_id(event: dict[str, Any]) -> str | None:
         return "flash_services_pmi"
     explicit = str(event.get("metric_id") or "")
     if explicit in OFFICIAL_METRICS or explicit in UNSUPPORTED_OFFICIAL_METRICS:
+        if _metric_semantics_mismatch(event, explicit):
+            return None
         return explicit
     for metric in (event.get("enrichment") or {}).get("metrics") or []:
         if isinstance(metric, dict):
             metric_id = str(metric.get("metric_id") or "")
             if metric_id in OFFICIAL_METRICS or metric_id in UNSUPPORTED_OFFICIAL_METRICS:
+                if _metric_semantics_mismatch(event, metric_id, metric=metric):
+                    continue
                 return metric_id
-    return candidate_metric_id({
-        "metric_id": explicit,
-        "event_name": event.get("name") or event.get("event_name"),
-    })
+    candidate = candidate_metric_id(
+        {
+            "metric_id": explicit,
+            "event_name": event.get("name") or event.get("event_name"),
+            "frequency": event.get("frequency"),
+            "evaluation_method": event.get("evaluation_method"),
+        }
+    )
+    if candidate and _metric_semantics_mismatch(event, candidate):
+        return None
+    return candidate
+
+
+def _metric_semantics_mismatch(
+    event: dict[str, Any],
+    metric_id: str,
+    *,
+    metric: dict[str, Any] | None = None,
+) -> bool:
+    metric = metric or {}
+    return bool(
+        metric_semantics_mismatch_reason(
+            metric_id,
+            name=event.get("name") or event.get("event_name"),
+            frequency_hint=" ".join(
+                str(item or "")
+                for item in (
+                    event.get("frequency"),
+                    event.get("evaluation_method"),
+                    metric.get("frequency"),
+                    metric.get("evaluation_method"),
+                )
+            ),
+        )
+    )
 
 
 def _feed_delayed(

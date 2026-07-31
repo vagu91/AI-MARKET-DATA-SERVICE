@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from app.core.config import Settings
@@ -129,10 +130,34 @@ class ProviderForceActualReconciliationService:
                 persisted_audit = existing_payload.get(
                     "actual_resolution"
                 )
-                if isinstance(persisted_audit, dict):
+                if _persisted_actual_audit_matches_occurrence(
+                    persisted_audit,
+                    payload=existing_payload,
+                    occurrence_id=occurrence_id,
+                    mapping_selected=mapping["metric_id"],
+                ):
                     enrichment = dict(
                         contract_event.get("enrichment") or {}
                     )
+                    persisted_actual_lineage = (
+                        _persisted_actual_field_lineage(
+                            existing_payload,
+                            persisted_audit=persisted_audit,
+                            occurrence_id=occurrence_id,
+                            mapping_selected=mapping["metric_id"],
+                            delivered_actual=contract_event.get(
+                                "actual"
+                            ),
+                        )
+                    )
+                    if persisted_actual_lineage is not None:
+                        field_lineage = dict(
+                            enrichment.get("field_lineage") or {}
+                        )
+                        field_lineage["actual"] = (
+                            persisted_actual_lineage
+                        )
+                        enrichment["field_lineage"] = field_lineage
                     enrichment["summary"] = {
                         **dict(enrichment.get("summary") or {}),
                         "actual_resolution": persisted_audit,
@@ -950,9 +975,29 @@ def _merge_canonical_occurrence(
         **{
             field: value
             for field, value in canonical_enrichment.items()
+            if field != "field_lineage"
             if value not in (None, "", [], {})
         },
     }
+    projected_field_lineage = (
+        dict(projected_enrichment.get("field_lineage") or {})
+        if isinstance(
+            projected_enrichment.get("field_lineage"), dict
+        )
+        else {}
+    )
+    canonical_field_lineage = (
+        dict(canonical_enrichment.get("field_lineage") or {})
+        if isinstance(
+            canonical_enrichment.get("field_lineage"), dict
+        )
+        else {}
+    )
+    if projected_field_lineage or canonical_field_lineage:
+        merged["enrichment"]["field_lineage"] = {
+            **projected_field_lineage,
+            **canonical_field_lineage,
+        }
     return merged
 
 
@@ -1315,6 +1360,163 @@ def _actual_result_succeeded(value: Any) -> bool:
             )
         )
     )
+
+
+def _persisted_actual_audit_matches_occurrence(
+    value: Any,
+    *,
+    payload: dict[str, Any],
+    occurrence_id: str,
+    mapping_selected: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("occurrence_id") or "") != occurrence_id:
+        return False
+    if (
+        str(value.get("mapping_selected") or "")
+        != mapping_selected
+    ):
+        return False
+    payload_occurrence = str(
+        payload.get("occurrence_id")
+        or payload.get("event_id")
+        or ""
+    )
+    return payload_occurrence == occurrence_id
+
+
+def _persisted_actual_field_lineage(
+    payload: dict[str, Any],
+    *,
+    persisted_audit: Any,
+    occurrence_id: str,
+    mapping_selected: str,
+    delivered_actual: Any,
+) -> dict[str, Any] | None:
+    if not _persisted_actual_audit_matches_occurrence(
+        persisted_audit,
+        payload=payload,
+        occurrence_id=occurrence_id,
+        mapping_selected=mapping_selected,
+    ):
+        return None
+    persisted_actual = payload.get("actual")
+    if (
+        persisted_actual in (None, "")
+        or delivered_actual in (None, "")
+        or not _same_field_value(
+            persisted_actual,
+            delivered_actual,
+        )
+    ):
+        return None
+
+    candidates: list[dict[str, Any]] = []
+    enrichment = (
+        payload.get("enrichment")
+        if isinstance(payload.get("enrichment"), dict)
+        else {}
+    )
+    for container in (
+        enrichment.get("field_lineage"),
+        payload.get("field_lineage"),
+        (
+            payload.get("lineage", {}).get("field_lineage")
+            if isinstance(payload.get("lineage"), dict)
+            else None
+        ),
+    ):
+        if not isinstance(container, dict):
+            continue
+        actual = container.get("actual")
+        if isinstance(actual, dict):
+            candidates.append(dict(actual))
+
+    source_lineage = payload.get("source_lineage")
+    if isinstance(source_lineage, dict):
+        source_lineage = [source_lineage]
+    if isinstance(source_lineage, list):
+        candidates.extend(
+            dict(item)
+            for item in source_lineage
+            if isinstance(item, dict)
+        )
+
+    persisted_actual_source = str(
+        payload.get("actual_source") or ""
+    ).strip()
+    for candidate in candidates:
+        source_field = str(
+            candidate.get("source_field") or ""
+        ).strip().lower()
+        if source_field not in {"actual", "current"}:
+            continue
+        candidate_occurrence = str(
+            candidate.get("occurrence_id") or ""
+        )
+        if (
+            candidate_occurrence
+            and candidate_occurrence != occurrence_id
+        ):
+            continue
+        if (
+            str(candidate.get("metric_id") or "")
+            != mapping_selected
+        ):
+            continue
+        if not str(candidate.get("frequency") or "").strip():
+            continue
+        candidate_value = candidate.get("value")
+        if (
+            candidate_value not in (None, "")
+            and not _same_field_value(
+                candidate_value,
+                persisted_actual,
+            )
+        ):
+            continue
+        lineage_sources = {
+            str(candidate.get(field) or "").strip().casefold()
+            for field in ("source", "publisher")
+            if candidate.get(field) not in (None, "")
+        }
+        if not lineage_sources:
+            continue
+        if (
+            persisted_actual_source
+            and persisted_actual_source.casefold()
+            not in lineage_sources
+        ):
+            continue
+        validation_status = str(
+            candidate.get("validation_status") or ""
+        ).strip().lower()
+        if validation_status and validation_status not in {
+            "accepted",
+            "approved",
+            "deterministic_verified",
+            "field_level_validated",
+            "passed",
+            "valid",
+            "verified",
+        }:
+            continue
+        return {
+            **candidate,
+            "occurrence_id": occurrence_id,
+            "field_semantics": "actual",
+            "source_field": "actual",
+            "value": persisted_actual,
+        }
+    return None
+
+
+def _same_field_value(left: Any, right: Any) -> bool:
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError):
+        return left == right
 
 
 def _request_scoped_database_audit(

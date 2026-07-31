@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,8 +13,14 @@ from app.models.common import Freshness, ProviderResult, ProviderType
 from app.providers.base import ProviderError, metadata
 from app.providers.sp_global_pmi import SERIES_ID, SpGlobalPmiProvider
 from app.services.deterministic_actual_resolver import DeterministicActualResolver
-from app.services.lifecycle_due_resolver import MacroActualLifecycleProviderAdapter
+from app.services.lifecycle_due_resolver import (
+    MacroActualLifecycleProviderAdapter,
+    _official_actual_datum,
+)
 from app.services.official_actual_semantics import normalize_reference_period
+from app.services.provider_force_actual_reconciliation_service import (
+    ProviderForceActualReconciliationService,
+)
 
 
 RELEASED = datetime(2026, 7, 24, 14, 0, tzinfo=UTC)
@@ -84,6 +91,46 @@ def test_new_home_sales_exact_occurrence_uses_official_series_and_localized_peri
     )
     assert candidate["source_series_id"] == "HSN1F"
     assert candidate["provider_adapter"] == "FRED_OFFICIAL_API"
+
+
+def test_official_derived_actual_preserves_series_and_transformation() -> None:
+    occurrence_id = "xtb:145296:2026-07-30"
+    datum = _official_actual_datum(
+        {
+            "occurrence_id": occurrence_id,
+            "name": "PCE A/A",
+            "frequency": "monthly",
+        },
+        candidate={
+            "value": "2.6",
+            "previous": "2.5",
+            "event_metric_id": "headline_pce_yoy",
+            "source_series_id": "BEA:PCE_PRICE_INDEX",
+            "transformation": "pct_change_yoy",
+            "reference_period": "2026-06",
+            "previous_reference_period": "2026-05",
+            "frequency": "monthly",
+            "unit": "percent",
+            "source": "BEA",
+            "publisher": "Bureau of Economic Analysis",
+            "source_url": (
+                "https://apps.bea.gov/iTable/?reqid=19&step=2"
+            ),
+            "validation_status": "accepted",
+        },
+        canonical_key=occurrence_id,
+        release=datetime(2026, 7, 30, 12, 30, tzinfo=UTC),
+    )
+
+    actual = datum["enrichment"]["field_lineage"]["actual"]
+    assert actual["occurrence_id"] == occurrence_id
+    assert actual["value"] == "2.6"
+    assert actual["source_series_id"] == "BEA:PCE_PRICE_INDEX"
+    assert actual["transformation"] == "pct_change_yoy"
+    previous = datum["enrichment"]["field_lineage"]["previous"]
+    assert previous["occurrence_id"] == occurrence_id
+    assert previous["value"] == "2.5"
+    assert previous["previous_reference_period"] == "2026-05"
 
 
 @pytest.mark.parametrize(
@@ -219,7 +266,9 @@ def test_stale_calendar_can_resolve_by_stable_occurrence_without_reappearing(
                         "previous": "51.2",
                         "event_metric_id": "flash_services_pmi",
                         "reference_period": "2026-07",
+                        "previous_reference_period": "2026-06",
                         "frequency": "monthly",
+                        "transformation": "level",
                         "unit": "index_points",
                         "source": "SPGLOBAL",
                         "publisher": "S&P Global Market Intelligence",
@@ -262,3 +311,163 @@ def test_stale_calendar_can_resolve_by_stable_occurrence_without_reappearing(
     assert result["datum"]["forecast"] == 51.5
     assert result["datum"]["reference_period"] == "2026-07"
     assert result["datum"]["actual_is_official"] is True
+    field_lineage = result["datum"]["enrichment"]["field_lineage"]
+    assert field_lineage["actual"]["occurrence_id"] == (
+        "xtb:146945:2026-07-24"
+    )
+    assert field_lineage["actual"]["value"] == "53.6"
+    assert field_lineage["actual"]["field_semantics"] == "actual"
+    assert field_lineage["actual"]["transformation"] == "level"
+    assert field_lineage["previous"]["occurrence_id"] == (
+        "xtb:146945:2026-07-24"
+    )
+    assert field_lineage["previous"]["value"] == "51.2"
+    assert field_lineage["previous"]["previous_reference_period"] == (
+        "2026-06"
+    )
+
+
+HOME_OCCURRENCE = "xtb:146392:2026-07-24"
+
+
+def _new_home_persisted_payload(
+    *,
+    audit_occurrence: str = HOME_OCCURRENCE,
+) -> dict:
+    return {
+        "occurrence_id": HOME_OCCURRENCE,
+        "event_id": HOME_OCCURRENCE,
+        "name": "New Home Sales",
+        "country": "US",
+        "metric_id": "new_home_sales",
+        "frequency": "monthly",
+        "reference_period": "2026-06",
+        "release_at": RELEASED.isoformat(),
+        "actual": "628",
+        "actual_source": "FRED",
+        "actual_source_url": (
+            "https://fred.stlouisfed.org/series/HSN1F"
+        ),
+        "actual_is_official": True,
+        "source_lineage": [
+            {
+                "source": "FRED",
+                "publisher": "FRED",
+                "source_url": (
+                    "https://fred.stlouisfed.org/series/HSN1F"
+                ),
+                "source_field": "actual",
+                "source_series_id": "HSN1F",
+                "metric_id": "new_home_sales",
+                "frequency": "monthly",
+                "reference_period": "2026-06",
+                "validation_status": "accepted",
+            }
+        ],
+        "actual_resolution": {
+            "occurrence_id": audit_occurrence,
+            "mapping_selected": "new_home_sales",
+            "provider_attempted": "FRED",
+            "provider_call_count": 1,
+            "provider_attempts": [
+                {
+                    "provider": "FRED",
+                    "called": True,
+                    "result": "SUCCESS",
+                }
+            ],
+            "actual_still_missing": False,
+        },
+    }
+
+
+def _reuse_service(payload: dict) -> ProviderForceActualReconciliationService:
+    service = object.__new__(ProviderForceActualReconciliationService)
+    service.clock = lambda: NOW
+    service.lifecycle = SimpleNamespace(
+        list_items=lambda: [
+            {
+                "entity_type": "macro_actual",
+                "entity_key": HOME_OCCURRENCE,
+                "freshness_state": "CURRENT_RELEASE",
+                "work_status": "COMPLETED",
+                "payload": payload,
+            }
+        ]
+    )
+    service.facts = SimpleNamespace(
+        economic_event_records=lambda **_kwargs: []
+    )
+    service.lifecycle_resolver = SimpleNamespace(
+        resolve=lambda _item: pytest.fail(
+            "valid canonical actual must not call a provider"
+        )
+    )
+    service.accounting_collector = None
+    service.force_refresh = True
+    service.request_id = "request-new-home"
+    service.correlation_id = "request-new-home"
+    return service
+
+
+def _new_home_contract() -> dict:
+    return {
+        "event_calendar": {
+            "critical_macro_events": [
+                {
+                    "occurrence_id": HOME_OCCURRENCE,
+                    "event_id": HOME_OCCURRENCE,
+                    "name": "New Home Sales",
+                    "country": "US",
+                    "metric_id": "new_home_sales",
+                    "frequency": "monthly",
+                    "reference_period": "2026-06",
+                    "release_at": RELEASED.isoformat(),
+                    "actual": 628,
+                    "actual_source": "FRED",
+                    "actual_is_official": True,
+                }
+            ]
+        }
+    }
+
+
+def test_valid_db_reuse_restores_exact_occurrence_actual_lineage() -> None:
+    prepared = _reuse_service(
+        _new_home_persisted_payload()
+    ).prepare(_new_home_contract())
+
+    event = prepared["contract"]["event_calendar"][
+        "critical_macro_events"
+    ][0]
+    actual_lineage = event["enrichment"]["field_lineage"][
+        "actual"
+    ]
+    assert actual_lineage["occurrence_id"] == HOME_OCCURRENCE
+    assert actual_lineage["value"] == "628"
+    assert actual_lineage["source"] == "FRED"
+    assert actual_lineage["source_series_id"] == "HSN1F"
+    assert actual_lineage["metric_id"] == "new_home_sales"
+    assert actual_lineage["frequency"] == "monthly"
+    projected = prepared["contract"]["macro_actuals"]["items"][0]
+    assert projected["actual"] == 628
+    assert projected["actual_source"] == "FRED"
+    assert projected["field_lineage"]["actual"] == actual_lineage
+
+
+def test_db_reuse_rejects_actual_lineage_from_another_occurrence() -> None:
+    prepared = _reuse_service(
+        _new_home_persisted_payload(
+            audit_occurrence="xtb:other:2026-07-24"
+        )
+    ).prepare(_new_home_contract())
+
+    event = prepared["contract"]["event_calendar"][
+        "critical_macro_events"
+    ][0]
+    enrichment = event.get("enrichment") or {}
+    assert "actual" not in (
+        enrichment.get("field_lineage") or {}
+    )
+    assert "macro_actuals" not in prepared["contract"]
+    assert prepared["audit"]["occurrences"] == []

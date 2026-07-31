@@ -299,11 +299,29 @@ def test_calendar_deduplicates_and_never_combines_occurrences_for_surprise() -> 
         "reference_period": "2026-06",
         "impact": "HIGH",
         "actual": 0.2,
+        "actual_is_official": True,
+        "actual_source": "BLS",
         "forecast": 0.1,
         "previous": 0.0,
         "field_lineage": {
-            "actual": {"occurrence_id": "one"},
-            "forecast": {"occurrence_id": "two"},
+            "actual": {
+                "occurrence_id": "one",
+                "metric_id": "headline_cpi_mom",
+                "reference_period": "2026-06",
+                "frequency": "MoM",
+                "source": "BLS",
+                "source_series_id": "CUSR0000SA0",
+                "transformation": "pct_change_mom",
+                "value": 0.2,
+            },
+            "forecast": {
+                "occurrence_id": "two",
+                "metric_id": "headline_cpi_mom",
+                "reference_period": "2026-06",
+                "frequency": "MoM",
+                "source": "XTB Economic Calendar",
+                "value": 0.1,
+            },
         },
     }
     duplicate = {**base, "event_id": "duplicate"}
@@ -343,6 +361,18 @@ def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
                 "freshness": "CURRENT_RELEASE",
                 "source": "XTB Economic Calendar",
                 "field_lineage": {
+                    "actual": {
+                        "source": "FRED",
+                        "occurrence_id": occurrence_id,
+                        "metric_id": "new_home_sales",
+                        "source_series_id": "HSN1F",
+                        "transformation": "level",
+                        "reference_period": "2026-06",
+                        "frequency": "monthly",
+                        "freshness": "CURRENT_RELEASE",
+                        "value": 628.0,
+                        "validation": {"status": "VERIFIED"},
+                    },
                     "consensus": {
                         "source": "XTB Economic Calendar",
                         "retrieved_at": (
@@ -373,7 +403,10 @@ def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
     assert event["consensus"] is None
     assert event["previous"] is None
     assert event["surprise_absolute"] is None
-    assert event["lineage"] == []
+    assert {
+        item["field"]
+        for item in event["lineage"]
+    } == {"actual"}
     assert "_field_reason_codes" not in event
     assert not _walk_invalid_states(payload["analytics"])
     assert {
@@ -399,6 +432,408 @@ def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
         payload,
         now=FIXED_NOW,
     )["checks"]["expired_values_delivered"] == 0
+    assert validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )["checks"]["semantic_mapping_errors"] == 0
+
+
+def test_live_pce_yoy_mom_mismatch_is_fail_closed() -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    occurrence_id = "xtb:145296:2026-07-30"
+    source = _synthetic_sync()
+    source["generated_at"] = now.isoformat()
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": occurrence_id,
+                "metric_id": "headline_pce_mom",
+                "name": "PCE A/A",
+                "release_at": "2026-07-30T12:30:00+00:00",
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "actual": -0.1,
+                "consensus": None,
+                "previous": 4.1,
+                "freshness": None,
+                "actual_is_official": None,
+                "actual_source": None,
+                "lineage": [
+                    {
+                        "field": "value",
+                        "source": {
+                            "publisher": "XTB Economic Calendar",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=now)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["occurrence_id"] == occurrence_id
+    assert event["metric_id"] == "headline_pce_yoy"
+    assert event["name"] == "PCE A/A"
+    assert event["actual"] is None
+    assert event["consensus"] is None
+    assert event["previous"] is None
+    assert event["previous_revised"] is None
+    assert event["actual_is_official"] is None
+    assert event["actual_source"] is None
+    assert event["freshness"] is None
+    assert event["lineage"] == []
+    assert event["reason_code"] == "EVENT_METRIC_FREQUENCY_MISMATCH"
+    assert {
+        (item["field"], item["reason_code"])
+        for item in payload["missing_data"]
+        if occurrence_id in item["field"]
+    } >= {
+        (
+            f"calendar.latest_released_events.{occurrence_id}.actual",
+            "EVENT_METRIC_FREQUENCY_MISMATCH",
+        ),
+        (
+            f"calendar.latest_released_events.{occurrence_id}.previous",
+            "EVENT_METRIC_FREQUENCY_MISMATCH",
+        ),
+    }
+    assert validate_senior_analyst_payload_v1(
+        payload,
+        now=now,
+    )["checks"]["semantic_mapping_errors"] == 0
+
+
+def test_pce_without_metric_id_cannot_bypass_official_lineage_gate() -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    occurrence_id = "xtb:pce-without-metric:2026-07-30"
+    source = _synthetic_sync()
+    source["generated_at"] = now.isoformat()
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": occurrence_id,
+                "name": "PCE A/A",
+                "release_at": "2026-07-30T12:30:00+00:00",
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "actual": 2.8,
+                "previous": 2.7,
+                "actual_is_official": None,
+                "actual_source": None,
+                "lineage": [],
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=now)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["metric_id"] == "headline_pce_yoy"
+    assert event["actual"] is None
+    assert event["previous"] is None
+    assert event["lineage"] == []
+    assert (
+        event["reason_code"]
+        == "FIELD_SPECIFIC_LINEAGE_NOT_AVAILABLE"
+    )
+    assert validate_senior_analyst_payload_v1(
+        payload,
+        now=now,
+    )["checks"]["semantic_mapping_errors"] == 0
+
+
+def test_validator_rejects_delivered_pce_values_without_metric_id() -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=now,
+    )
+    observed = {
+        "occurrence_id": "xtb:pce-without-metric:2026-07-30",
+        "name": "PCE A/A",
+        "release_at": "2026-07-30T12:30:00+00:00",
+        "reference_period": "2026-06",
+        "release_status": "RELEASED",
+        "actual": 2.8,
+        "consensus": None,
+        "previous": 2.7,
+        "previous_revised": None,
+        "freshness": None,
+        "actual_is_official": None,
+        "actual_source": None,
+        "lineage": [],
+    }
+    payload["analytics"]["calendar"]["latest_released_events"] = [
+        observed
+    ]
+    payload["analytics"]["calendar"]["active_event_windows"] = [
+        deepcopy(observed)
+    ]
+
+    result = validate_senior_analyst_payload_v1(payload, now=now)
+
+    assert result["checks"]["semantic_mapping_errors"] == 1
+    assert result["status"] == "FAIL"
+
+
+def test_validator_counts_live_pce_semantic_error_once_per_occurrence() -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=now,
+    )
+    observed = {
+        "occurrence_id": "xtb:145296:2026-07-30",
+        "metric_id": "headline_pce_mom",
+        "name": "PCE A/A",
+        "release_at": "2026-07-30T12:30:00+00:00",
+        "reference_period": "2026-06",
+        "release_status": "RELEASED",
+        "actual": -0.1,
+        "consensus": None,
+        "previous": 4.1,
+        "previous_revised": None,
+        "freshness": None,
+        "actual_is_official": None,
+        "actual_source": None,
+        "lineage": [],
+    }
+    payload["analytics"]["calendar"]["latest_released_events"] = [
+        observed
+    ]
+    payload["analytics"]["calendar"]["active_event_windows"] = [
+        deepcopy(observed)
+    ]
+
+    result = validate_senior_analyst_payload_v1(payload, now=now)
+
+    assert result["checks"]["semantic_mapping_errors"] == 1
+    assert result["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    ("name", "metric_id", "lineage", "expected_errors"),
+    [
+        (
+            "PCE A/A",
+            "headline_pce_yoy",
+            [
+                {
+                    "field": "actual",
+                    "occurrence_id": "pce-proof",
+                    "metric_id": "headline_pce_yoy",
+                    "reference_period": "2026-06",
+                    "frequency": "monthly",
+                    "source": "BEA",
+                    "source_series_id": "BEA:PCE_PRICE_INDEX",
+                    "transformation": "pct_change_yoy",
+                    "value": 2.8,
+                    "validation": {"status": "VERIFIED"},
+                }
+            ],
+            0,
+        ),
+        (
+            "PCE A/A",
+            "headline_pce_mom",
+            [
+                {
+                    "field": "actual",
+                    "occurrence_id": "pce-proof",
+                    "metric_id": "headline_pce_mom",
+                    "reference_period": "2026-06",
+                    "frequency": "monthly",
+                    "source": "BEA",
+                    "source_series_id": "BEA:PCE_PRICE_INDEX",
+                    "transformation": "pct_change_mom",
+                    "value": 0.2,
+                    "validation": {"status": "VERIFIED"},
+                }
+            ],
+            1,
+        ),
+        (
+            "PCE M/M",
+            "headline_pce_mom",
+            [
+                {
+                    "field": "value",
+                    "source": "XTB Economic Calendar",
+                }
+            ],
+            1,
+        ),
+        (
+            "Core PCE A/A",
+            "headline_pce_yoy",
+            [
+                {
+                    "field": "actual",
+                    "occurrence_id": "pce-proof",
+                    "metric_id": "headline_pce_yoy",
+                    "reference_period": "2026-06",
+                    "frequency": "YoY",
+                    "source": "BEA",
+                    "source_series_id": "BEA:PCE_PRICE_INDEX",
+                    "transformation": "pct_change_yoy",
+                    "value": 2.8,
+                    "validation": {"status": "VERIFIED"},
+                }
+            ],
+            1,
+        ),
+        (
+            "PCE A/A and M/M",
+            "headline_pce_mom",
+            [
+                {
+                    "field": "actual",
+                    "occurrence_id": "pce-proof",
+                    "metric_id": "headline_pce_mom",
+                    "reference_period": "2026-06",
+                    "frequency": "MoM",
+                    "source": "BEA",
+                    "source_series_id": "BEA:PCE_PRICE_INDEX",
+                    "transformation": "pct_change_mom",
+                    "value": 0.2,
+                    "validation": {"status": "VERIFIED"},
+                }
+            ],
+            1,
+        ),
+    ],
+)
+def test_validator_requires_pce_metric_and_field_specific_proof(
+    name: str,
+    metric_id: str,
+    lineage: list[dict],
+    expected_errors: int,
+) -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=now,
+    )
+    actual = 2.8 if metric_id.endswith("_yoy") else 0.2
+    payload["analytics"]["calendar"]["latest_released_events"] = [
+        {
+            "occurrence_id": "pce-proof",
+            "metric_id": metric_id,
+            "name": name,
+            "release_at": "2026-07-30T12:30:00+00:00",
+            "reference_period": "2026-06",
+            "release_status": "RELEASED",
+            "actual": actual,
+            "consensus": None,
+            "previous": None,
+            "previous_revised": None,
+            "freshness": "CURRENT_RELEASE",
+            "actual_is_official": True,
+            "actual_source": "BEA",
+            "lineage": lineage,
+        }
+    ]
+
+    result = validate_senior_analyst_payload_v1(payload, now=now)
+
+    assert (
+        result["checks"]["semantic_mapping_errors"]
+        == expected_errors
+    )
+
+
+def test_projection_uses_evaluation_method_even_with_monthly_frequency() -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    source = _synthetic_sync()
+    source["generated_at"] = now.isoformat()
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "pce-evaluation-method",
+                "metric_id": "headline_pce_mom",
+                "name": "PCE",
+                "frequency": "monthly",
+                "evaluation_method": "A/A",
+                "release_at": "2026-07-30T12:30:00+00:00",
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "actual": -0.1,
+                "previous": 4.1,
+                "lineage": [
+                    {
+                        "field": "value",
+                        "source": "XTB Economic Calendar",
+                    }
+                ],
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=now)
+    event = payload["analytics"]["calendar"]["latest_released_events"][0]
+
+    assert event["metric_id"] == "headline_pce_yoy"
+    assert event["actual"] is None
+    assert event["previous"] is None
+    assert event["reason_code"] == "EVENT_METRIC_FREQUENCY_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("lineage_updates", "expected_errors"),
+    [
+        ({}, 0),
+        ({"reference_period": "2020-01"}, 1),
+        ({"frequency": "monthly"}, 1),
+        ({"provider_occurrence_id": "foreign-occurrence"}, 1),
+    ],
+)
+def test_validator_requires_exact_previous_occurrence_period_and_basis(
+    lineage_updates: dict,
+    expected_errors: int,
+) -> None:
+    now = datetime(2026, 7, 30, 18, 20, tzinfo=UTC)
+    payload = build_senior_analyst_payload_v1(
+        _synthetic_sync(),
+        now=now,
+    )
+    previous_lineage = {
+        "field": "previous",
+        "occurrence_id": "pce-previous-proof",
+        "metric_id": "headline_pce_yoy",
+        "reference_period": "2026-05",
+        "frequency": "YoY",
+        "source": "XTB Economic Calendar",
+        "value": 2.7,
+        "validation": {"status": "VERIFIED"},
+        **lineage_updates,
+    }
+    payload["analytics"]["calendar"]["latest_released_events"] = [
+        {
+            "occurrence_id": "pce-previous-proof",
+            "metric_id": "headline_pce_yoy",
+            "name": "PCE A/A",
+            "release_at": "2026-07-30T12:30:00+00:00",
+            "reference_period": "2026-06",
+            "release_status": "RELEASED",
+            "actual": None,
+            "consensus": None,
+            "previous": 2.7,
+            "previous_revised": None,
+            "freshness": "CURRENT_RELEASE",
+            "actual_is_official": None,
+            "actual_source": None,
+            "lineage": [previous_lineage],
+        }
+    ]
+
+    result = validate_senior_analyst_payload_v1(payload, now=now)
+
+    assert (
+        result["checks"]["semantic_mapping_errors"]
+        == expected_errors
+    )
 
 
 def test_released_event_excludes_field_with_expired_lineage_deadline() -> None:
@@ -475,7 +910,7 @@ def test_event_lineage_aliases_cannot_validate_a_different_raw_field() -> None:
         "recently_released_events": [
             {
                 "occurrence_id": "occurrence-a",
-                "metric_id": "new_home_sales",
+                "metric_id": "consumer_confidence",
                 "release_at": release.isoformat(),
                 "release_status": "RELEASED",
                 "actual": 628.0,
@@ -768,6 +1203,50 @@ def test_usable_lineage_occurrence_must_match_the_event_occurrence() -> None:
     assert event["reason_code"] == "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
 
 
+def test_event_id_cannot_replace_canonical_occurrence_proof() -> None:
+    source = _synthetic_sync()
+    release = FIXED_NOW - timedelta(days=1)
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [
+            {
+                "occurrence_id": "canonical-pce-occurrence",
+                "event_id": "generic-pce-event",
+                "metric_id": "headline_pce_yoy",
+                "name": "PCE A/A",
+                "release_at": release.isoformat(),
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "actual": 2.8,
+                "actual_is_official": True,
+                "actual_source": "BEA",
+                "freshness": "CURRENT_RELEASE",
+                "field_lineage": {
+                    "actual": {
+                        "occurrence_id": "generic-pce-event",
+                        "metric_id": "headline_pce_yoy",
+                        "reference_period": "2026-06",
+                        "frequency": "YoY",
+                        "source": "BEA",
+                        "source_series_id": "BEA:PCE_PRICE_INDEX",
+                        "transformation": "pct_change_yoy",
+                        "value": 2.8,
+                        "validation": {"status": "VERIFIED"},
+                    }
+                },
+            }
+        ]
+    }
+
+    payload = build_senior_analyst_payload_v1(source, now=FIXED_NOW)
+    event = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+
+    assert event["actual"] is None
+    assert event["lineage"] == []
+    assert event["reason_code"] == "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
+
+
 def test_explicit_provider_occurrence_crosswalk_is_accepted() -> None:
     source = _synthetic_sync()
     release = FIXED_NOW - timedelta(days=1)
@@ -778,19 +1257,31 @@ def test_explicit_provider_occurrence_crosswalk_is_accepted() -> None:
                 "provider_event_id": 1062,
                 "provider_occurrence_id": 552847,
                 "metric_id": "flash_services_pmi",
+                "name": "Flash Services PMI",
                 "release_at": release.isoformat(),
+                "reference_period": "2026-07",
                 "release_status": "RELEASED",
                 "actual": 53.6,
+                "actual_is_official": True,
+                "actual_source": "S&P Global",
                 "forecast": 51.3,
                 "freshness": "CURRENT_RELEASE",
                 "field_lineage": {
                     "actual": {
                         "occurrence_id": 552847,
+                        "metric_id": "flash_services_pmi",
+                        "reference_period": "2026-07",
+                        "frequency": "monthly",
+                        "source": "S&P Global",
                         "freshness": "CURRENT_RELEASE",
                         "value": 53.6,
                     },
                     "forecast": {
                         "occurrence_id": "canonical-occurrence-a",
+                        "metric_id": "flash_services_pmi",
+                        "reference_period": "2026-07",
+                        "frequency": "monthly",
+                        "source": "S&P Global",
                         "freshness": "CURRENT_RELEASE",
                         "value": 51.3,
                     },

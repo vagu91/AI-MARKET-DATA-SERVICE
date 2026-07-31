@@ -1523,6 +1523,7 @@ def _official_actual_datum(
             or candidate.get("metric_id")
         ),
         "source_series_id": candidate.get("source_series_id"),
+        "transformation": candidate.get("transformation"),
         "reference_period": (
             candidate.get("reference_period")
             or candidate.get("period")
@@ -1538,6 +1539,13 @@ def _official_actual_datum(
         ),
         "source_field": "actual",
         **candidate_actual_lineage,
+        # The resolver has already matched this observation to the exact
+        # canonical occurrence.  Bind the field evidence to that occurrence
+        # after merging provider-supplied metadata so a conflicting provider
+        # identifier cannot replace the verified request target.
+        "occurrence_id": canonical_key,
+        "field_semantics": "actual",
+        "value": value,
     }
     enrichment = (
         dict(event.get("enrichment") or {})
@@ -1558,7 +1566,19 @@ def _official_actual_datum(
     ):
         field_lineage["forecast"] = {
             **dict(candidate_field_lineage["forecast"]),
+            "occurrence_id": canonical_key,
+            "metric_id": (
+                candidate.get("event_metric_id")
+                or candidate.get("metric_id")
+            ),
+            "reference_period": (
+                candidate.get("reference_period")
+                or candidate.get("period")
+            ),
+            "frequency": candidate.get("frequency"),
+            "value": selected_forecast,
             "field_semantics": "forecast",
+            "source_field": "forecast",
         }
     elif "forecast" not in field_lineage:
         scheduled_forecast = (
@@ -1583,10 +1603,14 @@ def _official_actual_datum(
         field_lineage["previous"] = {
             **actual_lineage,
             **candidate_previous_lineage,
+            "occurrence_id": canonical_key,
             "field_semantics": "previous",
             "source_field": "previous",
             "value": candidate.get("previous"),
             "reference_period": candidate.get(
+                "previous_reference_period"
+            ),
+            "previous_reference_period": candidate.get(
                 "previous_reference_period"
             ),
             "derivation": "previous_official_series_observation",

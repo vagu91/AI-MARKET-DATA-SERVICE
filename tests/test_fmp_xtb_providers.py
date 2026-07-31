@@ -236,6 +236,10 @@ def test_xtb_mapping_actual_forecast_previous_timezone_and_all_day() -> None:
     [
         ("Core CPI A/A", "core_cpi_yoy"),
         ("Indice dei prezzi alla produzione M/M", "headline_ppi_mom"),
+        ("PCE A/A", "headline_pce_yoy"),
+        ("PCE M/M", "headline_pce_mom"),
+        ("PCE annuale", "headline_pce_yoy"),
+        ("PCE mensile", "headline_pce_mom"),
         ("Richieste iniziali di sussidi di disoccupazione", "initial_jobless_claims"),
     ],
 )

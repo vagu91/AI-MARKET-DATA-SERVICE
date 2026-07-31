@@ -130,6 +130,7 @@ def _macro_fact(*, valid_until: datetime) -> dict:
 
 
 def _valid_macro_facts(*, valid_until: datetime) -> list[dict]:
+    data_as_of = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
     series = (
         ("DGS2", "FRED"),
         ("DFF", "FRED"),
@@ -153,7 +154,7 @@ def _valid_macro_facts(*, valid_until: datetime) -> list[dict]:
             "source": source,
             "raw_payload": {
                 "series_id": series_id,
-                "data_as_of": "2026-07-29",
+                "data_as_of": data_as_of,
                 "next_refresh_at": valid_until.isoformat(),
             },
         }
