@@ -447,11 +447,13 @@ def compute_cross_asset_context(
     hyg = changes.get("HYG")
     lqd = changes.get("LQD")
     credit = round(hyg - lqd, 6) if hyg is not None and lqd is not None else None
+    usd_sign = _sign(changes.get("UUP"))
+    duration_sign = _sign(changes.get("TLT"))
     risk_score_inputs = [
         _sign(sum(equity) / len(equity)) if equity else None,
         _sign(credit),
-        -_sign(changes.get("UUP")),
-        -_sign(changes.get("TLT")),
+        -usd_sign if usd_sign is not None else None,
+        -duration_sign if duration_sign is not None else None,
     ]
     usable = [item for item in risk_score_inputs if item is not None]
     risk_score = sum(usable) / len(usable) if usable else None

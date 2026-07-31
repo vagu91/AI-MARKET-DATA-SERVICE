@@ -601,6 +601,21 @@ def test_market_internals_and_cross_asset_proxies() -> None:
     assert "stale_rate_series" in cross["warnings"]
 
 
+def test_cross_asset_context_fails_closed_when_proxies_are_missing() -> None:
+    cross = compute_cross_asset_context(
+        quotes=[
+            {"symbol": "QQQ", "change_percentage": 1},
+            {"symbol": "SPY", "change_percentage": 0.5},
+        ],
+        fred_series={},
+    )
+
+    assert cross["status"] == "AVAILABLE"
+    assert cross["duration_proxy_tlt"] is None
+    assert cross["usd_proxy_uup"] is None
+    assert {"TLT", "UUP"} <= set(cross["missing_proxies"])
+
+
 def test_provider_first_planner_never_routes_numeric_gaps_to_ai() -> None:
     planner = ProviderFirstResolutionPlanner()
     covered = planner.plan(
