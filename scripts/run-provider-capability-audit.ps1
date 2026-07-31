@@ -142,8 +142,10 @@ function Assert-GitScope {
     if ($head -ne $remoteHead) {
         throw "Provider audit requires the pushed HEAD of the existing PR branch."
     }
-    $unexpected = @(git -C $Repo status --porcelain) |
-        Where-Object { $_ -notmatch "^\?\? ai-trader-consumer-payload\.json$" }
+    $unexpected = @(
+        @(git -C $Repo status --porcelain) |
+            Where-Object { $_ -notmatch "^\?\? ai-trader-consumer-payload\.json$" }
+    )
     if ($unexpected.Count -gt 0) {
         throw "Git worktree contains unexpected changes."
     }

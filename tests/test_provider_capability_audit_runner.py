@@ -118,11 +118,16 @@ def test_git_scope_check_works_when_runner_is_called_outside_repo(
             timeout=30,
         )
         assert completed.returncode == 0, completed.stderr
+    (fixture_repo / "ai-trader-consumer-payload.json").write_text(
+        "allowed untracked fixture\n",
+        encoding="utf-8",
+    )
 
     escaped_runner = str(RUNNER).replace("'", "''")
     escaped_repo = str(fixture_repo).replace("'", "''")
     escaped_outside = str(outside).replace("'", "''")
     command = (
+        "Set-StrictMode -Version 2.0;"
         "$errors=$null;$tokens=$null;"
         "$ast=[System.Management.Automation.Language.Parser]::ParseFile("
         f"'{escaped_runner}',[ref]$tokens,[ref]$errors);"
