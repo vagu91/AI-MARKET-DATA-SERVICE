@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
@@ -456,6 +457,103 @@ def test_schema_invalid_output_attests_process_and_exact_cli_bytes(
     assert attested_path.read_bytes() == raw_output
     assert attestation["output_size_bytes"] == len(raw_output)
     assert attestation["output_sha256"] == hashlib.sha256(raw_output).hexdigest()
+
+
+def test_event_observer_abort_attests_and_reaps_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    event_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "search-2",
+                "type": "web_search",
+                "query": "second bounded query",
+            },
+        }
+    )
+
+    class ObserverAbort(RuntimeError):
+        reason_code = "RESEARCH_TOOL_BUDGET_EXCEEDED"
+
+    class IncrementalProcess:
+        def __init__(self, command: list[str]) -> None:
+            self.command = command
+            self.pid = 6123
+            self.returncode: int | None = None
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO(f"{event_line}\n")
+            self.stderr = io.StringIO("")
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process: IncrementalProcess | None = None
+
+    def fake_popen(command: list[str], **_: Any) -> IncrementalProcess:
+        nonlocal process
+        process = IncrementalProcess(command)
+        return process
+
+    def terminate_observed(candidate: IncrementalProcess) -> bool:
+        candidate.returncode = 17
+        return True
+
+    def reject_event(_: dict[str, Any]) -> None:
+        raise ObserverAbort("audit tool budget exceeded")
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._terminate_process_group",
+        terminate_observed,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    with pytest.raises(ObserverAbort) as raised:
+        PersistentAIJobExecutor(cfg).execute_research(
+            job=job,
+            run=run,
+            profile={"profile_id": "NEWS_RESEARCH"},
+            workspace=tmp_path / "observer-abort",
+            watchdog_seconds=5,
+            effective_budget={
+                "max_searches": 1,
+                "max_opened_sources": 1,
+            },
+            event_observer=reject_event,
+        )
+
+    assert process is not None
+    assert process.poll() == 17
+    diagnostic = raised.value.diagnostic
+    attestation = diagnostic["process_attestation"]
+    assert diagnostic["category"] == "POLICY_ABORT"
+    assert diagnostic["observer_reason_code"] == (
+        "RESEARCH_TOOL_BUDGET_EXCEEDED"
+    )
+    assert attestation["process_observed"] is True
+    assert attestation["process_id"] == process.pid
+    assert attestation["exit_code"] == 17
+    assert attestation["process_terminated"] is True
+    assert attestation["status"] == "POLICY_ABORTED"
+    assert attestation["failure_reason"] == (
+        "research_tool_budget_exceeded"
+    )
+    assert Path(attestation["output_path"]).is_file()
 
 
 def test_timeout_emits_bound_attestation_and_reaps_mocked_process(

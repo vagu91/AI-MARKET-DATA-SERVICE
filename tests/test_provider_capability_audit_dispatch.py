@@ -22,6 +22,8 @@ from app.infrastructure.persistence.provider_cache_repository import (
 from app.services.provider_capability_audit import (
     AuditFilters,
     DatabaseBundleGuard,
+    HealthStatus,
+    ProbeExecutionError,
     ProbeOutcome,
     ProviderCapabilityAuditEngine,
     _bound_exchange_supports_claim,
@@ -1229,6 +1231,54 @@ class _AttestedAuthFailingResearchBackend(_AttestedFailingResearchBackend):
     exit_code = 1
 
 
+class _AttestedBudgetFailingResearchBackend:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def execute_research(
+        self,
+        *,
+        workspace: Path,
+        **_: Any,
+    ) -> ResearchBackendResult:
+        artifact = workspace / "codex-budget-process-failure.json"
+        exact = b'{"process":"budget-stopped"}\n'
+        artifact.write_bytes(exact)
+        error = ProbeExecutionError(
+            "research backend exceeded the observed audit tool budget",
+            status=HealthStatus.UNUSABLE,
+            reason_code="RESEARCH_TOOL_BUDGET_EXCEEDED",
+        )
+        error.dispatch_observation = {
+            "schema_version": "provider-audit-dispatch-observation-v1",
+            "origin": "BACKEND_EVENT_OBSERVER",
+            "backend_class": "PersistentAIJobExecutor",
+            "budget_stop_observed": True,
+            "events_observed": 2,
+            "search_attempts": 2,
+            "source_open_attempts": 0,
+            "event_sha256": ["a" * 64, "b" * 64],
+        }
+        error.diagnostic = {
+            "category": "POLICY_ABORT",
+            "process_attestation": {
+                "status": "POLICY_ABORTED",
+                "failure_reason": "research_tool_budget_exceeded",
+                "process_observed": True,
+                "process_id": 126,
+                "exit_code": 17,
+                "process_terminated": True,
+                "stdout_sha256": hashlib.sha256(b"events").hexdigest(),
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                "command_sha256": "c" * 64,
+                "output_path": str(artifact.resolve()),
+                "output_sha256": hashlib.sha256(exact).hexdigest(),
+                "output_size_bytes": len(exact),
+            },
+        }
+        raise error
+
+
 class _UnattestedFailingResearchBackend:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -1355,6 +1405,57 @@ async def test_persistent_backend_failure_uses_real_process_attestation(
     attestation = outcome.evidence["capture_attestation"]
     assert attestation["process_observed"] is True
     assert attestation["process_terminated"] is True
+
+
+@pytest.mark.asyncio
+async def test_attested_budget_stop_is_terminal_unusable_not_missing_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = provider_by_id("CODEX_CLI_RESEARCH_BACKEND")
+    settings = _settings(tmp_path, research_backend="codex_cli")
+    target = select_capability_targets(
+        (registration,),
+        AuditFilters.from_values(metrics=("event_missing_fields",)),
+        settings=settings,
+    )[0]
+    request = build_probe_requests(
+        (target,),
+        run_id="20260731T120000Z",
+        sandbox_root=tmp_path / "sandbox",
+        database_snapshot_path=None,
+        settings=settings,
+    )[0]
+    monkeypatch.setattr(
+        audit_script,
+        "_load_symbol",
+        lambda _: _AttestedBudgetFailingResearchBackend,
+    )
+
+    outcome = await audit_script.IsolatedRegistryProbeExecutor(settings)(
+        request
+    )
+
+    assert outcome.transport_status == "UNUSABLE"
+    assert "RESEARCH_TOOL_BUDGET_EXCEEDED" in outcome.reason_codes
+    assert outcome.evidence["real_adapter_invoked"] is True
+    assert outcome.evidence["probe_dispatch_status"] == "REAL_ADAPTER"
+    assert outcome.evidence["capture_verified"] is True
+    assert outcome.evidence["capture_attestation"]["exit_code"] == 17
+    assert outcome.evidence["backend_tool_attempt_count"] == 2
+    assert _capture_attestation_valid(
+        {
+            **outcome.evidence,
+            "configured": outcome.configured,
+            "transport_status": outcome.transport_status,
+            "network_exchange_count": len(outcome.network_exchanges),
+            "reason_codes": list(outcome.reason_codes),
+            "capture_attestation_sha256": audit_script._stable_sha256(  # noqa: SLF001
+                outcome.evidence["capture_attestation"]
+            ),
+        },
+        provider=registration,
+    )
 
 
 @pytest.mark.asyncio
@@ -1521,14 +1622,10 @@ async def test_research_tool_budget_fails_on_second_unique_attempt(
 
     assert outcome.transport_status == "UNUSABLE"
     assert outcome.reason_codes == ("RESEARCH_TOOL_BUDGET_EXCEEDED",)
-    assert outcome.attempts == 1
-    assert outcome.evidence["real_adapter_invoked"] is True
-    assert outcome.evidence["probe_dispatch_status"] == "REAL_ADAPTER"
+    assert outcome.attempts == 0
+    assert outcome.evidence["real_adapter_invoked"] is False
+    assert outcome.evidence["probe_dispatch_status"] == "FAILED"
     assert outcome.evidence["capture_verified"] is False
-    assert outcome.evidence["dispatch_observation"][
-        "budget_stop_observed"
-    ] is True
-    assert outcome.evidence["dispatch_observation"]["events_observed"] == 2
 
 
 class _SourceClaimResearchBackend:

@@ -187,9 +187,12 @@ def _backend_process_failure_observation(
         "category": category,
         "transport_status": transport_status,
         "reason_code": (
-            "PROBE_TIMEOUT"
-            if category == "TIMEOUT"
-            else f"CODEX_CLI_{category}"
+            str(getattr(exc, "reason_code", "") or "")
+            or (
+                "PROBE_TIMEOUT"
+                if category == "TIMEOUT"
+                else f"CODEX_CLI_{category}"
+            )
         ),
         "process_attestation": normalized,
     }
@@ -500,9 +503,6 @@ class IsolatedRegistryProbeExecutor:
                         "adapter_constructed": True,
                     }
                     return outcome
-                dispatch_observation = _validated_dispatch_observation(
-                    getattr(exc, "dispatch_observation", None)
-                )
                 return _failed_transport_outcome(
                     request,
                     capture,
@@ -511,9 +511,6 @@ class IsolatedRegistryProbeExecutor:
                     exc.reason_code,
                     type(exc).__name__,
                     dispatch_status=(
-                        "REAL_ADAPTER"
-                        if dispatch_observation is not None
-                        else
                         "FAILED"
                         if exc.reason_code
                         in {
@@ -522,7 +519,6 @@ class IsolatedRegistryProbeExecutor:
                         }
                         else "REAL_ADAPTER"
                     ),
-                    dispatch_observation=dispatch_observation,
                 )
             except Exception as exc:
                 return _failed_transport_outcome(
@@ -1601,12 +1597,20 @@ async def _invoke_registered_source(adapter: Any, request: ProbeRequest) -> Any:
                 status=HealthStatus.UNUSABLE,
                 reason_code="RESEARCH_RUNTIME_WORKER_PATH_NOT_OBSERVED",
             )
-        if backend.last_error is not None:
-            raise backend.last_error
-        backend_failure = _backend_process_failure_observation(
-            backend.last_exception
+        backend_exception = (
+            backend.last_error
+            if backend.last_error is not None
+            else backend.last_exception
         )
+        backend_failure = _backend_process_failure_observation(
+            backend_exception
+        )
+        if backend.last_error is not None and backend_failure is None:
+            raise backend.last_error
         if backend_failure is not None:
+            tool_observation = _validated_dispatch_observation(
+                getattr(backend_exception, "dispatch_observation", None)
+            )
             return {
                 "runtime_profile_id": runtime_profile_id,
                 "runtime_job_type": runtime_job_type,
@@ -1620,6 +1624,7 @@ async def _invoke_registered_source(adapter: Any, request: ProbeRequest) -> Any:
                     if isinstance(stored_job.get("result_payload"), Mapping)
                     else {}
                 ),
+                "audit_tool_observation": tool_observation,
                 "runtime_chain_attestation": {
                     "worker_class": type(worker).__qualname__,
                     "worker_process_once_observed": processed is True,
@@ -4429,7 +4434,6 @@ def _failed_transport_outcome(
     error_kind: str,
     *,
     dispatch_status: str = "REAL_ADAPTER",
-    dispatch_observation: Mapping[str, Any] | None = None,
 ) -> ProbeOutcome:
     last_exchange = capture.exchanges[-1] if capture.exchanges else None
     expected_mode = _expected_capture_mode(request)
@@ -4438,10 +4442,7 @@ def _failed_transport_outcome(
         expected_mode == "LOCAL_SANDBOX"
         and dispatch_status == "REAL_ADAPTER"
     )
-    event_stream_dispatch = dispatch_observation is not None
-    dispatch_observed = (
-        captured_attempt or local_invocation or event_stream_dispatch
-    )
+    dispatch_observed = captured_attempt or local_invocation
     effective_dispatch_status = (
         dispatch_status if dispatch_observed else "FAILED"
     )
@@ -4453,7 +4454,7 @@ def _failed_transport_outcome(
         raw_response=last_exchange.response_body if last_exchange else None,
         normalized_response=None,
         latency_ms=round((time.perf_counter() - started) * 1000, 3),
-        attempts=max(capture.attempts, 1 if event_stream_dispatch else 0),
+        attempts=capture.attempts,
         error_kind=error_kind,
         reason_codes=(reason_code,),
         checks={
@@ -4498,7 +4499,6 @@ def _failed_transport_outcome(
                 or local_invocation
             )
             else None,
-            "dispatch_observation": dispatch_observation,
             "capture_mode_configuration": (
                 _capture_mode_configuration(request)
             ),

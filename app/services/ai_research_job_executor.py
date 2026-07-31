@@ -414,6 +414,58 @@ class PersistentAIJobExecutor:
                     failure_reason="codex_cli_timeout",
                     subprocess_output_bytes=subprocess_output_bytes,
                 )
+            except Exception as exc:
+                observation = getattr(
+                    exc,
+                    "_codex_subprocess_capture",
+                    None,
+                )
+                if not isinstance(observation, dict):
+                    raise
+                stdout = _process_text(observation.get("stdout"))
+                stderr = _process_text(observation.get("stderr"))
+                process_terminated = bool(
+                    observation.get("process_terminated") is True
+                    and process.poll() is not None
+                )
+                duration_ms = int((perf_counter() - started) * 1000)
+                subprocess_output_bytes = _read_subprocess_output_bytes(
+                    output_path
+                )
+                reason_code = str(
+                    getattr(exc, "reason_code", None)
+                    or "EVENT_OBSERVER_REJECTED"
+                )
+                diagnostic = build_diagnostic(
+                    category="POLICY_ABORT",
+                    retryable=False,
+                    command=command,
+                    step=step,
+                    workspace=workspace,
+                    duration_ms=duration_ms,
+                    executable_version=executable_version,
+                    exit_code=process.returncode,
+                    stderr=stderr,
+                    stdout=stdout,
+                    error_events=extract_codex_error_events(stdout),
+                )
+                diagnostic["observer_reason_code"] = reason_code
+                diagnostic["process_attestation"] = (
+                    _persist_process_attestation(
+                        output_path=output_path,
+                        command=command,
+                        process=process,
+                        stdout=stdout,
+                        stderr=stderr,
+                        duration_ms=duration_ms,
+                        process_terminated=process_terminated,
+                        status="POLICY_ABORTED",
+                        failure_reason=reason_code.casefold(),
+                        subprocess_output_bytes=subprocess_output_bytes,
+                    )
+                )
+                setattr(exc, "diagnostic", diagnostic)
+                raise
         finally:
             with self._lock:
                 self._active.pop(process.pid, None)
@@ -1012,8 +1064,26 @@ def _communicate_jsonl_incrementally(
             ):
                 try:
                     event_observer(event)
-                except Exception:
-                    _terminate_process_group(process)
+                except Exception as exc:
+                    process_terminated = _terminate_process_group(process)
+                    stdout_thread.join(timeout=2)
+                    stderr_thread.join(timeout=2)
+                    while True:
+                        try:
+                            pending_line = lines.get_nowait()
+                        except Empty:
+                            break
+                        if pending_line is not None:
+                            stdout_lines.append(pending_line)
+                    setattr(
+                        exc,
+                        "_codex_subprocess_capture",
+                        {
+                            "stdout": "".join(stdout_lines),
+                            "stderr": "".join(stderr_parts),
+                            "process_terminated": process_terminated,
+                        },
+                    )
                     raise
         process.wait(timeout=max(deadline - monotonic(), 0.1))
     finally:
