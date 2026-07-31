@@ -2525,6 +2525,34 @@ def test_freshness_never_leaks_from_a_sibling_field_lineage() -> None:
     ) is None
 
 
+def test_unobserved_field_never_inherits_response_freshness(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    target = select_capability_targets(
+        (_registration(),),
+        AuditFilters(),
+        settings=settings,
+    )[0]
+    request = build_probe_requests(
+        (target,),
+        run_id="20260731T120000Z",
+        sandbox_root=tmp_path / "sandbox",
+        database_snapshot_path=None,
+        settings=settings,
+    )[0]
+    payload = _valid_atomic_payload()
+    del payload["actual"]
+
+    _, field_checks = audit_script._evidence_checks(  # noqa: SLF001
+        request,
+        payload,
+        observed_at=datetime(2026, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert field_checks[target.field_key("actual")]["freshness_valid"] is None
+
+
 def test_exported_field_evidence_uses_only_field_bound_lifecycle(
     tmp_path: Path,
 ) -> None:

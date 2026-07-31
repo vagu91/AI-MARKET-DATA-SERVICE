@@ -2060,14 +2060,18 @@ def _evidence_checks(
                 ),
                 "completeness_valid": completeness,
                 "freshness_valid": (
-                    True
-                    if explicit_null
-                    else _freshness_check(
-                        owner if owner is not None else normalized,
-                        target=target,
-                        field_name=field_name,
-                        field_value=value,
-                        now=observed_at,
+                    None
+                    if not observed
+                    else (
+                        True
+                        if explicit_null
+                        else _freshness_check(
+                            owner,
+                            target=target,
+                            field_name=field_name,
+                            field_value=value,
+                            now=observed_at,
+                        )
                     )
                 ),
                 "semantic_mapping_valid": semantic,
