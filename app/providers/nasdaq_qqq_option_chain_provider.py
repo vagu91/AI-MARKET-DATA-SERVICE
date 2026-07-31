@@ -100,13 +100,21 @@ class NasdaqQQQOptionChainProvider:
         if incomplete:
             warnings.append("nasdaq_options_snapshot_incomplete")
         now = datetime.now(UTC)
+        valid_until = _iso(
+            now
+            + timedelta(
+                minutes=self.settings.nasdaq_options_cache_minutes
+            )
+        )
         return {
             "status": "partial" if incomplete else ("found" if contracts else "not_found"),
             "provider": self.source,
             "source": "Nasdaq",
             "source_url": self.settings.nasdaq_qqq_option_chain_url,
             "retrieved_at": _iso(now),
-            "valid_until": _iso(now + timedelta(minutes=self.settings.nasdaq_options_cache_minutes)),
+            "valid_until": valid_until,
+            "content_valid_until": valid_until,
+            "refresh_due_at": valid_until,
             "snapshot": {
                 "underlying": symbol,
                 "instrument_family": "ETF_OPTIONS",

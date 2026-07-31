@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
 import pytest
 import respx
 
+import app.providers.news_provider as news_provider_module
+import app.services.provider_capability_registry as registry_module
 from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import (
     ProviderCacheRepository,
@@ -14,6 +17,8 @@ from app.infrastructure.persistence.provider_cache_repository import (
 from app.providers.news_provider import (
     NewsProvider,
     _article_key,
+    _news_runtime_provider_specs,
+    _provider_batch,
     _redact_provider_error,
     parse_alpha_vantage_news_with_accounting,
     parse_gdelt_articles,
@@ -42,6 +47,20 @@ class RecordingNewsRepository:
             raise RuntimeError("fixture persistence failure")
         self.stored.append(dict(article))
         return {"news_key": article["news_key"]}
+
+
+class OfflineAsyncClient:
+    entered = False
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    async def __aenter__(self) -> "OfflineAsyncClient":
+        type(self).entered = True
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        return None
 
 
 def _settings(tmp_path, **overrides) -> Settings:
@@ -133,6 +152,152 @@ def _assert_exact_provider_accounting(account: dict) -> None:
     assert account["partition_entries_missing_identity_or_reason"] == []
     assert account["raw_capture_contract_violations"] == []
     assert account["accounting_valid"] is True
+
+
+def _patch_news_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    policy,
+) -> None:
+    monkeypatch.setattr(
+        registry_module,
+        "DATASET_SOURCE_POLICIES",
+        tuple(
+            policy
+            if item.dataset_id == "current_news"
+            else item
+            for item in registry_module.DATASET_SOURCE_POLICIES
+        ),
+    )
+
+
+def test_news_runtime_default_order_is_current_policy_order() -> None:
+    policy = registry_module.dataset_policy_by_id("current_news")
+
+    assert tuple(
+        spec.provider_id for spec in _news_runtime_provider_specs()
+    ) == (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+
+
+@pytest.mark.asyncio
+async def test_news_runtime_dispatch_and_accounting_follow_reordered_policy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = registry_module.dataset_policy_by_id("current_news")
+    reordered = replace(
+        policy,
+        primary_provider="GDELT_DOC_API",
+        fallback_providers=(
+            "ALPHA_VANTAGE_NEWS_SENTIMENT",
+            *policy.fallback_providers[1:],
+        ),
+    )
+    _patch_news_policy(monkeypatch, reordered)
+    OfflineAsyncClient.entered = False
+    monkeypatch.setattr(
+        news_provider_module.httpx,
+        "AsyncClient",
+        OfflineAsyncClient,
+    )
+    settings = _settings(
+        tmp_path,
+        news_rss_enabled=False,
+        news_metadata_enrichment_limit_per_provider=0,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        settings,
+    )
+    calls: list[str] = []
+    specs = {
+        spec.provider_id: spec
+        for spec in _news_runtime_provider_specs()
+    }
+
+    async def observed(provider_id: str, **kwargs) -> dict:
+        spec = specs[provider_id]
+        calls.append(provider_id)
+        kwargs["execution_evidence"].record_call(spec.provider)
+        return _provider_batch(
+            provider=spec.provider,
+            provider_type=spec.provider_type,
+            reliability=spec.reliability,
+            limit=int(kwargs["limit"]),
+            raw_record_ids=[],
+            raw_capture=[],
+            articles=[],
+            technical_rejections=[],
+            explicit_out_of_scope=[],
+        )
+
+    async def observed_alpha(**kwargs) -> dict:
+        return await observed(
+            "ALPHA_VANTAGE_NEWS_SENTIMENT",
+            **kwargs,
+        )
+
+    async def observed_gdelt(**kwargs) -> dict:
+        return await observed("GDELT_DOC_API", **kwargs)
+
+    monkeypatch.setattr(
+        provider,
+        "_fetch_alpha_vantage",
+        observed_alpha,
+    )
+    monkeypatch.setattr(provider, "_fetch_gdelt", observed_gdelt)
+
+    result = await provider.fetch_for_symbols(
+        ["NVDA", "QQQ"],
+        limit=1,
+    )
+
+    expected_specs = _news_runtime_provider_specs()
+    assert OfflineAsyncClient.entered is True
+    assert calls == [
+        "GDELT_DOC_API",
+        "ALPHA_VANTAGE_NEWS_SENTIMENT",
+    ]
+    assert [
+        account["provider"]
+        for account in result.data["provider_accounting"]
+    ] == [spec.provider for spec in expected_specs]
+
+
+@pytest.mark.asyncio
+async def test_news_runtime_fails_closed_before_dispatch_for_unmapped_policy_provider(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = registry_module.dataset_policy_by_id("current_news")
+    invalid = replace(
+        policy,
+        fallback_providers=(
+            *policy.fallback_providers,
+            "UNMAPPED_NEWS_PROVIDER",
+        ),
+    )
+    _patch_news_policy(monkeypatch, invalid)
+    OfflineAsyncClient.entered = False
+    monkeypatch.setattr(
+        news_provider_module.httpx,
+        "AsyncClient",
+        OfflineAsyncClient,
+    )
+    provider = NewsProvider(
+        ProviderCacheRepository(tmp_path / "cache.sqlite3"),
+        _settings(tmp_path),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="RUNTIME_POLICY_MAPPING_MISMATCH:current_news",
+    ):
+        await provider.fetch_for_symbols(["NVDA"], limit=1)
+
+    assert OfflineAsyncClient.entered is False
 
 
 @pytest.mark.asyncio

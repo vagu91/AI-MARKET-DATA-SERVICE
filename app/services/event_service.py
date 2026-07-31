@@ -41,6 +41,13 @@ class EventService:
     ) -> list[dict[str, object]]:
         return [
             {
+                "provider_id": str(
+                    getattr(
+                        provider,
+                        "_registry_provider_id",
+                        provider.source,
+                    )
+                ),
                 "provider_name": provider.source,
                 "query_scope": f"country={country.upper()}",
             }

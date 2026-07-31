@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -8,15 +9,9 @@ from typing import Any, Mapping
 
 from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
-from app.providers.bea import BeaProvider
-from app.providers.bls import BlsProvider
-from app.providers.census import CensusProvider
-from app.providers.fred import FredProvider
 from app.providers.investing_flash_services_pmi import (
     SOURCE as INVESTING_FLASH_SOURCE,
-    InvestingFlashServicesPmiProvider,
 )
-from app.providers.sp_global_pmi import SpGlobalPmiProvider
 from app.services.event_value_candidate_repository import EventValueCandidateRepository
 from app.services.macro_consensus_service import candidate_metric_id
 from app.services.official_actual_semantics import (
@@ -25,6 +20,59 @@ from app.services.official_actual_semantics import (
     derive_official_actual,
     metric_semantics_mismatch_reason,
     normalize_reference_period,
+)
+from app.services.provider_capability_registry import (
+    dataset_policy_by_id,
+    dataset_runtime_provider_order,
+    provider_by_id,
+)
+
+
+FLASH_SERVICES_PMI_DATASET_ID = "flash_services_pmi"
+_FLASH_SERVICES_PMI_DISPATCH_IDS = frozenset(
+    {"SPGLOBAL", INVESTING_FLASH_SOURCE}
+)
+
+
+def _declared_flash_services_pmi_provider_order() -> tuple[str, ...]:
+    policy = dataset_policy_by_id(FLASH_SERVICES_PMI_DATASET_ID)
+    return (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+
+
+def _flash_services_pmi_provider_order() -> tuple[str, ...]:
+    return dataset_runtime_provider_order(
+        FLASH_SERVICES_PMI_DATASET_ID,
+        _FLASH_SERVICES_PMI_DISPATCH_IDS,
+    )
+
+
+def _registered_adapter(provider_id: str) -> Any:
+    registration = provider_by_id(provider_id)
+    module_name, separator, qualname = registration.adapter_path.partition(
+        ":"
+    )
+    if not separator:
+        raise RuntimeError(
+            f"registered adapter path is invalid:{provider_id}"
+        )
+    value: Any = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        value = getattr(value, part)
+    return value
+
+
+# These public aliases preserve the monkeypatch surface used by existing tests,
+# but their classes and paths now come from the central provider registry.
+BlsProvider = _registered_adapter("BLS")
+BeaProvider = _registered_adapter("BEA")
+CensusProvider = _registered_adapter("CENSUS")
+FredProvider = _registered_adapter("FRED")
+SpGlobalPmiProvider = _registered_adapter("SPGLOBAL")
+InvestingFlashServicesPmiProvider = _registered_adapter(
+    INVESTING_FLASH_SOURCE
 )
 
 
@@ -114,13 +162,29 @@ class DeterministicActualResolver:
                 "status": "NO_DATA", "results": [],
                 "error": f"official_metric_unsupported:{metric_id or 'UNKNOWN'}",
             }
-        provider_config = self.providers.get(spec.provider)
-        if provider_config is None:
-            return {"status": "NO_DATA", "results": [], "error": "official_provider_adapter_unavailable"}
-        provider = (
-            provider_config(self.cache, self.settings)
-            if isinstance(provider_config, type)
-            else provider_config
+        is_flash_services_pmi = (
+            spec.event_metric_id == FLASH_SERVICES_PMI_DATASET_ID
+        )
+        flash_provider_order: tuple[str, ...] = ()
+        if is_flash_services_pmi:
+            declared_order: tuple[str, ...] = ()
+            try:
+                declared_order = (
+                    _declared_flash_services_pmi_provider_order()
+                )
+                flash_provider_order = (
+                    _flash_services_pmi_provider_order()
+                )
+            except (KeyError, RuntimeError) as exc:
+                return _flash_pmi_runtime_policy_invalid(
+                    declared_order=declared_order,
+                    error=exc,
+                    source_series=spec.source_series_id,
+                )
+        active_provider_id = (
+            flash_provider_order[0]
+            if is_flash_services_pmi
+            else spec.provider
         )
         expected_period = (
             event.get("reference_period")
@@ -145,57 +209,58 @@ class DeterministicActualResolver:
                 "results": [],
                 "error": "official_reference_period_missing",
             }
+        if is_flash_services_pmi and release_date is None:
+            return {
+                "status": "NO_DATA",
+                "retryable": False,
+                "results": [],
+                "error": "official_release_date_missing",
+            }
+        provider_config = self.providers.get(active_provider_id)
+        if provider_config is None:
+            if is_flash_services_pmi:
+                return _flash_pmi_provider_adapter_unavailable(
+                    provider_order=flash_provider_order,
+                    unavailable_provider=active_provider_id,
+                    source_series=spec.source_series_id,
+                )
+            return {
+                "status": "NO_DATA",
+                "results": [],
+                "error": "official_provider_adapter_unavailable",
+            }
+        provider = _provider_instance(
+            provider_config,
+            cache=self.cache,
+            settings=self.settings,
+        )
         fallback_used = False
         primary_failure: str | None = None
 
         def fetch_flash_pmi_fallback(
             failure: str,
         ) -> tuple[Any | None, dict[str, Any] | None]:
-            fallback_config = self.providers.get(
-                INVESTING_FLASH_SOURCE
-            )
+            fallback_provider_id = flash_provider_order[1]
+            fallback_config = self.providers.get(fallback_provider_id)
             if fallback_config is None:
-                return None, {
-                    **_feed_delayed(
-                        failure,
-                        provider=spec.provider,
-                        source_series=spec.source_series_id,
-                        provider_http_outcome=(
-                            "HTTP_403"
-                            if failure
-                            == "sp_global_public_release_access_restricted"
-                            else None
-                        ),
-                    ),
-                    "fallback_reason_code": (
-                        "investing_flash_services_pmi_fallback_unavailable"
-                    ),
-                    "provider_attempts": [
-                        _observed_provider_call(
-                            spec.provider,
-                            _primary_attempt_result(failure),
-                        ),
-                        _observed_provider_skip(
-                            INVESTING_FLASH_SOURCE,
-                            (
-                                "INVESTING_FLASH_SERVICES_PMI_"
-                                "FALLBACK_UNAVAILABLE"
-                            ),
-                        ),
-                    ],
-                }
-            fallback = (
-                fallback_config(self.cache, self.settings)
-                if isinstance(fallback_config, type)
-                else fallback_config
+                return None, _flash_pmi_fallback_adapter_unavailable(
+                    failure=failure,
+                    primary_provider=flash_provider_order[0],
+                    fallback_provider=fallback_provider_id,
+                    source_series=spec.source_series_id,
+                )
+            fallback = _provider_instance(
+                fallback_config,
+                cache=self.cache,
+                settings=self.settings,
             )
             try:
-                fallback_result = asyncio.run(
-                    fallback.fetch(
-                        expected_period=expected_period,
-                        release_date=release_date.isoformat(),
-                        expected_release_at=release_timestamp,
-                    )
+                fallback_result = _fetch_flash_services_pmi_provider(
+                    fallback_provider_id,
+                    fallback,
+                    expected_period=expected_period,
+                    release_date=release_date,
+                    release_timestamp=release_timestamp,
                 )
             except Exception as fallback_exc:
                 return None, _flash_pmi_all_failed(
@@ -204,13 +269,22 @@ class DeterministicActualResolver:
                         str(fallback_exc)
                         or type(fallback_exc).__name__
                     ),
-                    provider=spec.provider,
+                    primary_provider=flash_provider_order[0],
+                    fallback_provider=fallback_provider_id,
                     source_series=spec.source_series_id,
                 )
             return fallback_result, None
 
         try:
-            if spec.provider == "CENSUS":
+            if is_flash_services_pmi:
+                result = _fetch_flash_services_pmi_provider(
+                    active_provider_id,
+                    provider,
+                    expected_period=expected_period,
+                    release_date=release_date,
+                    release_timestamp=release_timestamp,
+                )
+            elif spec.provider == "CENSUS":
                 dataset = spec.source_series_id.split(":", 2)[1]
                 result = asyncio.run(
                     provider.fetch(
@@ -221,20 +295,6 @@ class DeterministicActualResolver:
             elif spec.provider == "FRED":
                 result = asyncio.run(
                     provider.fetch(series_ids=[spec.source_series_id])
-                )
-            elif spec.provider == "SPGLOBAL":
-                if release_date is None:
-                    return {
-                        "status": "NO_DATA",
-                        "retryable": False,
-                        "results": [],
-                        "error": "official_release_date_missing",
-                    }
-                result = asyncio.run(
-                    provider.fetch(
-                        expected_period=expected_period,
-                        release_date=release_date.isoformat(),
-                    )
                 )
             else:
                 result = asyncio.run(provider.fetch())
@@ -248,7 +308,7 @@ class DeterministicActualResolver:
                 if detail
                 else f"official_provider_unavailable:{type(exc).__name__}"
             )
-            if spec.event_metric_id != "flash_services_pmi":
+            if not is_flash_services_pmi:
                 if detail == "sp_global_public_release_access_restricted":
                     return _feed_delayed(
                         "sp_global_public_release_access_restricted",
@@ -267,21 +327,26 @@ class DeterministicActualResolver:
             if delayed is not None:
                 return delayed
             fallback_used = True
+            active_provider_id = flash_provider_order[1]
 
         def retry_flash_pmi_after_result_failure(
             failure: str,
         ) -> tuple[bool, dict[str, Any] | None]:
-            nonlocal fallback_used, primary_failure, result
-            if spec.event_metric_id != "flash_services_pmi":
+            nonlocal active_provider_id, fallback_used, primary_failure, result
+            if not is_flash_services_pmi:
                 return False, None
             if fallback_used:
                 return False, _flash_pmi_all_failed(
                     primary_failure=(
                         primary_failure
-                        or "SPGLOBAL_PROVIDER_RESULT_REJECTED"
+                        or (
+                            f"{flash_provider_order[0]}_"
+                            "PROVIDER_RESULT_REJECTED"
+                        )
                     ),
                     fallback_failure=failure,
-                    provider=spec.provider,
+                    primary_provider=flash_provider_order[0],
+                    fallback_provider=flash_provider_order[1],
                     source_series=spec.source_series_id,
                 )
             primary_failure = failure
@@ -292,6 +357,7 @@ class DeterministicActualResolver:
                 return False, delayed
             result = fallback_result
             fallback_used = True
+            active_provider_id = flash_provider_order[1]
             return True, None
 
         while True:
@@ -307,14 +373,19 @@ class DeterministicActualResolver:
                 if retried:
                     continue
                 return _feed_delayed(failure)
-            expected_adapter = f"{spec.provider}_OFFICIAL_API"
+            expected_adapter = (
+                INVESTING_FLASH_SOURCE
+                if active_provider_id == INVESTING_FLASH_SOURCE
+                else f"{active_provider_id}_OFFICIAL_API"
+            )
             official_adapter_valid = (
-                result.metadata.source == spec.provider
+                active_provider_id != INVESTING_FLASH_SOURCE
+                and result.metadata.source == active_provider_id
                 and series.get("official_adapter") is True
                 and series.get("provider_adapter") == expected_adapter
             )
             fallback_adapter_valid = (
-                fallback_used
+                active_provider_id == INVESTING_FLASH_SOURCE
                 and result.metadata.source == INVESTING_FLASH_SOURCE
                 and series.get("provider_adapter")
                 == INVESTING_FLASH_SOURCE
@@ -438,7 +509,11 @@ class DeterministicActualResolver:
                     ),
                 }
             )
-            if fallback_used:
+            investing_selected = (
+                is_flash_services_pmi
+                and active_provider_id == INVESTING_FLASH_SOURCE
+            )
+            if investing_selected:
                 xtb_forecast = event.get(
                     "consensus", event.get("forecast")
                 )
@@ -487,23 +562,33 @@ class DeterministicActualResolver:
                         ),
                         "provider_accounting": {
                             "primary": _observed_provider_call(
-                                spec.provider,
-                                _primary_attempt_result(
-                                    primary_failure
+                                flash_provider_order[0],
+                                (
+                                    _primary_attempt_result(
+                                        primary_failure
+                                    )
+                                    if fallback_used
+                                    else "SUCCESS"
                                 ),
                             ),
-                            "fallbacks": [
-                                _observed_provider_call(
-                                    INVESTING_FLASH_SOURCE,
-                                    "SUCCESS",
-                                )
-                            ],
-                            "selected_source": (
-                                INVESTING_FLASH_SOURCE
+                            "fallbacks": (
+                                [
+                                    _observed_provider_call(
+                                        active_provider_id,
+                                        "SUCCESS",
+                                    )
+                                ]
+                                if fallback_used
+                                else []
                             ),
+                            "selected_source": active_provider_id,
                             "reason_code": (
-                                "FALLBACK_SELECTED_AFTER_"
-                                "PRIMARY_FAILURE"
+                                (
+                                    "FALLBACK_SELECTED_AFTER_"
+                                    "PRIMARY_FAILURE"
+                                )
+                                if fallback_used
+                                else "PRIMARY_SELECTED"
                             ),
                         },
                     }
@@ -560,12 +645,12 @@ class DeterministicActualResolver:
                     "status": "FAILED",
                     "results": [],
                     "error": failure,
-                    "provider": spec.provider,
+                    "provider": active_provider_id,
                     "source_series": spec.source_series_id,
                     "provider_call_count": 1,
                     "provider_attempts": [
                         _observed_provider_call(
-                            spec.provider,
+                            active_provider_id,
                             "SUCCESS",
                         )
                     ],
@@ -577,25 +662,23 @@ class DeterministicActualResolver:
             "resolution": "official_provider",
             "mapping_selected": spec.event_metric_id,
             "source_series": spec.source_series_id,
-            "provider": (
-                INVESTING_FLASH_SOURCE if fallback_used else spec.provider
-            ),
+            "provider": active_provider_id,
             "provider_call_count": 2 if fallback_used else 1,
             "provider_attempts": (
                 [
                     _observed_provider_call(
-                        spec.provider,
+                        flash_provider_order[0],
                         _primary_attempt_result(primary_failure),
                     ),
                     _observed_provider_call(
-                        INVESTING_FLASH_SOURCE,
+                        active_provider_id,
                         "SUCCESS",
                     ),
                 ]
                 if fallback_used
                 else [
                     _observed_provider_call(
-                        spec.provider,
+                        active_provider_id,
                         "SUCCESS",
                     )
                 ]
@@ -674,6 +757,143 @@ def _metric_semantics_mismatch(
     )
 
 
+def _provider_instance(
+    provider_config: Any,
+    *,
+    cache: ProviderCacheRepository,
+    settings: Settings,
+) -> Any:
+    return (
+        provider_config(cache, settings)
+        if isinstance(provider_config, type)
+        else provider_config
+    )
+
+
+def _fetch_flash_services_pmi_provider(
+    provider_id: str,
+    provider: Any,
+    *,
+    expected_period: str,
+    release_date: Any,
+    release_timestamp: Any,
+) -> Any:
+    if provider_id == "SPGLOBAL":
+        return asyncio.run(
+            provider.fetch(
+                expected_period=expected_period,
+                release_date=release_date.isoformat(),
+            )
+        )
+    if provider_id == INVESTING_FLASH_SOURCE:
+        return asyncio.run(
+            provider.fetch(
+                expected_period=expected_period,
+                release_date=release_date.isoformat(),
+                expected_release_at=release_timestamp,
+            )
+        )
+    raise RuntimeError(
+        "FLASH_SERVICES_PMI_RUNTIME_ADAPTER_UNMAPPED:"
+        f"{provider_id}"
+    )
+
+
+def _flash_pmi_runtime_policy_invalid(
+    *,
+    declared_order: tuple[str, ...],
+    error: Exception,
+    source_series: str,
+) -> dict[str, Any]:
+    reason = "flash_services_pmi_runtime_policy_mapping_invalid"
+    return {
+        "status": "NO_DATA",
+        "retryable": False,
+        "results": [],
+        "error": reason,
+        "reason_code": reason,
+        "policy_error": _redacted_provider_result(error),
+        "source_series": source_series,
+        "provider_call_count": 0,
+        "provider_attempts": [
+            _observed_provider_skip(
+                provider_id,
+                "RUNTIME_ADAPTER_MAPPING_UNAVAILABLE",
+            )
+            for provider_id in declared_order
+        ],
+    }
+
+
+def _flash_pmi_provider_adapter_unavailable(
+    *,
+    provider_order: tuple[str, ...],
+    unavailable_provider: str,
+    source_series: str,
+) -> dict[str, Any]:
+    reason = (
+        "flash_services_pmi_provider_adapter_unavailable:"
+        f"{unavailable_provider}"
+    )
+    return {
+        "status": "NO_DATA",
+        "retryable": False,
+        "results": [],
+        "error": reason,
+        "reason_code": reason,
+        "provider": unavailable_provider,
+        "source_series": source_series,
+        "provider_call_count": 0,
+        "provider_attempts": [
+            _observed_provider_skip(
+                provider_id,
+                (
+                    "PROVIDER_ADAPTER_UNAVAILABLE"
+                    if provider_id == unavailable_provider
+                    else "POLICY_CHAIN_BLOCKED_BY_UNAVAILABLE_ADAPTER"
+                ),
+            )
+            for provider_id in provider_order
+        ],
+    }
+
+
+def _flash_pmi_fallback_adapter_unavailable(
+    *,
+    failure: Any,
+    primary_provider: str,
+    fallback_provider: str,
+    source_series: str,
+) -> dict[str, Any]:
+    primary_result = _primary_attempt_result(failure)
+    return {
+        **_feed_delayed(
+            _redacted_provider_result(failure),
+            provider=primary_provider,
+            source_series=source_series,
+            provider_http_outcome=(
+                "HTTP_403"
+                if primary_result == "HTTP_403"
+                else None
+            ),
+        ),
+        "fallback_reason_code": (
+            "flash_services_pmi_fallback_adapter_unavailable:"
+            f"{fallback_provider}"
+        ),
+        "provider_attempts": [
+            _observed_provider_call(
+                primary_provider,
+                primary_result,
+            ),
+            _observed_provider_skip(
+                fallback_provider,
+                "FLASH_SERVICES_PMI_FALLBACK_ADAPTER_UNAVAILABLE",
+            ),
+        ],
+    }
+
+
 def _feed_delayed(
     reason: str,
     *,
@@ -731,7 +951,8 @@ def _flash_pmi_all_failed(
     *,
     primary_failure: Any,
     fallback_failure: Any,
-    provider: str,
+    primary_provider: str,
+    fallback_provider: str,
     source_series: str,
 ) -> dict[str, Any]:
     primary_result = _primary_attempt_result(primary_failure)
@@ -739,7 +960,7 @@ def _flash_pmi_all_failed(
     return {
         **_feed_delayed(
             _redacted_provider_result(primary_failure),
-            provider=provider,
+            provider=primary_provider,
             source_series=source_series,
             provider_http_outcome=(
                 "HTTP_403"
@@ -753,9 +974,12 @@ def _flash_pmi_all_failed(
             f"{fallback_result}"
         ),
         "provider_attempts": [
-            _observed_provider_call(provider, primary_result),
             _observed_provider_call(
-                INVESTING_FLASH_SOURCE,
+                primary_provider,
+                primary_result,
+            ),
+            _observed_provider_call(
+                fallback_provider,
                 fallback_result,
             ),
         ],

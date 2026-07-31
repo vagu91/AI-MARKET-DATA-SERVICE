@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import uuid
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -485,6 +486,12 @@ async def market_context_mnq(
                 runtime_kwargs["accounting_collector"] = (
                     accounting_collector
                 )
+            if "include_candidate_discovery" in inspect.signature(
+                deterministic_runtime.enrich_market_context
+            ).parameters:
+                runtime_kwargs["include_candidate_discovery"] = (
+                    audience != "senior_analyst_v1"
+                )
             contract = await deterministic_runtime.enrich_market_context(
                 contract,
                 **runtime_kwargs,
@@ -795,9 +802,16 @@ async def market_context_mnq(
     contract["risk_sentiment"] = risk_sentiment
     contract["social_sentiment"] = await SocialSentimentService(enrichment_orchestrator.settings).snapshot(refresh=refresh)
     contract = harden_market_context(contract, settings=enrichment_orchestrator.settings)
+    runtime_kwargs = {"refresh": refresh}
+    if "include_candidate_discovery" in inspect.signature(
+        deterministic_runtime.enrich_market_context
+    ).parameters:
+        runtime_kwargs["include_candidate_discovery"] = (
+            audience != "senior_analyst_v1"
+        )
     contract = await deterministic_runtime.enrich_market_context(
         contract,
-        refresh=refresh,
+        **runtime_kwargs,
     )
     return _materialize_market_context(
         contract,

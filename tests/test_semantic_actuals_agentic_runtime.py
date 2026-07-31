@@ -112,7 +112,15 @@ def derive(metric_id: str, values: list[str], period: str, **series) -> dict:
     spec = OFFICIAL_METRICS[metric_id]
     return derive_official_actual(
         spec,
-        {"observations": observations(values), **series},
+        {
+            "series_id": spec.source_series_id,
+            "source": spec.provider_id,
+            "source_url": spec.canonical_url,
+            "frequency": spec.frequency,
+            "seasonal_adjustment": spec.seasonal_adjustment,
+            "observations": observations(values),
+            **series,
+        },
         expected_period=period,
         retrieved_at="2026-07-22T10:00:00+00:00",
         release_timestamp="2026-07-22T08:30:00+00:00",
@@ -149,9 +157,12 @@ def observe_sources(repository: ResearchRuntimeRepository, run: dict, urls: list
 def test_cpi_mom_is_derived_from_two_index_levels() -> None:
     actual = derive("headline_cpi_mom", ["300.000", "301.500"], "2025-08")
     assert actual["value"] == "0.5"
+    assert actual["actual"] == actual["value"]
     assert actual["source_series_id"] == "CUSR0000SA0"
     assert actual["transformation"] == "pct_change_mom" and actual["seasonal_adjustment"] == "SA"
     assert actual["current_level"] == "301.500" and actual["comparison_level"] == "300.000"
+    assert actual["lineage"]["actual"]["metric_id"] == "headline_cpi_mom"
+    assert actual["lineage"]["actual"]["verification_status"] == "VERIFIED"
 
 
 def test_cpi_yoy_uses_thirteen_nsa_observations() -> None:
@@ -173,6 +184,11 @@ def test_gdp_uses_official_annualized_rate_not_chained_dollar_level() -> None:
     actual = derive_official_actual(
         spec,
         {
+            "series_id": spec.source_series_id,
+            "source": spec.provider_id,
+            "source_url": spec.canonical_url,
+            "frequency": spec.frequency,
+            "seasonal_adjustment": spec.seasonal_adjustment,
             "observations": [
                 {"period": "2026Q1", "value": "3.1", "release_vintage": "third-estimate"}
             ]
@@ -197,6 +213,13 @@ def test_period_mismatch_and_insufficient_observations_fail_closed() -> None:
         derive("headline_cpi_mom", ["300", "301"], "2026-01")
     with pytest.raises(ValueError, match="insufficient_official_observations"):
         derive("headline_cpi_yoy", ["300", "301"], "2025-08")
+    with pytest.raises(ValueError, match="source_series_mismatch"):
+        derive(
+            "headline_cpi_mom",
+            ["300", "301"],
+            "2025-08",
+            series_id="CUUR0000SA0",
+        )
 
 
 def test_latest_release_vintage_is_used_and_revision_is_preserved() -> None:
@@ -204,6 +227,11 @@ def test_latest_release_vintage_is_used_and_revision_is_preserved() -> None:
     actual = derive_official_actual(
         spec,
         {
+            "series_id": spec.source_series_id,
+            "source": spec.provider_id,
+            "source_url": spec.canonical_url,
+            "frequency": spec.frequency,
+            "seasonal_adjustment": spec.seasonal_adjustment,
             "observations": [
                 {"period": "2026-05", "value": "300", "release_vintage": "initial"},
                 {"period": "2026-06", "value": "301.2", "release_vintage": "initial"},
@@ -266,6 +294,7 @@ def bls_result(retrieved_at: datetime) -> ProviderResult:
         ),
         data={
             "CUSR0000SA0": {
+                "series_id": "CUSR0000SA0",
                 "units": "index",
                 "frequency": "monthly",
                 "seasonal_adjustment": "SA",

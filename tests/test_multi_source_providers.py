@@ -18,6 +18,7 @@ from app.services.acquisition_status_service import _diagnostic_rejection_reason
 from app.services.economic_value_parser import parse_economic_value
 from app.services.multi_source_runtime_service import MultiSourceRuntimeService, _exclusion_reasons, build_multi_source_context_blocks
 from app.services.positioning_runtime_service import PositioningRuntimeService
+from app.services.social_sentiment_service import SocialSentimentService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -151,14 +152,8 @@ def test_aaii_parser_reads_public_results_dom_and_historical_averages():
     assert parsed["historical_averages"]["bullish"] == 37.5
 
 
-async def test_aaii_incapsula_http_uses_browser_fallback_and_closes(monkeypatch, tmp_path):
+async def test_aaii_runtime_has_no_browser_fallback_opt_in(monkeypatch, tmp_path):
     blocked_html = "<html>Request unsuccessful. Incapsula incident id 123</html>"
-    browser_html = """
-    <section class="results">
-      <div class="weekending"><span>July 8, 2026</span><div>Bullish 36.3%</div><div>Neutral 26.5%</div><div>Bearish 37.2%</div></div>
-    </section>
-    """
-
     class FakeResponse:
         status_code = 200
         text = blocked_html
@@ -176,29 +171,20 @@ async def test_aaii_incapsula_http_uses_browser_fallback_and_closes(monkeypatch,
         async def get(self, *args, **kwargs):
             return FakeResponse()
 
-    async def fake_browser(url, *, timeout_seconds):
-        return browser_html, {
-            "browser_attempted": True,
-            "browser_success": True,
-            "browser_error": None,
-            "browser_closed": True,
-            "selector_found": True,
-        }
-
     monkeypatch.setattr(aaii_module.httpx, "AsyncClient", lambda timeout: FakeClient())
-    monkeypatch.setattr(aaii_module, "fetch_aaii_with_browser", fake_browser)
 
     result = await AaiiSentimentProvider(settings(tmp_path)).fetch()
 
     assert is_aaii_blocked_html(blocked_html) is True
-    assert result["status"] == "found"
+    assert result["status"] == "access_restricted"
     assert result["diagnostics"]["http_blocked"] is True
-    assert result["diagnostics"]["browser_attempted"] is True
-    assert result["diagnostics"]["browser_success"] is True
-    assert result["diagnostics"]["browser_closed"] is True
+    assert result["diagnostics"]["browser_attempted"] is False
 
 
-async def test_aaii_browser_fallback_failure_is_motivated(monkeypatch, tmp_path):
+async def test_aaii_audit_mode_never_uses_uncaptured_browser_fallback(
+    monkeypatch,
+    tmp_path,
+):
     blocked_html = "<html>Request unsuccessful. Incapsula incident id 123</html>"
 
     class FakeResponse:
@@ -218,30 +204,26 @@ async def test_aaii_browser_fallback_failure_is_motivated(monkeypatch, tmp_path)
         async def get(self, *args, **kwargs):
             return FakeResponse()
 
-    async def fake_browser(url, *, timeout_seconds):
-        return "<html><body>challenge still active</body></html>", {
-            "browser_attempted": True,
-            "browser_success": True,
-            "browser_error": None,
-            "browser_closed": True,
-            "selector_found": False,
-        }
-
-    monkeypatch.setattr(aaii_module.httpx, "AsyncClient", lambda timeout: FakeClient())
-    monkeypatch.setattr(aaii_module, "fetch_aaii_with_browser", fake_browser)
+    monkeypatch.setattr(
+        aaii_module.httpx,
+        "AsyncClient",
+        lambda timeout: FakeClient(),
+    )
 
     result = await AaiiSentimentProvider(settings(tmp_path)).fetch()
 
     assert result["status"] == "access_restricted"
-    assert result["diagnostics"]["browser_attempted"] is True
-    assert result["diagnostics"]["browser_closed"] is True
-    assert result["diagnostics"]["browser_error"] == "browser_page_loaded_but_sentiment_selectors_not_found"
+    assert result["diagnostics"]["browser_attempted"] is False
+    assert (
+        result["diagnostics"]["browser_error"]
+        == "browser_fallback_disabled_uncertified_runtime_leaf"
+    )
 
 
 async def test_aaii_refresh_false_does_not_attempt_network_or_browser(tmp_path):
     service = PositioningRuntimeService(settings(tmp_path))
 
-    async def fail_fetch():
+    async def fail_fetch(**kwargs):
         raise AssertionError("network should not be called")
 
     service.aaii_provider.fetch = fail_fetch
@@ -249,6 +231,138 @@ async def test_aaii_refresh_false_does_not_attempt_network_or_browser(tmp_path):
 
     assert result["status"] == "not_found"
     assert result["attempted_sources"] == []
+
+
+async def test_aaii_runtime_provider_api_has_no_uncertified_browser_opt_in(
+    tmp_path,
+):
+    service = PositioningRuntimeService(settings(tmp_path))
+    observed = {}
+
+    async def controlled_fetch(**kwargs):
+        observed.update(kwargs)
+        return {
+            "status": "not_found",
+            "source_url": None,
+            "warnings": ["direct_http_no_data"],
+            "errors": [],
+        }
+
+    service.aaii_provider.fetch = controlled_fetch
+    service._record = lambda *args, **kwargs: None
+    service._save = lambda *args, **kwargs: None
+
+    await service.aaii(refresh="force")
+
+    assert observed == {}
+
+
+async def test_aaii_cache_rejects_historical_browser_origin(tmp_path):
+    service = PositioningRuntimeService(settings(tmp_path))
+    service.facts.upsert_fact(
+        {
+            "fact_key": "sentiment:aaii",
+            "fact_type": "aaii_sentiment",
+            "country": "US",
+            "category": "aaii_sentiment",
+            "event_name": "AAII",
+            "source": "AAII_BROWSER",
+            "source_url": "https://www.aaii.com/sentimentsurvey",
+            "provider_type": "OFFICIAL_WEB",
+            "reliability": 0.82,
+            "confidence": 0.82,
+            "retrieved_at": "2026-07-31T08:00:00Z",
+            "valid_until": "2099-08-07T08:00:00Z",
+            "next_refresh_at": "2099-08-07T08:00:00Z",
+            "status": "active",
+            "raw_payload_json": {
+                "status": "found",
+                "source": "AAII",
+                "source_url": "https://www.aaii.com/sentimentsurvey",
+                "bullish_pct": 99.0,
+                "diagnostics": {
+                    "browser_attempted": True,
+                    "browser_success": True,
+                },
+            },
+        }
+    )
+    calls = 0
+
+    async def direct_fetch():
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "not_found",
+            "source": "AAII",
+            "source_url": "https://www.aaii.com/sentimentsurvey",
+            "warnings": ["direct_http_no_data"],
+            "errors": [],
+        }
+
+    service.aaii_provider.fetch = direct_fetch
+    service._record = lambda *args, **kwargs: None
+    service._save = lambda *args, **kwargs: None
+
+    result = await service.aaii(refresh="auto")
+
+    assert calls == 1
+    assert result["cache_status"] == "miss"
+    assert result.get("bullish_pct") is None
+    assert result["cache_rejection_reason"] == "AAII_CACHE_PROVENANCE_NOT_CERTIFIED"
+
+
+async def test_social_cache_rejects_historical_rss_origin(tmp_path):
+    cfg = settings(tmp_path)
+    service = SocialSentimentService(cfg)
+    service.facts.upsert_fact(
+        {
+            "fact_key": "social_sentiment:hacker_news",
+            "fact_type": "social_sentiment",
+            "country": "US",
+            "category": "social_sentiment",
+            "event_name": "Hacker News social sentiment",
+            "source": "Hacker News Algolia public API",
+            "source_url": cfg.hacker_news_rss_url,
+            "provider_type": "PUBLIC_HTTP",
+            "reliability": 0.45,
+            "confidence": 0.45,
+            "retrieved_at": "2026-07-31T08:00:00Z",
+            "valid_until": "2099-08-01T08:00:00Z",
+            "next_refresh_at": "2099-08-01T08:00:00Z",
+            "status": "active",
+            "raw_payload_json": {
+                "status": "found",
+                "provider": "hacker_news_rss_social_sentiment",
+                "source": "Hacker News Algolia public API",
+                "source_url": cfg.hacker_news_rss_url,
+                "social_market_sentiment": {"sentiment_score": 1.0},
+            },
+        }
+    )
+    calls = 0
+
+    async def algolia_fetch():
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "not_found",
+            "provider": "hacker_news_social_sentiment",
+            "source": "Hacker News Algolia public API",
+            "source_url": cfg.hacker_news_algolia_url,
+            "mention_count": 0,
+            "warnings": ["algolia_no_data"],
+            "errors": [],
+        }
+
+    service.provider.fetch = algolia_fetch
+    service.observations.record = lambda **kwargs: None
+
+    result = await service.snapshot(refresh="auto")
+
+    assert calls == 1
+    assert result["cache_used"] is False
+    assert result["cache_rejection_reason"] == "SOCIAL_CACHE_PROVENANCE_NOT_CERTIFIED"
 
 
 def test_macromicro_parser_extracts_valid_crosscheck():

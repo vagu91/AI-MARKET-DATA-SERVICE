@@ -91,6 +91,18 @@ class BeaProvider(BaseProvider):
     reliability = 0.94
     cache_key = "provider:bea:macro_latest:v2"
 
+    @classmethod
+    def runtime_default_series_ids(cls) -> tuple[str, ...]:
+        from app.services.provider_capability_registry import (
+            provider_default_runtime_metric_ids,
+        )
+
+        return provider_default_runtime_metric_ids("BEA")
+
+    @classmethod
+    def runtime_supported_series_ids(cls) -> tuple[str, ...]:
+        return tuple(str(spec["series_id"]) for spec in BEA_SERIES)
+
     def __init__(self, cache: ProviderCacheProtocol, settings: Settings) -> None:
         super().__init__(cache)
         self.settings = settings
@@ -108,13 +120,24 @@ class BeaProvider(BaseProvider):
         series: dict[str, dict[str, object]] = {}
         errors: list[str] = []
         latest_as_of: datetime | None = None
-        requested = set(series_ids or ())
+        selected = (
+            self.runtime_default_series_ids()
+            if series_ids is None
+            else tuple(series_ids)
+        )
+        requested = set(selected)
+        supported = set(self.runtime_supported_series_ids())
+        unsupported = sorted(requested - supported)
+        if unsupported:
+            raise ProviderError(
+                "BEA series not implemented by runtime adapter: "
+                + ",".join(unsupported)
+            )
         specs = sorted(
             [
                 spec
                 for spec in BEA_SERIES
-                if not requested
-                or str(spec["series_id"]) in requested
+                if str(spec["series_id"]) in requested
             ],
             key=itemgetter("table", "frequency"),
         )

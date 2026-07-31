@@ -9,11 +9,13 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.core.senior_analyst_policy import (
+    MNQ_EARNINGS_SELECTION_POLICY,
+    MNQ_PRIMARY_SYMBOLS,
+)
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.models.common import Freshness, Impact, ProviderResult, ProviderType
-from app.models.nasdaq import EarningsTiming
 from app.providers.base import BaseProvider, metadata
-from app.providers.mega_cap_snapshot_provider import MEGA_CAP_TICKERS
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,10 @@ class FmpEarningsCalendarProvider(BaseProvider):
         }
         request_params = {
             "from": retrieved_at.date().isoformat(),
-            "to": (retrieved_at.date() + timedelta(days=14)).isoformat(),
+            "to": (
+                retrieved_at.date()
+                + timedelta(days=MNQ_EARNINGS_SELECTION_POLICY.lookahead_days)
+            ).isoformat(),
         }
         try:
             async with httpx.AsyncClient(timeout=self.settings.timeout_earnings_seconds) as client:
@@ -67,16 +72,41 @@ class FmpEarningsCalendarProvider(BaseProvider):
         if not isinstance(payload, list):
             return self._result("parse_failed", "fmp_payload_not_list", retrieved_at, duration_ms=_elapsed(started), http_status=200, error=True)
 
-        events, rejected = normalize_fmp_earnings(payload, retrieved_at=retrieved_at, days=14)
+        events, rejected = normalize_fmp_earnings(
+            payload,
+            retrieved_at=retrieved_at,
+            days=MNQ_EARNINGS_SELECTION_POLICY.lookahead_days,
+            ttl_hours=max(int(self.settings.earnings_ttl_hours), 1),
+        )
+        excluded_count = max(len(payload) - len(events), 0)
         logger.info(
             "fmp_earnings_fetched",
-            extra={"provider": self.source, "endpoint": "/stable/earnings-calendar", "http_status": 200, "record_count": len(payload), "filtered_count": len(events), "rejected_count": rejected, "duration_ms": _elapsed(started)},
+            extra={
+                "provider": self.source,
+                "endpoint": "/stable/earnings-calendar",
+                "http_status": 200,
+                "record_count": len(payload),
+                "filtered_count": len(events),
+                "rejected_count": excluded_count,
+                "policy_filtered_or_invalid_count": rejected,
+                "deduplicated_count": max(
+                    excluded_count - rejected,
+                    0,
+                ),
+                "duration_ms": _elapsed(started),
+            },
         )
         return ProviderResult(
             metadata=metadata(self.source, self.provider_type, self.reliability, freshness=Freshness.RECENT),
             data={
                 "status": "found" if events else "not_found",
                 "events": events,
+                "selection_counts": {
+                    "total_available": len(payload),
+                    "relevant_count": len(events),
+                    "delivered_count": len(events),
+                    "excluded_count": excluded_count,
+                },
                 "data_quality": {
                     "errors": [],
                     "warnings": [] if events else ["fmp_no_relevant_earnings_in_14d"],
@@ -90,7 +120,13 @@ class FmpEarningsCalendarProvider(BaseProvider):
                     "cache_used": False,
                     "fetched_count": len(payload),
                     "validated_count": len(events),
-                    "rejected_count": rejected,
+                    "rejected_count": excluded_count,
+                    "policy_filtered_or_invalid_count": rejected,
+                    "deduplicated_count": max(
+                        excluded_count - rejected,
+                        0,
+                    ),
+                    "excluded_count": excluded_count,
                     "http_status": 200,
                     "provider_status": "found" if events else "not_found",
                     "duration_ms": _elapsed(started),
@@ -124,6 +160,12 @@ class FmpEarningsCalendarProvider(BaseProvider):
             data={
                 "status": status,
                 "events": [],
+                "selection_counts": {
+                    "total_available": 0,
+                    "relevant_count": 0,
+                    "delivered_count": 0,
+                    "excluded_count": 0,
+                },
                 "data_quality": {
                     "errors": [reason] if error else [],
                     "warnings": [] if error else [reason],
@@ -144,10 +186,19 @@ class FmpEarningsCalendarProvider(BaseProvider):
         )
 
 
-def normalize_fmp_earnings(rows: list[Any], *, retrieved_at: datetime, days: int) -> tuple[list[dict[str, Any]], int]:
+def normalize_fmp_earnings(
+    rows: list[Any],
+    *,
+    retrieved_at: datetime,
+    days: int,
+    ttl_hours: int = 24,
+) -> tuple[list[dict[str, Any]], int]:
     start = retrieved_at.date()
     end = start + timedelta(days=days)
-    watchlist = set(MEGA_CAP_TICKERS)
+    content_valid_until = retrieved_at + timedelta(
+        hours=max(int(ttl_hours), 1)
+    )
+    watchlist = set(MNQ_PRIMARY_SYMBOLS)
     selected: dict[tuple[str, str], dict[str, Any]] = {}
     rejected = 0
     for raw in rows:
@@ -163,30 +214,75 @@ def normalize_fmp_earnings(rows: list[Any], *, retrieved_at: datetime, days: int
             "symbol": symbol,
             "company": raw.get("name") or raw.get("company"),
             "date": event_date.isoformat(),
-            "timing": EarningsTiming.UNKNOWN.value,
+            "event_date": event_date.isoformat(),
+            "event_at": None,
+            "temporal_precision": (
+                MNQ_EARNINGS_SELECTION_POLICY.date_only_temporal_precision
+            ),
+            "timing": MNQ_EARNINGS_SELECTION_POLICY.date_only_timing,
             "eps_estimate": _number(raw.get("epsEstimated")),
             "eps_actual": _number(raw.get("epsActual")),
             "revenue_estimate": _number(raw.get("revenueEstimated")),
             "revenue_actual": _number(raw.get("revenueActual")),
             "provider_last_updated": raw.get("lastUpdated"),
             "retrieved_at_utc": retrieved_at.isoformat().replace("+00:00", "Z"),
+            "data_as_of": retrieved_at.isoformat().replace("+00:00", "Z"),
+            "content_valid_until": (
+                content_valid_until.isoformat().replace("+00:00", "Z")
+            ),
+            "refresh_due_at": (
+                content_valid_until.isoformat().replace("+00:00", "Z")
+            ),
             "source": "Financial Modeling Prep Earnings Calendar",
+            "publisher": "Financial Modeling Prep",
+            "distributor": "Financial Modeling Prep",
+            "acquisition_provider": "FMP_EARNINGS_CALENDAR",
             "source_url": "https://financialmodelingprep.com/stable/earnings-calendar",
             "event_risk_level": Impact.HIGH.value if symbol in {"NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "GOOG", "TSLA"} else Impact.MEDIUM.value,
             "reliability": 0.82,
-            "lineage": {
+            "field_lineage": {
                 field: {"source": "Financial Modeling Prep Earnings Calendar", "source_field": source_field}
                 for field, source_field in {
-                    "date": "date",
+                    "event_date": "date",
+                    "timing": "date",
                     "eps_estimate": "epsEstimated",
                     "eps_actual": "epsActual",
                     "revenue_estimate": "revenueEstimated",
                     "revenue_actual": "revenueActual",
                 }.items()
             },
+            "lineage": [
+                {
+                    "field": field,
+                    "source": "Financial Modeling Prep Earnings Calendar",
+                    "source_field": source_field,
+                    "publisher": "Financial Modeling Prep",
+                    "distributor": "Financial Modeling Prep",
+                    "acquisition_provider": "FMP_EARNINGS_CALENDAR",
+                    "source_url": (
+                        "https://financialmodelingprep.com/stable/"
+                        "earnings-calendar"
+                    ),
+                }
+                for field, source_field in {
+                    "event_date": "date",
+                    "timing": "date",
+                    "eps_estimate": "epsEstimated",
+                    "eps_actual": "epsActual",
+                    "revenue_estimate": "revenueEstimated",
+                    "revenue_actual": "revenueActual",
+                }.items()
+            ],
         }
         selected[(symbol, event["date"])] = event
-    return sorted(selected.values(), key=lambda item: (item["date"], item["symbol"])), rejected
+    ordered = sorted(
+        selected.values(),
+        key=lambda item: tuple(
+            str(item.get(field) or "")
+            for field in MNQ_EARNINGS_SELECTION_POLICY.sort_fields
+        ),
+    )
+    return ordered, rejected
 
 
 def _http_status(code: int) -> str:

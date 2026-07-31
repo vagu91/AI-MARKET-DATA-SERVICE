@@ -9,9 +9,11 @@ from uuid import uuid4
 from app.core.config import Settings
 from app.models.common import ProviderType
 from app.providers.parametric_cache import ParametricProviderCache
+import app.services.provider_capability_registry as provider_registry
 from app.services.data_freshness_service import (
     CanonicalFreshnessResult,
     DataFreshnessService,
+    parse_datetime,
 )
 from app.services.deterministic_market_context_service import (
     compute_cross_asset_context,
@@ -25,11 +27,93 @@ from app.services.request_provider_accounting import (
 from app.services.market_fact_repository import MarketFactRepository
 
 
-DETERMINISTIC_FACT_TYPES = {
-    "market_internals": "deterministic_market_internals",
-    "options_positioning": "deterministic_options_positioning",
-}
-DETERMINISTIC_MAX_AGE = timedelta(hours=2)
+def _deterministic_dataset_specs() -> dict[str, dict[str, Any]]:
+    specs: dict[str, dict[str, Any]] = {}
+    dataset_ids = tuple(
+        policy.dataset_id
+        for policy in provider_registry.DATASET_SOURCE_POLICIES
+        if policy.canonical_repository
+        == "MARKET_FACT_REPOSITORY"
+        and policy.dataset_id
+        in (
+            provider_registry
+            .MARKET_FACT_REPOSITORY_DATASET_QUERIES
+        )
+        and (
+            any(
+                fact_type.startswith("deterministic_")
+                for fact_type in (
+                    provider_registry
+                    .MARKET_FACT_REPOSITORY_DATASET_QUERIES[
+                        policy.dataset_id
+                    ]
+                    .fact_types
+                )
+            )
+            or any(
+                capability.dataset_id == policy.dataset_id
+                and capability.transformation.startswith(
+                    "deterministic_"
+                )
+                for capability in provider_registry.provider_by_id(
+                    policy.primary_provider
+                ).capabilities
+            )
+        )
+    )
+    if not dataset_ids:
+        raise RuntimeError(
+            "DETERMINISTIC_RUNTIME_DATASETS_NOT_REGISTERED"
+        )
+    for dataset_id in dataset_ids:
+        policy = provider_registry.dataset_policy_by_id(
+            dataset_id
+        )
+        query = (
+            provider_registry
+            .MARKET_FACT_REPOSITORY_DATASET_QUERIES
+            .get(dataset_id)
+        )
+        if (
+            query is None
+            or len(query.fact_types) != 1
+            or query.series_ids
+            or policy.canonical_repository
+            != "MARKET_FACT_REPOSITORY"
+            or policy.fallback_providers
+        ):
+            raise RuntimeError(
+                "DETERMINISTIC_RUNTIME_POLICY_INVALID:"
+                f"{dataset_id}"
+            )
+        registration = provider_registry.provider_by_id(
+            policy.primary_provider
+        )
+        if not any(
+            capability.dataset_id == dataset_id
+            for capability in registration.capabilities
+        ):
+            raise RuntimeError(
+                "DETERMINISTIC_RUNTIME_CAPABILITY_MISSING:"
+                f"{dataset_id}:{policy.primary_provider}"
+            )
+        specs[dataset_id] = {
+            "fact_type": query.fact_types[0],
+            "max_age": timedelta(
+                seconds=policy.sla_seconds
+            ),
+            "provider_id": policy.primary_provider,
+            "enable_setting": registration.enable_setting,
+        }
+    provider_ids = {
+        str(spec["provider_id"])
+        for spec in specs.values()
+    }
+    if len(provider_ids) != 1:
+        raise RuntimeError(
+            "DETERMINISTIC_RUNTIME_PROVIDER_DIVERGENCE"
+        )
+    return specs
 
 
 class DeterministicProviderRuntimeService:
@@ -57,6 +141,7 @@ class DeterministicProviderRuntimeService:
         *,
         refresh: str,
         trigger_type: str | None = None,
+        include_candidate_discovery: bool = True,
         accounting_collector: (
             RequestProviderAccountingCollector | None
         ) = None,
@@ -72,11 +157,32 @@ class DeterministicProviderRuntimeService:
             "ai_invocations": 0,
             "warnings": [],
         }
+        dataset_specs = _deterministic_dataset_specs()
+        provider_id = str(
+            dataset_specs["market_internals"]["provider_id"]
+        )
+        provider_registration = provider_registry.provider_by_id(
+            provider_id
+        )
+        provider_enabled = bool(
+            provider_registration.enable_setting
+            and getattr(
+                self.settings,
+                provider_registration.enable_setting,
+                False,
+            )
+        )
+        allow_supplemental_provider_calls = (
+            accounting_collector is None
+        )
 
         official = await self._official_context(
             output,
             telemetry,
             force=refresh == "force",
+            allow_provider_calls=(
+                allow_supplemental_provider_calls
+            ),
         )
         fred_series = official["fred"]
         output["rates_context"] = _rates_context(fred_series, self.clock())
@@ -85,13 +191,16 @@ class DeterministicProviderRuntimeService:
             official=official,
             telemetry=telemetry,
             force=refresh == "force",
+            allow_provider_calls=(
+                allow_supplemental_provider_calls
+            ),
         )
 
         database_rows: dict[str, dict[str, Any] | None] = {}
         database_lookups: dict[str, CanonicalFreshnessResult] = {}
-        for dataset_id, fact_type in DETERMINISTIC_FACT_TYPES.items():
+        for dataset_id, spec in dataset_specs.items():
             rows = self.facts.get_valid_facts_by_type(
-                fact_type,
+                str(spec["fact_type"]),
                 allow_stale=True,
             )
             row = rows[0] if rows else None
@@ -99,22 +208,31 @@ class DeterministicProviderRuntimeService:
             database_lookups[dataset_id] = (
                 self.freshness.evaluate_canonical(
                     row,
-                    max_age=DETERMINISTIC_MAX_AGE,
+                    max_age=spec["max_age"],
                     data_reference_mode="point_in_time",
                 )
             )
 
-        tradier = self.providers.get("tradier")
+        tradier = self.providers.get(provider_id.lower())
         tradier_correlation_id = (
             accounting_collector.correlation_id
             if accounting_collector is not None
-            else f"deterministic-tradier-{uuid4()}"
+            else (
+                f"deterministic-{provider_id.lower()}-"
+                f"{uuid4()}"
+            )
         )
-        tradier_scope_token = _begin_tradier_request_scope(
-            tradier,
-            correlation_id=tradier_correlation_id,
-        )
-        tradier_details: dict[str, dict[str, Any]] = {}
+        tradier_details_by_dataset: dict[
+            str,
+            dict[str, dict[str, Any]],
+        ] = {
+            "market_internals": {},
+            "options_positioning": {},
+        }
+        tradier_invoked_by_dataset = {
+            "market_internals": False,
+            "options_positioning": False,
+        }
         holdings = _holdings(output)
         constituent_symbols = [str(item.get("symbol") or "") for item in holdings]
         cross_symbols = _csv(self.settings.tradier_cross_asset_symbols)
@@ -126,56 +244,158 @@ class DeterministicProviderRuntimeService:
             not decision.usable
             for decision in database_lookups.values()
         )
-        try:
-            if (
-                providers_due
-                and tradier is not None
-                and self.settings.tradier_enabled
-                and self.settings.tradier_market_data_enabled
-            ):
-                try:
-                    quotes = await tradier.quotes(
-                        quote_symbols,
+        provider_ready = bool(
+            tradier is not None
+            and provider_enabled
+            and self.settings.tradier_market_data_enabled
+        )
+        if accounting_collector is None:
+            tradier_scope_token = _begin_tradier_request_scope(
+                tradier,
+                correlation_id=tradier_correlation_id,
+            )
+            try:
+                if providers_due and provider_ready:
+                    try:
+                        quotes = await tradier.quotes(
+                            quote_symbols,
+                            force=refresh == "force",
+                        )
+                    except Exception as exc:
+                        telemetry["warnings"].append(
+                            "tradier_quotes_partial:"
+                            f"{type(exc).__name__}"
+                        )
+                output["options_positioning"] = (
+                    _canonical_section(
+                        database_rows["options_positioning"]
+                    )
+                    if database_lookups["options_positioning"].usable
+                    else await self._options(
+                        tradier,
+                        quotes,
+                        telemetry,
                         force=refresh == "force",
                     )
-                except Exception as exc:
-                    telemetry["warnings"].append(
-                        "tradier_quotes_partial:"
-                        f"{type(exc).__name__}"
-                    )
-
-            output["options_positioning"] = (
-                _canonical_section(
-                    database_rows["options_positioning"]
                 )
-                if database_lookups["options_positioning"].usable
-                else await self._options(
+            finally:
+                shared_details = _end_tradier_request_scope(
                     tradier,
+                    tradier_scope_token,
+                )
+            tradier_details_by_dataset = {
+                "market_internals": shared_details,
+                "options_positioning": shared_details,
+            }
+            tradier_details = shared_details
+            output["market_internals"] = (
+                _canonical_section(database_rows["market_internals"])
+                if database_lookups["market_internals"].usable
+                else self._internals(
+                    holdings,
                     quotes,
                     telemetry,
-                    force=refresh == "force",
                 )
             )
-        finally:
-            tradier_details = _end_tradier_request_scope(
-                tradier,
-                tradier_scope_token,
-            )
+        else:
+            market_quotes: list[dict[str, Any]] = []
+            if database_lookups["market_internals"].usable:
+                output["market_internals"] = _canonical_section(
+                    database_rows["market_internals"]
+                )
+            else:
+                market_scope_token = _begin_tradier_request_scope(
+                    tradier,
+                    correlation_id=tradier_correlation_id,
+                )
+                try:
+                    if (
+                        provider_ready
+                        and self.settings.deterministic_market_internals_enabled
+                        and constituent_symbols
+                    ):
+                        try:
+                            tradier_invoked_by_dataset[
+                                "market_internals"
+                            ] = True
+                            market_quotes = await tradier.quotes(
+                                constituent_symbols,
+                                force=refresh == "force",
+                            )
+                        except Exception as exc:
+                            telemetry["warnings"].append(
+                                "tradier_market_internals_quotes_partial:"
+                                f"{type(exc).__name__}"
+                            )
+                finally:
+                    tradier_details_by_dataset["market_internals"] = (
+                        _end_tradier_request_scope(
+                            tradier,
+                            market_scope_token,
+                        )
+                    )
+                output["market_internals"] = self._internals(
+                    holdings,
+                    market_quotes,
+                    telemetry,
+                )
+                quotes.extend(market_quotes)
+
+            if database_lookups["options_positioning"].usable:
+                output["options_positioning"] = _canonical_section(
+                    database_rows["options_positioning"]
+                )
+            else:
+                option_quotes: list[dict[str, Any]] = []
+                options_scope_token = _begin_tradier_request_scope(
+                    tradier,
+                    correlation_id=tradier_correlation_id,
+                )
+                try:
+                    if (
+                        provider_ready
+                        and self.settings.deterministic_options_positioning_enabled
+                    ):
+                        try:
+                            tradier_invoked_by_dataset[
+                                "options_positioning"
+                            ] = True
+                            option_quotes = await tradier.quotes(
+                                ["QQQ"],
+                                force=refresh == "force",
+                            )
+                        except Exception as exc:
+                            telemetry["warnings"].append(
+                                "tradier_options_quote_partial:"
+                                f"{type(exc).__name__}"
+                            )
+                    output["options_positioning"] = await self._options(
+                        tradier,
+                        option_quotes,
+                        telemetry,
+                        force=refresh == "force",
+                    )
+                finally:
+                    tradier_details_by_dataset["options_positioning"] = (
+                        _end_tradier_request_scope(
+                            tradier,
+                            options_scope_token,
+                        )
+                    )
+                quotes.extend(option_quotes)
+            tradier_details = {
+                f"{dataset_id}:{key}": value
+                for dataset_id, details in (
+                    tradier_details_by_dataset.items()
+                )
+                for key, value in details.items()
+            }
         _merge_tradier_telemetry(
             telemetry,
             tradier_details,
             correlation_id=tradier_correlation_id,
         )
-        output["market_internals"] = (
-            _canonical_section(database_rows["market_internals"])
-            if database_lookups["market_internals"].usable
-            else self._internals(
-                holdings,
-                quotes,
-                telemetry,
-            )
-        )
-        for dataset_id in DETERMINISTIC_FACT_TYPES:
+        for dataset_id in dataset_specs:
             if (
                 not database_lookups[dataset_id].usable
                 and str(
@@ -186,25 +406,51 @@ class DeterministicProviderRuntimeService:
                 self._persist_deterministic_section(
                     dataset_id,
                     output[dataset_id],
+                    spec=dataset_specs[dataset_id],
                 )
         self._record_tradier_accounting(
             accounting_collector,
             tradier=tradier,
-            tradier_details=tradier_details,
+            tradier_details_by_dataset=(
+                tradier_details_by_dataset
+            ),
+            tradier_invoked_by_dataset=(
+                tradier_invoked_by_dataset
+            ),
             correlation_id=tradier_correlation_id,
             market_internals=output["market_internals"],
             options_positioning=output["options_positioning"],
             database_lookups=database_lookups,
+            provider_id=provider_id,
+            provider_enabled=provider_enabled,
         )
         output["cross_asset_context"] = self._cross_asset(
             quotes,
             fred_series,
             telemetry,
         )
-        output["earnings_intelligence"] = await self._earnings(
-            output,
-            telemetry,
-            force=refresh == "force",
+        discovery_allowed = bool(
+            include_candidate_discovery
+            and accounting_collector is None
+        )
+        output["earnings_intelligence"] = (
+            await self._earnings(
+                output,
+                telemetry,
+                force=refresh == "force",
+            )
+            if discovery_allowed
+            else _no_data(
+                "FINNHUB",
+                "TRIGGER",
+                (
+                    "candidate_discovery_not_delivered_for_audience"
+                    if not include_candidate_discovery
+                    else (
+                        "candidate_discovery_has_no_request_accounting_policy"
+                    )
+                ),
+            )
         )
         output["current_company_news"] = _verified_current_news(output)
 
@@ -265,6 +511,7 @@ class DeterministicProviderRuntimeService:
         *,
         refresh: str,
         trigger_type: str | None = None,
+        include_candidate_discovery: bool = True,
         accounting_collector: (
             RequestProviderAccountingCollector | None
         ) = None,
@@ -274,6 +521,9 @@ class DeterministicProviderRuntimeService:
                 contract,
                 refresh=refresh,
                 trigger_type=trigger_type,
+                include_candidate_discovery=(
+                    include_candidate_discovery
+                ),
                 accounting_collector=accounting_collector,
             )
         )
@@ -283,7 +533,11 @@ class DeterministicProviderRuntimeService:
         collector: RequestProviderAccountingCollector | None,
         *,
         tradier: Any,
-        tradier_details: dict[str, dict[str, Any]],
+        tradier_details_by_dataset: dict[
+            str,
+            dict[str, dict[str, Any]],
+        ],
+        tradier_invoked_by_dataset: dict[str, bool],
         correlation_id: str,
         market_internals: dict[str, Any],
         options_positioning: dict[str, Any],
@@ -291,16 +545,28 @@ class DeterministicProviderRuntimeService:
             str,
             CanonicalFreshnessResult,
         ],
+        provider_id: str,
+        provider_enabled: bool,
     ) -> None:
         if collector is None:
             return
-        details = _correlated_tradier_details(
-            tradier_details,
+        market_details = _correlated_tradier_details(
+            tradier_details_by_dataset.get(
+                "market_internals",
+                {},
+            ),
             correlation_id=correlation_id,
         )
-        quote_details = [
+        options_details = _correlated_tradier_details(
+            tradier_details_by_dataset.get(
+                "options_positioning",
+                {},
+            ),
+            correlation_id=correlation_id,
+        )
+        market_quote_details = [
             value
-            for value in details.values()
+            for value in market_details.values()
             if (
                 str(value.get("endpoint_category") or "")
                 == "quotes"
@@ -308,41 +574,55 @@ class DeterministicProviderRuntimeService:
         ]
         option_details = [
             value
-            for value in details.values()
+            for value in options_details.values()
             if (
                 str(value.get("endpoint_category") or "")
-                in {"option_expirations", "option_chain"}
+                in {
+                    "quotes",
+                    "option_expirations",
+                    "option_chain",
+                }
             )
         ]
         self._record_tradier_dataset(
             collector,
             dataset_id="market_internals",
             acquisition_id="tradier_quotes_for_market_internals",
-            endpoint_details=quote_details,
+            endpoint_details=market_quote_details,
             section=market_internals,
             enabled=bool(
                 tradier is not None
-                and self.settings.tradier_enabled
+                and provider_enabled
                 and self.settings.tradier_market_data_enabled
                 and self.settings.deterministic_market_internals_enabled
             ),
             database_lookup=database_lookups["market_internals"],
+            provider_id=provider_id,
+            provider_invoked=tradier_invoked_by_dataset.get(
+                "market_internals",
+                False,
+            ),
         )
         self._record_tradier_dataset(
             collector,
             dataset_id="options_positioning",
             acquisition_id="tradier_option_chain_for_positioning",
-            endpoint_details=[*quote_details, *option_details],
+            endpoint_details=option_details,
             section=options_positioning,
             enabled=bool(
                 tradier is not None
-                and self.settings.tradier_enabled
+                and provider_enabled
                 and self.settings.tradier_market_data_enabled
                 and self.settings.deterministic_options_positioning_enabled
             ),
             database_lookup=database_lookups[
                 "options_positioning"
             ],
+            provider_id=provider_id,
+            provider_invoked=tradier_invoked_by_dataset.get(
+                "options_positioning",
+                False,
+            ),
         )
 
     def _record_tradier_dataset(
@@ -355,6 +635,8 @@ class DeterministicProviderRuntimeService:
         section: dict[str, Any],
         enabled: bool,
         database_lookup: CanonicalFreshnessResult,
+        provider_id: str,
+        provider_invoked: bool,
     ) -> None:
         calls = sum(
             int(item.get("actual_provider_requests") or 0)
@@ -366,7 +648,7 @@ class DeterministicProviderRuntimeService:
         )
         if database_lookup.usable:
             attempt = provider_attempt(
-                "TRADIER",
+                provider_id,
                 called=False,
                 attempts=0,
                 result="NOT_CALLED",
@@ -376,7 +658,7 @@ class DeterministicProviderRuntimeService:
             complete = True
         elif calls:
             attempt = provider_attempt(
-                "TRADIER",
+                provider_id,
                 called=True,
                 attempts=calls,
                 result=str(section.get("status") or "NO_DATA").upper(),
@@ -385,7 +667,7 @@ class DeterministicProviderRuntimeService:
             complete = True
         elif cache_hits:
             attempt = provider_attempt(
-                "TRADIER",
+                provider_id,
                 called=False,
                 attempts=0,
                 result="CACHE_HIT",
@@ -393,13 +675,22 @@ class DeterministicProviderRuntimeService:
                 execution_origin="CACHE_DECISION",
             )
             complete = True
+        elif provider_invoked:
+            attempt = provider_attempt(
+                provider_id,
+                called=True,
+                attempts=1,
+                result="ATTEMPT_EVIDENCE_INCOMPLETE",
+                execution_origin="PROVIDER_CALL",
+            )
+            complete = False
         else:
             warning = next(
                 iter(section.get("warnings") or []),
                 "PROVIDER_DISABLED_OR_PREREQUISITE_MISSING",
             )
             attempt = provider_attempt(
-                "TRADIER",
+                provider_id,
                 called=False,
                 attempts=0,
                 result="NOT_CALLED",
@@ -436,9 +727,9 @@ class DeterministicProviderRuntimeService:
                 else None
             ),
             acquisition_reason_code=(
-                "TRADIER_VALUE_ACQUIRED"
+                f"{provider_id}_VALUE_ACQUIRED"
                 if section.get("status") == "AVAILABLE"
-                else "TRADIER_VALUE_NOT_AVAILABLE"
+                else f"{provider_id}_VALUE_NOT_AVAILABLE"
             ),
             evidence_complete=complete,
         )
@@ -447,10 +738,22 @@ class DeterministicProviderRuntimeService:
         self,
         dataset_id: str,
         section: dict[str, Any],
-    ) -> None:
-        observed_at = self.clock().astimezone(UTC)
+        *,
+        spec: Mapping[str, Any] | None = None,
+    ) -> bool:
+        resolved_spec = (
+            spec
+            or _deterministic_dataset_specs()[dataset_id]
+        )
+        retrieved_at = self.clock().astimezone(UTC)
+        observed_at = parse_datetime(
+            section.get("data_as_of")
+            or section.get("observed_at")
+        )
+        if observed_at is None:
+            return False
         valid_until = (
-            observed_at + DETERMINISTIC_MAX_AGE
+            observed_at + resolved_spec["max_age"]
         ).isoformat()
         payload = {
             **copy.deepcopy(section),
@@ -458,22 +761,33 @@ class DeterministicProviderRuntimeService:
             "content_valid_until": valid_until,
             "refresh_due_at": valid_until,
         }
+        decision = self.freshness.evaluate_canonical(
+            payload,
+            max_age=resolved_spec["max_age"],
+            data_reference_mode="point_in_time",
+            observed_at=retrieved_at,
+        )
+        if not decision.usable:
+            return False
         self.facts.upsert_fact(
             {
                 "fact_key": (
                     f"MNQ:{dataset_id}:"
-                    f"{DETERMINISTIC_FACT_TYPES[dataset_id]}"
+                    f"{resolved_spec['fact_type']}"
                 ),
-                "fact_type": DETERMINISTIC_FACT_TYPES[dataset_id],
+                "fact_type": resolved_spec["fact_type"],
                 "country": "US",
                 "symbol": "MNQ",
                 "category": dataset_id,
                 "event_name": dataset_id,
-                "source": section.get("provider") or "TRADIER",
+                "source": (
+                    section.get("provider")
+                    or resolved_spec["provider_id"]
+                ),
                 "provider_type": "API",
                 "reliability": 0.85,
                 "confidence": 0.85,
-                "retrieved_at": observed_at.isoformat(),
+                "retrieved_at": retrieved_at.isoformat(),
                 "release_at": observed_at.isoformat(),
                 "valid_until": valid_until,
                 "next_refresh_at": valid_until,
@@ -481,6 +795,7 @@ class DeterministicProviderRuntimeService:
                 "raw_payload_json": payload,
             }
         )
+        return True
 
     async def _official_context(
         self,
@@ -488,6 +803,7 @@ class DeterministicProviderRuntimeService:
         telemetry: dict[str, Any],
         *,
         force: bool,
+        allow_provider_calls: bool,
     ) -> dict[str, dict[str, Any]]:
         existing = _macro_series(contract)
         output: dict[str, dict[str, Any]] = {"fred": {}, "bls": {}, "bea": {}}
@@ -500,6 +816,8 @@ class DeterministicProviderRuntimeService:
             if selected:
                 output[provider_name] = selected
                 telemetry["cache_hits"] += 1
+                continue
+            if not allow_provider_calls:
                 continue
             provider = self.providers.get(provider_name)
             if provider is None:
@@ -525,6 +843,7 @@ class DeterministicProviderRuntimeService:
         official: dict[str, dict[str, Any]],
         telemetry: dict[str, Any],
         force: bool,
+        allow_provider_calls: bool,
     ) -> dict[str, Any]:
         items = _released_events(contract)
         for provider_name in ("bls", "bea"):
@@ -550,6 +869,7 @@ class DeterministicProviderRuntimeService:
             contract,
             telemetry,
             force=force,
+            allow_provider_calls=allow_provider_calls,
         )
         items.extend(census_items)
         return _section(
@@ -565,7 +885,10 @@ class DeterministicProviderRuntimeService:
         telemetry: dict[str, Any],
         *,
         force: bool,
+        allow_provider_calls: bool,
     ) -> list[dict[str, Any]]:
+        if not allow_provider_calls:
+            return []
         provider = self.providers.get("census")
         if provider is None or not self.settings.census_enabled:
             return []
@@ -667,6 +990,7 @@ class DeterministicProviderRuntimeService:
                 constituents=holdings,
                 holdings=holdings,
                 quotes=quotes,
+                evaluated_at=self.clock(),
             )
         )
 

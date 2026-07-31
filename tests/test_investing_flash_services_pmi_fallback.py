@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from app.providers.investing_flash_services_pmi import (
     InvestingFlashServicesPmiProvider,
 )
 from app.providers.sp_global_pmi import SERIES_ID
+import app.services.provider_capability_registry as provider_registry
 from app.services.deterministic_actual_resolver import DeterministicActualResolver
 
 
@@ -175,6 +177,7 @@ def _sp_global_result(
     failure: str | None = None,
 ) -> ProviderResult:
     series: dict[str, Any] = {
+        "series_id": SERIES_ID,
         "official_adapter": True,
         "provider_adapter": "SPGLOBAL_OFFICIAL_API",
         "source": "SPGLOBAL",
@@ -188,6 +191,8 @@ def _sp_global_result(
             "https://www.pmi.spglobal.com/Public/Home/PressRelease"
         ),
         "source_domain": "pmi.spglobal.com",
+        "frequency": "monthly",
+        "units": "index_points",
         "seasonal_adjustment": "SA",
         "observations": [
             {"period": "2026-06", "value": "51.2"},
@@ -280,6 +285,139 @@ def _pmi_event() -> dict[str, Any]:
         "forecast": 51.5,
         "previous": 51.2,
     }
+
+
+def _set_flash_services_pmi_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    primary_provider: str,
+    fallback_providers: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(
+        provider_registry,
+        "DATASET_SOURCE_POLICIES",
+        tuple(
+            replace(
+                policy,
+                primary_provider=primary_provider,
+                fallback_providers=fallback_providers,
+            )
+            if policy.dataset_id == "flash_services_pmi"
+            else policy
+            for policy in provider_registry.DATASET_SOURCE_POLICIES
+        ),
+    )
+
+
+def test_central_policy_reverse_order_calls_investing_and_short_circuits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_flash_services_pmi_policy(
+        monkeypatch,
+        primary_provider=SOURCE,
+        fallback_providers=("SPGLOBAL",),
+    )
+    settings = _settings(tmp_path)
+    call_order: list[str] = []
+    resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            "SPGLOBAL": _PostHttpPrimary(None, call_order),
+            SOURCE: _investing_provider(settings, call_order),
+        },
+    )
+
+    result = resolver.resolve_event(
+        event_key="xtb:146945:2026-07-24",
+        event=_pmi_event(),
+        temporal_state={
+            "release_at": "2026-07-24T13:45:00Z"
+        },
+        persist_candidate=False,
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["provider"] == SOURCE
+    assert result["provider_call_count"] == 1
+    assert result["reason_code"] is None
+    assert call_order == [SOURCE]
+    assert [
+        (attempt["provider"], attempt["result"])
+        for attempt in result["provider_attempts"]
+    ] == [(SOURCE, "SUCCESS")]
+    candidate = result["results"][0]
+    assert candidate["provider_accounting"] == {
+        "primary": {
+            "provider": SOURCE,
+            "called": True,
+            "attempts": 1,
+            "result": "SUCCESS",
+            "not_called_reason": None,
+            "execution_origin": "PROVIDER_CALL",
+        },
+        "fallbacks": [],
+        "selected_source": SOURCE,
+        "reason_code": "PRIMARY_SELECTED",
+    }
+
+
+def test_unmapped_provider_in_central_policy_fails_closed_before_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared_order = (
+        SOURCE,
+        "SPGLOBAL",
+        "OFFICIAL_ACTUAL_TRANSFORMATION",
+    )
+    _set_flash_services_pmi_policy(
+        monkeypatch,
+        primary_provider=declared_order[0],
+        fallback_providers=declared_order[1:],
+    )
+    settings = _settings(tmp_path)
+    call_order: list[str] = []
+    resolver = DeterministicActualResolver(
+        settings,
+        providers={
+            "SPGLOBAL": _PostHttpPrimary(None, call_order),
+            SOURCE: _investing_provider(settings, call_order),
+        },
+    )
+
+    result = resolver.resolve_event(
+        event_key="xtb:146945:2026-07-24",
+        event=_pmi_event(),
+        temporal_state={
+            "release_at": "2026-07-24T13:45:00Z"
+        },
+        persist_candidate=False,
+    )
+
+    assert result["status"] == "NO_DATA"
+    assert result["retryable"] is False
+    assert result["error"] == (
+        "flash_services_pmi_runtime_policy_mapping_invalid"
+    )
+    assert result["reason_code"] == result["error"]
+    assert result["provider_call_count"] == 0
+    assert call_order == []
+    assert [
+        (
+            attempt["provider"],
+            attempt["called"],
+            attempt["not_called_reason"],
+        )
+        for attempt in result["provider_attempts"]
+    ] == [
+        (
+            provider_id,
+            False,
+            "RUNTIME_ADAPTER_MAPPING_UNAVAILABLE",
+        )
+        for provider_id in declared_order
+    ]
 
 
 @pytest.mark.parametrize(

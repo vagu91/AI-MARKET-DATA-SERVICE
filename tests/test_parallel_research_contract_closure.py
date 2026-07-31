@@ -20,6 +20,7 @@ from app.services.execution_context import ExecutionContext
 from app.services.parallel_research_coordinator import ParallelResearchCoordinator
 from app.services.research_backend import (
     OpenAIResponsesResearchBackend,
+    ResearchBackendContractError,
     ResearchBackendResult,
     normalize_backend_payload,
 )
@@ -796,8 +797,10 @@ def test_real_pdf_parser_extracts_offline_nasdaq_fixture() -> None:
 def test_cli_and_api_fake_backends_share_contract_without_fallback(tmp_path: Path) -> None:
     raw = {
         "status": "NO_DATA",
+        "plan": {"topics": [], "queries": [], "stop_conditions": []},
         "claims": [],
         "searches": [],
+        "acquisition_requests": [],
         "warnings": ["bounded_no_data"],
     }
     expected = normalize_backend_payload(raw)
@@ -837,3 +840,71 @@ def test_cli_and_api_fake_backends_share_contract_without_fallback(tmp_path: Pat
     assert expected["contract"]["source_verification"] == "server_owned"
     assert result.backend == "openai_api" and cli.backend == "codex_cli"
     assert result.usage != cli.usage
+
+
+def test_openai_backend_enforces_closed_schema_and_explicit_revised_null(
+    tmp_path: Path,
+) -> None:
+    claim = {
+        "topic": "macro_calendar",
+        "field_semantics": "previous_revised",
+        "value": None,
+        "metric_id": "headline_pce_mom",
+        "period": "2026-06",
+        "frequency": "monthly",
+        "unit": "percent",
+        "event_key": "pce:2026-06",
+        "event_at": None,
+        "release_at": None,
+        "issuer": "BEA",
+        "symbol": None,
+        "valid_from": None,
+        "valid_until": None,
+        "published_at": None,
+        "retrieved_at": None,
+        "confidence": 0.0,
+        "topic_status": "NOT_APPLICABLE",
+        "evidence": [],
+        "warnings": [],
+        "reason_code": "NO_OCCURRENCE_SPECIFIC_EVIDENCE",
+    }
+    raw = {
+        "status": "COMPLETED",
+        "plan": {"topics": [], "queries": [], "stop_conditions": []},
+        "searches": [],
+        "acquisition_requests": [],
+        "claims": [claim],
+        "warnings": [],
+    }
+    cfg = settings(tmp_path, research_backend="openai_api")
+
+    def execute(payload: dict[str, Any]) -> ResearchBackendResult:
+        backend = OpenAIResponsesResearchBackend(
+            cfg,
+            request_sender=lambda request: {
+                "id": "resp-schema",
+                "model": request["model"],
+                "output_json": payload,
+                "usage": {"total_tokens": 1},
+            },
+        )
+        return backend.execute_research(
+            job={"job_id": "job", "symbol": "MNQ", "request_payload": {}},
+            run={"run_id": "run"},
+            profile={"profile_id": "NEWS_RESEARCH"},
+            workspace=tmp_path,
+            watchdog_seconds=10,
+            effective_budget={"max_searches": 1},
+        )
+
+    result = execute(raw)
+
+    assert result.payload["claims"][0]["field_semantics"] == (
+        "previous_revised"
+    )
+    assert result.payload["claims"][0]["value"] is None
+    assert result.payload["claims"][0]["reason_code"] == (
+        "NO_OCCURRENCE_SPECIFIC_EVIDENCE"
+    )
+    with pytest.raises(ResearchBackendContractError):
+        execute({**raw, "uncontracted": True})

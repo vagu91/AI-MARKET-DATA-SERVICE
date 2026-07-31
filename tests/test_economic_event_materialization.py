@@ -355,7 +355,7 @@ async def test_force_then_new_service_instance_and_cache_only_route_preserve_all
         force=True,
     )
     assert force_metadata["data_quality"]["ai_research_requests"] == 0
-    assert force_metadata["data_quality"]["ai_events_requested"] == 5
+    assert force_metadata["data_quality"]["ai_events_requested"] == 0
     assert ai.calls == 0
     assert all("ai_enrichment_pending" not in item.enrichment.warnings for item in forced)
 

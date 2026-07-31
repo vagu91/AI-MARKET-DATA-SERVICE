@@ -351,7 +351,11 @@ def test_orchestrator_ai_disabled_and_enabled_paths(tmp_path):
     )
     assert ai.calls == 0
     assert enriched[0].enrichment.forecast is None
-    assert metadata["data_quality"]["ai_research_status"] == "not_required"
+    assert metadata["data_quality"]["ai_research_status"] == "not_authorized"
+    assert (
+        "AI_RUNTIME_CAPABILITY_NOT_CERTIFIED"
+        in metadata["data_quality"]["warnings"]
+    )
 
 
 def test_ai_researcher_output_validation(tmp_path):

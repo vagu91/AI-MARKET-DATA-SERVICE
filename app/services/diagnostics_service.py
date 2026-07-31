@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 import asyncio
 import inspect
+import math
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
@@ -14,8 +15,10 @@ from app.models.macro import MacroLatestResponse
 from app.models.macro import MacroSeries
 from app.models.nasdaq import NasdaqContextResponse
 from app.services.data_freshness_service import (
+    CanonicalFreshnessPolicy,
     CanonicalFreshnessResult,
     DataFreshnessService,
+    evaluate_canonical_freshness,
     parse_datetime,
 )
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
@@ -50,7 +53,12 @@ from app.services.macro_consensus_service import MacroConsensusService, merge_co
 from app.services.news_intelligence_runtime_service import NewsIntelligenceRuntimeService
 from app.services.nasdaq_data_service import NasdaqDataService
 from app.services.positioning_runtime_service import PositioningRuntimeService
-from app.services.multi_source_runtime_service import MultiSourceRuntimeService, apply_multi_source_context
+from app.services.multi_source_runtime_service import (
+    FACT_TYPES as MULTI_SOURCE_FACT_TYPES,
+    MultiSourceRuntimeService,
+    _earnings_runtime_spec,
+    apply_multi_source_context,
+)
 from app.services.fed_expectations_service import FedExpectationsService
 from app.services.force_generation_staging_service import (
     ForceGenerationStaging,
@@ -65,100 +73,248 @@ from app.services.request_provider_accounting import (
     RequestProviderAccountingCollector,
     provider_attempt,
 )
+from app.services import provider_capability_registry
 
 
-MACRO_ACCOUNTING_SERIES: dict[str, tuple[str, ...]] = {
-    "treasury_rates": (
-        "DGS2",
-        "DGS10",
-        "DGS30",
-        "T10Y2Y",
-        "T10Y3M",
-        "NFCI",
-    ),
-    "fed_funds": ("DFF", "FEDFUNDS", "SOFR"),
-    "target_range": ("DFEDTARL", "DFEDTARU"),
-    "cpi": ("CUSR0000SA0", "CUSR0000SA0L1E"),
-    "ppi": ("WPUFD4",),
-    "pce": (
-        "BEA:PCE",
-        "BEA:PCE_PRICE_INDEX",
-        "BEA:CORE_PCE",
-    ),
-    "gdp": ("BEA:GDP", "GDP"),
-    "employment": ("LNS14000000", "UNRATE"),
-    "wages": ("CES0500000003",),
-    "nfp": ("CES0000000001", "PAYEMS"),
-    "jobless_claims": ("ICSA",),
+CALENDAR_FALLBACK_RUNTIME_NAMES = {
+    "INVESTING_ECONOMIC_CALENDAR": "investing_economic_calendar",
+    "XTB": "xtb_economic_calendar",
 }
-NASDAQ_ACCOUNTING_FACT_TYPES: dict[str, tuple[str, ...]] = {
-    "nasdaq_100": ("qqq_holdings", "nasdaq_context"),
-    "mega_cap_quotes": ("mega_cap_snapshot", "mega_cap_breadth"),
-    "earnings": ("earnings_event",),
-}
-MACRO_ACCOUNTING_MAX_AGE = {
-    "treasury_rates": timedelta(days=2),
-    "fed_funds": timedelta(days=2),
-    "target_range": timedelta(days=45),
-    "cpi": timedelta(days=45),
-    "ppi": timedelta(days=45),
-    "pce": timedelta(days=45),
-    "gdp": timedelta(days=120),
-    "employment": timedelta(days=45),
-    "wages": timedelta(days=45),
-    "nfp": timedelta(days=45),
-    "jobless_claims": timedelta(days=14),
-}
-MACRO_PROVIDER_SERIES = {
-    "FRED": {
-        "VIXCLS",
-        "DGS2",
-        "DGS10",
-        "DGS30",
-        "T10Y2Y",
-        "T10Y3M",
-        "NFCI",
-        "DFF",
-        "FEDFUNDS",
-        "SOFR",
-        "DFEDTARL",
-        "DFEDTARU",
-        "ICSA",
-        "VIXCLS",
-    },
-    "BLS": {
-        "CUSR0000SA0",
-        "CUSR0000SA0L1E",
-        "WPUFD4",
-        "LNS14000000",
-        "CES0500000003",
-        "CES0000000001",
-    },
-    "BEA": {
-        "BEA:PCE",
-        "BEA:PCE_PRICE_INDEX",
-        "BEA:CORE_PCE",
-        "BEA:GDP",
-    },
-}
-NASDAQ_ACCOUNTING_MAX_AGE = {
-    "nasdaq_100": timedelta(hours=12),
-    "mega_cap_quotes": timedelta(hours=12),
-    "earnings": timedelta(days=14),
-}
-NEWS_ACCOUNTING_PROVIDER_NAMES = {
-    "ALPHA_VANTAGE_NEWS_SENTIMENT": (
-        "Alpha Vantage NEWS_SENTIMENT"
-    ),
-    "GDELT_DOC_API": "GDELT Doc API",
-    "FEDERAL_RESERVE_RSS": "Federal Reserve RSS",
-    "BLS_RSS": "BLS RSS",
-    "BEA_RSS": "BEA RSS",
-    "YAHOO_FINANCE_RSS": "Yahoo Finance RSS",
-    "MARKETWATCH_RSS": "MarketWatch RSS",
-    "GOOGLE_NEWS_RSS": "Google News RSS",
-}
-VIX_MAX_AGE = timedelta(days=2)
+
+
+def _registry_dataset_policy(dataset_id: str) -> Any:
+    return provider_capability_registry.dataset_policy_by_id(
+        dataset_id
+    )
+
+
+def _dataset_sla(dataset_id: str) -> timedelta:
+    policy = _registry_dataset_policy(dataset_id)
+    if (
+        not isinstance(policy.sla_seconds, int)
+        or isinstance(policy.sla_seconds, bool)
+        or policy.sla_seconds <= 0
+    ):
+        raise RuntimeError(f"DATASET_SLA_INVALID:{dataset_id}")
+    return timedelta(seconds=policy.sla_seconds)
+
+
+def _repository_query(dataset_id: str) -> Any:
+    policy = _registry_dataset_policy(dataset_id)
+    query = (
+        provider_capability_registry
+        .MARKET_FACT_REPOSITORY_DATASET_QUERIES
+        .get(dataset_id)
+    )
+    if (
+        query is None
+        or policy.canonical_repository
+        != "MARKET_FACT_REPOSITORY"
+        or not query.fact_types
+        or query.frequency != policy.frequency
+    ):
+        raise RuntimeError(
+            f"MARKET_FACT_REPOSITORY_QUERY_INVALID:{dataset_id}"
+        )
+    return query
+
+
+def _macro_repository_queries() -> dict[str, Any]:
+    queries: dict[str, Any] = {}
+    for policy in (
+        provider_capability_registry.DATASET_SOURCE_POLICIES
+    ):
+        if (
+            policy.section not in {"macro", "rates"}
+            or policy.canonical_repository
+            != "MARKET_FACT_REPOSITORY"
+        ):
+            continue
+        query = _repository_query(policy.dataset_id)
+        if not query.series_ids:
+            raise RuntimeError(
+                "MACRO_REPOSITORY_SERIES_MAPPING_MISSING:"
+                f"{policy.dataset_id}"
+            )
+        queries[policy.dataset_id] = query
+    if not queries:
+        raise RuntimeError("MACRO_REPOSITORY_QUERY_SET_EMPTY")
+    return queries
+
+
+def _nasdaq_repository_queries() -> dict[str, Any]:
+    queries = {
+        policy.dataset_id: _repository_query(policy.dataset_id)
+        for policy in (
+            provider_capability_registry.DATASET_SOURCE_POLICIES
+        )
+        if policy.section in {"nasdaq", "earnings"}
+        and policy.canonical_repository
+        == "MARKET_FACT_REPOSITORY"
+    }
+    if set(queries) != {
+        policy.dataset_id
+        for policy in (
+            provider_capability_registry.DATASET_SOURCE_POLICIES
+        )
+        if policy.section in {"nasdaq", "earnings"}
+        and policy.canonical_repository
+        == "MARKET_FACT_REPOSITORY"
+    }:
+        raise RuntimeError("NASDAQ_REPOSITORY_QUERY_SET_INCOMPLETE")
+    return queries
+
+
+def _macro_requested_series(
+    dataset_ids: set[str],
+    *,
+    queries: dict[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    requested: dict[str, list[str]] = {}
+    for dataset_id in queries:
+        if dataset_id not in dataset_ids:
+            continue
+        policy = _registry_dataset_policy(dataset_id)
+        query_series = tuple(
+            str(series_id).strip().upper()
+            for series_id in queries[dataset_id].series_ids
+            if str(series_id).strip()
+        )
+        mapped = False
+        for provider_id in (
+            policy.primary_provider,
+            *policy.fallback_providers,
+        ):
+            registration = (
+                provider_capability_registry.provider_by_id(
+                    provider_id
+                )
+            )
+            capable = {
+                str(capability.metric_id).strip().upper()
+                for capability in registration.capabilities
+                if capability.dataset_id == dataset_id
+            }
+            provider_series = tuple(
+                series_id
+                for series_id in query_series
+                if series_id in capable
+            )
+            if not provider_series:
+                continue
+            mapped = True
+            bucket = requested.setdefault(provider_id, [])
+            for series_id in provider_series:
+                if series_id not in bucket:
+                    bucket.append(series_id)
+        if not mapped:
+            raise RuntimeError(
+                "MACRO_PROVIDER_CAPABILITY_SERIES_MISSING:"
+                f"{dataset_id}"
+            )
+    return {
+        provider_id: tuple(series_ids)
+        for provider_id, series_ids in requested.items()
+    }
+
+
+def _required_macro_dataset_series(
+    dataset_id: str,
+    *,
+    query: Any,
+) -> tuple[str, ...]:
+    """Return the atomic series that can satisfy one registered dataset.
+
+    Repository queries may retain legacy aliases which no configured provider
+    can acquire.  The runtime requirement is therefore the ordered
+    intersection between the central repository query and the capabilities of
+    the policy's configured providers.  Every resulting atomic series is
+    required before a composite cache record can be reused.
+    """
+
+    requested = _macro_requested_series(
+        {dataset_id},
+        queries={dataset_id: query},
+    )
+    capable = {
+        str(series_id).strip().upper()
+        for series_ids in requested.values()
+        for series_id in series_ids
+        if str(series_id).strip()
+    }
+    required = tuple(
+        str(series_id).strip().upper()
+        for series_id in query.series_ids
+        if str(series_id).strip().upper() in capable
+    )
+    if not required:
+        raise RuntimeError(
+            f"MACRO_DATASET_REQUIRED_SERIES_MISSING:{dataset_id}"
+        )
+    return required
+
+
+def _runtime_macro_provider_ids(
+    providers: list[Any],
+    *,
+    expected_provider_ids: set[str],
+) -> tuple[set[str], bool]:
+    resolved: set[str] = set()
+    complete = True
+    for instance in providers:
+        source = str(getattr(instance, "source", "")).strip().upper()
+        if source in expected_provider_ids:
+            resolved.add(source)
+            continue
+        runtime_path = (
+            f"{type(instance).__module__}:"
+            f"{type(instance).__qualname__}"
+        )
+        class_name = type(instance).__name__
+        candidates = []
+        for provider_id in expected_provider_ids:
+            registration = (
+                provider_capability_registry.provider_by_id(
+                    provider_id
+                )
+            )
+            paths = (
+                registration.adapter_path,
+                *registration.additional_adapter_paths,
+            )
+            if runtime_path in paths or any(
+                path.rpartition(":")[2].rsplit(".", 1)[-1]
+                == class_name
+                for path in paths
+            ):
+                candidates.append(provider_id)
+        if len(candidates) != 1:
+            complete = False
+            continue
+        resolved.add(candidates[0])
+    return resolved, complete
+
+
+def _news_accounting_provider_names() -> dict[str, str]:
+    from app.providers.news_provider import NEWS_PROVIDER_SPECS
+
+    policy = _registry_dataset_policy("current_news")
+    provider_ids = (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+    display_names = tuple(
+        str(spec[0])
+        for spec in NEWS_PROVIDER_SPECS
+    )
+    if (
+        len(display_names) != len(provider_ids)
+        or len(set(display_names)) != len(display_names)
+    ):
+        raise RuntimeError(
+            "NEWS_RUNTIME_ACCOUNTING_MAPPING_INVALID"
+        )
+    return dict(zip(provider_ids, display_names, strict=True))
 
 
 def _merge_nasdaq_materializations(
@@ -187,6 +343,52 @@ def _merge_nasdaq_materializations(
     if acquired.get("data_quality"):
         output["data_quality"] = acquired["data_quality"]
     return output or None
+
+
+def _nasdaq_dataset_materialization_complete(
+    dataset_id: str,
+    materialized: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(materialized, dict):
+        return False
+    if dataset_id == "nasdaq_100":
+        holdings = materialized.get("qqq_holdings") or {}
+        rows = holdings.get("holdings") or holdings.get("top_holdings") or []
+        declared_count = int(holdings.get("holdings_count") or 0)
+        return bool(
+            str(holdings.get("status") or "").lower()
+            in {"found", "available", "valid"}
+            and rows
+            and declared_count == len(rows)
+            and holdings.get("weight_data_available") is not False
+            and all(
+                isinstance(item, dict)
+                and item.get("symbol")
+                and (
+                    item.get("weight_pct") is not None
+                    or item.get("weight") is not None
+                )
+                for item in rows
+            )
+        )
+    if dataset_id == "mega_cap_quotes":
+        snapshot = materialized.get("mega_cap_snapshot") or {}
+        stocks = snapshot.get("stocks") or []
+        tracked_count = int(snapshot.get("tracked_count") or 0)
+        resolved_count = int(snapshot.get("resolved_count") or 0)
+        return bool(
+            stocks
+            and tracked_count > 0
+            and resolved_count == tracked_count == len(stocks)
+            and all(
+                isinstance(item, dict)
+                and item.get("symbol")
+                and item.get("last_price") is not None
+                and item.get("change_pct") is not None
+                for item in stocks
+            )
+        )
+    return False
 
 
 class DiagnosticsService:
@@ -340,6 +542,7 @@ class DiagnosticsService:
             force_schedule_coverage = await self._force_schedule_catch_up(
                 now=now,
                 stage_for_atomic_finalization=True,
+                execution_context=request_context,
             )
             force_schedule_preflight_performed = True
             self.force_generation_plan = dict(
@@ -428,28 +631,17 @@ class DiagnosticsService:
                     )
                 )
                 calendar_db_lookup = True
+                leaf_aggregate = _calendar_leaf_attempt_aggregate(
+                    force_schedule_coverage
+                )
                 calendar_provider_called = bool(
-                    force_schedule_coverage.get(
-                        "provider_calls_executed"
-                    )
+                    leaf_aggregate["called"]
                 )
-                calendar_catch_up_complete = bool(
-                    calendar_provider_called
-                    and _calendar_catch_up_succeeded(
-                        force_schedule_coverage
-                    )
-                )
-                calendar_provider_result = (
-                    "SCHEDULE_CATCH_UP_COMPLETED"
-                    if calendar_catch_up_complete
-                    else "SCHEDULE_CATCH_UP_INCOMPLETE"
-                    if calendar_provider_called
-                    else "NOT_CALLED"
+                calendar_provider_result = str(
+                    leaf_aggregate["result"]
                 )
                 calendar_not_called_reason = (
-                    None
-                    if calendar_provider_called
-                    else "CANONICAL_EVENT_HISTORY_AVAILABLE"
+                    leaf_aggregate["not_called_reason"]
                 )
             else:
                 try:
@@ -628,64 +820,68 @@ class DiagnosticsService:
             nasdaq_quality.pop("_news_provider_quality", {})
             or {}
         )
-        earnings_preloaded_block = nasdaq_quality.pop(
-            "_earnings_preloaded_block",
-            None,
+        earnings_preloaded_blocks = dict(
+            nasdaq_quality.pop(
+                "_earnings_preloaded_blocks",
+                {},
+            )
+            or {}
         )
         multi_runtime = MultiSourceRuntimeService(self.settings)
         primary_calendar_succeeded = (
             _calendar_primary_acquisition_succeeded(
                 pending_calendar_accounting,
                 events=enriched,
+                coverage=force_schedule_coverage,
             )
         )
-        investing_refresh = (
-            "false"
-            if primary_calendar_succeeded
-            else refresh
+        calendar_refresh = (
+            refresh
             if force
-            or (
+            else "auto"
+            if (
                 refresh == "auto"
                 and self.macro_consensus.needs_refresh(enriched)
             )
             else "false"
         )
-        investing_payload = await multi_runtime.provider(
-            "investing_economic_calendar",
-            refresh=investing_refresh,
+        calendar_fallback_order = (
+            _calendar_fallback_provider_order()
         )
-        xtb_payload = await multi_runtime.provider(
-            "xtb_economic_calendar",
-            refresh=(
-                "false"
-                if primary_calendar_succeeded
-                or _runtime_block_available(investing_payload)
-                else refresh
-                if refresh in {"false", "force"}
-                else "auto"
-            ),
+        calendar_fallback_payloads = (
+            await _run_calendar_fallback_chain(
+                multi_runtime,
+                provider_order=calendar_fallback_order,
+                refresh=calendar_refresh,
+                primary_succeeded=primary_calendar_succeeded,
+            )
         )
+        ordered_calendar_payloads = [
+            calendar_fallback_payloads[provider_id]
+            for provider_id in calendar_fallback_order
+        ]
+        investing_payload = calendar_fallback_payloads[
+            "INVESTING_ECONOMIC_CALENDAR"
+        ]
+        xtb_payload = calendar_fallback_payloads["XTB"]
         if pending_calendar_accounting:
             self._record_calendar_accounting(
                 accounting_collector,
                 **pending_calendar_accounting,
                 coverage=force_schedule_coverage,
-                fallback_blocks=[
-                    investing_payload,
-                    xtb_payload,
-                ],
+                fallback_blocks=ordered_calendar_payloads,
             )
         if refresh != "false":
             candidates = EventValueCandidateRepository(self.settings)
-            candidates.persist_provider_payload(investing_payload)
-            candidates.persist_provider_payload(xtb_payload)
+            for payload in ordered_calendar_payloads:
+                candidates.persist_provider_payload(payload)
         canonical_events = self._canonical_three_week_events(
             country=country,
             now=now,
         )
         enriched = reconcile_calendar_events(
             [*enriched, *canonical_events],
-            [investing_payload, xtb_payload],
+            ordered_calendar_payloads,
             now=now,
             temporal_validation=self.facts.temporal_validation,
         )
@@ -701,7 +897,9 @@ class DiagnosticsService:
             "consensus_materialized_count", "consensus_missing_count",
         )}
         if refresh != "false":
-            ranked_consensus = merge_consensus_provider_payloads(investing_payload, xtb_payload)
+            ranked_consensus = merge_consensus_provider_payloads(
+                *ordered_calendar_payloads
+            )
             enriched, consensus_quality, _ = self.macro_consensus.enrich_and_persist(
                 enriched,
                 ranked_consensus,
@@ -767,7 +965,17 @@ class DiagnosticsService:
             "partial_response": not (bool(macro.series) and bool(nasdaq_context)),
         }
         cot_payload = await self.positioning_runtime.cot(refresh=refresh)
-        aaii_payload = await self.positioning_runtime.aaii(refresh=refresh)
+        senior_accounted_request = accounting_collector is not None
+        aaii_payload = (
+            _supplemental_source_not_requested(
+                source="AAII",
+                reason_code=(
+                    "SENIOR_ANALYST_SUPPLEMENTAL_SOURCE_NOT_REQUESTED"
+                ),
+            )
+            if senior_accounted_request
+            else await self.positioning_runtime.aaii(refresh=refresh)
+        )
         self._record_positioning_accounting(
             accounting_collector,
             payload=cot_payload,
@@ -818,10 +1026,9 @@ class DiagnosticsService:
             "investing_economic_calendar": investing_payload,
             "xtb_economic_calendar": xtb_payload,
         }
-        if earnings_preloaded_block:
-            multi_source_preloaded["nasdaq_earnings"] = (
-                earnings_preloaded_block
-            )
+        multi_source_preloaded.update(
+            earnings_preloaded_blocks
+        )
         fed_record, fed_freshness = (
             fed_expectations_preflight
         )
@@ -850,9 +1057,16 @@ class DiagnosticsService:
                 ),
                 provider_source="CBOE",
             )
+        multi_source_kwargs: dict[str, Any] = {
+            "refresh": multi_refresh,
+            "preloaded_blocks": multi_source_preloaded,
+        }
+        if senior_accounted_request:
+            multi_source_kwargs[
+                "include_supplemental_context"
+            ] = False
         multi_source = await multi_runtime.snapshot(
-            refresh=multi_refresh,
-            preloaded_blocks=multi_source_preloaded,
+            **multi_source_kwargs
         )
         apply_multi_source_context(contract, multi_source)
         contract["rates_expectations"] = self.fed_expectations.snapshot(
@@ -863,13 +1077,36 @@ class DiagnosticsService:
             legacy_block=contract.get("rates_expectations") or {},
             canonical_preflight=fed_expectations_preflight,
         )
-        risk_context, risk_sentiment = await self.risk_context.snapshot(
-            refresh=refresh,
-            macro_snapshot=contract.get("macro_snapshot") or {},
-            preloaded_risk_indices=(multi_source.get("blocks") or {}).get("cboe_risk_indices") or {},
-            preloaded_qqq_options=(multi_source.get("blocks") or {}).get("nasdaq_qqq_options") or {},
-            existing_legacy=contract.get("risk_sentiment") or {},
-            canonical_preflight=risk_context_preflight,
+        risk_context_kwargs: dict[str, Any] = {
+            "refresh": refresh,
+            "macro_snapshot": (
+                contract.get("macro_snapshot") or {}
+            ),
+            "preloaded_risk_indices": (
+                (multi_source.get("blocks") or {}).get(
+                    "cboe_risk_indices"
+                )
+                or {}
+            ),
+            "preloaded_qqq_options": (
+                (multi_source.get("blocks") or {}).get(
+                    "nasdaq_qqq_options"
+                )
+                or {}
+            ),
+            "existing_legacy": (
+                contract.get("risk_sentiment") or {}
+            ),
+            "canonical_preflight": risk_context_preflight,
+        }
+        if senior_accounted_request:
+            risk_context_kwargs[
+                "include_supplemental_options"
+            ] = False
+        risk_context, risk_sentiment = (
+            await self.risk_context.snapshot(
+                **risk_context_kwargs
+            )
         )
         contract["risk_context"] = risk_context
         contract["risk_sentiment"] = risk_sentiment
@@ -896,7 +1133,18 @@ class DiagnosticsService:
                 None,
             ),
         )
-        contract["social_sentiment"] = await SocialSentimentService(self.settings).snapshot(refresh=refresh)
+        contract["social_sentiment"] = (
+            _supplemental_source_not_requested(
+                source="Hacker News",
+                reason_code=(
+                    "SENIOR_ANALYST_SUPPLEMENTAL_SOURCE_NOT_REQUESTED"
+                ),
+            )
+            if senior_accounted_request
+            else await SocialSentimentService(
+                self.settings
+            ).snapshot(refresh=refresh)
+        )
         return harden_market_context(contract, settings=self.settings)
 
     def _canonical_three_week_events(
@@ -943,6 +1191,7 @@ class DiagnosticsService:
         *,
         now: datetime,
         stage_for_atomic_finalization: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         if not stage_for_atomic_finalization:
             scheduler = ResearchSchedulerService(self.settings)
@@ -957,6 +1206,7 @@ class DiagnosticsService:
                     schedule_acquire=self.event_service.list_events,
                     now=now,
                     materialize_snapshot=False,
+                    execution_context=execution_context,
                 )
                 if (
                     result.get("reason")
@@ -982,6 +1232,7 @@ class DiagnosticsService:
                     schedule_acquire=self.event_service.list_events,
                     now=now,
                     materialize_snapshot=False,
+                    execution_context=execution_context,
                 )
                 if (
                     result.get("reason")
@@ -1194,14 +1445,19 @@ class DiagnosticsService:
         dict[str, Any] | None,
         CanonicalFreshnessResult,
     ]:
-        rows = self.facts.get_valid_facts_by_type(
-            "official_macro_latest",
-            allow_stale=True,
-        )
-        fact = _matching_macro_fact(rows, ("VIXCLS",))
+        query = _repository_query("vix")
+        rows = [
+            fact
+            for fact_type in query.fact_types
+            for fact in self.facts.get_valid_facts_by_type(
+                fact_type,
+                allow_stale=True,
+            )
+        ]
+        fact = _matching_macro_fact(rows, query.series_ids)
         freshness = self.freshness.evaluate_canonical(
             fact,
-            max_age=VIX_MAX_AGE,
+            max_age=_dataset_sla("vix"),
             data_reference_mode="point_in_time",
         )
         return fact, freshness
@@ -1225,27 +1481,41 @@ class DiagnosticsService:
         # ``force`` starts a new acquisition decision; it never bypasses the
         # canonical repository.
         lookup_performed = True
-        lookup_rows = self.facts.get_valid_facts_by_type(
-            "official_macro_latest",
-            allow_stale=True,
-        )
+        macro_queries = _macro_repository_queries()
+        lookup_rows = [
+            fact
+            for fact_type in dict.fromkeys(
+                fact_type
+                for query in macro_queries.values()
+                for fact_type in query.fact_types
+            )
+            for fact in self.facts.get_valid_facts_by_type(
+                fact_type,
+                allow_stale=True,
+            )
+        ]
         include_vix = vix_preflight is not None
         vix_fact = vix_preflight[0] if vix_preflight else None
         vix_freshness = vix_preflight[1] if vix_preflight else None
-        cached_by_dataset: dict[str, dict[str, Any]] = {}
-        for dataset_id, series_ids in MACRO_ACCOUNTING_SERIES.items():
-            fact = _matching_macro_fact(lookup_rows, series_ids)
-            decision = self.freshness.evaluate_canonical(
-                fact,
-                max_age=MACRO_ACCOUNTING_MAX_AGE[dataset_id],
+        cached_by_dataset: dict[str, list[dict[str, Any]]] = {}
+        for dataset_id, query in macro_queries.items():
+            facts = _complete_macro_dataset_facts(
+                lookup_rows,
+                dataset_id=dataset_id,
+                query=query,
+                freshness=self.freshness,
             )
-            if fact is not None and decision.usable:
-                cached_by_dataset[dataset_id] = fact
+            if facts:
+                cached_by_dataset[dataset_id] = facts
         cached = list(
             {
                 str(fact.get("fact_key")): fact
                 for fact in (
-                    *cached_by_dataset.values(),
+                    *(
+                        fact
+                        for dataset_facts in cached_by_dataset.values()
+                        for fact in dataset_facts
+                    ),
                     *(
                         (vix_fact,)
                         if include_vix
@@ -1259,7 +1529,7 @@ class DiagnosticsService:
         )
         if (
             len(cached_by_dataset)
-            == len(MACRO_ACCOUNTING_SERIES)
+            == len(macro_queries)
             and (
                 not include_vix
                 or (
@@ -1313,25 +1583,23 @@ class DiagnosticsService:
         latest_parameters = inspect.signature(
             self.macro_service.latest
         ).parameters
-        due_series = {
-            series_id
-            for dataset_id, series_ids in MACRO_ACCOUNTING_SERIES.items()
+        due_datasets = {
+            dataset_id
+            for dataset_id in macro_queries
             if dataset_id not in cached_by_dataset
-            for series_id in series_ids
         }
+        requested_queries = dict(macro_queries)
         if (
             include_vix
             and vix_freshness is not None
             and not vix_freshness.usable
         ):
-            due_series.add("VIXCLS")
-        requested_series = {
-            provider: tuple(
-                sorted(due_series.intersection(provider_series))
-            )
-            for provider, provider_series in MACRO_PROVIDER_SERIES.items()
-            if due_series.intersection(provider_series)
-        }
+            due_datasets.add("vix")
+            requested_queries["vix"] = _repository_query("vix")
+        requested_series = _macro_requested_series(
+            due_datasets,
+            queries=requested_queries,
+        )
         latest_kwargs: dict[str, Any] = {}
         if "force" in latest_parameters:
             latest_kwargs["force"] = force
@@ -1342,31 +1610,39 @@ class DiagnosticsService:
             macro
         )
         written = self._save_macro(macro)
-        read_back_rows = self.facts.get_valid_facts_by_type(
-            "official_macro_latest",
-            allow_stale=True,
-        )
-        read_back = []
-        for dataset_id, series_ids in MACRO_ACCOUNTING_SERIES.items():
-            fact = _matching_macro_fact(read_back_rows, series_ids)
-            if (
-                fact is not None
-                and self.freshness.evaluate_canonical(
-                    fact,
-                    max_age=MACRO_ACCOUNTING_MAX_AGE[dataset_id],
-                ).usable
-            ):
-                read_back.append(fact)
+        read_back_rows = [
+            fact
+            for fact_type in dict.fromkeys(
+                fact_type
+                for query in requested_queries.values()
+                for fact_type in query.fact_types
+            )
+            for fact in self.facts.get_valid_facts_by_type(
+                fact_type,
+                allow_stale=True,
+            )
+        ]
+        read_back: list[dict[str, Any]] = []
+        for dataset_id, query in macro_queries.items():
+            read_back.extend(
+                _complete_macro_dataset_facts(
+                read_back_rows,
+                    dataset_id=dataset_id,
+                    query=query,
+                    freshness=self.freshness,
+                )
+            )
         if include_vix:
+            vix_query = _repository_query("vix")
             read_back_vix = _matching_macro_fact(
                 read_back_rows,
-                ("VIXCLS",),
+                vix_query.series_ids,
             )
             if (
                 read_back_vix is not None
                 and self.freshness.evaluate_canonical(
                     read_back_vix,
-                    max_age=VIX_MAX_AGE,
+                    max_age=_dataset_sla("vix"),
                     data_reference_mode="point_in_time",
                 ).usable
             ):
@@ -1518,6 +1794,74 @@ class DiagnosticsService:
         )
         return events
 
+    def _nasdaq_database_dataset_evidence(
+        self,
+        *,
+        dataset_id: str,
+        query: Any,
+        lookup_rows: dict[str, list[dict[str, Any]]],
+    ) -> tuple[
+        dict[str, Any] | None,
+        CanonicalFreshnessResult | None,
+        dict[str, list[dict[str, Any]]],
+        dict[str, Any] | None,
+    ]:
+        fresh_by_type: dict[str, list[dict[str, Any]]] = {
+            fact_type: [] for fact_type in query.fact_types
+        }
+        freshness_by_fact_id: dict[int, CanonicalFreshnessResult] = {}
+        for fact_type in query.fact_types:
+            for fact in lookup_rows.get(fact_type, []):
+                decision = self.freshness.evaluate_canonical(
+                    fact,
+                    max_age=_dataset_sla(dataset_id),
+                    data_reference_mode="point_in_time",
+                )
+                freshness_by_fact_id[id(fact)] = decision
+                if decision.usable:
+                    fresh_by_type[fact_type].append(fact)
+        materialized = materialize_nasdaq_context_from_facts(
+            fresh_by_type
+        )
+        evidence_fact_type = (
+            "qqq_holdings"
+            if dataset_id == "nasdaq_100"
+            else "mega_cap_snapshot"
+        )
+        materialization_complete = (
+            _nasdaq_dataset_materialization_complete(
+                dataset_id,
+                materialized,
+            )
+        )
+        evidence_rows = (
+            fresh_by_type.get(evidence_fact_type) or []
+            if materialization_complete
+            else [
+                fact
+                for fact in lookup_rows.get(
+                    evidence_fact_type,
+                    [],
+                )
+                if (
+                    freshness_by_fact_id.get(id(fact)) is not None
+                    and not freshness_by_fact_id[id(fact)].usable
+                )
+            ]
+        )
+        if not evidence_rows:
+            return None, None, {}, None
+        fact = evidence_rows[0]
+        decision = freshness_by_fact_id.get(id(fact))
+        if decision is None:
+            return None, None, {}, None
+        return (
+            fact,
+            decision,
+            fresh_by_type if materialization_complete else {},
+            materialized if materialization_complete else None,
+        )
+
     async def _nasdaq_db_first(
         self,
         *,
@@ -1530,33 +1874,49 @@ class DiagnosticsService:
         ) = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         lookup_performed = True
+        repository_queries = _nasdaq_repository_queries()
+        lookup_fact_types = tuple(
+            dict.fromkeys(
+                fact_type
+                for query in repository_queries.values()
+                for fact_type in query.fact_types
+            )
+        )
         lookup_rows = {
             fact_type: self.facts.get_valid_facts_by_type(
                 fact_type,
                 allow_stale=True,
             )
-            for fact_type in (
-                "qqq_holdings",
-                "mega_cap_snapshot",
-                "mega_cap_breadth",
-                "earnings_event",
-                "nasdaq_context",
-            )
+            for fact_type in lookup_fact_types
         }
         facts_by_type: dict[str, list[dict[str, Any]]] = {
             fact_type: [] for fact_type in lookup_rows
         }
         valid_datasets: set[str] = set()
-        for dataset_id, fact_types in NASDAQ_ACCOUNTING_FACT_TYPES.items():
-            for fact_type in fact_types:
-                for fact in lookup_rows[fact_type]:
-                    if self.freshness.evaluate_canonical(
-                        fact,
-                        max_age=NASDAQ_ACCOUNTING_MAX_AGE[dataset_id],
-                        data_reference_mode="point_in_time",
-                    ).usable:
-                        facts_by_type[fact_type].append(fact)
-                        valid_datasets.add(dataset_id)
+        for dataset_id in ("nasdaq_100", "mega_cap_quotes"):
+            query = repository_queries[dataset_id]
+            fact, decision, dataset_rows, dataset_materialized = (
+                self._nasdaq_database_dataset_evidence(
+                    dataset_id=dataset_id,
+                    query=query,
+                    lookup_rows=lookup_rows,
+                )
+            )
+            if (
+                fact is None
+                or decision is None
+                or not decision.usable
+                or not _nasdaq_dataset_materialization_complete(
+                    dataset_id,
+                    dataset_materialized,
+                )
+            ):
+                continue
+            valid_datasets.add(dataset_id)
+            for fact_type, rows in dataset_rows.items():
+                for row in rows:
+                    if row not in facts_by_type[fact_type]:
+                        facts_by_type[fact_type].append(row)
         cached_count = sum(len(items) for items in facts_by_type.values())
         materialized = materialize_nasdaq_context_from_facts(
             facts_by_type
@@ -1581,7 +1941,7 @@ class DiagnosticsService:
             fetch_missing
             and (provider_datasets or fetch_news)
         )
-        earnings_preloaded = self._earnings_preloaded_block(
+        earnings_preloaded = self._earnings_preloaded_blocks(
             lookup_rows,
         )
         base_quality: dict[str, Any] = {
@@ -1594,8 +1954,8 @@ class DiagnosticsService:
             "warnings": [],
             "errors": [],
         }
-        if earnings_preloaded is not None:
-            base_quality["_earnings_preloaded_block"] = (
+        if earnings_preloaded:
+            base_quality["_earnings_preloaded_blocks"] = (
                 earnings_preloaded
             )
 
@@ -1702,45 +2062,62 @@ class DiagnosticsService:
             "_news_provider_quality": news_quality,
         }
 
-    def _earnings_preloaded_block(
+    def _earnings_preloaded_blocks(
         self,
         lookup_rows: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, Any] | None:
-        for fact in lookup_rows.get("earnings_event", []):
-            freshness = self.freshness.evaluate_canonical(
-                fact,
-                max_age=NASDAQ_ACCOUNTING_MAX_AGE["earnings"],
-                data_reference_mode="point_in_time",
-            )
-            if not freshness.usable:
-                continue
-            raw = (
-                fact.get("raw_payload")
-                if isinstance(fact.get("raw_payload"), dict)
-                else {}
-            )
-            payload = {
-                **raw,
-                "events": list(raw.get("events") or []),
-                "relevant_upcoming": list(
-                    raw.get("relevant_upcoming")
-                    or raw.get("events")
-                    or []
-                ),
-            }
-            return {
-                **payload,
-                **_canonical_preflight_runtime_block(
-                    payload,
-                    lookup=_canonical_freshness_evidence(
-                        freshness
+    ) -> dict[str, dict[str, Any]]:
+        policy = _registry_dataset_policy("earnings")
+        query = _repository_query("earnings")
+        output: dict[str, dict[str, Any]] = {}
+        for provider_id in (
+            policy.primary_provider,
+            *policy.fallback_providers,
+        ):
+            spec = _earnings_runtime_spec(provider_id)
+            block_name = spec["block_name"]
+            fact_type = MULTI_SOURCE_FACT_TYPES.get(block_name)
+            if fact_type not in query.fact_types:
+                raise RuntimeError(
+                    "EARNINGS_PRELOAD_FACT_TYPE_MAPPING_INVALID:"
+                    f"{provider_id}:{fact_type or 'MISSING'}"
+                )
+            for fact in lookup_rows.get(fact_type, []):
+                freshness = self.freshness.evaluate_canonical(
+                    fact,
+                    max_age=_dataset_sla("earnings"),
+                    data_reference_mode="point_in_time",
+                )
+                if not freshness.usable:
+                    continue
+                raw = (
+                    fact.get("raw_payload")
+                    if isinstance(fact.get("raw_payload"), dict)
+                    else {}
+                )
+                payload = {
+                    **raw,
+                    "events": list(raw.get("events") or []),
+                    "relevant_upcoming": list(
+                        raw.get("relevant_upcoming")
+                        or raw.get("events")
+                        or []
                     ),
-                    provider_source=(
-                        "Nasdaq Earnings Calendar"
+                }
+                output[block_name] = {
+                    **payload,
+                    **_canonical_preflight_runtime_block(
+                        payload,
+                        lookup=_canonical_freshness_evidence(
+                            freshness
+                        ),
+                        provider_source=str(
+                            fact.get("source")
+                            or spec["source"]
+                        ),
                     ),
-                ),
-            }
-        return None
+                }
+                break
+        return output
 
     def _save_nasdaq_context(
         self,
@@ -1778,19 +2155,39 @@ class DiagnosticsService:
                 if isinstance(raw, dict)
                 else now_iso()
             )
-            data_as_of = (
-                raw.get("data_as_of")
-                or raw.get("as_of")
-                or raw.get("weight_as_of")
-                or retrieved_at
-                if isinstance(raw, dict)
-                else retrieved_at
-            )
-            fact_valid_until = (
-                raw.get("weight_valid_until")
-                if fact_type == "qqq_holdings" and isinstance(raw, dict)
-                else valid_until
-            ) or valid_until
+            if dataset_id == "mega_cap_quotes":
+                observation = parse_datetime(
+                    raw.get("data_as_of")
+                    if isinstance(raw, dict)
+                    else None
+                )
+                decision_at = self.freshness.clock().astimezone(UTC)
+                if (
+                    observation is None
+                    or observation > decision_at + timedelta(minutes=5)
+                    or decision_at
+                    >= observation + _dataset_sla(dataset_id)
+                ):
+                    continue
+                data_as_of = observation.isoformat()
+                fact_valid_until = (
+                    observation + _dataset_sla(dataset_id)
+                ).isoformat()
+            else:
+                data_as_of = (
+                    raw.get("data_as_of")
+                    or raw.get("as_of")
+                    or raw.get("weight_as_of")
+                    or retrieved_at
+                    if isinstance(raw, dict)
+                    else retrieved_at
+                )
+                fact_valid_until = (
+                    raw.get("weight_valid_until")
+                    if fact_type == "qqq_holdings"
+                    and isinstance(raw, dict)
+                    else valid_until
+                ) or valid_until
             persisted_raw = (
                 {
                     **raw,
@@ -1887,42 +2284,102 @@ class DiagnosticsService:
     ) -> None:
         if collector is None:
             return
-        shared = tuple(MACRO_ACCOUNTING_SERIES)
-        provider_results = {
-            str(item.source or "").upper(): item
-            for item in macro.provider_results
-        }
-        configured_sources = {
-            str(
-                getattr(
-                    provider,
-                    "source",
-                    type(provider).__name__.replace("Provider", ""),
-                )
-            ).upper()
-            for provider in self.macro_service.providers
-        }
-        for dataset_id, series_ids in MACRO_ACCOUNTING_SERIES.items():
-            policy = collector.policies[dataset_id]
-            fact = _matching_macro_fact(lookup_rows, series_ids)
-            freshness = (
-                self.freshness.evaluate_canonical(
-                    fact,
-                    max_age=MACRO_ACCOUNTING_MAX_AGE[dataset_id],
-                )
-                if fact is not None
-                else None
+        macro_queries = _macro_repository_queries()
+        shared = tuple(macro_queries)
+        expected_providers = {
+            provider_id
+            for dataset_id in macro_queries
+            for provider_id in (
+                _registry_dataset_policy(dataset_id).primary_provider,
+                *_registry_dataset_policy(
+                    dataset_id
+                ).fallback_providers,
             )
-            selected = next(
+        }
+        provider_results = {
+            provider_id: item
+            for item in macro.provider_results
+            if (
+                provider_id := str(
+                    item.source or ""
+                ).strip().upper()
+            )
+            in expected_providers
+        }
+        (
+            configured_sources,
+            runtime_mapping_complete,
+        ) = _runtime_macro_provider_ids(
+            list(self.macro_service.providers),
+            expected_provider_ids=expected_providers,
+        )
+        for dataset_id, query in macro_queries.items():
+            series_ids = _required_macro_dataset_series(
+                dataset_id,
+                query=query,
+            )
+            policy = collector.policies[dataset_id]
+            database_facts = (
+                _structurally_complete_macro_dataset_facts(
+                lookup_rows,
+                dataset_id=dataset_id,
+                query=query,
+                )
+            )
+            evaluated_database_facts = [
+                (
+                    item,
+                    self.freshness.evaluate_canonical(
+                        item,
+                    max_age=_dataset_sla(dataset_id),
+                    ),
+                )
+                for item in database_facts
+            ]
+            selected_database_evidence = next(
                 (
                     item
-                    for item in macro.series
-                    if str(item.series_id).upper() in series_ids
+                    for item in evaluated_database_facts
+                    if not item[1].usable
                 ),
-                None,
+                evaluated_database_facts[0]
+                if evaluated_database_facts
+                else None,
             )
+            fact = (
+                selected_database_evidence[0]
+                if selected_database_evidence
+                else None
+            )
+            freshness = (
+                selected_database_evidence[1]
+                if selected_database_evidence
+                else None
+            )
+            database_usable = bool(
+                evaluated_database_facts
+                and all(
+                    decision.usable
+                    for _, decision in evaluated_database_facts
+                )
+            )
+            selected_by_series = {
+                str(item.series_id).upper(): item
+                for item in macro.series
+                if str(item.series_id).upper() in series_ids
+                and item.value is not None
+            }
+            provider_value_complete = (
+                set(selected_by_series) == set(series_ids)
+            )
+            selected = (
+                selected_by_series[series_ids[0]]
+                if provider_value_complete
+                else None
+            )
+
             def observed_attempt(provider: str) -> tuple[dict[str, Any], bool]:
-                if fact is not None and freshness and freshness.usable:
+                if database_usable:
                     return (
                         provider_attempt(
                             provider,
@@ -1940,9 +2397,12 @@ class DiagnosticsService:
                         metadata.provider_type == ProviderType.CACHE
                     )
                     matching_value = bool(
-                        selected is not None
-                        and str(selected.source or "").upper()
-                        == provider
+                        provider_value_complete
+                        and all(
+                            str(item.source or "").upper()
+                            == provider
+                            for item in selected_by_series.values()
+                        )
                     )
                     return (
                         provider_attempt(
@@ -1971,13 +2431,7 @@ class DiagnosticsService:
                         ),
                         not from_cache,
                     )
-                provider_configured = (
-                    provider.replace("_", "")
-                    in {
-                        item.replace("_", "")
-                        for item in configured_sources
-                    }
-                )
+                provider_configured = provider in configured_sources
                 return (
                     provider_attempt(
                         provider,
@@ -1992,7 +2446,10 @@ class DiagnosticsService:
                         ),
                         execution_origin="OBSERVED_SKIP",
                     ),
-                    not provider_configured,
+                    bool(
+                        runtime_mapping_complete
+                        and not provider_configured
+                    ),
                 )
 
             primary, primary_complete = observed_attempt(
@@ -2013,10 +2470,12 @@ class DiagnosticsService:
                 database_lookup_reason=(
                     "OFFICIAL_MACRO_DATABASE_LOOKUP"
                     if lookup_performed
-                    else "FORCE_REFRESH_BYPASSED_DATABASE_LOOKUP"
+                    else "CANONICAL_DATABASE_LOOKUP_NOT_PERFORMED"
                 ),
                 database_record_found=(
-                    fact is not None if lookup_performed else None
+                    bool(database_facts)
+                    if lookup_performed
+                    else None
                 ),
                 database_data_as_of=(
                     freshness.data_as_of
@@ -2056,14 +2515,14 @@ class DiagnosticsService:
                     selected.source
                     if selected is not None
                     else fact.get("source")
-                    if fact
+                    if fact and database_usable
                     else None
                 ),
                 acquisition_reason_code=(
                     "PROVIDER_VALUE_ACQUIRED"
                     if selected is not None and provider_batch_called
                     else "VALID_DATABASE_RECORD_SELECTED"
-                    if fact and freshness and freshness.usable
+                    if database_usable
                     else "VALUE_NOT_ACQUIRED"
                 ),
                 evidence_complete=evidence_complete,
@@ -2082,6 +2541,7 @@ class DiagnosticsService:
     ) -> None:
         if collector is None:
             return
+        repository_queries = _nasdaq_repository_queries()
         invoked_datasets = (
             set(provider_invoked_datasets)
             if provider_invoked_datasets is not None
@@ -2092,49 +2552,18 @@ class DiagnosticsService:
             if provider_invoked
             else set()
         )
-        for dataset_id, fact_types in NASDAQ_ACCOUNTING_FACT_TYPES.items():
+        for dataset_id, query in repository_queries.items():
             # Earnings is acquired and accounted by the dedicated Nasdaq
             # earnings block later in this same request.
             if dataset_id == "earnings":
                 continue
             policy = collector.policies[dataset_id]
-            facts = [
-                fact
-                for fact_type in fact_types
-                for fact in lookup_rows.get(fact_type, [])
-            ]
-            evaluated_facts = [
-                (
-                    fact,
-                    self.freshness.evaluate_canonical(
-                        fact,
-                        max_age=NASDAQ_ACCOUNTING_MAX_AGE[
-                            dataset_id
-                        ],
-                        data_reference_mode="point_in_time",
-                    ),
+            fact, freshness, _dataset_rows, _cached_materialized = (
+                self._nasdaq_database_dataset_evidence(
+                    dataset_id=dataset_id,
+                    query=query,
+                    lookup_rows=lookup_rows,
                 )
-                for fact in facts
-            ]
-            selected_evidence = next(
-                (
-                    item
-                    for item in evaluated_facts
-                    if item[1].usable
-                ),
-                evaluated_facts[0]
-                if evaluated_facts
-                else None,
-            )
-            fact = (
-                selected_evidence[0]
-                if selected_evidence
-                else None
-            )
-            freshness = (
-                selected_evidence[1]
-                if selected_evidence
-                else None
             )
             quality = {}
             section = None
@@ -2150,6 +2579,17 @@ class DiagnosticsService:
                     if hasattr(quality_model, "model_dump")
                     else dict(quality_model or {})
                 )
+            provider_materialized = (
+                normalize_nasdaq_context(context)
+                if context is not None
+                else None
+            )
+            provider_value_complete = (
+                _nasdaq_dataset_materialization_complete(
+                    dataset_id,
+                    provider_materialized,
+                )
+            )
             accounts = {
                 str(item.get("provider")): item
                 for item in quality.get(
@@ -2237,9 +2677,7 @@ class DiagnosticsService:
             selected_source = (
                 getattr(section, "source", None)
                 if section is not None
-                and bool(
-                    quality.get("final_data_available")
-                )
+                and provider_value_complete
                 else None
             )
             collector.record(
@@ -2254,7 +2692,7 @@ class DiagnosticsService:
                 database_lookup_reason=(
                     "NASDAQ_CONTEXT_DATABASE_LOOKUP"
                     if lookup_performed
-                    else "FORCE_REFRESH_BYPASSED_DATABASE_LOOKUP"
+                    else "CANONICAL_DATABASE_LOOKUP_NOT_PERFORMED"
                 ),
                 database_record_found=(
                     fact is not None if lookup_performed else None
@@ -2332,17 +2770,26 @@ class DiagnosticsService:
             coverage or {},
             events=events,
             provider_called=provider_called,
+            database_lookup_performed=database_lookup_performed,
         )
         database_valid = _database_lookup_is_valid(lookup)
+        leaf_aggregate = _calendar_leaf_attempt_aggregate(
+            coverage or {}
+        )
+        leaf_evidence_complete = bool(
+            leaf_aggregate["complete"]
+        )
         primary = provider_attempt(
             policy.primary_provider,
-            called=provider_called,
-            attempts=1 if provider_called else 0,
-            result=provider_result,
-            not_called_reason=provider_not_called_reason,
+            called=bool(leaf_aggregate["called"]),
+            attempts=int(leaf_aggregate["attempts"]),
+            result=str(leaf_aggregate["result"]),
+            not_called_reason=(
+                leaf_aggregate["not_called_reason"]
+            ),
             execution_origin=(
                 "PROVIDER_CALL"
-                if provider_called
+                if leaf_aggregate["called"]
                 else "CACHE_DECISION"
                 if database_valid
                 else "OBSERVED_SKIP"
@@ -2390,11 +2837,11 @@ class DiagnosticsService:
             "macro_calendar",
             acquisition_id="canonical_event_calendar",
             shared_dataset_ids=("macro_calendar",),
-            database_lookup_performed=True,
+            database_lookup_performed=lookup["performed"],
             database_lookup_reason=(
                 "CANONICAL_EVENT_HISTORY_LOOKUP"
                 if database_lookup_performed
-                else "FORCE_EVENT_PROVIDER_PATH"
+                else "CANONICAL_EVENT_HISTORY_LOOKUP_NOT_PERFORMED"
             ),
             database_record_found=lookup["found"],
             database_data_as_of=lookup["data_as_of"],
@@ -2407,6 +2854,7 @@ class DiagnosticsService:
             ),
             database_record_expired=lookup["expired"],
             database_freshness_evaluation=lookup["freshness"],
+            database_lookup_summary=lookup.get("summary"),
             primary_provider=primary,
             fallbacks=fallback_attempts,
             acquisition_selected_source=(
@@ -2417,6 +2865,17 @@ class DiagnosticsService:
             acquisition_reason_code=acquisition_reason_code,
             evidence_complete=bool(
                 lookup["complete"]
+                and leaf_evidence_complete
+                and provider_called
+                is bool(leaf_aggregate["called"])
+                and (
+                    str(provider_result)
+                    == str(leaf_aggregate["result"])
+                )
+                and (
+                    provider_not_called_reason
+                    == leaf_aggregate["not_called_reason"]
+                )
                 and len(fallback_attempts)
                 == len(policy.fallback_providers)
             ),
@@ -2433,6 +2892,7 @@ class DiagnosticsService:
     ) -> None:
         if collector is None:
             return
+        max_age = _dataset_sla("current_news")
         item = next(
             (
                 candidate
@@ -2440,7 +2900,7 @@ class DiagnosticsService:
                 if _news_exclusion_reason(candidate) is None
                 and self.freshness.evaluate_canonical(
                     candidate,
-                    max_age=timedelta(hours=24),
+                    max_age=max_age,
                 ).usable
             ),
             None,
@@ -2478,17 +2938,16 @@ class DiagnosticsService:
                     )
                 )
             }
+            provider_names = _news_accounting_provider_names()
             attempts = []
             evidence_complete = bool(
                 len(raw_account_rows) == len(policy_providers)
                 and len(raw_accounts) == len(policy_providers)
                 and set(raw_accounts)
-                == set(NEWS_ACCOUNTING_PROVIDER_NAMES.values())
+                == set(provider_names.values())
             )
             for provider in policy_providers:
-                actual_name = NEWS_ACCOUNTING_PROVIDER_NAMES[
-                    provider
-                ]
+                actual_name = provider_names[provider]
                 account = raw_accounts.get(actual_name)
                 if account is None:
                     attempts.append(
@@ -2734,14 +3193,17 @@ class DiagnosticsService:
                 "FED_EXPECTATIONS_DATABASE_LOOKUP"
             ),
         )
+        earnings_policy = collector.policies["earnings"]
+        ordered_earnings_blocks = _ordered_dataset_runtime_blocks(
+            blocks,
+            policy=earnings_policy,
+        )
         self._record_block_dataset(
             collector,
             dataset_id="earnings",
-            acquisition_id="nasdaq_earnings_calendar",
-            block=blocks.get("nasdaq_earnings") or {},
-            fallback_blocks=[
-                blocks.get("fmp_earnings") or {},
-            ],
+            acquisition_id="earnings_registry_provider_chain",
+            block=ordered_earnings_blocks[0],
+            fallback_blocks=ordered_earnings_blocks[1:],
         )
         risk_block = blocks.get("cboe_risk_indices") or {}
         for dataset_id in ("vix", "vvix", "risk"):
@@ -2763,70 +3225,138 @@ class DiagnosticsService:
                 and not lookup.get("expired")
                 and lookup.get("freshness") == "VALID"
             )
-            cboe_attempt = _attempt_from_runtime_block(
-                "CBOE",
-                risk_block,
-            )
+            cboe_attempt = _attempt_from_runtime_block("CBOE", risk_block)
+            selected_vix_source: str | None = None
             if dataset_id == "vix":
-                if database_valid:
-                    primary = _database_selected_attempt("FRED")
-                    fallbacks = [
-                        _database_selected_attempt("CBOE")
-                    ]
-                else:
-                    evidence = vix_provider_evidence or {}
-                    primary = provider_attempt(
-                        "FRED",
-                        called=bool(evidence.get("called")),
-                        attempts=int(evidence.get("attempts") or 0),
-                        result=str(
-                            evidence.get("result") or "NOT_CALLED"
-                        ),
-                        not_called_reason=(
-                            None
-                            if evidence.get("called")
-                            else "PROVIDER_EXECUTION_EVIDENCE_NOT_AVAILABLE"
-                        ),
-                        execution_origin=(
-                            "PROVIDER_CALL"
-                            if evidence.get("called")
-                            else "OBSERVED_SKIP"
-                        ),
+                evidence = vix_provider_evidence or {}
+                macro_provider_id = str(
+                    evidence.get("provider") or ""
+                ).upper()
+                if not macro_provider_id:
+                    vix_query = _repository_query("vix")
+                    mapped_vix_providers = _macro_requested_series(
+                        {"vix"},
+                        queries={"vix": vix_query},
                     )
-                    fallbacks = [
+                    if len(mapped_vix_providers) == 1:
+                        macro_provider_id = next(
+                            iter(mapped_vix_providers)
+                        )
+                policy = collector.policies["vix"]
+                provider_order = (
+                    policy.primary_provider,
+                    *policy.fallback_providers,
+                )
+                if set(provider_order) != {
+                    macro_provider_id,
+                    "CBOE",
+                }:
+                    attempts = [
                         provider_attempt(
-                            "CBOE",
+                            provider,
                             called=False,
                             attempts=0,
                             result="NOT_CALLED",
                             not_called_reason=(
-                                "PRIOR_PROVIDER_SUCCEEDED"
+                                "RUNTIME_PROVIDER_MAPPING_UNAVAILABLE"
                             ),
                             execution_origin="OBSERVED_SKIP",
                         )
-                        if _attempt_succeeded(primary)
-                        else cboe_attempt
+                        for provider in provider_order
                     ]
+                else:
+                    delivered_vix, delivered_source = (
+                        _delivered_vix_value(risk_context)
+                    )
+                    macro_called = bool(evidence.get("called"))
+                    macro_result = str(
+                        evidence.get("result") or "NOT_CALLED"
+                    )
+                    if (
+                        macro_called
+                        and _attempt_succeeded(
+                            {
+                                "called": True,
+                                "result": macro_result,
+                            }
+                        )
+                        and (
+                            delivered_vix is None
+                            or delivered_source is None
+                            or macro_provider_id
+                            not in delivered_source
+                        )
+                    ):
+                        macro_result = "NO_DATA_FOR_VIX"
+                    macro_attempt = (
+                        _database_selected_attempt(macro_provider_id)
+                        if database_valid
+                        else provider_attempt(
+                            macro_provider_id,
+                            called=macro_called,
+                            attempts=int(
+                                evidence.get("attempts") or 0
+                            ),
+                            result=macro_result,
+                            not_called_reason=(
+                                None
+                                if macro_called
+                                else (
+                                    "PROVIDER_EXECUTION_EVIDENCE_NOT_AVAILABLE"
+                                )
+                            ),
+                            execution_origin=(
+                                "PROVIDER_CALL"
+                                if macro_called
+                                else "OBSERVED_SKIP"
+                            ),
+                        )
+                    )
+                    cboe_attempt = _vix_cboe_attempt(
+                        risk_block,
+                        risk_context=risk_context,
+                    )
+                    observed = {
+                        macro_provider_id: macro_attempt,
+                        "CBOE": cboe_attempt,
+                    }
+                    attempts = [
+                        observed[provider]
+                        for provider in provider_order
+                    ]
+                    if delivered_vix is not None and delivered_source:
+                        selected_vix_source = next(
+                            (
+                                attempt["provider"]
+                                for attempt in attempts
+                                if _attempt_succeeded(attempt)
+                                and str(attempt["provider"]).upper()
+                                in delivered_source
+                            ),
+                            (
+                                policy.primary_provider
+                                if database_valid
+                                and policy.primary_provider
+                                in delivered_source
+                                else None
+                            ),
+                        )
+                primary = attempts[0]
+                fallbacks = attempts[1:]
             else:
                 primary = cboe_attempt
                 fallbacks = []
             risk_value = (
-                risk_context.get(dataset_id)
-                if dataset_id in {"vix", "vvix"}
+                _delivered_vix_value(risk_context)[0]
+                if dataset_id == "vix"
+                else risk_context.get("vvix")
+                if dataset_id == "vvix"
                 else risk_context.get("derived_context")
             )
             collector.record(
                 dataset_id,
-                acquisition_id=(
-                    "vix_fred_cboe_provider_chain"
-                    if dataset_id == "vix"
-                    else "cboe_risk_context"
-                ),
-                shared_dataset_ids=(
-                    ("vix",)
-                    if dataset_id == "vix"
-                    else ("vvix", "risk")
-                ),
+                acquisition_id="risk_context_shared_acquisition",
+                shared_dataset_ids=("vix", "vvix", "risk"),
                 database_lookup_performed=bool(lookup.get("performed")),
                 database_lookup_reason=(
                     "VIX_CANONICAL_DATABASE_LOOKUP"
@@ -2851,12 +3381,16 @@ class DiagnosticsService:
                 primary_provider=primary,
                 fallbacks=fallbacks,
                 acquisition_selected_source=(
-                    (risk_context.get("source_summary") or {})
-                    .get("selected_sources", {})
-                    .get(dataset_id)
-                    or risk_block.get("source")
-                    if risk_value
-                    else None
+                    selected_vix_source
+                    if dataset_id == "vix"
+                    else (
+                        (risk_context.get("source_summary") or {})
+                        .get("selected_sources", {})
+                        .get(dataset_id)
+                        or risk_block.get("source")
+                        if risk_value
+                        else None
+                    )
                 ),
                 acquisition_reason_code=(
                     "RISK_CONTEXT_ACQUIRED"
@@ -2864,80 +3398,131 @@ class DiagnosticsService:
                     else "RISK_CONTEXT_NOT_AVAILABLE"
                 ),
             )
-        schedule_blocks = [
-            blocks.get("nasdaq_market_info") or {},
-            blocks.get("cme_market_schedule") or {},
-            blocks.get("investing_holidays") or {},
-            blocks.get("marketbeat_holidays") or {},
-        ]
         policy = collector.policies["market_schedule"]
-        schedule_lookup = (
-            schedule_blocks[0].get("database_lookup") or {}
+        schedule_blocks = _ordered_dataset_runtime_blocks(
+            blocks,
+            policy=policy,
         )
-        schedule_database_valid = _database_lookup_is_valid(
-            schedule_lookup
+        schedule_order = (
+            policy.primary_provider, *policy.fallback_providers
         )
-        schedule_attempts = [
-            _runtime_or_database_skip_attempt(
+        schedule_attempts: list[dict[str, Any]] = []
+        capability_acquisitions_by_metric: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+        for provider, block in zip(
+            schedule_order,
+            schedule_blocks,
+            strict=True,
+        ):
+            lookup = (
+                dict(block.get("database_lookup") or {})
+                if isinstance(
+                    block.get("database_lookup"),
+                    dict,
+                )
+                else {}
+            )
+            attempt = _runtime_or_database_skip_attempt(
                 provider,
                 block,
-                database_valid=schedule_database_valid,
-            )
-            for provider, block in zip(
-                (
-                    policy.primary_provider,
-                    *policy.fallback_providers,
+                database_valid=_database_lookup_is_valid(
+                    lookup
                 ),
-                schedule_blocks,
-                strict=True,
             )
+            schedule_attempts.append(attempt)
+            metric_id = str(
+                block.get("capability_metric_id") or ""
+            ).strip()
+            capability = (
+                capability_acquisitions_by_metric.setdefault(
+                    metric_id,
+                    {
+                        "capability_metric_id": metric_id,
+                        "provider_ids": [],
+                        "database_lookups": [],
+                        "selected_provider": None,
+                    },
+                )
+            )
+            capability["provider_ids"].append(provider)
+            capability["database_lookups"].append(
+                {
+                    "provider": provider,
+                    "performed": lookup.get("performed"),
+                    "found": lookup.get("found"),
+                    "data_as_of": lookup.get("data_as_of"),
+                    "content_valid_until": lookup.get(
+                        "content_valid_until"
+                    ),
+                    "refresh_due_at": lookup.get(
+                        "refresh_due_at"
+                    ),
+                    "lifecycle_status": lookup.get(
+                        "lifecycle_status"
+                    ),
+                    "expired": lookup.get("expired"),
+                    "freshness": lookup.get("freshness"),
+                    "reason_code": lookup.get("reason_code"),
+                }
+            )
+            if (
+                capability["selected_provider"] is None
+                and (
+                    _database_lookup_is_valid(lookup)
+                    or _attempt_succeeded(attempt)
+                )
+            ):
+                capability["selected_provider"] = provider
+        capability_acquisitions = list(
+            capability_acquisitions_by_metric.values()
+        )
+        capability_first_lookups = [
+            acquisition["database_lookups"][0]
+            for acquisition in capability_acquisitions
+            if acquisition["database_lookups"]
+        ]
+        schedule_lookup_performed = bool(
+            capability_first_lookups
+            and all(
+                lookup.get("performed") is True
+                for lookup in capability_first_lookups
+            )
+        )
+        selected_schedule_providers = [
+            acquisition["selected_provider"]
+            for acquisition in capability_acquisitions
+            if acquisition["selected_provider"] is not None
         ]
         collector.record(
             "market_schedule",
             acquisition_id="market_schedule_provider_chain",
             shared_dataset_ids=("market_schedule",),
-            database_lookup_performed=bool(
-                schedule_lookup.get("performed")
-            ),
+            database_lookup_performed=schedule_lookup_performed,
             database_lookup_reason=(
-                "MARKET_SCHEDULE_CANONICAL_CACHE_LOOKUP"
+                "MARKET_SCHEDULE_CAPABILITY_SCOPED_CACHE_LOOKUPS"
             ),
-            database_record_found=(
-                schedule_lookup
-            ).get("found"),
-            database_data_as_of=(
-                schedule_lookup
-            ).get("data_as_of"),
-            database_content_valid_until=(
-                schedule_lookup
-            ).get("content_valid_until"),
-            database_refresh_due_at=(
-                schedule_lookup
-            ).get("refresh_due_at"),
-            database_lifecycle_status=(
-                schedule_lookup
-            ).get("lifecycle_status"),
-            database_record_expired=(
-                schedule_lookup
-            ).get("expired"),
-            database_freshness_evaluation=str(
-                (
-                    schedule_lookup
-                ).get("freshness")
-                or "NOT_LOOKED_UP"
+            database_record_found=None,
+            database_data_as_of=None,
+            database_content_valid_until=None,
+            database_refresh_due_at=None,
+            database_lifecycle_status=None,
+            database_record_expired=None,
+            database_freshness_evaluation=(
+                "CAPABILITY_SCOPED"
             ),
+            capability_acquisitions=capability_acquisitions,
             primary_provider=schedule_attempts[0],
             fallbacks=schedule_attempts[1:],
-            acquisition_selected_source=next(
-                (
-                    block.get("source")
-                    for block in schedule_blocks
-                    if str(block.get("status") or "").lower()
-                    in {"found", "available", "valid", "partial"}
-                ),
-                None,
+            acquisition_selected_source=(
+                "MIXED"
+                if selected_schedule_providers
+                else None
             ),
-            acquisition_reason_code="MARKET_SCHEDULE_PROVIDER_CHAIN_COMPLETED",
+            acquisition_reason_code=(
+                "MARKET_SCHEDULE_CAPABILITY_ACQUISITIONS_COMPLETED"
+            ),
         )
 
     def _record_block_dataset(
@@ -3082,40 +3667,168 @@ class DiagnosticsService:
 def _vix_provider_evidence(
     macro: MacroLatestResponse,
 ) -> dict[str, Any]:
-    fred_results = [
+    query = _repository_query("vix")
+    requested = _macro_requested_series(
+        {"vix"},
+        queries={"vix": query},
+    )
+    if len(requested) != 1:
+        raise RuntimeError("VIX_MACRO_PROVIDER_MAPPING_INVALID")
+    provider_id, provider_series = next(iter(requested.items()))
+    provider_results = [
         result
         for result in macro.provider_results
         if str(getattr(result, "source", "")).upper()
-        == "FRED"
+        == provider_id
     ]
     found = any(
         str(getattr(series, "series_id", "")).upper()
-        == "VIXCLS"
+        in provider_series
         and getattr(series, "value", None) is not None
         and str(getattr(series, "source", "")).upper()
-        == "FRED"
+        == provider_id
         for series in macro.series
     )
     failed = bool(
-        fred_results
+        provider_results
         and any(
             getattr(result, "errors", None)
-            for result in fred_results
+            for result in provider_results
         )
     )
     return {
-        "called": bool(fred_results),
-        "attempts": len(fred_results),
+        "provider": provider_id,
+        "called": bool(provider_results),
+        "attempts": len(provider_results),
         "result": (
             "FOUND"
             if found
             else "FAILED"
             if failed
             else "NO_DATA"
-            if fred_results
+            if provider_results
             else "NOT_CALLED"
         ),
     }
+
+
+def _finite_numeric_value(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _risk_metric_source(
+    risk_context: dict[str, Any],
+    metric_id: str,
+) -> str | None:
+    metric = risk_context.get(metric_id)
+    direct = metric.get("source") if isinstance(metric, dict) else None
+    selected = (
+        (risk_context.get("source_summary") or {})
+        .get("selected_sources", {})
+        .get(metric_id)
+    )
+    if isinstance(selected, dict):
+        selected = selected.get("source")
+    source = direct or selected
+    return str(source).strip().upper() if source else None
+
+
+def _delivered_vix_value(
+    risk_context: dict[str, Any],
+) -> tuple[float | None, str | None]:
+    value = risk_context.get("vix")
+    if not isinstance(value, dict):
+        return None, None
+    numeric = _finite_numeric_value(value.get("value"))
+    if (
+        str(value.get("status") or "").lower()
+        not in {"found", "available", "valid"}
+        or numeric is None
+        or numeric <= 0
+    ):
+        return None, None
+    return numeric, _risk_metric_source(risk_context, "vix")
+
+
+def _cboe_vix_observation_values(
+    block: dict[str, Any],
+) -> tuple[float, ...]:
+    observed: list[float] = []
+    indices = block.get("indices")
+    if isinstance(indices, dict):
+        for key, item in indices.items():
+            if str(key).strip().upper() != "VIX" or not isinstance(
+                item,
+                dict,
+            ):
+                continue
+            for field in ("value", "current_price", "close"):
+                value = _finite_numeric_value(item.get(field))
+                if value is not None and value > 0:
+                    observed.append(value)
+                    break
+    history = block.get("history")
+    vix_history = (
+        history.get("vix") or history.get("VIX")
+        if isinstance(history, dict)
+        else None
+    )
+    if isinstance(vix_history, list) and vix_history:
+        latest = vix_history[-1]
+        if isinstance(latest, dict):
+            value = _finite_numeric_value(latest.get("value"))
+            if value is not None and value > 0:
+                observed.append(value)
+    return tuple(observed)
+
+
+def _cboe_vix_was_observed_and_delivered(
+    block: dict[str, Any],
+    risk_context: dict[str, Any],
+) -> bool:
+    delivered, source = _delivered_vix_value(risk_context)
+    return bool(
+        delivered is not None
+        and source is not None
+        and "CBOE" in source
+        and any(
+            math.isclose(
+                delivered,
+                observed,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            for observed in _cboe_vix_observation_values(block)
+        )
+    )
+
+
+def _vix_cboe_attempt(
+    block: dict[str, Any],
+    *,
+    risk_context: dict[str, Any],
+) -> dict[str, Any]:
+    attempt = _attempt_from_runtime_block("CBOE", block)
+    if attempt.get("called") is not True:
+        return attempt
+    return provider_attempt(
+        "CBOE",
+        called=True,
+        attempts=int(attempt.get("attempts") or 0),
+        result=(
+            "SUCCESS"
+            if _cboe_vix_was_observed_and_delivered(
+                block,
+                risk_context,
+            )
+            else "NO_DATA_FOR_VIX"
+        ),
+        execution_origin="PROVIDER_CALL",
+    )
 
 
 def _canonical_freshness_evidence(
@@ -3147,6 +3860,145 @@ def _database_selected_attempt(
     )
 
 
+def _calendar_fallback_provider_order() -> tuple[str, ...]:
+    policy = _registry_dataset_policy("macro_calendar")
+    order = tuple(policy.fallback_providers)
+    mapped = set(CALENDAR_FALLBACK_RUNTIME_NAMES)
+    if (
+        not order
+        or len(order) != len(set(order))
+        or set(order) != mapped
+    ):
+        raise RuntimeError(
+            "MACRO_CALENDAR_FALLBACK_RUNTIME_POLICY_MISMATCH:"
+            f"{','.join(order)}"
+        )
+    return order
+
+
+async def _run_calendar_fallback_chain(
+    runtime: Any,
+    *,
+    provider_order: tuple[str, ...],
+    refresh: str,
+    primary_succeeded: bool,
+) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    prior_succeeded = primary_succeeded
+    for provider_id in provider_order:
+        runtime_name = CALENDAR_FALLBACK_RUNTIME_NAMES.get(
+            provider_id
+        )
+        if runtime_name is None:
+            raise RuntimeError(
+                "MACRO_CALENDAR_FALLBACK_ADAPTER_UNMAPPED:"
+                f"{provider_id}"
+            )
+        payload = await runtime.provider(
+            runtime_name,
+            refresh="false" if prior_succeeded else refresh,
+        )
+        output[provider_id] = {
+            **payload,
+            "dataset_id": "macro_calendar",
+            "provider_id": provider_id,
+        }
+        prior_succeeded = bool(
+            prior_succeeded or _runtime_block_available(payload)
+        )
+    return output
+
+
+def _runtime_dataset_blocks_by_provider(
+    blocks: dict[str, dict[str, Any]],
+    *,
+    dataset_id: str,
+) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for block in blocks.values():
+        if (
+            not isinstance(block, dict)
+            or block.get("dataset_id") != dataset_id
+        ):
+            continue
+        provider_id = str(block.get("provider_id") or "")
+        if not provider_id or provider_id in output:
+            raise RuntimeError(
+                "RUNTIME_DATASET_PROVIDER_EVIDENCE_INVALID:"
+                f"{dataset_id}:{provider_id or 'MISSING'}"
+            )
+        output[provider_id] = block
+    return output
+
+
+def _ordered_dataset_runtime_blocks(
+    blocks: dict[str, dict[str, Any]],
+    *,
+    policy: Any,
+) -> list[dict[str, Any]]:
+    dataset_id = str(policy.dataset_id)
+    by_provider = _runtime_dataset_blocks_by_provider(
+        blocks,
+        dataset_id=dataset_id,
+    )
+    provider_order = (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+    return [
+        by_provider.get(provider_id, {})
+        for provider_id in provider_order
+    ]
+
+
+def _ordered_provider_attempts(
+    provider_order: tuple[str, ...],
+    *,
+    observed: dict[str, dict[str, Any]],
+    database_valid: bool,
+) -> list[dict[str, Any]]:
+    if (
+        not provider_order
+        or len(provider_order) != len(set(provider_order))
+        or any(provider not in observed for provider in provider_order)
+    ):
+        return [
+            provider_attempt(
+                provider,
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="RUNTIME_PROVIDER_MAPPING_UNAVAILABLE",
+                execution_origin="OBSERVED_SKIP",
+            )
+            for provider in provider_order
+        ]
+    if database_valid:
+        return [
+            _database_selected_attempt(provider)
+            for provider in provider_order
+        ]
+    output: list[dict[str, Any]] = []
+    prior_succeeded = False
+    for provider in provider_order:
+        if prior_succeeded:
+            attempt = provider_attempt(
+                provider,
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="PRIOR_PROVIDER_SUCCEEDED",
+                execution_origin="OBSERVED_SKIP",
+            )
+        else:
+            attempt = dict(observed[provider])
+        output.append(attempt)
+        prior_succeeded = bool(
+            prior_succeeded or _attempt_succeeded(attempt)
+        )
+    return output
+
+
 def _matching_macro_fact(
     rows: list[dict[str, Any]],
     series_ids: tuple[str, ...],
@@ -3170,6 +4022,61 @@ def _matching_macro_fact(
         ):
             return fact
     return None
+
+
+def _matching_macro_facts(
+    rows: list[dict[str, Any]],
+    series_ids: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    return {
+        series_id: fact
+        for series_id in series_ids
+        if (
+            fact := _matching_macro_fact(rows, (series_id,))
+        )
+        is not None
+    }
+
+
+def _complete_macro_dataset_facts(
+    rows: list[dict[str, Any]],
+    *,
+    dataset_id: str,
+    query: Any,
+    freshness: DataFreshnessService,
+) -> list[dict[str, Any]]:
+    selected = _structurally_complete_macro_dataset_facts(
+        rows,
+        dataset_id=dataset_id,
+        query=query,
+    )
+    if not selected:
+        return []
+    if not all(
+        freshness.evaluate_canonical(
+            fact,
+            max_age=_dataset_sla(dataset_id),
+        ).usable
+        for fact in selected
+    ):
+        return []
+    return selected
+
+
+def _structurally_complete_macro_dataset_facts(
+    rows: list[dict[str, Any]],
+    *,
+    dataset_id: str,
+    query: Any,
+) -> list[dict[str, Any]]:
+    required = _required_macro_dataset_series(
+        dataset_id,
+        query=query,
+    )
+    matched = _matching_macro_facts(rows, required)
+    if set(matched) != set(required):
+        return []
+    return [matched[series_id] for series_id in required]
 
 
 def _event_value(event: Any, *keys: str) -> Any:
@@ -3402,6 +4309,7 @@ def _calendar_primary_acquisition_succeeded(
     accounting: dict[str, Any],
     *,
     events: list[Any],
+    coverage: dict[str, Any] | None = None,
 ) -> bool:
     if accounting.get("provider_called") is True:
         return _attempt_succeeded(
@@ -3410,10 +4318,20 @@ def _calendar_primary_acquisition_succeeded(
                 "result": accounting.get("provider_result"),
             }
         )
-    return bool(
+    if not (
         events
         and accounting.get("database_lookup_performed") is True
-    )
+    ):
+        return False
+    if coverage:
+        lookup = _calendar_database_evidence(
+            coverage,
+            events=events,
+            provider_called=False,
+            database_lookup_performed=True,
+        )
+        return _database_lookup_is_valid(lookup)
+    return True
 
 
 def _calendar_catch_up_succeeded(coverage: dict[str, Any]) -> bool:
@@ -3434,6 +4352,79 @@ def _calendar_catch_up_succeeded(coverage: dict[str, Any]) -> bool:
         and int(coverage.get("quarantined_occurrence_count") or 0)
         == 0
     )
+
+
+def _calendar_leaf_attempt_aggregate(
+    coverage: dict[str, Any],
+) -> dict[str, Any]:
+    attempts = [
+        item
+        for item in (coverage.get("provider_attempts") or [])
+        if isinstance(item, dict)
+    ]
+    expected_count = int(
+        coverage.get("providers_expected")
+        or len(coverage.get("expected_provider_ids") or [])
+        or 0
+    )
+    if not attempts or len(attempts) != expected_count:
+        return {
+            "complete": False,
+            "called": False,
+            "attempts": 0,
+            "result": "EVIDENCE_NOT_AVAILABLE",
+            "not_called_reason": (
+                "CALENDAR_LEAF_PROVIDER_EVIDENCE_MISSING"
+            ),
+        }
+    called = [item for item in attempts if item.get("called") is True]
+    attempt_count = sum(
+        int(item.get("attempts") or 0) for item in called
+    )
+    successes = sum(
+        int(item.get("successful_attempts") or 0)
+        for item in called
+    )
+    failures = sum(
+        int(item.get("failed_attempts") or 0)
+        for item in called
+    )
+    if called:
+        result = (
+            "SCHEDULE_CATCH_UP_COMPLETED"
+            if attempt_count > 0
+            and successes == attempt_count
+            and failures == 0
+            and _calendar_catch_up_succeeded(coverage)
+            else "SCHEDULE_CATCH_UP_INCOMPLETE"
+            if attempt_count > 0
+            and successes == attempt_count
+            and failures == 0
+            else "SCHEDULE_CATCH_UP_FAILED"
+            if attempt_count > 0
+            and failures == attempt_count
+            and successes == 0
+            else "SCHEDULE_CATCH_UP_PARTIAL"
+        )
+        reason = None
+    else:
+        result = "NOT_CALLED"
+        reason = (
+            "VALID_DATABASE_RECORD_SELECTED"
+            if all(
+                item.get("not_called_reason")
+                == "VALID_DATABASE_COVERAGE"
+                for item in attempts
+            )
+            else "CALENDAR_LEAF_PROVIDER_NOT_CALLED"
+        )
+    return {
+        "complete": True,
+        "called": bool(called),
+        "attempts": attempt_count,
+        "result": result,
+        "not_called_reason": reason,
+    }
 
 
 def _news_provider_execution_evidence_complete(
@@ -3497,8 +4488,9 @@ def _calendar_database_evidence(
     *,
     events: list[Any],
     provider_called: bool,
+    database_lookup_performed: bool | None = None,
 ) -> dict[str, Any]:
-    del provider_called
+    del events, provider_called
     preflight = coverage.get("database_lookup_daily_matrix")
     matrices = (
         (preflight or {}).get("by_provider")
@@ -3507,21 +4499,314 @@ def _calendar_database_evidence(
         if isinstance(coverage.get("daily_matrix"), dict)
         else {}
     )
-    rows: list[tuple[str, dict[str, Any]]] = []
-    for matrix in (matrices or {}).values():
+    lookup_performed = (
+        database_lookup_performed
+        if type(database_lookup_performed) is bool
+        else bool(preflight or matrices)
+    )
+    if not lookup_performed:
+        return {
+            "performed": False,
+            "found": None,
+            "data_as_of": None,
+            "content_valid_until": None,
+            "refresh_due_at": None,
+            "expired": None,
+            "lifecycle_status": None,
+            "freshness": "NOT_LOOKED_UP",
+            "complete": False,
+        }
+    requested_dates = sorted(
+        {
+            str(day)
+            for day in (
+                coverage.get("requested_dates")
+                or (
+                    preflight.get("requested_dates")
+                    if isinstance(preflight, dict)
+                    else []
+                )
+                or []
+            )
+            if str(day)
+        }
+    )
+    expected_provider_names = sorted(
+        {
+            str(value)
+            for value in (
+                (preflight or {}).get(
+                    "expected_provider_names",
+                    [],
+                )
+                if isinstance(preflight, dict)
+                else []
+            )
+            or coverage.get("expected_provider_names")
+            or (
+                (coverage.get("daily_matrix") or {}).get(
+                    "expected_provider_names",
+                    [],
+                )
+                if isinstance(
+                    coverage.get("daily_matrix"),
+                    dict,
+                )
+                else []
+            )
+            if str(value)
+        }
+    )
+    provider_id_by_name = dict(
+        (
+            (preflight or {}).get("provider_id_by_name")
+            if isinstance(preflight, dict)
+            else None
+        )
+        or coverage.get("provider_id_by_name")
+        or (
+            (coverage.get("daily_matrix") or {}).get(
+                "provider_id_by_name"
+            )
+            if isinstance(
+                coverage.get("daily_matrix"),
+                dict,
+            )
+            else None
+        )
+        or {}
+    )
+    expected_provider_ids = sorted(
+        {
+            str(value)
+            for value in (
+                (preflight or {}).get(
+                    "expected_provider_ids",
+                    [],
+                )
+                if isinstance(preflight, dict)
+                else []
+            )
+            or coverage.get("expected_provider_ids")
+            or (
+                (coverage.get("daily_matrix") or {}).get(
+                    "expected_provider_ids",
+                    [],
+                )
+                if isinstance(
+                    coverage.get("daily_matrix"),
+                    dict,
+                )
+                else []
+            )
+            if str(value)
+        }
+    )
+    rows: list[tuple[str, str, dict[str, Any]]] = []
+    for provider, matrix in (matrices or {}).items():
         for day, value in (
             (matrix.get("by_date") or {}).items()
             if isinstance(matrix, dict)
             else ()
         ):
             if isinstance(value, dict):
-                rows.append((str(day), value))
-    today = datetime.now(UTC).date().isoformat()
-    selected = next(
-        (item for item in rows if item[0] == today),
-        rows[0] if rows else None,
+                rows.append(
+                    (str(provider), str(day), value)
+                )
+    observed_provider_names = sorted(
+        str(value) for value in (matrices or {})
     )
-    if selected is None:
+    expected_provider_metadata_valid = bool(
+        expected_provider_names
+        and expected_provider_ids
+        and set(provider_id_by_name)
+        == set(expected_provider_names)
+        and {
+            str(provider_id_by_name[name])
+            for name in expected_provider_names
+        }
+        == set(expected_provider_ids)
+    )
+    evaluated_provider_names = sorted(
+        set(observed_provider_names)
+        & set(expected_provider_names)
+    )
+    evaluated_provider_ids = sorted(
+        {
+            str(provider_id_by_name[name])
+            for name in evaluated_provider_names
+            if name in provider_id_by_name
+        }
+    )
+    unexpected_provider_names = sorted(
+        set(observed_provider_names)
+        - set(expected_provider_names)
+    )
+    expected_observations = (
+        len(expected_provider_names) * len(requested_dates)
+    )
+    observed_keys = {
+        (provider, day)
+        for provider, day, _row in rows
+        if provider in expected_provider_names
+    }
+    expected_keys = {
+        (provider, day)
+        for provider in expected_provider_names
+        for day in requested_dates
+    }
+    missing_observations = len(expected_keys - observed_keys)
+    rows = [
+        item
+        for item in rows
+        if item[0] in expected_provider_names
+    ]
+    provider_attempts = [
+        dict(item)
+        for item in (coverage.get("provider_attempts") or [])
+        if isinstance(item, dict)
+    ]
+    decision_at = datetime.now(UTC)
+    (
+        provider_refresh_required_names,
+        provider_refresh_required_ids,
+    ) = _calendar_refresh_required_providers(
+        rows,
+        expected_provider_names=expected_provider_names,
+        requested_dates=requested_dates,
+        provider_id_by_name=provider_id_by_name,
+        decision_at=decision_at,
+    )
+    if (
+        not rows
+        or not requested_dates
+        or not expected_provider_metadata_valid
+        or unexpected_provider_names
+    ):
+        window_start = requested_dates[0] if requested_dates else None
+        window_end = requested_dates[-1] if requested_dates else None
+        return {
+            "performed": True,
+            "found": False,
+            "data_as_of": None,
+            "content_valid_until": None,
+            "refresh_due_at": None,
+            "expired": False,
+            "lifecycle_status": None,
+            "freshness": "NOT_FOUND",
+            "complete": False,
+            "summary": {
+                "providers_expected": len(
+                    expected_provider_names
+                ),
+                "providers_evaluated": len(
+                    evaluated_provider_names
+                ),
+                "provider_ids_expected": expected_provider_ids,
+                "provider_ids_evaluated": evaluated_provider_ids,
+                "provider_names_expected": expected_provider_names,
+                "provider_names_evaluated": (
+                    evaluated_provider_names
+                ),
+                "unexpected_provider_names": (
+                    unexpected_provider_names
+                ),
+                "provider_refresh_required_ids": (
+                    provider_refresh_required_ids
+                ),
+                "provider_refresh_required_names": (
+                    provider_refresh_required_names
+                ),
+                "provider_attempts": provider_attempts,
+                "observations_expected": expected_observations,
+                "observations_evaluated": 0,
+                "observations_missing": expected_observations,
+                "records_terminal": 0,
+                "records_missing_or_incomplete": 0,
+                "records_expired": 0,
+                "window_start": window_start,
+                "window_end": window_end,
+            },
+        }
+    terminal_statuses = {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
+    evaluated: list[dict[str, Any]] = []
+    for provider, day, row in rows:
+        status = str(row.get("status") or "").upper()
+        content_deadline = parse_datetime(row.get("valid_until"))
+        refresh_deadline = parse_datetime(
+            row.get("next_revision_check_at")
+            or row.get("next_retry_at")
+        )
+        terminal = status in terminal_statuses
+        expired = bool(
+            terminal
+            and content_deadline is not None
+            and refresh_deadline is not None
+            and (
+                decision_at >= content_deadline
+                or decision_at >= refresh_deadline
+            )
+        )
+        evaluated.append(
+            {
+                "provider": provider,
+                "day": day,
+                "status": status,
+                "terminal": terminal,
+                "content_deadline": content_deadline,
+                "refresh_deadline": refresh_deadline,
+                "expired": expired,
+            }
+        )
+    terminal_count = sum(
+        int(item["terminal"])
+        for item in evaluated
+    )
+    missing_count = len(evaluated) - terminal_count
+    expired_count = sum(
+        int(item["expired"])
+        for item in evaluated
+    )
+    summary = {
+        "providers_expected": len(expected_provider_names),
+        "providers_evaluated": len(
+            evaluated_provider_names
+        ),
+        "provider_ids_expected": expected_provider_ids,
+        "provider_ids_evaluated": evaluated_provider_ids,
+        "provider_names_expected": expected_provider_names,
+        "provider_names_evaluated": evaluated_provider_names,
+        "unexpected_provider_names": unexpected_provider_names,
+        "provider_refresh_required_ids": (
+            provider_refresh_required_ids
+        ),
+        "provider_refresh_required_names": (
+            provider_refresh_required_names
+        ),
+        "provider_attempts": provider_attempts,
+        "observations_expected": expected_observations,
+        "observations_evaluated": len(evaluated),
+        "observations_missing": missing_observations,
+        "records_terminal": terminal_count,
+        "records_missing_or_incomplete": missing_count,
+        "records_expired": expired_count,
+        "window_start": requested_dates[0],
+        "window_end": requested_dates[-1],
+    }
+    if missing_observations:
+        return {
+            "performed": True,
+            "found": False,
+            "data_as_of": None,
+            "content_valid_until": None,
+            "refresh_due_at": None,
+            "expired": False,
+            "lifecycle_status": None,
+            "freshness": "NOT_FOUND",
+            "complete": False,
+            "summary": summary,
+        }
+    if missing_count:
         return {
             "performed": True,
             "found": False,
@@ -3532,46 +4817,130 @@ def _calendar_database_evidence(
             "lifecycle_status": None,
             "freshness": "NOT_FOUND",
             "complete": True,
+            "summary": summary,
         }
-    day, row = selected
-    status = str(row.get("status") or "").upper()
-    valid_until = row.get("valid_until")
-    refresh_due_at = (
-        row.get("next_revision_check_at")
-        or row.get("next_retry_at")
+    if any(
+        item["content_deadline"] is None
+        or item["refresh_deadline"] is None
+        for item in evaluated
+    ):
+        return {
+            "performed": True,
+            "found": True,
+            "data_as_of": _calendar_matrix_reference_day(
+                evaluated,
+                decision_at=decision_at,
+            ),
+            "content_valid_until": None,
+            "refresh_due_at": None,
+            "expired": True,
+            "lifecycle_status": "ACTIVE",
+            "freshness": "INCOMPLETE_DEADLINE_EVIDENCE",
+            "complete": False,
+            "summary": summary,
+        }
+    content_valid_until = min(
+        item["content_deadline"]
+        for item in evaluated
     )
-    decision_at = datetime.now(UTC)
-    valid_deadline = parse_datetime(valid_until)
-    refresh_deadline = parse_datetime(refresh_due_at)
-    expired = bool(
-        status not in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
-        or
-        valid_deadline is None
-        or refresh_deadline is None
-        or decision_at >= valid_deadline
-        or decision_at >= refresh_deadline
+    refresh_due_at = min(
+        item["refresh_deadline"]
+        for item in evaluated
+    )
+    aggregate = {
+        "database_data_as_of": _calendar_matrix_reference_day(
+            evaluated,
+            decision_at=decision_at,
+        ),
+        "database_content_valid_until": (
+            content_valid_until.isoformat()
+        ),
+        "database_refresh_due_at": refresh_due_at.isoformat(),
+        "database_lifecycle_status": "ACTIVE",
+    }
+    freshness = evaluate_canonical_freshness(
+        aggregate,
+        policy=CanonicalFreshnessPolicy(
+            max_age=_dataset_sla("macro_calendar"),
+            data_reference_mode="event_occurrence",
+        ),
+        observed_at=decision_at,
     )
     return {
         "performed": True,
         "found": True,
-        "data_as_of": day,
-        "content_valid_until": valid_until,
-        "refresh_due_at": refresh_due_at,
-        "lifecycle_status": (
-            "VALID"
-            if status in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
-            else "INVALID"
-        ),
-        "expired": expired,
-        "freshness": (
-            "VALID"
-            if not expired
-            else "INVALID_LIFECYCLE"
-            if status not in {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
-            else "REFRESH_DUE"
-        ),
-        "complete": bool(valid_deadline and refresh_deadline),
+        "data_as_of": freshness.data_as_of,
+        "content_valid_until": freshness.content_valid_until,
+        "refresh_due_at": freshness.refresh_due_at,
+        "lifecycle_status": freshness.lifecycle,
+        "expired": freshness.expired,
+        "freshness": freshness.evaluation,
+        "complete": freshness.complete,
+        "summary": summary,
     }
+
+
+def _calendar_refresh_required_providers(
+    rows: list[tuple[str, str, dict[str, Any]]],
+    *,
+    expected_provider_names: list[str],
+    requested_dates: list[str],
+    provider_id_by_name: dict[str, Any],
+    decision_at: datetime,
+) -> tuple[list[str], list[str]]:
+    terminal_statuses = {"VERIFIED_COMPLETE", "VERIFIED_EMPTY"}
+    rows_by_key = {
+        (provider, day): row
+        for provider, day, row in rows
+    }
+    required_names: list[str] = []
+    for provider_name in expected_provider_names:
+        provider_due = False
+        for day in requested_dates:
+            row = rows_by_key.get((provider_name, day))
+            if row is None:
+                provider_due = True
+                break
+            status = str(row.get("status") or "").upper()
+            content_deadline = parse_datetime(
+                row.get("valid_until")
+            )
+            refresh_deadline = parse_datetime(
+                row.get("next_revision_check_at")
+                or row.get("next_retry_at")
+            )
+            if (
+                status not in terminal_statuses
+                or content_deadline is None
+                or refresh_deadline is None
+                or decision_at >= content_deadline
+                or decision_at >= refresh_deadline
+            ):
+                provider_due = True
+                break
+        if provider_due:
+            required_names.append(provider_name)
+    required_ids = sorted(
+        {
+            str(provider_id_by_name[name])
+            for name in required_names
+            if name in provider_id_by_name
+        }
+    )
+    return sorted(required_names), required_ids
+
+
+def _calendar_matrix_reference_day(
+    rows: list[dict[str, Any]],
+    *,
+    decision_at: datetime,
+) -> str:
+    today = decision_at.date().isoformat()
+    days = sorted(str(item["day"]) for item in rows)
+    if today in days:
+        return today
+    past = [day for day in days if day <= today]
+    return past[-1] if past else days[0]
 
 
 def _event_enrichment_metadata(
@@ -3769,6 +5138,7 @@ def _select_current_news_database_candidate(
     *,
     freshness_service: Any,
 ) -> tuple[dict[str, Any] | None, Any]:
+    max_age = _dataset_sla("current_news")
     observed_item: dict[str, Any] | None = None
     observed_freshness: Any = None
     for item in items:
@@ -3776,7 +5146,7 @@ def _select_current_news_database_candidate(
             continue
         freshness = freshness_service.evaluate_canonical(
             item,
-            max_age=timedelta(hours=24),
+            max_age=max_age,
         )
         if observed_item is None:
             observed_item = item
@@ -3789,7 +5159,7 @@ def _select_current_news_database_candidate(
         None,
         freshness_service.evaluate_canonical(
             None,
-            max_age=timedelta(hours=24),
+            max_age=max_age,
         ),
     )
 
@@ -3916,4 +5286,27 @@ def _sentiment_context_from_runtime(aaii: dict[str, Any]) -> dict[str, Any]:
                 "warnings": ["social_sentiment_optional_not_configured"],
             }
         },
+    }
+
+
+def _supplemental_source_not_requested(
+    *,
+    source: str,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "status": "not_called",
+        "reason_code": reason_code,
+        "source": source,
+        "data_as_of": None,
+        "retrieved_at": None,
+        "content_valid_until": None,
+        "refresh_due_at": None,
+        "provider_calls": 0,
+        "actual_network_calls": 0,
+        "attempted": False,
+        "cache_used": False,
+        "warnings": [reason_code.lower()],
+        "errors": [],
+        "service_role": "data provider only",
     }

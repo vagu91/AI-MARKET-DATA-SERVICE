@@ -45,6 +45,20 @@ class InvestingFedRateMonitorProvider:
         warnings = []
         if not parsed["meetings"]:
             warnings.append("investing_fed_rate_monitor_no_meetings")
+        data_as_of = _observation_data_as_of(parsed["meetings"])
+        if parsed["meetings"] and data_as_of is None:
+            warnings.append(
+                "investing_fed_rate_monitor_observation_time_not_proved"
+            )
+        valid_until = _iso(
+            now
+            + timedelta(
+                minutes=(
+                    self.settings
+                    .investing_fed_rate_monitor_ttl_minutes
+                )
+            )
+        )
         return {
             "status": "found" if parsed["meetings"] else "not_found",
             "provider": self.source,
@@ -55,8 +69,11 @@ class InvestingFedRateMonitorProvider:
             "official_fed_data": False,
             "official_fed_source": False,
             "official_cme_data": False,
+            "data_as_of": data_as_of,
             "retrieved_at": _iso(now),
-            "valid_until": _iso(now + timedelta(minutes=self.settings.investing_fed_rate_monitor_ttl_minutes)),
+            "valid_until": valid_until,
+            "content_valid_until": valid_until,
+            "refresh_due_at": valid_until,
             "meetings": parsed["meetings"],
             "current_meeting": parsed["meetings"][0] if parsed["meetings"] else None,
             "history_endpoint": {
@@ -77,6 +94,40 @@ class InvestingFedRateMonitorProvider:
             "duration_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),
             "service_role": "data provider only",
         }
+
+
+def _observation_data_as_of(
+    meetings: list[dict[str, Any]],
+) -> str | None:
+    observations = [
+        parsed.astimezone(UTC)
+        for meeting in meetings
+        if (
+            parsed := _datetime_or_none(
+                meeting.get("updated_at")
+            )
+        )
+        is not None
+    ]
+    if len(observations) != len(meetings) or not observations:
+        return None
+    return _iso(min(observations))
+
+
+def _datetime_or_none(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+    return (
+        parsed.astimezone(UTC)
+        if parsed.tzinfo
+        else parsed.replace(tzinfo=UTC)
+    )
 
 
 def parse_investing_fed_rate_monitor_html(text: str, *, max_meetings: int = 8) -> dict[str, Any]:

@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from app.models.common import ProviderResult, ProviderType
 from app.models.nasdaq import (
@@ -25,7 +25,12 @@ from app.providers.earnings_provider import EarningsProvider
 from app.providers.mega_cap_snapshot_provider import MEGA_CAP_TICKERS, MegaCapSnapshotProvider
 from app.providers.news_provider import NEWS_PROVIDER_SPECS, NewsProvider
 from app.providers.qqq_holdings_provider import QQQHoldingsProvider
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessPolicy,
+    evaluate_canonical_freshness,
+    parse_datetime,
+)
+from app.services.provider_capability_registry import dataset_policy_by_id
 from app.services.qqq_weight_intelligence_service import (
     EQUAL_WEIGHT_PROXY,
     RECONSTRUCTED_MARKET_CAP_WEIGHT,
@@ -41,11 +46,14 @@ class NasdaqDataService:
         mega_cap_snapshot_provider: MegaCapSnapshotProvider,
         earnings_provider: EarningsProvider,
         news_provider: NewsProvider,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.qqq_holdings_provider = qqq_holdings_provider
         self.mega_cap_snapshot_provider = mega_cap_snapshot_provider
         self.earnings_provider = earnings_provider
         self.news_provider = news_provider
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     async def qqq_holdings(
         self,
@@ -126,28 +134,108 @@ class NasdaqDataService:
             force=force,
         )
         data = result.data if isinstance(result.data, dict) else {}
+        now = self.clock().astimezone(UTC)
+        max_age = timedelta(
+            seconds=dataset_policy_by_id(
+                "mega_cap_quotes"
+            ).sla_seconds
+        )
         stocks = []
+        rejected_stale_symbols: list[str] = []
+        rejected_missing_observation_symbols: list[str] = []
         for item in data.get("stocks", []):
             item = dict(item)
+            symbol = str(item.get("symbol") or "").upper()
+            observed_at = parse_datetime(item.get("data_as_of"))
+            if observed_at is None:
+                rejected_missing_observation_symbols.append(symbol)
+                continue
+            deadline = observed_at + max_age
+            freshness = evaluate_canonical_freshness(
+                {
+                    **item,
+                    "data_as_of": observed_at.isoformat(),
+                    "content_valid_until": deadline.isoformat(),
+                    "refresh_due_at": deadline.isoformat(),
+                },
+                policy=CanonicalFreshnessPolicy(
+                    max_age=max_age,
+                    data_reference_mode="point_in_time",
+                ),
+                observed_at=now,
+            )
+            if not freshness.usable:
+                rejected_stale_symbols.append(symbol)
+                continue
+            item["data_as_of"] = observed_at.isoformat()
             holding = weights.get(item.get("symbol"))
             item["weight"] = holding.weight if holding else None
             item["weight_method"] = holding.weight_method if holding else None
             item["weight_source"] = holding.weight_source if holding else None
             stocks.append(MegaCapStock.model_validate(item))
-        quality_data = data.get("data_quality", {})
+        quality_data = dict(data.get("data_quality", {}))
         quality_data["fallback_used"] = bool(quality_data.get("fallback_used") or result.metadata.is_fallback)
         quality_data["errors"] = _merge_errors(quality_data.get("errors", []), result.metadata.errors)
-        quality_data.setdefault("warnings", [])
-        quality_data.setdefault("final_data_available", bool(stocks))
+        quality_data["warnings"] = list(
+            quality_data.get("warnings") or []
+        )
+        if rejected_stale_symbols:
+            quality_data["warnings"].append(
+                "mega_cap_quote_outside_dataset_sla:"
+                + ",".join(rejected_stale_symbols)
+            )
+        if rejected_missing_observation_symbols:
+            quality_data["warnings"].append(
+                "mega_cap_quote_observation_time_missing:"
+                + ",".join(
+                    rejected_missing_observation_symbols
+                )
+            )
+        quality_data["final_data_available"] = bool(stocks)
+        quality_data["no_data_found"] = not bool(stocks)
         quality_data.setdefault("tracked_count", len(MEGA_CAP_TICKERS))
         quality_data["resolved_count"] = len(stocks)
+        quality_data["rejected_stale_symbols"] = (
+            rejected_stale_symbols
+        )
+        quality_data["rejected_missing_observation_symbols"] = (
+            rejected_missing_observation_symbols
+        )
+        quality_data["reason_code"] = (
+            "MEGA_CAP_NO_CURRENT_PROVIDER_OBSERVATIONS"
+            if not stocks
+            and (
+                rejected_stale_symbols
+                or rejected_missing_observation_symbols
+            )
+            else quality_data.get("reason_code")
+        )
         _set_provider_runtime(quality_data, result.metadata.provider_type)
-        quality_data.setdefault(
-            "missing_prices",
-            [stock.symbol for stock in stocks if stock.last_price is None],
+        quality_data["missing_prices"] = list(
+            dict.fromkeys(
+                [
+                    *list(quality_data.get("missing_prices") or []),
+                    *rejected_stale_symbols,
+                    *rejected_missing_observation_symbols,
+                    *[
+                        stock.symbol
+                        for stock in stocks
+                        if stock.last_price is None
+                    ],
+                ]
+            )
+        )
+        data_as_of = min(
+            (
+                stock.data_as_of
+                for stock in stocks
+                if stock.data_as_of is not None
+            ),
+            default=None,
         )
         response = MegaCapSnapshotResponse(
             retrieved_at=result.metadata.retrieved_at,
+            data_as_of=data_as_of,
             source=result.metadata.source,
             provider_type=result.metadata.provider_type,
             reliability=result.metadata.reliability,
@@ -238,7 +326,8 @@ class NasdaqDataService:
                 constituent_count=len(contributors),
             )
         return MegaCapBreadthResponse(
-            retrieved_at=datetime.now(UTC),
+            retrieved_at=self.clock().astimezone(UTC),
+            data_as_of=snapshot.data_as_of,
             tracked_count=len(stocks),
             positive_count=sum(1 for stock in usable if (stock.change_pct or 0.0) > 0),
             negative_count=sum(1 for stock in usable if (stock.change_pct or 0.0) < 0),

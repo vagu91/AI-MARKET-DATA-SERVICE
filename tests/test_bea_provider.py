@@ -80,7 +80,7 @@ def settings(tmp_path) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_bea_provider_returns_requested_macro_series(tmp_path) -> None:
+async def test_bea_provider_default_is_registry_scoped(tmp_path) -> None:
     provider = BeaProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings(tmp_path))
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -100,7 +100,6 @@ async def test_bea_provider_returns_requested_macro_series(tmp_path) -> None:
     assert set(result.data) == {
         "BEA:GDP",
         "BEA:REAL_GDP",
-        "BEA:PCE",
         "BEA:PCE_PRICE_INDEX",
         "BEA:CORE_PCE",
         "BEA:PERSONAL_INCOME",
@@ -127,6 +126,6 @@ async def test_bea_provider_reports_missing_series_without_breaking_response(tmp
         result = await provider.fetch()
 
     assert "BEA:CORE_PCE" not in result.data
-    assert "BEA:PCE" in result.data
+    assert "BEA:PCE" not in result.data
     assert result.metadata.is_fallback is False
     assert any("T20804 returned no data" in error for error in result.metadata.errors)

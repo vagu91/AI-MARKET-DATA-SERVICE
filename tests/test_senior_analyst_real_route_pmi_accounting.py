@@ -438,7 +438,7 @@ def test_correlated_observed_skip_chain_completes_pmi_accounting(
         now=now,
         collector=collector,
         lifecycle=lifecycle,
-        force_refresh=False,
+        force_refresh=True,
         resolver=resolver,
     )
 
@@ -540,12 +540,44 @@ def test_pmi_accounting_selects_latest_released_not_future_occurrence(
     contract = _pmi_contract()
     past = contract["event_calendar"]["critical_macro_events"][0]
     past_release = (now - timedelta(hours=1)).isoformat()
+    content_valid_until = (now + timedelta(hours=2)).isoformat()
+    refresh_due_at = (now + timedelta(hours=1)).isoformat()
+    reference_period = now.strftime("%Y-%m")
     past.update(
         {
             "release_at": past_release,
             "time_utc": past_release,
+            "reference_period": reference_period,
             "actual": 51.4,
             "actual_source": "S&P Global",
+            "actual_is_official": True,
+            "freshness_state": "CURRENT_RELEASE",
+            "content_valid_until": content_valid_until,
+            "refresh_due_at": refresh_due_at,
+            "source_lineage": [
+                {
+                    "occurrence_id": PMI_ID,
+                    "source": "S&P Global",
+                    "publisher": "S&P Global",
+                    "source_url": (
+                        "https://www.pmi.spglobal.com/Public/"
+                        "Home/PressRelease"
+                    ),
+                    "source_field": "actual",
+                    "source_series_id": (
+                        "SPGLOBAL:US:FLASH_SERVICES_PMI"
+                    ),
+                    "metric_id": "flash_services_pmi",
+                    "frequency": "monthly",
+                    "transformation": "level",
+                    "reference_period": reference_period,
+                    "value": 51.4,
+                    "freshness": "CURRENT_RELEASE",
+                    "content_valid_until": content_valid_until,
+                    "refresh_due_at": refresh_due_at,
+                    "validation_status": "accepted",
+                }
+            ],
         }
     )
     future = {
@@ -563,8 +595,8 @@ def test_pmi_accounting_selects_latest_released_not_future_occurrence(
         "entity_key": PMI_ID,
         "freshness_state": "CURRENT",
         "work_status": "RESOLVED",
-        "valid_until": (now + timedelta(hours=2)).isoformat(),
-        "next_refresh_at": (now + timedelta(hours=2)).isoformat(),
+        "valid_until": content_valid_until,
+        "next_refresh_at": refresh_due_at,
         "payload": {
                 **past,
                 "actual_resolution": {
@@ -826,9 +858,46 @@ def test_real_route_uses_investing_after_sp_global_failure(
     assert row["acquisition_reason_code"] == (
         "FLASH_SERVICES_PMI_DELIVERABLE_ACQUIRED"
     )
-    assert row["selected_source"] == INVESTING_SOURCE
+    assert row["selected_source"] == INVESTING_SOURCE, json.dumps(
+        {
+            "events": payload["analytics"]["calendar"].get(
+                "latest_released_events"
+            ),
+            "missing_data": [
+                item
+                for item in payload.get("missing_data") or []
+                if "flash" in str(item).casefold()
+                or PMI_ID in str(item)
+            ],
+            "row": row,
+        },
+        default=str,
+        sort_keys=True,
+    )
     assert row["selected_value_present"] is True
-    assert row["delivered_value"][0]["value"] == 53.6
+    assert row["delivered_value"]["payload_path"] == [
+        "analytics.calendar.latest_released_events",
+        "analytics.calendar.active_event_windows",
+        "analytics.calendar.next_24h_events",
+        "analytics.calendar.next_7d_high_impact_events",
+    ]
+    assert row["delivered_value"]["item_count"] == sum(
+        len(payload["analytics"]["calendar"].get(key) or [])
+        for key in (
+            "latest_released_events",
+            "active_event_windows",
+            "next_24h_events",
+            "next_7d_high_impact_events",
+        )
+    )
+    assert len(row["delivered_value"]["content_sha256"]) == 64
+    assert any(
+        event.get("actual") == 53.6
+        for event in payload["analytics"]["calendar"].get(
+            "latest_released_events"
+        )
+        or []
+    )
     assert payload["request"]["same_request_provider_accounting"] is True
     validation = validate_senior_analyst_payload_v1(
         payload,

@@ -65,6 +65,7 @@ async def test_mega_cap_breadth_uses_weights_and_equal_weight_fallback() -> None
                         "market_session": "REGULAR",
                         "currency": "USD",
                         "source": "fixture",
+                        "data_as_of": datetime.now(UTC).isoformat(),
                         "retrieved_at": datetime.now(UTC).isoformat(),
                     },
                     {
@@ -77,6 +78,7 @@ async def test_mega_cap_breadth_uses_weights_and_equal_weight_fallback() -> None
                         "market_session": "REGULAR",
                         "currency": "USD",
                         "source": "fixture",
+                        "data_as_of": datetime.now(UTC).isoformat(),
                         "retrieved_at": datetime.now(UTC).isoformat(),
                     },
                 ],
@@ -143,6 +145,7 @@ async def test_mega_cap_breadth_with_twelve_tickers() -> None:
                         "market_session": "REGULAR",
                         "currency": "USD",
                         "source": "fixture",
+                        "data_as_of": datetime.now(UTC).isoformat(),
                         "retrieved_at": datetime.now(UTC).isoformat(),
                     }
                     for idx, symbol in enumerate(tickers)

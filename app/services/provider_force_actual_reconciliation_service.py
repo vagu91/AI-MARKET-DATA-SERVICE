@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from app.core.config import Settings
 from app.services.data_freshness_service import (
@@ -22,7 +23,12 @@ from app.services.event_driven_lifecycle_service import (
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.observability_contract_service import TelemetryRepository
 from app.services.official_actual_semantics import (
+    OFFICIAL_METRICS,
     normalize_reference_period,
+)
+from app.services.provider_capability_registry import (
+    dataset_policy_by_id,
+    provider_by_id,
 )
 from app.services.request_provider_accounting import (
     RequestProviderAccountingCollector,
@@ -36,6 +42,39 @@ CALENDAR_SECTIONS = (
     "fed_communications",
     "other_economic_events",
 )
+FLASH_SERVICES_PMI_DATASET_ID = "flash_services_pmi"
+_ACCEPTED_FIELD_VALIDATION_STATES = frozenset(
+    {
+        "accepted",
+        "approved",
+        "deterministic_verified",
+        "field_level_validated",
+        "passed",
+        "valid",
+        "verified",
+    }
+)
+_CURRENT_FIELD_FRESHNESS_STATES = frozenset(
+    {
+        "CURRENT",
+        "CURRENT_LATEST_OFFICIAL_RELEASE",
+        "CURRENT_RELEASE",
+        "FRESH",
+    }
+)
+
+
+def _flash_services_pmi_provider_order() -> tuple[str, ...]:
+    policy = dataset_policy_by_id(FLASH_SERVICES_PMI_DATASET_ID)
+    order = (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+    if not order[0] or len(order) != len(set(order)):
+        raise RuntimeError(
+            "FLASH_SERVICES_PMI_PROVIDER_POLICY_INVALID"
+        )
+    return order
 
 
 class ProviderForceActualReconciliationService:
@@ -126,6 +165,7 @@ class ProviderForceActualReconciliationService:
                 else {}
             )
             lifecycle_before = _lifecycle_before(existing)
+            actual_evidence_repair_required = False
             if contract_event.get("actual") not in (None, ""):
                 persisted_audit = existing_payload.get(
                     "actual_resolution"
@@ -136,9 +176,6 @@ class ProviderForceActualReconciliationService:
                     occurrence_id=occurrence_id,
                     mapping_selected=mapping["metric_id"],
                 ):
-                    enrichment = dict(
-                        contract_event.get("enrichment") or {}
-                    )
                     persisted_actual_lineage = (
                         _persisted_actual_field_lineage(
                             existing_payload,
@@ -148,9 +185,13 @@ class ProviderForceActualReconciliationService:
                             delivered_actual=contract_event.get(
                                 "actual"
                             ),
+                            now=now,
                         )
                     )
                     if persisted_actual_lineage is not None:
+                        enrichment = dict(
+                            contract_event.get("enrichment") or {}
+                        )
                         field_lineage = dict(
                             enrichment.get("field_lineage") or {}
                         )
@@ -158,54 +199,65 @@ class ProviderForceActualReconciliationService:
                             persisted_actual_lineage
                         )
                         enrichment["field_lineage"] = field_lineage
-                    enrichment["summary"] = {
-                        **dict(enrichment.get("summary") or {}),
-                        "actual_resolution": persisted_audit,
-                    }
-                    output = _replace_occurrence(
-                        output,
-                        occurrence_id=occurrence_id,
-                        event={
-                            **contract_event,
-                            **{
-                                key: existing_payload.get(key)
-                                for key in (
-                                    "comparison_lineage",
-                                    "release_status",
-                                    "status",
-                                    "actual_source",
-                                    "actual_source_url",
-                                    "actual_is_official",
-                                    "source_lineage",
-                                    "acquisition_method",
-                                    "freshness_state",
-                                    "time_utc",
-                                    "release_at",
-                                )
-                                if existing_payload.get(key)
-                                not in (None, "")
-                            },
-                            "freshness_state": (
-                                existing_payload.get("freshness_state")
-                                or "CURRENT_RELEASE"
-                            ),
+                        enrichment["summary"] = {
+                            **dict(enrichment.get("summary") or {}),
                             "actual_resolution": persisted_audit,
-                            "enrichment": enrichment,
-                        },
-                    )
-                    audits.append(
-                        _request_scoped_database_audit(
-                            persisted_audit,
+                        }
+                        output = _replace_occurrence(
+                            output,
                             occurrence_id=occurrence_id,
-                            lifecycle_before=lifecycle_before,
-                            mapping_selected=mapping["metric_id"],
-                            observed_at=now,
-                            value_present=True,
-                            request_id=self.request_id,
-                            correlation_id=self.correlation_id,
+                            event={
+                                **contract_event,
+                                **{
+                                    key: existing_payload.get(key)
+                                    for key in (
+                                        "comparison_lineage",
+                                        "release_status",
+                                        "status",
+                                        "actual_source",
+                                        "actual_source_url",
+                                        "actual_is_official",
+                                        "source_lineage",
+                                        "acquisition_method",
+                                        "freshness_state",
+                                        "time_utc",
+                                        "release_at",
+                                        "content_valid_until",
+                                        "refresh_due_at",
+                                        "valid_until",
+                                        "next_refresh_at",
+                                    )
+                                    if existing_payload.get(key)
+                                    not in (None, "")
+                                },
+                                "freshness_state": (
+                                    existing_payload.get(
+                                        "freshness_state"
+                                    )
+                                    or "CURRENT_RELEASE"
+                                ),
+                                "actual_resolution": persisted_audit,
+                                "enrichment": enrichment,
+                            },
                         )
-                    )
-                continue
+                        audits.append(
+                            _request_scoped_database_audit(
+                                persisted_audit,
+                                occurrence_id=occurrence_id,
+                                lifecycle_before=lifecycle_before,
+                                mapping_selected=mapping["metric_id"],
+                                observed_at=now,
+                                value_present=True,
+                                request_id=self.request_id,
+                                correlation_id=self.correlation_id,
+                            )
+                        )
+                        continue
+                # A value without complete, field-specific canonical evidence
+                # is not a reusable DB hit.  Keep the DB lookup observable but
+                # remove the unproven delivery value before entering the normal
+                # deterministic resolver/provider path.
+                actual_evidence_repair_required = True
             release = parse_datetime(
                 contract_event.get("release_at")
                 or contract_event.get("scheduled_at_utc")
@@ -247,6 +299,8 @@ class ProviderForceActualReconciliationService:
                     release_date=release,
                 ),
             }
+            if actual_evidence_repair_required:
+                payload = _without_unproven_actual(payload)
             eligibility, reclaim_reason = _eligibility(
                 existing,
                 now=now,
@@ -254,6 +308,11 @@ class ProviderForceActualReconciliationService:
                 request_id=self.request_id,
                 correlation_id=self.correlation_id,
             )
+            if actual_evidence_repair_required:
+                eligibility = "RECLAIMABLE"
+                reclaim_reason = (
+                    "CANONICAL_ACTUAL_FIELD_EVIDENCE_INCOMPLETE"
+                )
             if eligibility != "RECLAIMABLE":
                 persisted = payload.get("actual_resolution")
                 if _same_request_provider_audit(
@@ -508,6 +567,16 @@ class ProviderForceActualReconciliationService:
                 "content_valid_until": lifecycle.valid_until,
                 "refresh_due_at": lifecycle.next_refresh_at,
             }
+            if resolved:
+                datum = _complete_same_acquisition_field_lineage(
+                    datum,
+                    candidate=candidate,
+                    audit=audit,
+                    lifecycle=lifecycle,
+                    occurrence_id=occurrence_id,
+                    mapping_selected=mapping["metric_id"],
+                    now=now,
+                )
             resolved_items.append((lifecycle, datum, work_status))
             canonical_reconciliations.append(
                 {
@@ -597,6 +666,9 @@ class ProviderForceActualReconciliationService:
         collector = self.accounting_collector
         if collector is None:
             return
+        provider_order = _flash_services_pmi_provider_order()
+        primary_provider_id = provider_order[0]
+        fallback_provider_ids = provider_order[1:]
         occurrences_by_id = {
             occurrence_id: event
             for occurrence_id, event in _contract_occurrences(
@@ -706,45 +778,73 @@ class ProviderForceActualReconciliationService:
         )
         if database_valid:
             primary = provider_attempt(
-                "SPGLOBAL",
+                primary_provider_id,
                 called=False,
                 attempts=0,
                 result="NOT_CALLED",
                 not_called_reason="VALID_DATABASE_RECORD_SELECTED",
                 execution_origin="CACHE_DECISION",
             )
-            fallback = provider_attempt(
-                "INVESTING_EVENT_1062",
-                called=False,
-                attempts=0,
-                result="NOT_CALLED",
-                not_called_reason="VALID_DATABASE_RECORD_SELECTED",
-                execution_origin="CACHE_DECISION",
-            )
+            fallbacks = [
+                provider_attempt(
+                    provider_id,
+                    called=False,
+                    attempts=0,
+                    result="NOT_CALLED",
+                    not_called_reason=(
+                        "VALID_DATABASE_RECORD_SELECTED"
+                    ),
+                    execution_origin="CACHE_DECISION",
+                )
+                for provider_id in fallback_provider_ids
+            ]
         else:
             primary = _actual_attempt(
-                "SPGLOBAL",
-                attempts_by_provider.get("SPGLOBAL"),
+                primary_provider_id,
+                attempts_by_provider.get(primary_provider_id),
                 skipped_reason=(
                     "NO_FLASH_SERVICES_PMI_OCCURRENCE"
                     if not occurrences
                     else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
                 ),
             )
-            fallback = _actual_attempt(
-                "INVESTING_EVENT_1062",
-                attempts_by_provider.get("INVESTING_EVENT_1062"),
-                skipped_reason=(
-                    "NO_FLASH_SERVICES_PMI_OCCURRENCE"
-                    if not occurrences
-                    else "PRIMARY_SUCCEEDED"
-                    if attempts_by_provider.get(
-                        "SPGLOBAL", {}
-                    ).get("result")
-                    == "SUCCESS"
-                    else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
-                ),
-            )
+            fallbacks = []
+            for index, provider_id in enumerate(
+                fallback_provider_ids,
+                start=1,
+            ):
+                prior_success = next(
+                    (
+                        prior_index
+                        for prior_index, prior_provider_id in enumerate(
+                            provider_order[:index]
+                        )
+                        if _actual_result_succeeded(
+                            attempts_by_provider.get(
+                                prior_provider_id,
+                                {},
+                            ).get("result")
+                        )
+                    ),
+                    None,
+                )
+                fallbacks.append(
+                    _actual_attempt(
+                        provider_id,
+                        attempts_by_provider.get(provider_id),
+                        skipped_reason=(
+                            "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                            if not occurrences
+                            else "PRIMARY_SUCCEEDED"
+                            if prior_success == 0
+                            else "PRIOR_PROVIDER_SUCCEEDED"
+                            if prior_success is not None
+                            else (
+                                "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+                            )
+                        ),
+                    )
+                )
         evidence_complete = bool(
             target is not None
             and target_audit is not None
@@ -803,7 +903,7 @@ class ProviderForceActualReconciliationService:
                 else "NOT_FOUND"
             ),
             primary_provider=primary,
-            fallbacks=[fallback],
+            fallbacks=fallbacks,
             acquisition_selected_source=(
                 (target_audit or {}).get("provider_attempted")
                 or selected.get("actual_source")
@@ -861,9 +961,11 @@ class ProviderForceActualReconciliationService:
         reason_code: str,
         observed_at: datetime,
     ) -> dict[str, Any]:
-        providers = [provider]
-        if mapping_selected == "flash_services_pmi":
-            providers.append("INVESTING_EVENT_1062")
+        providers = (
+            list(_flash_services_pmi_provider_order())
+            if mapping_selected == FLASH_SERVICES_PMI_DATASET_ID
+            else [provider]
+        )
         provider_attempts = _request_scoped_provider_attempts(
             [
                 {
@@ -1264,14 +1366,14 @@ def _actual_provider_chain_complete(
     request_id: str,
     correlation_id: str,
 ) -> bool:
+    expected_order = list(_flash_services_pmi_provider_order())
     providers = [
         str(item.get("provider") or "")
         for item in attempts
     ]
-    if providers not in (
-        ["SPGLOBAL"],
-        ["SPGLOBAL", "INVESTING_EVENT_1062"],
-    ):
+    primary_only = providers == expected_order[:1]
+    full_chain = providers == expected_order
+    if not primary_only and not full_chain:
         return False
     if any(
         item.get("request_id") != request_id
@@ -1281,17 +1383,13 @@ def _actual_provider_chain_complete(
     ):
         return False
     if (
-        providers == ["SPGLOBAL", "INVESTING_EVENT_1062"]
+        full_chain
         and provider_calls == 0
         and _observed_lifecycle_skip_flow_valid(attempts)
     ):
         return True
-    by_provider = {
-        str(item.get("provider") or ""): item
-        for item in attempts
-    }
-    primary = by_provider.get("SPGLOBAL")
-    if primary is None or primary.get("called") is not True:
+    primary = attempts[0]
+    if primary.get("called") is not True:
         return False
     observed_calls = sum(
         max(int(item.get("attempts") or 0), 1)
@@ -1300,27 +1398,33 @@ def _actual_provider_chain_complete(
     )
     if provider_calls != observed_calls:
         return False
-    primary_succeeded = _actual_result_succeeded(
-        primary.get("result")
-    )
-    fallback = by_provider.get("INVESTING_EVENT_1062")
-    if primary_succeeded:
-        return fallback is None or fallback.get("called") is False
-    return bool(
-        fallback is not None
-        and fallback.get("called") is True
-    )
+    if primary_only and not full_chain:
+        return _actual_result_succeeded(primary.get("result"))
+
+    success_seen = False
+    for attempt in attempts:
+        if success_seen:
+            if attempt.get("called") is not False:
+                return False
+            continue
+        if attempt.get("called") is not True:
+            return False
+        success_seen = _actual_result_succeeded(
+            attempt.get("result")
+        )
+    return True
 
 
 def _provider_chain_all_failed(
     attempts: list[dict[str, Any]],
 ) -> bool:
+    expected_order = list(_flash_services_pmi_provider_order())
     return bool(
         [
             str(item.get("provider") or "")
             for item in attempts
         ]
-        == ["SPGLOBAL", "INVESTING_EVENT_1062"]
+        == expected_order
         and all(
             item.get("called") is True
             and not _actual_result_succeeded(item.get("result"))
@@ -1393,6 +1497,7 @@ def _persisted_actual_field_lineage(
     occurrence_id: str,
     mapping_selected: str,
     delivered_actual: Any,
+    now: datetime,
 ) -> dict[str, Any] | None:
     if not _persisted_actual_audit_matches_occurrence(
         persisted_audit,
@@ -1443,9 +1548,34 @@ def _persisted_actual_field_lineage(
             if isinstance(item, dict)
         )
 
-    persisted_actual_source = str(
-        payload.get("actual_source") or ""
-    ).strip()
+    spec = OFFICIAL_METRICS.get(mapping_selected)
+    if spec is None:
+        return None
+    actual_is_official = payload.get("actual_is_official")
+    persisted_actual_source = _source_identity(
+        payload.get("actual_source")
+    )
+    registered_fallback = None
+    if actual_is_official is False:
+        policy = dataset_policy_by_id(mapping_selected)
+        registered_fallback = next(
+            (
+                provider_id
+                for provider_id in policy.fallback_providers
+                if _source_identity(provider_id)
+                == persisted_actual_source
+            ),
+            None,
+        )
+        if (
+            mapping_selected != FLASH_SERVICES_PMI_DATASET_ID
+            or registered_fallback is None
+        ):
+            return None
+    elif actual_is_official is not True:
+        return None
+    elif persisted_actual_source != _source_identity(spec.provider_id):
+        return None
     for candidate in candidates:
         source_field = str(
             candidate.get("source_field") or ""
@@ -1453,54 +1583,168 @@ def _persisted_actual_field_lineage(
         if source_field not in {"actual", "current"}:
             continue
         candidate_occurrence = str(
-            candidate.get("occurrence_id") or ""
+            candidate.get("occurrence_id")
+            or candidate.get("canonical_event_key")
+            or ""
         )
-        if (
-            candidate_occurrence
-            and candidate_occurrence != occurrence_id
-        ):
+        if candidate_occurrence != occurrence_id:
             continue
         if (
             str(candidate.get("metric_id") or "")
             != mapping_selected
         ):
             continue
-        if not str(candidate.get("frequency") or "").strip():
+        if (
+            str(candidate.get("frequency") or "").strip().lower()
+            != spec.frequency
+            or str(candidate.get("source_series_id") or "").strip()
+            != spec.source_series_id
+            or str(candidate.get("transformation") or "").strip()
+            != spec.transformation
+        ):
             continue
         candidate_value = candidate.get("value")
-        if (
-            candidate_value not in (None, "")
-            and not _same_field_value(
-                candidate_value,
-                persisted_actual,
-            )
+        if candidate_value in (None, "") or not _same_field_value(
+            candidate_value,
+            persisted_actual,
         ):
             continue
         lineage_sources = {
-            str(candidate.get(field) or "").strip().casefold()
-            for field in ("source", "publisher")
+            _source_identity(candidate.get(field))
+            for field in (
+                "source",
+                "publisher",
+                "source_originator",
+            )
             if candidate.get(field) not in (None, "")
         }
-        if not lineage_sources:
-            continue
         if (
-            persisted_actual_source
-            and persisted_actual_source.casefold()
-            not in lineage_sources
+            not lineage_sources
+            or _source_identity(spec.provider_id) not in lineage_sources
         ):
             continue
-        validation_status = str(
-            candidate.get("validation_status") or ""
-        ).strip().lower()
-        if validation_status and validation_status not in {
-            "accepted",
-            "approved",
-            "deterministic_verified",
-            "field_level_validated",
-            "passed",
-            "valid",
-            "verified",
-        }:
+        lineage_acquisition_sources = {
+            _source_identity(candidate.get(field))
+            for field in (
+                "acquisition_provider",
+                "distributor",
+                "distribution_source",
+            )
+            if candidate.get(field) not in (None, "")
+        }
+        if actual_is_official is True and (
+            (
+                persisted_actual_source
+                not in lineage_sources | lineage_acquisition_sources
+            )
+            or (
+                lineage_acquisition_sources
+                and persisted_actual_source
+                not in lineage_acquisition_sources
+            )
+        ):
+            continue
+        if actual_is_official is False and (
+            registered_fallback is None
+            or _source_identity(registered_fallback)
+            not in lineage_acquisition_sources
+        ):
+            continue
+        official_domains = provider_by_id(spec.provider_id).source_domains
+        if actual_is_official is True:
+            official_urls = tuple(
+                candidate.get(field)
+                for field in ("source_url", "canonical_url")
+                if candidate.get(field) not in (None, "")
+            )
+            if (
+                not official_urls
+                or any(
+                    not _https_url_matches_domains(
+                        value,
+                        official_domains,
+                    )
+                    for value in official_urls
+                )
+            ):
+                continue
+        else:
+            assert registered_fallback is not None
+            fallback_domains = provider_by_id(
+                registered_fallback
+            ).source_domains
+            if not _https_url_matches_domains(
+                candidate.get("source_url"),
+                fallback_domains,
+            ) or not _https_url_matches_domains(
+                candidate.get("canonical_url"),
+                official_domains,
+            ):
+                continue
+        if not _field_validation_accepted(candidate):
+            continue
+        lifecycle_evidence = (
+            candidate.get("lifecycle")
+            if isinstance(candidate.get("lifecycle"), dict)
+            else {}
+        )
+        freshness_states = {
+            str(container.get(field) or "").strip().upper()
+            for container, fields in (
+                (
+                    candidate,
+                    (
+                        "freshness",
+                        "freshness_state",
+                        "lifecycle_status",
+                    ),
+                ),
+                (
+                    lifecycle_evidence,
+                    (
+                        "status",
+                        "lifecycle_status",
+                        "freshness",
+                        "freshness_state",
+                    ),
+                ),
+            )
+            for field in fields
+            if container.get(field) not in (None, "")
+        }
+        if (
+            not freshness_states
+            or not freshness_states
+            <= _CURRENT_FIELD_FRESHNESS_STATES
+        ):
+            continue
+        content_valid_until = _effective_lineage_deadline(
+            candidate,
+            fields=("content_valid_until", "valid_until"),
+        )
+        refresh_due_at = _effective_lineage_deadline(
+            candidate,
+            fields=("refresh_due_at", "next_refresh_at"),
+        )
+        normalized_now = _utc_datetime(now)
+        if (
+            content_valid_until is None
+            or refresh_due_at is None
+            or normalized_now is None
+            or content_valid_until <= normalized_now
+            or refresh_due_at <= normalized_now
+            or refresh_due_at > content_valid_until
+        ):
+            continue
+        observed_period = normalize_reference_period(
+            candidate.get("reference_period") or candidate.get("period"),
+            frequency=spec.frequency,
+        )
+        expected_period = normalize_reference_period(
+            payload.get("reference_period") or payload.get("period"),
+            frequency=spec.frequency,
+        )
+        if not observed_period or observed_period != expected_period:
             continue
         return {
             **candidate,
@@ -1510,6 +1754,501 @@ def _persisted_actual_field_lineage(
             "value": persisted_actual,
         }
     return None
+
+
+def _without_unproven_actual(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = {
+        **payload,
+        "actual": None,
+        "actual_source": None,
+        "actual_source_url": None,
+        "actual_is_official": None,
+    }
+    for container_name in ("field_lineage",):
+        container = sanitized.get(container_name)
+        if isinstance(container, dict):
+            sanitized[container_name] = {
+                key: value
+                for key, value in container.items()
+                if str(key).strip().lower() != "actual"
+            }
+    enrichment = (
+        dict(sanitized.get("enrichment") or {})
+        if isinstance(sanitized.get("enrichment"), dict)
+        else {}
+    )
+    if enrichment:
+        enrichment["actual"] = None
+        field_lineage = enrichment.get("field_lineage")
+        if isinstance(field_lineage, dict):
+            enrichment["field_lineage"] = {
+                key: value
+                for key, value in field_lineage.items()
+                if str(key).strip().lower() != "actual"
+            }
+        sanitized["enrichment"] = enrichment
+    lineage = sanitized.get("lineage")
+    if isinstance(lineage, dict) and isinstance(
+        lineage.get("field_lineage"), dict
+    ):
+        sanitized["lineage"] = {
+            **lineage,
+            "field_lineage": {
+                key: value
+                for key, value in lineage["field_lineage"].items()
+                if str(key).strip().lower() != "actual"
+            },
+        }
+    source_lineage = sanitized.get("source_lineage")
+    if isinstance(source_lineage, list):
+        sanitized["source_lineage"] = [
+            item
+            for item in source_lineage
+            if not isinstance(item, dict)
+            or str(
+                item.get("source_field")
+                or item.get("field_semantics")
+                or item.get("field")
+                or ""
+            ).strip().lower()
+            not in {"actual", "current"}
+        ]
+    return sanitized
+
+
+def _complete_same_acquisition_field_lineage(
+    datum: dict[str, Any],
+    *,
+    candidate: dict[str, Any] | None,
+    audit: dict[str, Any],
+    lifecycle: DatumLifecycle,
+    occurrence_id: str,
+    mapping_selected: str,
+    now: datetime,
+) -> dict[str, Any]:
+    if (
+        not isinstance(candidate, dict)
+        or not _candidate_validation_accepted(candidate, audit)
+        or str(lifecycle.freshness_state).upper() != "FRESH"
+    ):
+        return datum
+    content_valid_until = _utc_datetime(lifecycle.valid_until)
+    refresh_due_at = _utc_datetime(lifecycle.next_refresh_at)
+    normalized_now = _utc_datetime(now)
+    if (
+        content_valid_until is None
+        or refresh_due_at is None
+        or normalized_now is None
+        or content_valid_until <= normalized_now
+        or refresh_due_at <= normalized_now
+        or refresh_due_at > content_valid_until
+    ):
+        return datum
+
+    enrichment = (
+        dict(datum.get("enrichment") or {})
+        if isinstance(datum.get("enrichment"), dict)
+        else {}
+    )
+    raw_field_lineage = enrichment.get("field_lineage")
+    if not isinstance(raw_field_lineage, dict):
+        return datum
+    field_lineage = dict(raw_field_lineage)
+    updated_fields: dict[str, dict[str, Any]] = {}
+    for field, raw_lineage in field_lineage.items():
+        if not isinstance(raw_lineage, dict):
+            continue
+        lineage = dict(raw_lineage)
+        if not _lineage_belongs_to_candidate_acquisition(
+            field=str(field),
+            lineage=lineage,
+            candidate=candidate,
+            occurrence_id=occurrence_id,
+            mapping_selected=mapping_selected,
+        ):
+            continue
+        updated_fields[str(field)] = {
+            **lineage,
+            "validation_status": "accepted",
+            "freshness": "CURRENT_RELEASE",
+            "freshness_state": "CURRENT_RELEASE",
+            "content_valid_until": content_valid_until.isoformat(),
+            "refresh_due_at": refresh_due_at.isoformat(),
+            **(
+                {"data_as_of": lifecycle.data_as_of}
+                if lifecycle.data_as_of not in (None, "")
+                else {}
+            ),
+        }
+    if not updated_fields:
+        return datum
+
+    field_lineage.update(updated_fields)
+    enrichment["field_lineage"] = field_lineage
+    output = {**datum, "enrichment": enrichment}
+    if isinstance(datum.get("field_lineage"), dict):
+        output["field_lineage"] = {
+            **dict(datum["field_lineage"]),
+            **updated_fields,
+        }
+    source_lineage = datum.get("source_lineage")
+    if isinstance(source_lineage, list) and "actual" in updated_fields:
+        output["source_lineage"] = [
+            (
+                dict(updated_fields["actual"])
+                if isinstance(item, dict)
+                and str(
+                    item.get("source_field")
+                    or item.get("field_semantics")
+                    or item.get("field")
+                    or ""
+                ).strip().lower()
+                in {"actual", "current"}
+                and _lineage_occurrence_matches(
+                    item,
+                    occurrence_id=occurrence_id,
+                )
+                else item
+            )
+            for item in source_lineage
+        ]
+    return output
+
+
+def _lineage_belongs_to_candidate_acquisition(
+    *,
+    field: str,
+    lineage: dict[str, Any],
+    candidate: dict[str, Any],
+    occurrence_id: str,
+    mapping_selected: str,
+) -> bool:
+    normalized_field = field.strip().lower()
+    if not _lineage_occurrence_matches(
+        lineage,
+        occurrence_id=occurrence_id,
+    ):
+        return False
+    if str(lineage.get("metric_id") or "") != mapping_selected:
+        return False
+    expected_value: Any = None
+    evidence: dict[str, Any] = candidate
+    candidate_field_lineage = (
+        candidate.get("field_lineage")
+        if isinstance(candidate.get("field_lineage"), dict)
+        else {}
+    )
+    if normalized_field == "actual":
+        expected_value = candidate.get("value")
+        if expected_value in (None, ""):
+            expected_value = candidate.get("actual")
+    elif (
+        normalized_field == "previous"
+        and lineage.get("derivation")
+        == "previous_official_series_observation"
+    ):
+        expected_value = candidate.get("previous")
+    elif normalized_field in {
+        "consensus",
+        "forecast",
+        "previous",
+        "previous_revised",
+        "revised_previous",
+    }:
+        aliases = {
+            "consensus": ("consensus", "forecast"),
+            "forecast": ("forecast", "consensus"),
+            "previous": ("previous",),
+            "previous_revised": (
+                "previous_revised",
+                "revised_previous",
+            ),
+            "revised_previous": (
+                "revised_previous",
+                "previous_revised",
+            ),
+        }[normalized_field]
+        evidence = next(
+            (
+                dict(candidate_field_lineage[alias])
+                for alias in aliases
+                if isinstance(candidate_field_lineage.get(alias), dict)
+            ),
+            {},
+        )
+        if not evidence:
+            return False
+        expected_value = next(
+            (
+                candidate.get(alias)
+                for alias in aliases
+                if candidate.get(alias) not in (None, "")
+            ),
+            None,
+        )
+    if expected_value in (None, ""):
+        return False
+    lineage_value = lineage.get("value")
+    if lineage_value in (None, "") or not _same_field_value(
+        lineage_value,
+        expected_value,
+    ):
+        return False
+    return _same_acquisition_identity(
+        lineage,
+        evidence=evidence,
+        candidate=candidate,
+        field=normalized_field,
+    )
+
+
+def _same_acquisition_identity(
+    lineage: dict[str, Any],
+    *,
+    evidence: dict[str, Any],
+    candidate: dict[str, Any],
+    field: str,
+) -> bool:
+    derived_official_field = field in {"actual", "previous"} and (
+        field == "actual"
+        or lineage.get("derivation")
+        == "previous_official_series_observation"
+    )
+    if derived_official_field:
+        expected_series = candidate.get("source_series_id")
+        expected_transformation = candidate.get("transformation")
+        expected_frequency = candidate.get("frequency")
+        expected_period = (
+            candidate.get("previous_reference_period")
+            if field == "previous"
+            else candidate.get("reference_period")
+            or candidate.get("period")
+        )
+        expected_source = _source_identity(
+            candidate.get("source") or candidate.get("publisher")
+        )
+        if (
+            expected_series in (None, "")
+            or expected_transformation in (None, "")
+            or expected_frequency in (None, "")
+            or expected_period in (None, "")
+            or not expected_source
+        ):
+            return False
+        if (
+            str(lineage.get("source_series_id") or "")
+            != str(expected_series)
+            or str(lineage.get("transformation") or "")
+            != str(expected_transformation)
+            or str(lineage.get("frequency") or "").strip().lower()
+            != str(expected_frequency).strip().lower()
+        ):
+            return False
+        observed_period = normalize_reference_period(
+            lineage.get("reference_period") or lineage.get("period"),
+            frequency=str(expected_frequency),
+        )
+        normalized_expected_period = normalize_reference_period(
+            expected_period,
+            frequency=str(expected_frequency),
+        )
+        lineage_sources = {
+            _source_identity(lineage.get(key))
+            for key in ("source", "publisher", "source_originator")
+            if lineage.get(key) not in (None, "")
+        }
+        expected_acquisition = _source_identity(
+            candidate.get("acquisition_provider")
+        )
+        expected_distribution = _source_identity(
+            candidate.get("distribution_source")
+        )
+        lineage_acquisition = {
+            _source_identity(lineage.get(key))
+            for key in (
+                "acquisition_provider",
+                "distributor",
+                "distribution_source",
+            )
+            if lineage.get(key) not in (None, "")
+        }
+        return bool(
+            observed_period
+            and observed_period == normalized_expected_period
+            and expected_source in lineage_sources
+            and (
+                not expected_acquisition
+                or expected_acquisition in lineage_acquisition
+            )
+            and (
+                not expected_distribution
+                or expected_distribution in lineage_acquisition
+            )
+        )
+
+    evidence_sources = {
+        _source_identity(evidence.get(key))
+        for key in (
+            "source",
+            "publisher",
+            "distributor",
+            "acquisition_provider",
+        )
+        if evidence.get(key) not in (None, "")
+    }
+    lineage_sources = {
+        _source_identity(lineage.get(key))
+        for key in (
+            "source",
+            "publisher",
+            "distributor",
+            "acquisition_provider",
+        )
+        if lineage.get(key) not in (None, "")
+    }
+    if not evidence_sources or not evidence_sources & lineage_sources:
+        return False
+    for key in (
+        "source_series_id",
+        "transformation",
+        "frequency",
+        "reference_period",
+    ):
+        expected = evidence.get(key)
+        if expected not in (None, "") and str(
+            lineage.get(key) or ""
+        ) != str(expected):
+            return False
+    validation_states = {
+        str(value).strip().lower()
+        for value in (
+            evidence.get("validation_status"),
+            evidence.get("verification_status"),
+        )
+        if value not in (None, "")
+    }
+    return not validation_states or bool(
+        validation_states <= _ACCEPTED_FIELD_VALIDATION_STATES
+    )
+
+
+def _lineage_occurrence_matches(
+    lineage: dict[str, Any],
+    *,
+    occurrence_id: str,
+) -> bool:
+    return str(
+        lineage.get("occurrence_id")
+        or lineage.get("canonical_event_key")
+        or ""
+    ) == occurrence_id
+
+
+def _candidate_validation_accepted(
+    candidate: dict[str, Any],
+    audit: dict[str, Any],
+) -> bool:
+    statuses = {
+        str(value).strip().lower()
+        for value in (
+            candidate.get("validation_status"),
+            audit.get("candidate_validation"),
+        )
+        if value not in (None, "")
+    }
+    return bool(
+        statuses
+        and statuses <= _ACCEPTED_FIELD_VALIDATION_STATES
+    )
+
+
+def _field_validation_accepted(value: dict[str, Any]) -> bool:
+    validation = (
+        value.get("validation")
+        if isinstance(value.get("validation"), dict)
+        else {}
+    )
+    statuses = {
+        str(item).strip().lower()
+        for item in (
+            value.get("validation_status"),
+            value.get("verification_status"),
+            validation.get("status"),
+        )
+        if item not in (None, "")
+    }
+    return bool(
+        statuses
+        and statuses <= _ACCEPTED_FIELD_VALIDATION_STATES
+    )
+
+
+def _effective_lineage_deadline(
+    value: dict[str, Any],
+    *,
+    fields: tuple[str, ...],
+) -> datetime | None:
+    lifecycle = (
+        value.get("lifecycle")
+        if isinstance(value.get("lifecycle"), dict)
+        else {}
+    )
+    raw_values = [
+        container.get(field)
+        for container in (value, lifecycle)
+        for field in fields
+        if container.get(field) not in (None, "")
+    ]
+    if not raw_values:
+        return None
+    parsed = [_utc_datetime(item) for item in raw_values]
+    if any(item is None for item in parsed):
+        return None
+    return min(item for item in parsed if item is not None)
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    parsed = value if isinstance(value, datetime) else parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _source_identity(value: Any) -> str:
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def _https_url_matches_domains(
+    value: Any,
+    domains: tuple[str, ...],
+) -> bool:
+    if not domains or value in (None, ""):
+        return False
+    try:
+        parsed = urlsplit(str(value))
+    except ValueError:
+        return False
+    hostname = str(parsed.hostname or "").casefold().rstrip(".")
+    return bool(
+        parsed.scheme.casefold() == "https"
+        and hostname
+        and not parsed.username
+        and not parsed.password
+        and any(
+            hostname == str(domain).casefold().rstrip(".")
+            or hostname.endswith(
+                f".{str(domain).casefold().rstrip('.')}"
+            )
+            for domain in domains
+            if str(domain).strip()
+        )
+    )
 
 
 def _same_field_value(left: Any, right: Any) -> bool:

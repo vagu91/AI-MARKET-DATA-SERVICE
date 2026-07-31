@@ -422,7 +422,14 @@ def test_10_cli_and_api_share_normalized_contract(tmp_path: Path) -> None:
         profile=profile,
         effective_budget={"max_searches": 3},
     )
-    payload = {"status": "NO_DATA", "claims": [], "searches": []}
+    payload = {
+        "status": "NO_DATA",
+        "plan": {"topics": [], "queries": [], "stop_conditions": []},
+        "claims": [],
+        "searches": [],
+        "acquisition_requests": [],
+        "warnings": [],
+    }
     api = OpenAIResponsesResearchBackend(
         settings,
         request_sender=lambda request: {

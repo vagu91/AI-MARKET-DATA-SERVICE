@@ -638,7 +638,7 @@ def test_24_partial_provider_only_exposes_missing_fields_to_ai() -> None:
     )
     assert result["status"] == "PARTIAL"
     assert result["missing_fields"] == ["previous_close"]
-    assert result["ai_eligible"] is True
+    assert result["ai_eligible"] is False
 
 
 def test_25_temporary_provider_failure_creates_backoff_and_negative_cache() -> None:

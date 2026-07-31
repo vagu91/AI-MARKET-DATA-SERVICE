@@ -277,8 +277,9 @@ def test_official_actual_worker_updates_history_and_fact_with_surprise(
                 reliability=0.99,
             ),
             data={
-                "CUSR0000SA0": {
-                    "value": 101.5,
+                    "CUSR0000SA0": {
+                        "series_id": "CUSR0000SA0",
+                        "value": 101.5,
                     "data_as_of": released.time_utc.strftime("%Y-%m-01"),
                     "units": "index",
                     "frequency": "monthly",

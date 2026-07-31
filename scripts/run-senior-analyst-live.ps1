@@ -86,10 +86,14 @@ function Save-DatabaseBundle {
 
 function Publish-LatestAcceptance {
     param(
+        [string]$RunId,
         [string]$PayloadPath,
         [string]$ValidationReportPath,
         [string]$Destination
     )
+    if ([string]::IsNullOrWhiteSpace($RunId)) {
+        throw "Cannot publish latest acceptance without a run ID."
+    }
     if (-not (Test-Path -LiteralPath $PayloadPath -PathType Leaf)) {
         throw "Cannot publish latest acceptance without the exact HTTP body."
     }
@@ -101,6 +105,23 @@ function Publish-LatestAcceptance {
         ConvertFrom-Json
     if ($report.status -ne "PASS" -or -not $report.validated_exact_http_body) {
         throw "Latest acceptance can be published only from an exact-body PASS."
+    }
+    if (-not ($report.PSObject.Properties.Name -contains "body_size_bytes")) {
+        throw "Validation report is missing exact HTTP body size."
+    }
+    $reportedBodySize = $report.body_size_bytes
+    if (
+        -not (
+            $reportedBodySize -is [int] -or
+            $reportedBodySize -is [long]
+        ) -or
+        [long]$reportedBodySize -lt 0
+    ) {
+        throw "Validation report exact HTTP body size is invalid."
+    }
+    $payloadSize = [long](Get-Item -LiteralPath $PayloadPath).Length
+    if ($payloadSize -ne [long]$reportedBodySize) {
+        throw "Exact HTTP body size does not match the validation report."
     }
 
     $payload = Get-Content -LiteralPath $PayloadPath -Raw |
@@ -133,9 +154,11 @@ function Publish-LatestAcceptance {
     try {
         $latest = [ordered]@{
             result = "PASS"
+            run_id = $RunId
             response_generated_at = [string]$responseGeneratedAt
             full_payload_path = [IO.Path]::GetFullPath($PayloadPath)
             full_payload_sha256 = $payloadHash
+            body_size_bytes = $payloadSize
             readiness_status = [string]$readinessStatus
         }
         $json = ($latest | ConvertTo-Json -Depth 4) + [Environment]::NewLine
@@ -279,6 +302,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Senior Analyst LIVE validation failed. See $ReportPath"
 }
 Publish-LatestAcceptance `
+    -RunId $RunId `
     -PayloadPath $BodyPath `
     -ValidationReportPath $ReportPath `
     -Destination $LatestPath

@@ -138,7 +138,15 @@ def test_provider_resolution_results_in_zero_ai(tmp_path: Path) -> None:
     assert (result["ai_invocations"], calls["ai"]) == (0, 0)
 
 
-def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:
+def test_unresolved_eligible_gap_invokes_ai_once(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,
@@ -149,7 +157,7 @@ def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:
     calls: list[list[dict[str, Any]]] = []
     result = ResearchSchedulerService(settings, clock=lambda: NOW).scan_due_items(
         owner="test",
-        resolver=lambda _: {"status": "EXHAUSTED"},
+        resolver=lambda _: {"status": "EXHAUSTED", "ai_eligible": True},
         ai_enqueue=lambda items: calls.append(items),
         trigger_type="macro_actual",
         execution_context=ExecutionContext.explicit_ai(
@@ -217,7 +225,15 @@ def test_expired_negative_cache_allows_new_attempt(tmp_path: Path) -> None:
     ) is None
 
 
-def test_two_due_items_are_coalesced_into_one_ai_enqueue(tmp_path: Path) -> None:
+def test_two_due_items_are_coalesced_into_one_ai_enqueue(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,
@@ -229,7 +245,7 @@ def test_two_due_items_are_coalesced_into_one_ai_enqueue(tmp_path: Path) -> None
     calls: list[Any] = []
     result = ResearchSchedulerService(settings, clock=lambda: NOW).scan_due_items(
         owner="test",
-        resolver=lambda _: {"status": "EXHAUSTED"},
+        resolver=lambda _: {"status": "EXHAUSTED", "ai_eligible": True},
         ai_enqueue=lambda items: calls.append(items),
         trigger_type="macro_actual",
         execution_context=ExecutionContext.explicit_ai(

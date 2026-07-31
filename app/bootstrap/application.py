@@ -4,45 +4,9 @@ from typing import Any
 
 from app.core.config import Settings
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheRepository
-from app.providers.bea import BeaProvider
-from app.providers.bea_calendar import BeaReleaseScheduleProvider
-from app.providers.bls import BlsProvider
-from app.providers.bls_calendar import BlsReleaseCalendarProvider
-from app.providers.earnings_provider import EarningsProvider
-from app.providers.event_enrichment import (
-    DailyFxEnrichmentProvider,
-    FXStreetEconomicCalendarProvider,
-    ForexFactoryEnrichmentProvider,
-    GenericSearchSnippetCalendarProvider,
-    InvestingEnrichmentProvider,
-    ManualEventEnrichmentProvider,
-    MarketWatchEconomicCalendarProvider,
-    OpenAIEventEnrichmentProvider,
-    PlaywrightDailyFXProvider,
-    PlaywrightForexFactoryProvider,
-    PlaywrightInvestingProvider,
-    TargetedSearchEventEnrichmentProvider,
-    YahooEconomicCalendarProvider,
-)
-from app.providers.fed_calendar import FederalReserveCalendarProvider
-from app.providers.federal_reserve import FederalReserveRssProvider
-from app.providers.fred import FredProvider
-from app.providers.sp_global_pmi import SpGlobalPmiProvider
 from app.providers.investing_flash_services_pmi import (
     SOURCE as INVESTING_FLASH_SOURCE,
-    InvestingFlashServicesPmiProvider,
 )
-from app.providers.census import CensusProvider
-from app.providers.finnhub import FinnhubProvider
-from app.providers.tradier import TradierProvider
-from app.providers.mega_cap_snapshot_provider import MegaCapSnapshotProvider
-from app.providers.news_provider import NewsProvider
-from app.providers.qqq_holdings_provider import QQQHoldingsProvider
-from app.providers.cftc_cot_provider import CftcCotProvider
-from app.providers.cboe_put_call_provider import CboePutCallProvider
-from app.providers.cboe_risk_indices_provider import CboeRiskIndicesProvider
-from app.providers.cboe_vix_futures_provider import CboeVixFuturesProvider
-from app.providers.scraper_calendar import EconomicCalendarScraperProvider
 from app.services.enrichment_orchestrator import EnrichmentOrchestrator
 from app.services.event_enrichment_service import EventEnrichmentService
 from app.services.event_service import EventService
@@ -71,6 +35,13 @@ from app.services.research_agent_enablement import validate_research_agent_mappi
 from app.services.deterministic_provider_runtime_service import (
     DeterministicProviderRuntimeService,
 )
+from app.services.provider_adapter_factory import create_registered_adapter
+from app.services.provider_capability_registry import (
+    event_enrichment_runtime_adapter_bindings,
+    event_runtime_adapter_bindings,
+    macro_runtime_provider_ids,
+    validate_registry,
+)
 
 
 def build_application_state(
@@ -78,6 +49,9 @@ def build_application_state(
     *,
     deterministic_provider_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # One fail-fast registry governs runtime policy, audit probes, accounting,
+    # and the generated source matrix.
+    validate_registry()
     validate_research_agent_mapping()
     assert_test_database_isolated(
         settings.database_path,
@@ -87,62 +61,79 @@ def build_application_state(
     init_market_db(settings)
 
     deterministic_providers = {
-        "fred": FredProvider(cache, settings),
-        "bls": BlsProvider(cache, settings),
-        "bea": BeaProvider(cache, settings),
-        "census": CensusProvider(cache, settings),
-        "spglobal": SpGlobalPmiProvider(cache, settings),
-        "investing_flash_services_pmi": InvestingFlashServicesPmiProvider(
+        "fred": create_registered_adapter("FRED", cache, settings),
+        "bls": create_registered_adapter("BLS", cache, settings),
+        "bea": create_registered_adapter("BEA", cache, settings),
+        "census": create_registered_adapter("CENSUS", cache, settings),
+        "spglobal": create_registered_adapter(
+            "SPGLOBAL",
             cache,
             settings,
         ),
-        "finnhub": FinnhubProvider(cache, settings),
-        "tradier": TradierProvider(cache, settings),
+        "investing_flash_services_pmi": create_registered_adapter(
+            INVESTING_FLASH_SOURCE,
+            cache,
+            settings,
+        ),
+        "finnhub": create_registered_adapter("FINNHUB", cache, settings),
+        "tradier": create_registered_adapter("TRADIER", cache, settings),
     }
     deterministic_providers.update(deterministic_provider_overrides or {})
     macro_providers = [
-        deterministic_providers["fred"],
-        deterministic_providers["bls"],
-        deterministic_providers["bea"],
+        deterministic_providers[provider_id.casefold()]
+        for provider_id in macro_runtime_provider_ids()
     ]
     macro_service = MacroService(providers=macro_providers)
     census_provider = deterministic_providers["census"]
     event_enrichment_service = EventEnrichmentService(
         cache=cache,
         providers=[
-            DailyFxEnrichmentProvider(settings),
-            ForexFactoryEnrichmentProvider(settings),
-            InvestingEnrichmentProvider(settings),
-            FXStreetEconomicCalendarProvider(settings),
-            MarketWatchEconomicCalendarProvider(settings),
-            YahooEconomicCalendarProvider(settings),
-            GenericSearchSnippetCalendarProvider(settings),
-            PlaywrightDailyFXProvider(settings),
-            PlaywrightForexFactoryProvider(settings),
-            PlaywrightInvestingProvider(settings),
-            TargetedSearchEventEnrichmentProvider(settings),
-            ManualEventEnrichmentProvider(settings),
-            OpenAIEventEnrichmentProvider(settings),
+            create_registered_adapter(
+                provider_id,
+                settings,
+                adapter_name=adapter_name,
+            )
+            for provider_id, adapter_name
+            in event_enrichment_runtime_adapter_bindings()
         ],
     )
     temporal_validation = TemporalValidationService(settings)
     event_service = EventService(
         providers=[
-            FederalReserveCalendarProvider(cache, settings),
-            FederalReserveRssProvider(cache, settings),
-            BlsReleaseCalendarProvider(cache, settings),
-            BeaReleaseScheduleProvider(cache, settings),
-            EconomicCalendarScraperProvider(cache, settings),
+            create_registered_adapter(
+                provider_id,
+                cache,
+                settings,
+                adapter_name=adapter_name,
+            )
+            for provider_id, adapter_name in event_runtime_adapter_bindings()
         ],
         enrichment_service=event_enrichment_service,
         temporal_validation=temporal_validation,
     )
     market_news_repository = MarketNewsRepository(settings)
     nasdaq_data_service = NasdaqDataService(
-        qqq_holdings_provider=QQQHoldingsProvider(cache, settings),
-        mega_cap_snapshot_provider=MegaCapSnapshotProvider(cache, settings),
-        earnings_provider=EarningsProvider(cache, settings),
-        news_provider=NewsProvider(cache, settings, market_news_repository=market_news_repository),
+        qqq_holdings_provider=create_registered_adapter(
+            "INVESCO",
+            cache,
+            settings,
+        ),
+        mega_cap_snapshot_provider=create_registered_adapter(
+            "YAHOO_FINANCE_CHART",
+            cache,
+            settings,
+        ),
+        earnings_provider=create_registered_adapter(
+            "LEGACY_EARNINGS_AGGREGATOR",
+            cache,
+            settings,
+        ),
+        news_provider=create_registered_adapter(
+            "ALPHA_VANTAGE_NEWS_SENTIMENT",
+            cache,
+            settings,
+            market_news_repository=market_news_repository,
+        ),
     )
     enrichment_orchestrator = EnrichmentOrchestrator(
         settings,
@@ -178,7 +169,8 @@ def build_application_state(
                 deterministic_providers["spglobal"],
                 deterministic_providers["investing_flash_services_pmi"],
             ]
-            if getattr(provider, "source", "") in {
+            if getattr(provider, "source", "")
+            in {
                 "BLS",
                 "BEA",
                 "CENSUS",
@@ -196,10 +188,21 @@ def build_application_state(
             nasdaq_data_service=nasdaq_data_service,
             settings=settings,
             official_actual_resolver=official_actual_resolver,
-            cftc_provider=CftcCotProvider(settings),
-            cboe_risk_indices_provider=CboeRiskIndicesProvider(settings),
-            cboe_vix_futures_provider=CboeVixFuturesProvider(settings),
-            cboe_put_call_provider=CboePutCallProvider(settings),
+            cftc_provider=create_registered_adapter("CFTC", settings),
+            cboe_risk_indices_provider=create_registered_adapter(
+                "CBOE",
+                settings,
+            ),
+            cboe_vix_futures_provider=create_registered_adapter(
+                "CBOE",
+                settings,
+                adapter_name="CboeVixFuturesProvider",
+            ),
+            cboe_put_call_provider=create_registered_adapter(
+                "CBOE",
+                settings,
+                adapter_name="CboePutCallProvider",
+            ),
         ),
     )
 

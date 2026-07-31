@@ -13,10 +13,11 @@ from app.providers.cboe_risk_indices_provider import _aggregate_data_as_of
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.diagnostics_service import (
     DiagnosticsService,
-    MACRO_ACCOUNTING_SERIES,
-    VIX_MAX_AGE,
     _attempt_from_runtime_block,
     _calendar_database_evidence,
+    _dataset_sla,
+    _macro_repository_queries,
+    _required_macro_dataset_series,
 )
 from app.services.multi_source_runtime_service import (
     FACT_TYPES,
@@ -30,6 +31,58 @@ from app.services.risk_context_runtime_service import (
 
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+
+_CALENDAR_PROVIDERS = (
+    ("BEA", "BEA Release Schedule"),
+    ("BLS", "BLS Release Calendar"),
+    ("FEDERAL_RESERVE", "Federal Reserve Calendar"),
+)
+
+
+def _calendar_coverage(
+    *,
+    requested_dates: list[str],
+    by_provider: dict[str, dict],
+) -> dict:
+    provider_ids = [
+        provider_id
+        for provider_id, _provider_name in _CALENDAR_PROVIDERS
+    ]
+    provider_names = sorted(
+        provider_name
+        for _provider_id, provider_name in _CALENDAR_PROVIDERS
+    )
+    provider_id_by_name = {
+        provider_name: provider_id
+        for provider_id, provider_name in _CALENDAR_PROVIDERS
+    }
+    return {
+        "requested_dates": requested_dates,
+        "expected_provider_ids": provider_ids,
+        "expected_provider_names": provider_names,
+        "provider_id_by_name": provider_id_by_name,
+        "provider_attempts": [
+            {
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "query_scope": "country=US",
+                "called": True,
+                "attempts": 1,
+                "successful_attempts": 1,
+                "failed_attempts": 0,
+                "result": "SUCCESS",
+                "not_called_reason": None,
+            }
+            for provider_id, provider_name in _CALENDAR_PROVIDERS
+        ],
+        "database_lookup_daily_matrix": {
+            "requested_dates": requested_dates,
+            "expected_provider_ids": provider_ids,
+            "expected_provider_names": provider_names,
+            "provider_id_by_name": provider_id_by_name,
+            "by_provider": by_provider,
+        },
+    }
 
 
 def _settings(tmp_path) -> Settings:
@@ -272,13 +325,9 @@ class _ObservedRiskProvider:
 
 class _NotFoundRiskNormalizer:
     def build(self, **_kwargs):
-        return {
-            "status": "not_found",
-            "diagnostics": {"provider_calls": 0},
-            "history": {},
-            "quality": {"quality_score": 0.0},
-            "warnings": ["controlled_no_data"],
-        }
+        payload = empty_risk_context(refresh="force")
+        payload["warnings"] = ["controlled_no_data"]
+        return payload
 
 
 class _MacroFacts:
@@ -418,6 +467,30 @@ async def test_risk_force_reads_valid_database_before_providers(
     }
 
 
+def test_risk_lookup_does_not_promote_retrieval_to_data_as_of(
+    tmp_path,
+) -> None:
+    payload = _risk_payload(
+        valid_until=NOW + timedelta(hours=1),
+        next_refresh_at=NOW + timedelta(hours=1),
+    )
+    payload.pop("data_as_of")
+    service = RiskContextRuntimeService(
+        _settings(tmp_path),
+        repository=_RiskRepository(payload),
+        clock=lambda: NOW,
+    )
+
+    _latest, freshness = service.lookup_canonical()
+
+    assert freshness.found is True
+    assert freshness.usable is False
+    assert freshness.evaluation == "MISSING_DATA_AS_OF"
+    assert freshness.reason_code == (
+        "CANONICAL_RECORD_TIME_NOT_PROVED"
+    )
+
+
 @pytest.mark.asyncio
 async def test_expired_vix_attempts_fred_before_cboe_fallback(
     tmp_path,
@@ -427,10 +500,14 @@ async def test_expired_vix_attempts_fred_before_cboe_fallback(
     sequence: list[str] = []
     valid_rows = [
         _macro_fact(
-            series_ids[0],
+            series_id,
             valid_until=NOW + timedelta(hours=1),
         )
-        for series_ids in MACRO_ACCOUNTING_SERIES.values()
+        for dataset_id, query in _macro_repository_queries().items()
+        for series_id in _required_macro_dataset_series(
+            dataset_id,
+            query=query,
+        )
     ]
     expired_vix = _macro_fact(
         "VIXCLS",
@@ -450,7 +527,7 @@ async def test_expired_vix_attempts_fred_before_cboe_fallback(
     diagnostics._save_macro = lambda _macro: 0
     vix_freshness = diagnostics.freshness.evaluate_canonical(
         expired_vix,
-        max_age=VIX_MAX_AGE,
+        max_age=_dataset_sla("vix"),
         data_reference_mode="point_in_time",
     )
 
@@ -461,6 +538,7 @@ async def test_expired_vix_attempts_fred_before_cboe_fallback(
 
     assert fred.requested_series == {"FRED": ("VIXCLS",)}
     assert quality["vix_provider_evidence"] == {
+        "provider": "FRED",
         "called": True,
         "attempts": 1,
         "result": "FAILED",
@@ -561,7 +639,7 @@ async def test_risk_force_refreshes_expired_database_record(
         "next_refresh_at": (NOW + timedelta(hours=1)).isoformat(),
     }
 
-    await service.snapshot(
+    result, _legacy = await service.snapshot(
         refresh="force",
         macro_snapshot={},
         preloaded_risk_indices=preloaded,
@@ -578,6 +656,11 @@ async def test_risk_force_refreshes_expired_database_record(
         service.last_database_lookup["reason_code"]
         == "CANONICAL_CONTENT_VALID_UNTIL_EXPIRED"
     )
+    assert result["status"] == "not_found"
+    assert result["vix"]["value"] is None
+    assert result["vvix"]["value"] is None
+    assert result["source_summary"]["last_known_good_used"] is False
+    assert result["diagnostics"].get("last_known_good_used") is not True
 
 
 @pytest.mark.asyncio
@@ -849,29 +932,140 @@ def test_calendar_provider_call_preserves_expired_database_lookup() -> None:
     now = datetime.now(UTC)
     day = now.date().isoformat()
     evidence = _calendar_database_evidence(
-        {
-            "database_lookup_daily_matrix": {
-                "by_provider": {
-                    "controlled": {
-                        "by_date": {
-                            day: {
-                                "status": "VERIFIED_COMPLETE",
-                                "valid_until": (
-                                    now - timedelta(minutes=1)
-                                ).isoformat(),
-                                "next_revision_check_at": (
-                                    now - timedelta(minutes=1)
-                                ).isoformat(),
-                            }
+        _calendar_coverage(
+            requested_dates=[day],
+            by_provider={
+                provider_name: {
+                    "by_date": {
+                        day: {
+                            "status": "VERIFIED_COMPLETE",
+                            "valid_until": (
+                                now - timedelta(minutes=1)
+                            ).isoformat(),
+                            "next_revision_check_at": (
+                                now - timedelta(minutes=1)
+                            ).isoformat(),
                         }
                     }
                 }
-            }
-        },
+                for _provider_id, provider_name
+                in _CALENDAR_PROVIDERS
+            },
+        ),
         events=[],
         provider_called=True,
     )
 
     assert evidence["found"] is True
     assert evidence["expired"] is True
-    assert evidence["freshness"] == "REFRESH_DUE"
+    assert evidence["freshness"] == (
+        "EXPIRED_CONTENT_VALID_UNTIL"
+    )
+
+
+def test_calendar_database_evidence_aggregates_every_provider_day() -> None:
+    now = datetime.now(UTC)
+    today = now.date().isoformat()
+    tomorrow = (now + timedelta(days=1)).date().isoformat()
+    evidence = _calendar_database_evidence(
+        _calendar_coverage(
+            requested_dates=[today, tomorrow],
+            by_provider={
+                "BEA Release Schedule": {
+                    "by_date": {
+                        today: {
+                            "status": "VERIFIED_COMPLETE",
+                            "valid_until": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                            "next_revision_check_at": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                        }
+                    }
+                },
+                "BLS Release Calendar": {
+                    "by_date": {
+                        tomorrow: {
+                            "status": "PARTIAL",
+                            "valid_until": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                            "next_revision_check_at": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                        }
+                    }
+                },
+            },
+        ),
+        events=[],
+        provider_called=True,
+    )
+
+    assert evidence["found"] is False
+    assert evidence["expired"] is False
+    assert evidence["freshness"] == "NOT_FOUND"
+    assert evidence["complete"] is False
+    summary = evidence["summary"]
+    assert summary["providers_expected"] == 3
+    assert summary["providers_evaluated"] == 2
+    assert summary["provider_ids_expected"] == [
+        "BEA",
+        "BLS",
+        "FEDERAL_RESERVE",
+    ]
+    assert summary["observations_expected"] == 6
+    assert summary["observations_evaluated"] == 2
+    assert summary["observations_missing"] == 4
+    assert summary["records_terminal"] == 1
+    assert summary["records_missing_or_incomplete"] == 1
+    assert summary["records_expired"] == 0
+    assert summary["window_start"] == today
+    assert summary["window_end"] == tomorrow
+
+
+def test_calendar_database_evidence_uses_weakest_deadline() -> None:
+    now = datetime.now(UTC)
+    today = now.date().isoformat()
+    tomorrow = (now + timedelta(days=1)).date().isoformat()
+    evidence = _calendar_database_evidence(
+        _calendar_coverage(
+            requested_dates=[today, tomorrow],
+            by_provider={
+                provider_name: {
+                    "by_date": {
+                        today: {
+                            "status": "VERIFIED_COMPLETE",
+                            "valid_until": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                            "next_revision_check_at": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                        },
+                        tomorrow: {
+                            "status": "VERIFIED_EMPTY",
+                            "valid_until": (
+                                now - timedelta(minutes=1)
+                            ).isoformat(),
+                            "next_revision_check_at": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                        }
+                    }
+                }
+                for _provider_id, provider_name
+                in _CALENDAR_PROVIDERS
+            },
+        ),
+        events=[],
+        provider_called=True,
+    )
+
+    assert evidence["found"] is True
+    assert evidence["expired"] is True
+    assert evidence["freshness"] == (
+        "EXPIRED_CONTENT_VALID_UNTIL"
+    )
+    assert evidence["summary"]["records_expired"] == 3

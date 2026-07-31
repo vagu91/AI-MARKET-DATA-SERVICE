@@ -435,6 +435,7 @@ def test_partial_result_exposes_only_missing_fields_without_enqueue(
         }
     )
     assert direct["missing_fields"] == ["consensus"]
+    assert direct["ai_eligible"] is False
     result = ResearchSchedulerService(
         settings,
         clock=lambda: NOW,
@@ -444,10 +445,10 @@ def test_partial_result_exposes_only_missing_fields_without_enqueue(
         ai_enqueue=None,
     )
 
-    assert result["ai_eligible_count"] == 1
+    assert result["ai_eligible_count"] == 0
     assert result["ai_invocations"] == result["ai_jobs_created"] == 0
     final = stored_item(settings, item["item_id"])
-    assert final["work_status"] == "IDLE"
+    assert final["work_status"] == "DISABLED"
     assert final["payload"]["actual"] == 2.7
     assert final["payload"]["consensus"] is None
     assert final["lease_owner"] is final["lease_expires_at"] is None
@@ -456,7 +457,18 @@ def test_partial_result_exposes_only_missing_fields_without_enqueue(
 
 def test_mixed_ai_eligible_and_disabled_residuals_finalize_every_lease(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "app.services.lifecycle_due_resolver."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,

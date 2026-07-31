@@ -41,6 +41,8 @@ def _covered_dates(
 
 class BlsReleaseCalendarProvider(BaseProvider):
     source = "BLS Release Calendar"
+    canonical_source = "BLS"
+    query_scope = "bls_release_occurrence"
     provider_type = ProviderType.SCRAPER
     reliability = 0.82
     cache_key = "provider:bls_release_calendar:events:v2"

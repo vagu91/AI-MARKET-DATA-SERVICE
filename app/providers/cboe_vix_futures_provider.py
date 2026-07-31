@@ -65,6 +65,12 @@ class CboeVixFuturesProvider:
         previous, _ = parse_vix_futures_csv(previous_text or "", data_as_of=previous_date.isoformat() if previous_date else None)
         previous_by_symbol = {item["contract_symbol"]: item for item in previous}
         now = datetime.now(UTC)
+        valid_until = _iso(
+            now
+            + timedelta(
+                minutes=self.settings.risk_context_ttl_minutes
+            )
+        )
         for position, item in enumerate(contracts[:6], start=1):
             prior = previous_by_symbol.get(item["contract_symbol"])
             previous_close = prior.get("last_price") if prior else None
@@ -75,7 +81,9 @@ class CboeVixFuturesProvider:
                     "change": round(item["last_price"] - previous_close, 6) if previous_close else None,
                     "change_pct": round((item["last_price"] / previous_close - 1) * 100, 6) if previous_close else None,
                     "retrieved_at": _iso(now),
-                    "valid_until": _iso(now + timedelta(minutes=self.settings.risk_context_ttl_minutes)),
+                    "valid_until": valid_until,
+                    "content_valid_until": valid_until,
+                    "refresh_due_at": valid_until,
                     "freshness": "LAST_SESSION",
                     "reliability": 0.96,
                     "confidence": 0.94,
@@ -98,7 +106,9 @@ class CboeVixFuturesProvider:
             "is_official_source": True,
             "data_as_of": latest_date.isoformat(),
             "retrieved_at": _iso(now),
-            "valid_until": _iso(now + timedelta(minutes=self.settings.risk_context_ttl_minutes)),
+            "valid_until": valid_until,
+            "content_valid_until": valid_until,
+            "refresh_due_at": valid_until,
             "contracts": contracts,
             "diagnostics": {
                 **diagnostics,

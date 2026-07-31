@@ -12,6 +12,9 @@ from app.services.data_freshness_service import parse_datetime
 from app.services.event_driven_lifecycle_service import compute_datum_lifecycle
 from app.services.official_actual_semantics import normalize_reference_period
 from app.services.research_agent_enablement import research_agent_enablement
+from app.services.provider_capability_registry import (
+    automatic_ai_delivery_authorized,
+)
 from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key
 
@@ -993,13 +996,20 @@ class DeterministicLifecycleDueResolver:
                         list(item.get("fields_attempted") or []),
                     )
                 ),
-                "ai_eligible": bool(decision["agent_enabled"]),
+                "ai_eligible": bool(
+                    decision["agent_enabled"]
+                    and automatic_ai_delivery_authorized()
+                ),
                 "agent_status": (
-                    "ENABLED" if decision["agent_enabled"] else "DISABLED"
+                    "ENABLED"
+                    if decision["agent_enabled"]
+                    and automatic_ai_delivery_authorized()
+                    else "DISABLED"
                 ),
                 "execution_status": (
                     "ELIGIBLE"
                     if decision["agent_enabled"]
+                    and automatic_ai_delivery_authorized()
                     else "NOT_REQUESTED"
                 ),
                 **telemetry,
@@ -1074,14 +1084,21 @@ class DeterministicLifecycleDueResolver:
             "lifecycle": lifecycle,
             "next_retry_at": lifecycle.next_retry_at,
             "ai_eligible": bool(
-                decision["agent_enabled"] and not terminal
+                decision["agent_enabled"]
+                and not terminal
+                and automatic_ai_delivery_authorized()
             ),
             "agent_status": (
-                "ENABLED" if decision["agent_enabled"] else "DISABLED"
+                "ENABLED"
+                if decision["agent_enabled"]
+                and automatic_ai_delivery_authorized()
+                else "DISABLED"
             ),
             "execution_status": (
                 "ELIGIBLE"
-                if decision["agent_enabled"] and not terminal
+                if decision["agent_enabled"]
+                and not terminal
+                and automatic_ai_delivery_authorized()
                 else "NOT_REQUESTED"
             ),
             "data_outcome": (

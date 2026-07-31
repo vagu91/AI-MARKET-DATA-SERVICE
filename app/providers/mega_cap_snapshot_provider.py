@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
@@ -11,8 +11,21 @@ from app.models.nasdaq import MarketSession
 from app.providers.alpha_vantage import ensure_alpha_payload_ok, parse_float, parse_int
 from app.providers.base import BaseProvider, metadata
 from app.providers.calendar_utils import REQUEST_HEADERS
+from app.services.provider_capability_registry import (
+    dataset_policy_by_id,
+    dataset_runtime_provider_order,
+)
 
 MEGA_CAP_TICKERS = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "GOOG", "AVGO", "TSLA", "AMD", "NFLX", "COST"]
+MEGA_CAP_DATASET_ID = "mega_cap_quotes"
+_MEGA_CAP_PROVIDER_DISPATCH_IDS = frozenset(
+    {
+        "YAHOO_FINANCE_CHART",
+        "STOOQ",
+        "ALPHA_VANTAGE",
+        "YAHOO_FINANCE_QUOTE",
+    }
+)
 
 
 class MegaCapSnapshotProvider(BaseProvider):
@@ -28,182 +41,283 @@ class MegaCapSnapshotProvider(BaseProvider):
     async def fetch(self) -> ProviderResult:
         errors: list[str] = []
         provider_accounting: list[dict[str, object]] = []
-        async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
-            stocks, chart_errors = await self._fetch_yahoo_chart(client)
-            errors.extend(chart_errors)
-            provider_accounting.append(
-                _provider_observation(
-                    "YAHOO_FINANCE_CHART",
-                    calls=len(MEGA_CAP_TICKERS),
-                    status=(
-                        "SUCCESS"
-                        if stocks and not chart_errors
-                        else "PARTIAL"
-                        if stocks
-                        else "FAILED"
-                    ),
-                )
+        declared_order: tuple[str, ...] = ()
+        try:
+            declared_order = _declared_mega_cap_provider_order()
+            provider_order = _mega_cap_provider_order()
+        except (KeyError, RuntimeError) as exc:
+            reason = (
+                "mega_cap_runtime_provider_policy_invalid:"
+                f"{exc}"
             )
-            if stocks:
-                return _snapshot_result(
-                    source="Yahoo Finance Chart",
-                    provider_type=ProviderType.API,
-                    reliability=0.7,
-                    stocks=stocks,
-                    errors=errors,
-                    fallback_used=False,
-                    provider_accounting=_complete_provider_accounting(
-                        provider_accounting,
-                        alpha_configured=bool(
-                            self.settings.alpha_vantage_api_key
-                        ),
-                    ),
-                )
-
-            try:
-                response = await client.get(_stooq_url(), headers=REQUEST_HEADERS)
-                response.raise_for_status()
-                stocks, stooq_errors = parse_stooq_quotes(response.text)
-                errors.extend(stooq_errors)
-                provider_accounting.append(
+            return _snapshot_result(
+                source=self.source,
+                provider_type=ProviderType.API,
+                reliability=0.0,
+                stocks=[],
+                errors=[reason],
+                provider_accounting=[
                     _provider_observation(
-                        "STOOQ",
-                        calls=1,
-                        status=(
-                            "SUCCESS"
-                            if stocks and not stooq_errors
-                            else "PARTIAL"
-                            if stocks
-                            else "NO_DATA"
-                        ),
-                    )
-                )
-                if stocks:
-                    return _snapshot_result(
-                        source="Stooq Quote CSV",
-                        provider_type=ProviderType.CSV,
-                        reliability=0.66,
-                        stocks=stocks,
-                        errors=errors,
-                        fallback_used=True,
-                        provider_accounting=(
-                            _complete_provider_accounting(
-                                provider_accounting,
-                                alpha_configured=bool(
-                                    self.settings.alpha_vantage_api_key
-                                ),
-                            )
-                        ),
-                    )
-            except Exception as exc:
-                errors.append(f"Stooq quote provider_failed: {exc or 'empty error detail'}")
-                provider_accounting.append(
-                    _provider_observation(
-                        "STOOQ",
-                        calls=1,
-                        status="FAILED",
-                        reason_code=(
-                            str(exc) or type(exc).__name__
-                        ),
-                    )
-                )
-
-            if self.settings.alpha_vantage_api_key:
-                stocks, av_errors = await self._fetch_alpha_vantage_fallback(client)
-                errors.extend(av_errors)
-                provider_accounting.append(
-                    _provider_observation(
-                        "ALPHA_VANTAGE",
-                        calls=1,
-                        status=(
-                            "SUCCESS"
-                            if stocks
-                            else "FAILED"
-                            if av_errors
-                            else "NO_DATA"
-                        ),
-                        reason_code=(
-                            "; ".join(av_errors) or None
-                        ),
-                    )
-                )
-                if stocks:
-                    return _snapshot_result(
-                        source="Alpha Vantage GLOBAL_QUOTE",
-                        provider_type=ProviderType.API,
-                        reliability=0.76,
-                        stocks=stocks,
-                        errors=errors,
-                        fallback_used=True,
-                        provider_accounting=(
-                            _complete_provider_accounting(
-                                provider_accounting,
-                                alpha_configured=True,
-                            )
-                        ),
-                    )
-            else:
-                provider_accounting.append(
-                    _provider_observation(
-                        "ALPHA_VANTAGE",
+                        provider,
                         calls=0,
                         status="NOT_CALLED",
-                        reason_code="ALPHA_VANTAGE_NOT_CONFIGURED",
-                    )
-                )
-
-            try:
-                response = await client.get(
-                    self.settings.yahoo_quote_url,
-                    params={"symbols": ",".join(MEGA_CAP_TICKERS)},
-                    headers=REQUEST_HEADERS,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                stocks, yahoo_errors = parse_yahoo_quotes(payload)
-                errors.extend(yahoo_errors)
-                provider_accounting.append(
-                    _provider_observation(
-                        "YAHOO_FINANCE_QUOTE",
-                        calls=1,
-                        status=(
-                            "SUCCESS"
-                            if stocks and not yahoo_errors
-                            else "PARTIAL"
-                            if stocks
-                            else "NO_DATA"
+                        reason_code=(
+                            "RUNTIME_ADAPTER_MAPPING_UNAVAILABLE"
                         ),
                     )
-                )
-                if stocks:
-                    return _snapshot_result(
-                        source="Yahoo Finance Quote",
-                        provider_type=ProviderType.API,
-                        reliability=0.72,
-                        stocks=stocks,
-                        errors=errors,
-                        fallback_used=True,
-                        provider_accounting=(
-                            _complete_provider_accounting(
-                                provider_accounting,
-                                alpha_configured=bool(
-                                    self.settings.alpha_vantage_api_key
+                    for provider in declared_order
+                ],
+            )
+        async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+            for position, provider_id in enumerate(provider_order):
+                fallback_used = position > 0
+                if provider_id == "YAHOO_FINANCE_CHART":
+                    stocks, chart_errors = (
+                        await self._fetch_yahoo_chart(client)
+                    )
+                    stocks, observation_errors = (
+                        _current_provider_stocks(stocks)
+                    )
+                    chart_errors.extend(observation_errors)
+                    errors.extend(chart_errors)
+                    provider_accounting.append(
+                        _provider_observation(
+                            provider_id,
+                            calls=len(MEGA_CAP_TICKERS),
+                            status=(
+                                "SUCCESS"
+                                if stocks and not chart_errors
+                                else "PARTIAL"
+                                if stocks
+                                else "FAILED"
+                            ),
+                        )
+                    )
+                    if stocks:
+                        return _snapshot_result(
+                            source="Yahoo Finance Chart",
+                            provider_type=ProviderType.API,
+                            reliability=0.7,
+                            stocks=stocks,
+                            errors=errors,
+                            fallback_used=fallback_used,
+                            provider_accounting=(
+                                _complete_provider_accounting(
+                                    provider_accounting,
+                                    provider_order=provider_order,
+                                    alpha_configured=bool(
+                                        self.settings.alpha_vantage_api_key
+                                    ),
+                                )
+                            ),
+                        )
+                    continue
+
+                if provider_id == "STOOQ":
+                    try:
+                        response = await client.get(
+                            _stooq_url(),
+                            headers=REQUEST_HEADERS,
+                        )
+                        response.raise_for_status()
+                        stocks, stooq_errors = parse_stooq_quotes(
+                            response.text
+                        )
+                        stocks, observation_errors = (
+                            _current_provider_stocks(stocks)
+                        )
+                        stooq_errors.extend(observation_errors)
+                        errors.extend(stooq_errors)
+                        provider_accounting.append(
+                            _provider_observation(
+                                provider_id,
+                                calls=1,
+                                status=(
+                                    "SUCCESS"
+                                    if stocks and not stooq_errors
+                                    else "PARTIAL"
+                                    if stocks
+                                    else "NO_DATA"
                                 ),
                             )
-                        ),
+                        )
+                        if stocks:
+                            return _snapshot_result(
+                                source="Stooq Quote CSV",
+                                provider_type=ProviderType.CSV,
+                                reliability=0.66,
+                                stocks=stocks,
+                                errors=errors,
+                                fallback_used=fallback_used,
+                                provider_accounting=(
+                                    _complete_provider_accounting(
+                                        provider_accounting,
+                                        provider_order=provider_order,
+                                        alpha_configured=bool(
+                                            self.settings.alpha_vantage_api_key
+                                        ),
+                                    )
+                                ),
+                            )
+                    except Exception as exc:
+                        errors.append(
+                            "Stooq quote provider_failed: "
+                            f"{exc or 'empty error detail'}"
+                        )
+                        provider_accounting.append(
+                            _provider_observation(
+                                provider_id,
+                                calls=1,
+                                status="FAILED",
+                                reason_code=(
+                                    str(exc) or type(exc).__name__
+                                ),
+                            )
+                        )
+                    continue
+
+                if provider_id == "ALPHA_VANTAGE":
+                    if not self.settings.alpha_vantage_api_key:
+                        provider_accounting.append(
+                            _provider_observation(
+                                provider_id,
+                                calls=0,
+                                status="NOT_CALLED",
+                                reason_code=(
+                                    "ALPHA_VANTAGE_NOT_CONFIGURED"
+                                ),
+                            )
+                        )
+                        continue
+                    stocks, av_errors = (
+                        await self._fetch_alpha_vantage_fallback(
+                            client
+                        )
                     )
-            except Exception as exc:
-                errors.append(f"Yahoo Finance quote provider_failed: {exc or 'empty error detail'}")
+                    stocks, observation_errors = (
+                        _current_provider_stocks(stocks)
+                    )
+                    av_errors.extend(observation_errors)
+                    errors.extend(av_errors)
+                    provider_accounting.append(
+                        _provider_observation(
+                            provider_id,
+                            calls=1,
+                            status=(
+                                "SUCCESS"
+                                if stocks
+                                else "FAILED"
+                                if av_errors
+                                else "NO_DATA"
+                            ),
+                            reason_code=(
+                                "; ".join(av_errors) or None
+                            ),
+                        )
+                    )
+                    if stocks:
+                        return _snapshot_result(
+                            source="Alpha Vantage GLOBAL_QUOTE",
+                            provider_type=ProviderType.API,
+                            reliability=0.76,
+                            stocks=stocks,
+                            errors=errors,
+                            fallback_used=fallback_used,
+                            provider_accounting=(
+                                _complete_provider_accounting(
+                                    provider_accounting,
+                                    provider_order=provider_order,
+                                    alpha_configured=True,
+                                )
+                            ),
+                        )
+                    continue
+
+                if provider_id == "YAHOO_FINANCE_QUOTE":
+                    try:
+                        response = await client.get(
+                            self.settings.yahoo_quote_url,
+                            params={
+                                "symbols": ",".join(
+                                    MEGA_CAP_TICKERS
+                                )
+                            },
+                            headers=REQUEST_HEADERS,
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+                        stocks, yahoo_errors = parse_yahoo_quotes(
+                            payload
+                        )
+                        stocks, observation_errors = (
+                            _current_provider_stocks(stocks)
+                        )
+                        yahoo_errors.extend(observation_errors)
+                        errors.extend(yahoo_errors)
+                        provider_accounting.append(
+                            _provider_observation(
+                                provider_id,
+                                calls=1,
+                                status=(
+                                    "SUCCESS"
+                                    if stocks and not yahoo_errors
+                                    else "PARTIAL"
+                                    if stocks
+                                    else "NO_DATA"
+                                ),
+                            )
+                        )
+                        if stocks:
+                            return _snapshot_result(
+                                source="Yahoo Finance Quote",
+                                provider_type=ProviderType.API,
+                                reliability=0.72,
+                                stocks=stocks,
+                                errors=errors,
+                                fallback_used=fallback_used,
+                                provider_accounting=(
+                                    _complete_provider_accounting(
+                                        provider_accounting,
+                                        provider_order=provider_order,
+                                        alpha_configured=bool(
+                                            self.settings.alpha_vantage_api_key
+                                        ),
+                                    )
+                                ),
+                            )
+                    except Exception as exc:
+                        errors.append(
+                            "Yahoo Finance quote provider_failed: "
+                            f"{exc or 'empty error detail'}"
+                        )
+                        provider_accounting.append(
+                            _provider_observation(
+                                provider_id,
+                                calls=1,
+                                status="FAILED",
+                                reason_code=(
+                                    str(exc) or type(exc).__name__
+                                ),
+                            )
+                        )
+                    continue
+
+                reason = (
+                    "MEGA_CAP_RUNTIME_ADAPTER_UNMAPPED:"
+                    f"{provider_id}"
+                )
+                errors.append(reason)
                 provider_accounting.append(
                     _provider_observation(
-                        "YAHOO_FINANCE_QUOTE",
-                        calls=1,
-                        status="FAILED",
+                        provider_id,
+                        calls=0,
+                        status="NOT_CALLED",
                         reason_code=(
-                            str(exc) or type(exc).__name__
+                            "RUNTIME_ADAPTER_MAPPING_UNAVAILABLE"
                         ),
                     )
                 )
+                break
 
         return _snapshot_result(
             source=self.source,
@@ -213,6 +327,7 @@ class MegaCapSnapshotProvider(BaseProvider):
             errors=errors or ["No quote provider returned data"],
             provider_accounting=_complete_provider_accounting(
                 provider_accounting,
+                provider_order=provider_order,
                 alpha_configured=bool(
                     self.settings.alpha_vantage_api_key
                 ),
@@ -291,6 +406,9 @@ def parse_alpha_vantage_global_quote(symbol: str, payload: dict) -> dict[str, ob
     price = parse_float(quote.get("05. price"))
     change = parse_float(quote.get("09. change"))
     change_pct = parse_float(quote.get("10. change percent"))
+    data_as_of = _provider_observation_iso(
+        quote.get("07. latest trading day")
+    )
     return {
         "symbol": str(quote.get("01. symbol") or symbol).upper(),
         "name": None,
@@ -302,6 +420,10 @@ def parse_alpha_vantage_global_quote(symbol: str, payload: dict) -> dict[str, ob
         "market_session": MarketSession.UNKNOWN.value,
         "currency": "USD",
         "source": "Alpha Vantage GLOBAL_QUOTE",
+        "data_as_of": data_as_of,
+        "observation_time_source": (
+            "07. latest trading day" if data_as_of else None
+        ),
         "retrieved_at": datetime.now(UTC).isoformat(),
     }
 
@@ -315,6 +437,9 @@ def parse_yahoo_quotes(payload: dict) -> tuple[list[dict[str, object]], list[str
         symbol = str(item.get("symbol", "")).upper()
         if not symbol:
             continue
+        data_as_of = _provider_observation_iso(
+            item.get("regularMarketTime")
+        )
         seen.add(symbol)
         stocks.append(
             {
@@ -328,6 +453,10 @@ def parse_yahoo_quotes(payload: dict) -> tuple[list[dict[str, object]], list[str
                 "market_session": _session(item),
                 "currency": item.get("currency") or "USD",
                 "source": "Yahoo Finance Quote",
+                "data_as_of": data_as_of,
+                "observation_time_source": (
+                    "regularMarketTime" if data_as_of else None
+                ),
                 "retrieved_at": retrieved_at.isoformat(),
             }
         )
@@ -343,9 +472,16 @@ def parse_yahoo_chart(symbol: str, payload: dict) -> dict[str, object] | None:
     result = results[0]
     meta = result.get("meta", {})
     quote = (result.get("indicators", {}).get("quote") or [{}])[0]
-    closes = [value for value in quote.get("close", []) if value is not None]
+    raw_closes = list(quote.get("close", []) or [])
+    close_indices = [
+        index
+        for index, value in enumerate(raw_closes)
+        if value is not None
+    ]
+    closes = [raw_closes[index] for index in close_indices]
     volumes = [value for value in quote.get("volume", []) if value is not None]
     price = parse_float(meta.get("regularMarketPrice"))
+    price_from_meta = price is not None
     previous_close = parse_float(meta.get("chartPreviousClose") or meta.get("previousClose"))
     if price is None and closes:
         price = parse_float(closes[-1])
@@ -353,6 +489,19 @@ def parse_yahoo_chart(symbol: str, payload: dict) -> dict[str, object] | None:
         previous_close = parse_float(closes[-2])
     change = price - previous_close if price is not None and previous_close is not None else None
     change_pct = change / previous_close * 100.0 if change is not None and previous_close else None
+    chart_timestamps = list(result.get("timestamp") or [])
+    provider_time = meta.get("regularMarketTime")
+    observation_source = "regularMarketTime"
+    if (
+        not price_from_meta
+        and provider_time is None
+        and close_indices
+        and close_indices[-1] < len(chart_timestamps)
+        and chart_timestamps[close_indices[-1]] is not None
+    ):
+        provider_time = chart_timestamps[close_indices[-1]]
+        observation_source = "chart.timestamp[price_index]"
+    data_as_of = _provider_observation_iso(provider_time)
     return {
         "symbol": symbol.upper(),
         "name": meta.get("shortName") or meta.get("longName"),
@@ -364,6 +513,10 @@ def parse_yahoo_chart(symbol: str, payload: dict) -> dict[str, object] | None:
         "market_session": MarketSession.UNKNOWN.value,
         "currency": meta.get("currency") or "USD",
         "source": "Yahoo Finance Chart",
+        "data_as_of": data_as_of,
+        "observation_time_source": (
+            observation_source if data_as_of else None
+        ),
         "retrieved_at": datetime.now(UTC).isoformat(),
     }
 
@@ -392,6 +545,13 @@ def parse_stooq_quotes(text: str) -> tuple[list[dict[str, object]], list[str]]:
         baseline = previous_close if previous_close is not None else open_price
         change = close - baseline if close is not None and baseline is not None else None
         change_pct = change / baseline * 100.0 if change is not None and baseline else None
+        date_text = str(row.get("Date") or "").strip()
+        time_text = str(row.get("Time") or "").strip()
+        data_as_of = _provider_observation_iso(
+            f"{date_text}T{time_text}"
+            if date_text and time_text
+            else date_text
+        )
         stocks.append(
             {
                 "symbol": symbol,
@@ -404,6 +564,10 @@ def parse_stooq_quotes(text: str) -> tuple[list[dict[str, object]], list[str]]:
                 "market_session": MarketSession.UNKNOWN.value,
                 "currency": "USD",
                 "source": "Stooq Quote CSV",
+                "data_as_of": data_as_of,
+                "observation_time_source": (
+                    "Date+Time" if data_as_of else None
+                ),
                 "retrieved_at": retrieved_at.isoformat(),
             }
         )
@@ -413,12 +577,81 @@ def parse_stooq_quotes(text: str) -> tuple[list[dict[str, object]], list[str]]:
     return stocks, errors
 
 
-MEGA_CAP_PROVIDER_ORDER = (
-    "YAHOO_FINANCE_CHART",
-    "STOOQ",
-    "ALPHA_VANTAGE",
-    "YAHOO_FINANCE_QUOTE",
-)
+def _provider_observation_iso(value: object) -> str | None:
+    """Normalize a provider-issued observation time without using retrieval time."""
+
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), UTC).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(float(text), UTC).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _current_provider_stocks(
+    stocks: list[dict[str, object]],
+    *,
+    observed_at: datetime | None = None,
+) -> tuple[list[dict[str, object]], list[str]]:
+    decision_at = (observed_at or datetime.now(UTC)).astimezone(UTC)
+    max_age = timedelta(
+        seconds=dataset_policy_by_id(
+            MEGA_CAP_DATASET_ID
+        ).sla_seconds
+    )
+    accepted: list[dict[str, object]] = []
+    errors: list[str] = []
+    for stock in stocks:
+        symbol = str(stock.get("symbol") or "UNKNOWN")
+        observation = _provider_observation_datetime(
+            stock.get("data_as_of")
+        )
+        if observation is None:
+            errors.append(
+                f"{symbol} provider observation time missing"
+            )
+            continue
+        if (
+            observation > decision_at + timedelta(minutes=5)
+            or decision_at >= observation + max_age
+        ):
+            errors.append(
+                f"{symbol} provider observation outside dataset SLA"
+            )
+            continue
+        accepted.append(stock)
+    return accepted, errors
+
+
+def _declared_mega_cap_provider_order() -> tuple[str, ...]:
+    policy = dataset_policy_by_id(MEGA_CAP_DATASET_ID)
+    return (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+
+
+def _mega_cap_provider_order() -> tuple[str, ...]:
+    return dataset_runtime_provider_order(
+        MEGA_CAP_DATASET_ID,
+        _MEGA_CAP_PROVIDER_DISPATCH_IDS,
+    )
 
 
 def _provider_observation(
@@ -440,6 +673,7 @@ def _provider_observation(
 def _complete_provider_accounting(
     observations: list[dict[str, object]],
     *,
+    provider_order: tuple[str, ...] | None = None,
     alpha_configured: bool,
 ) -> list[dict[str, object]]:
     by_provider = {
@@ -448,7 +682,7 @@ def _complete_provider_accounting(
     }
     prior_succeeded = False
     output: list[dict[str, object]] = []
-    for provider in MEGA_CAP_PROVIDER_ORDER:
+    for provider in provider_order or _mega_cap_provider_order():
         observed = by_provider.get(provider)
         if observed is not None:
             output.append(observed)
@@ -485,6 +719,21 @@ def _snapshot_result(
     provider_accounting: list[dict[str, object]] | None = None,
 ) -> ProviderResult:
     errors = _dedupe_errors([error for error in errors if error])
+    data_as_of = _snapshot_data_as_of(stocks)
+    now = datetime.now(UTC)
+    max_age_seconds = dataset_policy_by_id(
+        MEGA_CAP_DATASET_ID
+    ).sla_seconds
+    snapshot_freshness = (
+        Freshness.RECENT
+        if data_as_of is not None
+        and data_as_of <= now
+        and now - data_as_of
+        <= timedelta(seconds=max_age_seconds)
+        else Freshness.STALE
+        if data_as_of is not None and data_as_of <= now
+        else Freshness.UNKNOWN
+    )
     missing_prices = [stock["symbol"] for stock in stocks if stock.get("last_price") is None]
     seen = {stock["symbol"] for stock in stocks}
     missing_symbols = [symbol for symbol in MEGA_CAP_TICKERS if symbol not in seen]
@@ -496,7 +745,12 @@ def _snapshot_result(
             source=source,
             provider_type=provider_type,
             reliability=reliability if stocks else 0.0,
-            freshness=Freshness.LIVE if stocks else Freshness.UNKNOWN,
+            data_as_of=data_as_of,
+            freshness=(
+                snapshot_freshness
+                if stocks
+                else Freshness.UNKNOWN
+            ),
             is_fallback=fallback_used,
             errors=quality_errors,
         ),
@@ -515,10 +769,39 @@ def _snapshot_result(
                 "final_data_available": bool(stocks),
                 "no_data_found": not bool(stocks),
                 "provider_failed": any("provider_failed" in error for error in quality_errors),
+                "reason_code": (
+                    "RUNTIME_PROVIDER_POLICY_INVALID"
+                    if any(
+                        "runtime_provider_policy_invalid" in error
+                        for error in quality_errors
+                    )
+                    else None
+                ),
                 "rate_limited": any("rate_limited" in error or "Note:" in error or "Information:" in error for error in quality_errors),
             },
         },
     )
+
+
+def _snapshot_data_as_of(
+    stocks: list[dict[str, object]],
+) -> datetime | None:
+    observations = [
+        _provider_observation_datetime(stock.get("data_as_of"))
+        for stock in stocks
+    ]
+    if not stocks or any(value is None for value in observations):
+        return None
+    return min(
+        value for value in observations if value is not None
+    )
+
+
+def _provider_observation_datetime(value: object) -> datetime | None:
+    normalized = _provider_observation_iso(value)
+    if normalized is None:
+        return None
+    return datetime.fromisoformat(normalized)
 
 
 def _stooq_url() -> str:

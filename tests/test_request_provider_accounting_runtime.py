@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import app.api.routes as routes
+import app.services.provider_capability_registry as provider_registry
 from app.api.deps import (
     get_deterministic_provider_runtime,
     get_enrichment_orchestrator,
@@ -24,7 +26,11 @@ from app.models.common import (
 )
 from app.models.macro import MacroLatestResponse, MacroSeries
 from app.services.data_freshness_service import DataFreshnessService
-from app.services.diagnostics_service import DiagnosticsService
+from app.services.diagnostics_service import (
+    DiagnosticsService,
+    _macro_repository_queries,
+    _required_macro_dataset_series,
+)
 from app.services.request_provider_accounting import (
     RequestProviderAccountingCollector,
     provider_attempt,
@@ -131,19 +137,16 @@ def _macro_fact(*, valid_until: datetime) -> dict:
 
 def _valid_macro_facts(*, valid_until: datetime) -> list[dict]:
     data_as_of = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
-    series = (
-        ("DGS2", "FRED"),
-        ("DFF", "FRED"),
-        ("DFEDTARL", "FEDERAL_RESERVE"),
-        ("CUSR0000SA0", "BLS"),
-        ("WPUFD4", "BLS"),
-        ("BEA:PCE", "BEA"),
-        ("BEA:GDP", "BEA"),
-        ("LNS14000000", "BLS"),
-        ("CES0500000003", "BLS"),
-        ("CES0000000001", "BLS"),
-        ("ICSA", "FRED"),
-    )
+    series = [
+        (series_id, policy.primary_provider)
+        for dataset_id, query in _macro_repository_queries().items()
+        for policy in DATASET_POLICIES
+        if policy.dataset_id == dataset_id
+        for series_id in _required_macro_dataset_series(
+            dataset_id,
+            query=query,
+        )
+    ]
     return [
         {
             **_macro_fact(valid_until=valid_until),
@@ -240,11 +243,9 @@ def test_expired_db_record_calls_primary_provider(tmp_path) -> None:
     )
     service = _macro_service(
         settings,
-        rows=[
-            _macro_fact(
-                valid_until=datetime.now(UTC) - timedelta(seconds=1)
-            )
-        ],
+        rows=_valid_macro_facts(
+            valid_until=datetime.now(UTC) - timedelta(seconds=1)
+        ),
         response=response,
     )
     collector = _collector(
@@ -377,9 +378,11 @@ def test_route_plumbing_cannot_pass_with_provider_only_manual_accounting(
             contract,
             *,
             refresh,
+            include_candidate_discovery,
             accounting_collector,
         ):
             assert refresh == "force"
+            assert include_candidate_discovery is False
             for dataset_id in sorted(deterministic_ids):
                 policy = next(
                     item
@@ -561,11 +564,132 @@ def test_flash_pmi_runtime_evidence_preserves_fallback_order_and_selection() -> 
     assert manifest["evidence_status"] == "ACQUISITION_COMPLETE"
     row = manifest["datasets"][0]
     assert row["primary_provider"]["called"] is True
+    assert row["primary_provider"]["result"] == "HTTP_403"
     assert [item["provider"] for item in row["fallbacks"]] == [
         "INVESTING_EVENT_1062"
     ]
     assert row["fallbacks"][0]["called"] is True
     assert row["acquisition_selected_source"] == "INVESTING_EVENT_1062"
+
+
+def test_flash_pmi_accounting_order_tracks_mutated_central_policy(
+    monkeypatch,
+) -> None:
+    policy = provider_registry.dataset_policy_by_id(
+        "flash_services_pmi"
+    )
+    mutated_policy = replace(
+        policy,
+        fallback_providers=(
+            "INVESTING_EVENT_1062",
+            "OFFICIAL_ACTUAL_TRANSFORMATION",
+        ),
+    )
+    monkeypatch.setattr(
+        provider_registry,
+        "DATASET_SOURCE_POLICIES",
+        tuple(
+            mutated_policy
+            if item.dataset_id == mutated_policy.dataset_id
+            else item
+            for item in provider_registry.DATASET_SOURCE_POLICIES
+        ),
+    )
+    collector_policy = replace(
+        next(
+            item
+            for item in DATASET_POLICIES
+            if item.dataset_id == mutated_policy.dataset_id
+        ),
+        primary_provider=mutated_policy.primary_provider,
+        fallback_providers=mutated_policy.fallback_providers,
+    )
+    collector = _collector([collector_policy])
+    service = object.__new__(
+        ProviderForceActualReconciliationService
+    )
+    service.accounting_collector = collector
+    service.lifecycle = type(
+        "EmptyLifecycleRepository",
+        (),
+        {"list_items": lambda _self: []},
+    )()
+    now = datetime.now(UTC)
+
+    service._record_flash_pmi_accounting(
+        contract=_flash_contract(
+            actual=53.6,
+            source="INVESTING_EVENT_1062",
+        ),
+        audits=[
+            {
+                "occurrence_id": "xtb:146945:2026-07-24",
+                "request_id": collector.request_id,
+                "correlation_id": collector.correlation_id,
+                "mapping_selected": "flash_services_pmi",
+                "provider_attempted": "INVESTING_EVENT_1062",
+                "provider_call_count": 2,
+                "lifecycle_before": {
+                    "freshness_state": "STALE",
+                    "valid_until": (
+                        now - timedelta(minutes=5)
+                    ).isoformat(),
+                    "next_refresh_at": (
+                        now - timedelta(minutes=5)
+                    ).isoformat(),
+                },
+                "provider_attempts": [
+                    {
+                        "provider": "SPGLOBAL",
+                        "called": True,
+                        "attempts": 1,
+                        "result": "HTTP_403",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": now.isoformat(),
+                    },
+                    {
+                        "provider": "INVESTING_EVENT_1062",
+                        "called": True,
+                        "attempts": 1,
+                        "result": "SUCCESS",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": now.isoformat(),
+                    },
+                    {
+                        "provider": "OFFICIAL_ACTUAL_TRANSFORMATION",
+                        "called": False,
+                        "attempts": 0,
+                        "result": "NOT_CALLED",
+                        "not_called_reason": "PRIOR_PROVIDER_SUCCEEDED",
+                        "execution_origin": "OBSERVED_SKIP",
+                        "request_id": collector.request_id,
+                        "correlation_id": collector.correlation_id,
+                        "observed_at": now.isoformat(),
+                    },
+                ],
+            }
+        ],
+    )
+
+    manifest = collector.manifest()
+    assert manifest["evidence_status"] == "ACQUISITION_COMPLETE"
+    row = manifest["datasets"][0]
+    assert row["primary_provider"]["provider"] == "SPGLOBAL"
+    assert row["primary_provider"]["result"] == "HTTP_403"
+    assert [item["provider"] for item in row["fallbacks"]] == [
+        "INVESTING_EVENT_1062",
+        "OFFICIAL_ACTUAL_TRANSFORMATION",
+    ]
+    assert [item["called"] for item in row["fallbacks"]] == [
+        True,
+        False,
+    ]
+    assert row["fallbacks"][0]["result"] == "SUCCESS"
+    assert row["acquisition_selected_source"] == (
+        "INVESTING_EVENT_1062"
+    )
 
 
 def test_flash_pmi_all_provider_failures_leave_value_null() -> None:

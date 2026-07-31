@@ -20,6 +20,9 @@ from app.services.provider_observation_repository import ProviderObservationRepo
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.temporal_domain_service import exact_occurrence_key
 from app.services.execution_context import ExecutionContext
+from app.services.provider_capability_registry import (
+    automatic_ai_delivery_authorized,
+)
 
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
@@ -230,7 +233,12 @@ class EnrichmentOrchestrator:
             ai_failure_reason = None
             ai_diagnostic_artifact_dir: str | None = None
             ai_jobs: list[dict[str, Any]] = []
-            if provider_missing and self.settings.enable_ai_researcher:
+            ai_runtime_authorized = automatic_ai_delivery_authorized()
+            if (
+                provider_missing
+                and self.settings.enable_ai_researcher
+                and ai_runtime_authorized
+            ):
                 ai_candidates = self._ai_candidates(provider_missing, limit=False)[: self.settings.ai_researcher_max_events]
                 metrics["ai_events_requested"] = len(ai_candidates)
                 metrics["ai_candidate_event_ids"] = [event.event_id for event in ai_candidates]
@@ -252,9 +260,19 @@ class EnrichmentOrchestrator:
                     raw_payload_json={"job_ids": [job["job_id"] for job in ai_jobs]},
                 )
             else:
-                metrics["ai_research_status"] = "disabled" if not self.settings.enable_ai_researcher else "not_required"
-                if provider_missing and not self.settings.enable_ai_researcher:
-                    metrics["warnings_json"].append("ai_researcher_disabled")
+                metrics["ai_research_status"] = (
+                    "disabled"
+                    if not self.settings.enable_ai_researcher
+                    else "not_authorized"
+                    if not ai_runtime_authorized
+                    else "not_required"
+                )
+                if provider_missing:
+                    metrics["warnings_json"].append(
+                        "ai_researcher_disabled"
+                        if not self.settings.enable_ai_researcher
+                        else "AI_RUNTIME_CAPABILITY_NOT_CERTIFIED"
+                    )
             for event in provider_missing:
                 updated = event.model_copy(deep=True)
                 if ai_jobs:
@@ -268,10 +286,14 @@ class EnrichmentOrchestrator:
                 enriched_by_id[event.event_id] = updated
 
             result = [enriched_by_id.get(event.event_id, event) for event in events]
-            release_jobs = self.ai_jobs.enqueue_temporal_refreshes(
-                result,
-                correlation_id=run_id,
-                execution_context=execution_context,
+            release_jobs = (
+                self.ai_jobs.enqueue_temporal_refreshes(
+                    result,
+                    correlation_id=run_id,
+                    execution_context=execution_context,
+                )
+                if ai_runtime_authorized
+                else []
             )
             if release_jobs:
                 metrics["ai_research_requests"] += len(release_jobs)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -36,6 +37,9 @@ from app.services.research_tool_telemetry import (
     normalize_usage,
 )
 from app.services.temporal_validation_service import TemporalValidationService
+
+
+PROCESS_REAP_TIMEOUT_SECONDS = 2
 
 
 class PersistentAIJobExecutor:
@@ -277,6 +281,10 @@ class PersistentAIJobExecutor:
             ),
             duration_ms=int((perf_counter() - started) * 1000),
             model=None,
+            transport_attestation=dict(
+                result.get("_process_attestation") or {}
+            ),
+            output_path=str(result.get("_output_path") or "") or None,
         )
 
     def _invoke(
@@ -293,7 +301,11 @@ class PersistentAIJobExecutor:
         event_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         started = perf_counter()
+        timeout_seconds = max(int(watchdog_seconds), 1)
         output_path.unlink(missing_ok=True)
+        attested_output_path = _attested_subprocess_output_path(output_path)
+        attested_output_path.unlink(missing_ok=True)
+        _process_attestation_envelope_path(output_path).unlink(missing_ok=True)
         kwargs: dict[str, Any] = {
             "cwd": workspace,
             "stdin": subprocess.PIPE,
@@ -342,55 +354,132 @@ class PersistentAIJobExecutor:
                 else:
                     stdout, stderr = process.communicate(
                         input=prompt,
-                        timeout=max(int(watchdog_seconds), 1),
+                        timeout=timeout_seconds,
                     )
             except subprocess.TimeoutExpired as exc:
-                _terminate_process_group(process)
+                process_terminated = _terminate_process_group(process)
                 if json_event_stream and event_observer is not None:
-                    stdout = str(exc.output or "")
-                    stderr = str(exc.stderr or "")
+                    stdout = _process_text(exc.output)
+                    stderr = _process_text(exc.stderr)
                 else:
-                    stdout, stderr = process.communicate()
+                    try:
+                        stdout, stderr = process.communicate(
+                            timeout=PROCESS_REAP_TIMEOUT_SECONDS
+                        )
+                    except subprocess.TimeoutExpired as drain_exc:
+                        process_terminated = False
+                        stdout = _process_text(
+                            drain_exc.output
+                            if drain_exc.output is not None
+                            else exc.output
+                        )
+                        stderr = _process_text(
+                            drain_exc.stderr
+                            if drain_exc.stderr is not None
+                            else exc.stderr
+                        )
+                    else:
+                        stdout = _process_text(stdout)
+                        stderr = _process_text(stderr)
+                        process_terminated = process.poll() is not None
                 error_events = extract_codex_error_events(stdout)
-                raise CodexCLIError(
-                    build_diagnostic(
-                        category="TIMEOUT",
-                        retryable=True,
-                        command=command,
-                        step=step,
-                        workspace=workspace,
-                        duration_ms=int((perf_counter() - started) * 1000),
-                        executable_version=executable_version,
-                        exit_code=process.returncode,
-                        stderr=stderr,
-                        stdout=stdout,
-                        error_events=error_events,
-                    )
+                duration_ms = int((perf_counter() - started) * 1000)
+                subprocess_output_bytes = _read_subprocess_output_bytes(
+                    output_path
                 )
-        finally:
-            with self._lock:
-                self._active.pop(process.pid, None)
-        error_events = extract_codex_error_events(stdout)
-        if process.returncode != 0:
-            category, retryable = classify_codex_failure(
-                exit_code=process.returncode,
-                stderr=stderr,
-                error_events=error_events,
-            )
-            raise CodexCLIError(
-                build_diagnostic(
-                    category=category,
-                    retryable=retryable,
+                diagnostic = build_diagnostic(
+                    category="TIMEOUT",
+                    retryable=True,
                     command=command,
                     step=step,
                     workspace=workspace,
-                    duration_ms=int((perf_counter() - started) * 1000),
+                    duration_ms=duration_ms,
                     executable_version=executable_version,
                     exit_code=process.returncode,
                     stderr=stderr,
                     stdout=stdout,
                     error_events=error_events,
                 )
+                raise _attested_codex_error(
+                    diagnostic,
+                    output_path=output_path,
+                    command=command,
+                    process=process,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout_seconds=timeout_seconds,
+                    duration_ms=duration_ms,
+                    process_terminated=process_terminated,
+                    status="TIMED_OUT",
+                    failure_reason="codex_cli_timeout",
+                    subprocess_output_bytes=subprocess_output_bytes,
+                )
+        finally:
+            with self._lock:
+                self._active.pop(process.pid, None)
+        error_events = extract_codex_error_events(stdout)
+        subprocess_output_bytes = _read_subprocess_output_bytes(output_path)
+        process_terminated = process.poll() is not None
+        if process.returncode != 0:
+            category, retryable = classify_codex_failure(
+                exit_code=process.returncode,
+                stderr=stderr,
+                error_events=error_events,
+            )
+            duration_ms = int((perf_counter() - started) * 1000)
+            diagnostic = build_diagnostic(
+                category=category,
+                retryable=retryable,
+                command=command,
+                step=step,
+                workspace=workspace,
+                duration_ms=duration_ms,
+                executable_version=executable_version,
+                exit_code=process.returncode,
+                stderr=stderr,
+                stdout=stdout,
+                error_events=error_events,
+            )
+            raise _attested_codex_error(
+                diagnostic,
+                output_path=output_path,
+                command=command,
+                process=process,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                process_terminated=process_terminated,
+                status="FAILED",
+                failure_reason=f"codex_cli_{category.casefold()}",
+                subprocess_output_bytes=subprocess_output_bytes,
+            )
+        if output_path.name == "agentic_research_output.json" and not process_terminated:
+            duration_ms = int((perf_counter() - started) * 1000)
+            diagnostic = build_diagnostic(
+                category="PROCESS_ATTESTATION",
+                retryable=False,
+                command=command,
+                step=step,
+                workspace=workspace,
+                duration_ms=duration_ms,
+                executable_version=executable_version,
+                exit_code=process.returncode,
+                stderr="successful_subprocess_termination_not_observed",
+                stdout=stdout,
+                error_events=error_events,
+            )
+            raise _attested_codex_error(
+                diagnostic,
+                output_path=output_path,
+                command=command,
+                process=process,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                process_terminated=False,
+                status="FAILED",
+                failure_reason="codex_cli_process_termination_unobserved",
+                subprocess_output_bytes=subprocess_output_bytes,
             )
         if json_event_stream:
             _ignored_payload, tool_events, usage, _stream_error = parse_codex_json_event_stream(
@@ -402,57 +491,110 @@ class PersistentAIJobExecutor:
             payload, error = parse_json_from_stdout(stdout)
             tool_events, usage = [], None
         if payload is None:
-            raise CodexCLIError(
-                build_diagnostic(
-                    category="OUTPUT_CONTRACT",
-                    retryable=False,
-                    command=command,
-                    step=step,
-                    workspace=workspace,
-                    duration_ms=int((perf_counter() - started) * 1000),
-                    executable_version=executable_version,
-                    exit_code=process.returncode,
-                    stderr=f"{stderr}\n{error or 'invalid_json'}",
-                    stdout=stdout,
-                    error_events=error_events,
-                )
+            duration_ms = int((perf_counter() - started) * 1000)
+            diagnostic = build_diagnostic(
+                category="OUTPUT_CONTRACT",
+                retryable=False,
+                command=command,
+                step=step,
+                workspace=workspace,
+                duration_ms=duration_ms,
+                executable_version=executable_version,
+                exit_code=process.returncode,
+                stderr=f"{stderr}\n{error or 'invalid_json'}",
+                stdout=stdout,
+                error_events=error_events,
+            )
+            raise _attested_codex_error(
+                diagnostic,
+                output_path=output_path,
+                command=command,
+                process=process,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                process_terminated=process_terminated,
+                status="FAILED",
+                failure_reason="codex_cli_output_missing_or_invalid_json",
+                subprocess_output_bytes=subprocess_output_bytes,
             )
         payload = normalize_payload_text(payload)
         if contains_mojibake(payload):
-            raise CodexCLIError(
-                build_diagnostic(
-                    category="OUTPUT_CONTRACT",
-                    retryable=False,
-                    command=command,
-                    step=step,
-                    workspace=workspace,
-                    duration_ms=int((perf_counter() - started) * 1000),
-                    executable_version=executable_version,
-                    exit_code=process.returncode,
-                    stderr=f"{stderr}\nknown_mojibake_rejected",
-                    stdout=stdout,
-                    error_events=error_events,
-                )
+            duration_ms = int((perf_counter() - started) * 1000)
+            diagnostic = build_diagnostic(
+                category="OUTPUT_CONTRACT",
+                retryable=False,
+                command=command,
+                step=step,
+                workspace=workspace,
+                duration_ms=duration_ms,
+                executable_version=executable_version,
+                exit_code=process.returncode,
+                stderr=f"{stderr}\nknown_mojibake_rejected",
+                stdout=stdout,
+                error_events=error_events,
+            )
+            raise _attested_codex_error(
+                diagnostic,
+                output_path=output_path,
+                command=command,
+                process=process,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                process_terminated=process_terminated,
+                status="FAILED",
+                failure_reason="codex_cli_output_mojibake",
+                subprocess_output_bytes=subprocess_output_bytes,
             )
         if schema is not None:
             try:
                 validate_payload(payload, schema)
             except ValueError as exc:
-                raise CodexCLIError(
-                    build_diagnostic(
-                        category="OUTPUT_CONTRACT",
-                        retryable=False,
-                        command=command,
-                        step=step,
-                        workspace=workspace,
-                        duration_ms=int((perf_counter() - started) * 1000),
-                        executable_version=executable_version,
-                        exit_code=process.returncode,
-                        stderr=f"{stderr}\n{exc}",
-                        stdout=stdout,
-                        error_events=error_events,
-                    )
+                duration_ms = int((perf_counter() - started) * 1000)
+                diagnostic = build_diagnostic(
+                    category="OUTPUT_CONTRACT",
+                    retryable=False,
+                    command=command,
+                    step=step,
+                    workspace=workspace,
+                    duration_ms=duration_ms,
+                    executable_version=executable_version,
+                    exit_code=process.returncode,
+                    stderr=f"{stderr}\n{exc}",
+                    stdout=stdout,
+                    error_events=error_events,
+                )
+                raise _attested_codex_error(
+                    diagnostic,
+                    output_path=output_path,
+                    command=command,
+                    process=process,
+                    stdout=stdout,
+                    stderr=stderr,
+                    duration_ms=duration_ms,
+                    process_terminated=process_terminated,
+                    status="FAILED",
+                    failure_reason="codex_cli_output_schema_invalid",
+                    subprocess_output_bytes=subprocess_output_bytes,
                 ) from exc
+        success_process_attestation = None
+        if (
+            output_path.name == "agentic_research_output.json"
+            and subprocess_output_bytes is not None
+        ):
+            success_process_attestation = _persist_process_attestation(
+                output_path=output_path,
+                command=command,
+                process=process,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=int((perf_counter() - started) * 1000),
+                process_terminated=process_terminated,
+                status="SUCCEEDED",
+                failure_reason=None,
+                subprocess_output_bytes=subprocess_output_bytes,
+            )
         output_path.write_text(
             json.dumps(redact_payload(payload), indent=2, ensure_ascii=False, default=str),
             encoding="utf-8",
@@ -463,7 +605,7 @@ class PersistentAIJobExecutor:
                 json.dumps(redact_payload(tool_events), indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8",
             )
-        return {
+        returned = {
             "status": "SUCCEEDED",
             **payload,
             "_tool_events": tool_events,
@@ -471,6 +613,14 @@ class PersistentAIJobExecutor:
             "usage_status": "available" if usage is not None else "usage_unavailable",
             "_events_persisted_incrementally": event_observer is not None,
         }
+        if success_process_attestation is not None:
+            returned.update(
+                {
+                    "_output_path": success_process_attestation["output_path"],
+                    "_process_attestation": success_process_attestation,
+                }
+            )
+        return returned
 
     def _preflight_error(
         self,
@@ -872,30 +1022,165 @@ def _communicate_jsonl_incrementally(
     return "".join(stdout_lines), "".join(stderr_parts)
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
+def _terminate_process_group(process: subprocess.Popen[str]) -> bool:
+    reaped = False
     try:
-        if os.name == "nt":
-            process.send_signal(signal.CTRL_BREAK_EVENT)
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                subprocess.Popen(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                ).wait(timeout=10)
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+        if process.poll() is None:
+            if os.name == "nt":
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                try:
+                    process.wait(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    subprocess.Popen(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    ).wait(timeout=10)
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        # A final direct kill below remains mandatory even when group
+        # signalling is unavailable or the helper command fails.
+        pass
     finally:
         if process.poll() is None:
-            process.kill()
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            reaped = False
+        else:
+            reaped = process.poll() is not None
+    return reaped
+
+
+def _attested_subprocess_output_path(output_path: Path) -> Path:
+    if output_path.name == "agentic_research_output.json":
+        name = "agentic_research_subprocess_output.json"
+    else:
+        name = f"{output_path.stem}.subprocess-output{output_path.suffix}"
+    return output_path.with_name(name).resolve()
+
+
+def _process_attestation_envelope_path(output_path: Path) -> Path:
+    return output_path.with_name(
+        f"{output_path.stem}.process-attestation.json"
+    ).resolve()
+
+
+def _read_subprocess_output_bytes(output_path: Path) -> bytes | None:
+    try:
+        return output_path.read_bytes() if output_path.is_file() else None
+    except OSError:
+        return None
+
+
+def _process_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _attested_codex_error(
+    diagnostic: dict[str, Any],
+    *,
+    output_path: Path,
+    command: list[str],
+    process: subprocess.Popen[str],
+    stdout: str,
+    stderr: str,
+    duration_ms: int,
+    process_terminated: bool,
+    status: str,
+    failure_reason: str,
+    subprocess_output_bytes: bytes | None,
+    timeout_seconds: int | None = None,
+) -> CodexCLIError:
+    diagnostic["process_attestation"] = _persist_process_attestation(
+        output_path=output_path,
+        command=command,
+        process=process,
+        stdout=stdout,
+        stderr=stderr,
+        duration_ms=duration_ms,
+        process_terminated=process_terminated,
+        status=status,
+        failure_reason=failure_reason,
+        subprocess_output_bytes=subprocess_output_bytes,
+        timeout_seconds=timeout_seconds,
+    )
+    return CodexCLIError(diagnostic)
+
+
+def _persist_process_attestation(
+    *,
+    output_path: Path,
+    command: list[str],
+    process: subprocess.Popen[str],
+    stdout: str,
+    stderr: str,
+    duration_ms: int,
+    process_terminated: bool,
+    status: str,
+    failure_reason: str | None,
+    subprocess_output_bytes: bytes | None,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Persist exact CLI bytes, or a secret-free envelope when none exist."""
+
+    command_bytes = json.dumps(
+        redact_payload(command),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    record = {
+        "schema_version": "codex-cli-process-attestation-v1",
+        "status": status,
+        "failure_reason": failure_reason,
+        "process_observed": True,
+        "process_id": process.pid,
+        "exit_code": process.returncode,
+        "process_terminated": process_terminated,
+        "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+        "command_sha256": hashlib.sha256(command_bytes).hexdigest(),
+        "duration_ms": max(int(duration_ms), 0),
+        "subprocess_output_observed": subprocess_output_bytes is not None,
+    }
+    if timeout_seconds is not None:
+        record["timeout_seconds"] = max(int(timeout_seconds), 1)
+    if subprocess_output_bytes is not None:
+        artifact_path = _attested_subprocess_output_path(output_path)
+        artifact_bytes = subprocess_output_bytes
+        output_kind = "SUBPROCESS_OUTPUT"
+    else:
+        artifact_path = _process_attestation_envelope_path(output_path)
+        artifact_bytes = (
+            json.dumps(
+                {**record, "output_kind": "PROCESS_ATTESTATION_ENVELOPE"},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        output_kind = "PROCESS_ATTESTATION_ENVELOPE"
+    artifact_path.write_bytes(artifact_bytes)
+    return {
+        **record,
+        "output_kind": output_kind,
+        "output_path": str(artifact_path),
+        "output_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "output_size_bytes": len(artifact_bytes),
+    }
 
 
 def parse_codex_json_event_stream(

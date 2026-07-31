@@ -9,6 +9,7 @@ from app.services.senior_analyst_projection_v1 import (
     build_senior_analyst_payload_v1,
     validate_senior_analyst_payload_v1,
 )
+from app.services.provider_capability_registry import provider_by_id
 
 
 NOW = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
@@ -16,6 +17,60 @@ REQUEST_ID = "sa-accounting-test"
 STARTED_AT = (NOW - timedelta(seconds=30)).isoformat()
 COMPLETED_AT = (NOW - timedelta(seconds=1)).isoformat()
 OBSERVED_AT = (NOW - timedelta(seconds=10)).isoformat()
+
+_CALENDAR_PROVIDERS = (
+    ("BEA", "BEA Release Schedule"),
+    ("BLS", "BLS Release Calendar"),
+    ("FEDERAL_RESERVE", "Federal Reserve Calendar"),
+)
+
+
+def _calendar_lookup_summary() -> dict:
+    provider_ids = [
+        provider_id
+        for provider_id, _provider_name in _CALENDAR_PROVIDERS
+    ]
+    provider_names = sorted(
+        provider_name
+        for _provider_id, provider_name in _CALENDAR_PROVIDERS
+    )
+    return {
+        "providers_expected": 3,
+        "providers_evaluated": 3,
+        "provider_ids_expected": provider_ids,
+        "provider_ids_evaluated": provider_ids,
+        "provider_names_expected": provider_names,
+        "provider_names_evaluated": provider_names,
+        "unexpected_provider_names": [],
+        "provider_refresh_required_ids": provider_ids,
+        "provider_refresh_required_names": provider_names,
+        "provider_attempts": [
+            {
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "query_scope": "country=US",
+                "request_id": REQUEST_ID,
+                "correlation_id": REQUEST_ID,
+                "started_at": OBSERVED_AT,
+                "observed_at": OBSERVED_AT,
+                "called": True,
+                "attempts": 1,
+                "successful_attempts": 1,
+                "failed_attempts": 0,
+                "result": "SUCCESS",
+                "not_called_reason": None,
+            }
+            for provider_id, provider_name in _CALENDAR_PROVIDERS
+        ],
+        "observations_expected": 3,
+        "observations_evaluated": 3,
+        "observations_missing": 0,
+        "records_terminal": 3,
+        "records_missing_or_incomplete": 0,
+        "records_expired": 0,
+        "window_start": NOW.date().isoformat(),
+        "window_end": NOW.date().isoformat(),
+    }
 
 
 def _source() -> dict:
@@ -35,6 +90,8 @@ def _source() -> dict:
 
 
 def _complete_row(policy) -> dict:
+    if policy.dataset_id == "market_schedule":
+        return _complete_market_schedule_row(policy)
     return {
         "dataset_id": policy.dataset_id,
         "request_id": REQUEST_ID,
@@ -57,6 +114,11 @@ def _complete_row(policy) -> dict:
         "database_lifecycle_status": None,
         "database_record_expired": False,
         "database_freshness_evaluation": "NOT_FOUND",
+        "database_lookup_summary": (
+            _calendar_lookup_summary()
+            if policy.dataset_id == "macro_calendar"
+            else None
+        ),
         "primary_provider": {
             "provider": policy.primary_provider,
             "called": True,
@@ -82,6 +144,107 @@ def _complete_row(policy) -> dict:
         ],
         "acquisition_selected_source": policy.primary_provider,
         "acquisition_reason_code": "CONTROLLED_PROVIDER_VALUE_ACQUIRED",
+    }
+
+
+def _complete_market_schedule_row(policy) -> dict:
+    provider_order = (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+    metrics = {
+        provider_id: next(
+            capability.metric_id
+            for capability in provider_by_id(provider_id).capabilities
+            if capability.dataset_id == policy.dataset_id
+        )
+        for provider_id in provider_order
+    }
+    attempts = {
+        provider_id: {
+            "provider": provider_id,
+            "called": provider_id != "MARKETBEAT",
+            "attempts": 0 if provider_id == "MARKETBEAT" else 1,
+            "result": (
+                "NOT_CALLED" if provider_id == "MARKETBEAT" else "SUCCESS"
+            ),
+            "not_called_reason": (
+                "PRIOR_SCHEDULE_CAPABILITY_PROVIDER_SUCCEEDED"
+                if provider_id == "MARKETBEAT"
+                else None
+            ),
+            "execution_origin": (
+                "OBSERVED_SKIP"
+                if provider_id == "MARKETBEAT"
+                else "PROVIDER_CALL"
+            ),
+        }
+        for provider_id in provider_order
+    }
+
+    def lookup(provider_id: str) -> dict:
+        performed = provider_id != "MARKETBEAT"
+        return {
+            "provider": provider_id,
+            "performed": performed,
+            "found": False if performed else None,
+            "data_as_of": None,
+            "content_valid_until": None,
+            "refresh_due_at": None,
+            "lifecycle_status": None,
+            "expired": False if performed else None,
+            "freshness": "NOT_FOUND" if performed else "NOT_LOOKED_UP",
+            "reason_code": (
+                "CANONICAL_RECORD_NOT_FOUND"
+                if performed
+                else "PRIOR_SCHEDULE_CAPABILITY_PROVIDER_SUCCEEDED"
+            ),
+        }
+
+    groups: dict[str, list[str]] = {}
+    for provider_id in provider_order:
+        groups.setdefault(metrics[provider_id], []).append(provider_id)
+    capability_acquisitions = [
+        {
+            "capability_metric_id": metric_id,
+            "provider_ids": provider_ids,
+            "database_lookups": [
+                lookup(provider_id) for provider_id in provider_ids
+            ],
+            "selected_provider": provider_ids[0],
+        }
+        for metric_id, provider_ids in groups.items()
+    ]
+    return {
+        "dataset_id": policy.dataset_id,
+        "request_id": REQUEST_ID,
+        "correlation_id": REQUEST_ID,
+        "evidence_origin": "NORMAL_APPLICATION_REQUEST",
+        "evidence_status": "ACQUISITION_COMPLETE",
+        "observed_at": OBSERVED_AT,
+        "acquisition_id": "observed:market_schedule",
+        "shared_acquisition_dataset_ids": [policy.dataset_id],
+        "database_lookup_performed": True,
+        "database_lookup_reason": (
+            "MARKET_SCHEDULE_CAPABILITY_SCOPED_CACHE_LOOKUPS"
+        ),
+        "database_record_found": None,
+        "database_data_as_of": None,
+        "database_content_valid_until": None,
+        "database_refresh_due_at": None,
+        "database_lifecycle_status": None,
+        "database_record_expired": None,
+        "database_freshness_evaluation": "CAPABILITY_SCOPED",
+        "capability_acquisitions": capability_acquisitions,
+        "primary_provider": attempts[policy.primary_provider],
+        "fallbacks": [
+            attempts[provider_id]
+            for provider_id in policy.fallback_providers
+        ],
+        "acquisition_selected_source": "MIXED",
+        "acquisition_reason_code": (
+            "MARKET_SCHEDULE_CAPABILITY_ACQUISITIONS_COMPLETED"
+        ),
     }
 
 
@@ -449,8 +612,14 @@ def test_flash_pmi_delivery_requires_matching_acquisition_occurrence() -> None:
 
     assert row["evidence_status"] == "COMPLETE"
     assert row["selected_value_present"] is True
-    assert len(row["delivered_value"]) == 1
-    assert row["delivered_value"][0]["occurrence_id"] == occurrence_id
+    assert row["delivered_value"]["payload_path"] == [
+        "analytics.calendar.latest_released_events",
+        "analytics.calendar.active_event_windows",
+        "analytics.calendar.next_24h_events",
+        "analytics.calendar.next_7d_high_impact_events",
+    ]
+    assert row["delivered_value"]["item_count"] == 2
+    assert len(row["delivered_value"]["content_sha256"]) == 64
     assert _validate_live(payload)["checks"]["provider_accounting_valid"] is True
 
     mismatched = deepcopy(source)
@@ -518,3 +687,70 @@ def test_vix_and_vvix_null_delivery_is_not_selected_from_metadata() -> None:
         assert row["selected_source"] is None
         assert row["payload_freshness"] == "UNAVAILABLE"
     assert _validate_live(payload)["checks"]["provider_accounting_valid"] is True
+
+
+def test_earnings_delivery_uses_verified_collection_reference() -> None:
+    source = _source()
+    source["sections"]["earnings"] = {
+        "nasdaq_earnings": {
+            "upcoming": [
+                {
+                    "symbol": "AMD",
+                    "event_date": (NOW + timedelta(days=1))
+                    .date()
+                    .isoformat(),
+                    "data_as_of": NOW.isoformat(),
+                        "content_valid_until": (
+                            NOW + timedelta(days=2)
+                        ).isoformat(),
+                        "refresh_due_at": (
+                            NOW + timedelta(days=1)
+                        ).isoformat(),
+                        "source": "NASDAQ",
+                    "source_url": "https://example.test/earnings/AMD",
+                }
+            ]
+        }
+    }
+    source["request_scoped_provider_accounting"] = _manifest()
+
+    payload = _build(source)
+    row = next(
+        item
+        for item in payload["provider_accounting"]
+        if item["dataset_id"] == "earnings"
+    )
+
+    assert row["selected_value_present"] is True
+    assert row["delivered_value"]["payload_path"] == (
+        "analytics.earnings.events"
+    )
+    assert row["delivered_value"]["item_count"] == 1
+    assert len(row["delivered_value"]["content_sha256"]) == 64
+    result = _validate_live(payload)
+    assert result["checks"]["selected_value_presence_mismatches"] == 0
+    assert result["checks"]["provider_accounting_valid"] is True
+
+    for key, invalid_value in (
+        ("payload_path", "analytics.news.current_news"),
+        ("item_count", 2),
+        ("content_sha256", "0" * 64),
+    ):
+        tampered = deepcopy(payload)
+        tampered_row = next(
+            item
+            for item in tampered["provider_accounting"]
+            if item["dataset_id"] == "earnings"
+        )
+        tampered_row["delivered_value"][key] = invalid_value
+        tampered_result = _validate_live(tampered)
+        assert (
+            tampered_result["checks"][
+                "selected_value_presence_mismatches"
+            ]
+            > 0
+        )
+        assert (
+            tampered_result["checks"]["provider_accounting_valid"]
+            is False
+        )

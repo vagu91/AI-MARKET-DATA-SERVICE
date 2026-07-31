@@ -157,7 +157,8 @@ async def test_investing_fed_monitor_provider_fetches_secondary_probabilities(tm
     html = """
     <div class="cardWrapper"><div class="fedRateDate">Jul 29, 2026</div>
     <div class="infoFed"><div><span>Future Price:</span><i>96.373</i></div></div>
-    <table class="fedRateTbl"><tbody><tr><td>3.50 - 3.75 <span eventId="516971" calcKey="%3.75"></span></td><td>100.0%</td><td>100.0%</td><td>100.0%</td></tr></tbody></table></div>
+    <table class="fedRateTbl"><tbody><tr><td>3.50 - 3.75 <span eventId="516971" calcKey="%3.75"></span></td><td>100.0%</td><td>100.0%</td><td>100.0%</td></tr></tbody></table>
+    <div class="fedUpdate">Updated: Jul 10, 2026 01:05PM EDT</div></div>
     """
 
     with respx.mock(assert_all_called=True) as router_mock:
@@ -169,6 +170,7 @@ async def test_investing_fed_monitor_provider_fetches_secondary_probabilities(tm
     assert result["dataset_type"] == "market_implied_target_rate_distribution"
     assert result["official_fed_data"] is False
     assert result["official_cme_data"] is False
+    assert result["data_as_of"] == "2026-07-10T17:05:00Z"
     assert result["current_meeting"]["event_id"] == "516971"
     assert result["current_meeting"]["meeting_at"] == "2026-07-29T14:00:00-04:00"
     assert result["history_endpoint"]["status"] == "not_integrated"
@@ -205,7 +207,12 @@ async def test_multi_source_refresh_false_uses_db_for_new_providers_without_netw
             "retrieved_at": now.isoformat(),
             "valid_until": valid_until.isoformat(),
             "next_refresh_at": valid_until.isoformat(),
-            "meetings": [{"meeting_date": "2026-07-29"}],
+            "meetings": [
+                {
+                    "meeting_date": "2026-07-29",
+                    "updated_at": now.isoformat(),
+                }
+            ],
             "warnings": [],
             "errors": [],
             "diagnostics": {},
@@ -260,7 +267,12 @@ async def test_force_rejects_expired_multi_source_cache_and_calls_provider(
                 "retrieved_at": now.isoformat(),
                 "valid_until": expired_at.isoformat(),
                 "next_refresh_at": expired_at.isoformat(),
-                "meetings": [{"meeting_date": "2026-07-29"}],
+                "meetings": [
+                    {
+                        "meeting_date": "2026-07-29",
+                        "updated_at": now.isoformat(),
+                    }
+                ],
             },
         }
     )
@@ -277,7 +289,12 @@ async def test_force_rejects_expired_multi_source_cache_and_calls_provider(
             "retrieved_at": now.isoformat(),
             "valid_until": (now + timedelta(hours=1)).isoformat(),
             "next_refresh_at": (now + timedelta(hours=1)).isoformat(),
-            "meetings": [{"meeting_date": "2026-09-16"}],
+            "meetings": [
+                {
+                    "meeting_date": "2026-09-16",
+                    "updated_at": now.isoformat(),
+                }
+            ],
             "warnings": [],
             "errors": [],
         }

@@ -214,6 +214,7 @@ async def test_runtime_accounting_propagates_canonical_lifecycle(
             {
                 "status": "AVAILABLE",
                 "provider": "TRADIER",
+                "data_as_of": NOW.isoformat(),
                 "warnings": [],
             },
         )
@@ -231,3 +232,152 @@ async def test_runtime_accounting_propagates_canonical_lifecycle(
         row["database_lifecycle_status"]
         for row in manifest["datasets"]
     } == {"ACTIVE"}
+
+
+@pytest.mark.asyncio
+async def test_db_valid_dataset_is_not_included_in_other_tradier_acquisition(
+    tmp_path: Path,
+) -> None:
+    cfg = _settings(tmp_path)
+    cfg.deterministic_cross_asset_context_enabled = False
+    quote_symbol_requests: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/markets/quotes"):
+            symbols = str(request.url.params["symbols"])
+            quote_symbol_requests.append(symbols)
+            return httpx.Response(
+                200,
+                json={
+                    "quotes": {
+                        "quote": {
+                            "symbol": "QQQ",
+                            "last": 500.0,
+                            "bid": 499.0,
+                            "ask": 501.0,
+                            "trade_date": 1785500000000,
+                        }
+                    }
+                },
+                request=request,
+            )
+        return _transport(request)
+
+    cache = ProviderCacheRepository(cfg.database_path)
+    provider = TradierProvider(
+        cache,
+        cfg,
+        transport=httpx.MockTransport(transport),
+        clock=lambda: NOW,
+    )
+    runtime = DeterministicProviderRuntimeService(
+        cfg,
+        providers={"tradier": provider},
+        cache=cache,
+        clock=lambda: NOW,
+    )
+    runtime._persist_deterministic_section(
+        "market_internals",
+        {
+            "status": "AVAILABLE",
+            "provider": "TRADIER",
+            "data_as_of": NOW.isoformat(),
+            "breadth": {"advancers": 1, "decliners": 0},
+            "warnings": [],
+        },
+    )
+    collector = _collector("separate-tradier-acquisitions")
+
+    await runtime.enrich_market_context(
+        {
+            "nasdaq_context": {
+                "qqq_holdings": {
+                    "holdings": [
+                        {"symbol": "AAPL", "weight": 1.0}
+                    ]
+                }
+            }
+        },
+        refresh="force",
+        accounting_collector=collector,
+    )
+
+    assert quote_symbol_requests == ["QQQ"]
+    rows = {
+        row["dataset_id"]: row
+        for row in collector.manifest()["datasets"]
+    }
+    assert rows["market_internals"]["database_freshness_evaluation"] == (
+        "VALID"
+    )
+    assert rows["market_internals"]["primary_provider"] == {
+        "provider": "TRADIER",
+        "called": False,
+        "attempts": 0,
+        "result": "NOT_CALLED",
+        "not_called_reason": "VALID_DATABASE_RECORD_SELECTED",
+        "execution_origin": "CACHE_DECISION",
+    }
+    assert rows["market_internals"]["shared_acquisition_dataset_ids"] == [
+        "market_internals"
+    ]
+    assert rows["options_positioning"]["primary_provider"]["called"] is True
+    assert rows["options_positioning"]["primary_provider"]["attempts"] == 4
+
+
+@pytest.mark.asyncio
+async def test_failed_tradier_transport_is_not_reported_as_not_called(
+    tmp_path: Path,
+) -> None:
+    cfg = _settings(tmp_path)
+    cfg.deterministic_cross_asset_context_enabled = False
+    cfg.tradier_retry_attempts = 1
+    observed_requests: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        observed_requests.append(str(request.url))
+        return httpx.Response(
+            500,
+            json={"error": "controlled failure"},
+            request=request,
+        )
+
+    cache = ProviderCacheRepository(cfg.database_path)
+    provider = TradierProvider(
+        cache,
+        cfg,
+        transport=httpx.MockTransport(transport),
+        clock=lambda: NOW,
+    )
+    runtime = DeterministicProviderRuntimeService(
+        cfg,
+        providers={"tradier": provider},
+        cache=cache,
+        clock=lambda: NOW,
+    )
+    collector = _collector("failed-tradier-transport")
+
+    await runtime.enrich_market_context(
+        {
+            "nasdaq_context": {
+                "qqq_holdings": {
+                    "holdings": [
+                        {"symbol": "AAPL", "weight": 1.0}
+                    ]
+                }
+            }
+        },
+        refresh="force",
+        accounting_collector=collector,
+    )
+
+    assert len(observed_requests) == 2
+    manifest = collector.manifest()
+    assert manifest["evidence_status"] == "INCOMPLETE"
+    for row in manifest["datasets"]:
+        assert row["evidence_status"] == "INCOMPLETE"
+        assert row["primary_provider"]["called"] is True
+        assert row["primary_provider"]["attempts"] == 1
+        assert row["primary_provider"]["result"] == (
+            "ATTEMPT_EVIDENCE_INCOMPLETE"
+        )

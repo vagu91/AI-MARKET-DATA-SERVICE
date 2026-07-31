@@ -6,9 +6,16 @@ import math
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
+from app.core.senior_analyst_policy import (
+    MAX_SENIOR_ANALYST_PAYLOAD_BYTES,
+    MNQ_EARNINGS_SELECTION_POLICY,
+    MNQ_PRIMARY_SYMBOLS,
+    PROVIDER_ACCOUNTING_COLLECTION_PATHS,
+)
 from app.services.data_integrity_service import (
     news_content_status,
     substantive_news_text,
@@ -24,9 +31,16 @@ from app.services.official_actual_semantics import (
     metric_semantics_mismatch_reason,
     normalize_reference_period,
 )
+from app.services.provider_capability_registry import (
+    DATASET_SOURCE_POLICIES,
+    MARKET_FACT_REPOSITORY_DATASET_QUERIES,
+    dataset_policy_by_id,
+    provider_by_id,
+)
 from app.services.request_provider_accounting import (
     _canonical_database_evidence_valid,
     _provider_flow_valid,
+    _shared_acquisition_links_valid,
 )
 
 
@@ -46,27 +60,55 @@ VALID_FRESHNESS_STATES = {
     "CURRENT_LATEST_OFFICIAL_RELEASE",
     "LAST_AVAILABLE_OFFICIAL_CLOSE",
 }
-REQUIRED_MEGA_CAPS = ("AAPL", "NVDA", "AMZN", "META", "TSLA", "AMD")
-TREASURY_RATE_SERIES = frozenset(
-    {"DGS2", "DGS10", "DGS30", "T10Y2Y", "T10Y3M", "NFCI"}
-)
-FED_FUNDS_RATE_SERIES = frozenset({"DFF", "FEDFUNDS", "SOFR"})
-TARGET_RANGE_SERIES = frozenset({"DFEDTARL", "DFEDTARU"})
-MACRO_DATASET_SERIES = {
-    "cpi": frozenset({"CUSR0000SA0", "CUSR0000SA0L1E"}),
-    "ppi": frozenset({"WPUFD4"}),
-    "pce": frozenset(
-        {
-            "BEA:PCE",
-            "BEA:PCE_PRICE_INDEX",
-            "BEA:CORE_PCE",
+_INVALID_DELIVERY_REFERENCE = object()
+REQUIRED_MEGA_CAPS = MNQ_PRIMARY_SYMBOLS
+
+
+def _registered_repository_series(dataset_id: str) -> frozenset[str]:
+    query = MARKET_FACT_REPOSITORY_DATASET_QUERIES.get(dataset_id)
+    if query is None or not query.series_ids:
+        raise RuntimeError(
+            f"SENIOR_ANALYST_REPOSITORY_SERIES_MISSING:{dataset_id}"
+        )
+    return frozenset(query.series_ids)
+
+
+def _registered_repository_dataset_id(
+    series_id: str,
+) -> str | None:
+    normalized = str(series_id or "").strip().upper()
+    matches = tuple(
+        dataset_id
+        for dataset_id, query in (
+            MARKET_FACT_REPOSITORY_DATASET_QUERIES.items()
+        )
+        if normalized
+        and normalized
+        in {
+            str(candidate).strip().upper()
+            for candidate in query.series_ids
         }
-    ),
-    "gdp": frozenset({"BEA:GDP", "GDP"}),
-    "employment": frozenset({"LNS14000000", "UNRATE"}),
-    "wages": frozenset({"CES0500000003"}),
-    "nfp": frozenset({"CES0000000001", "PAYEMS"}),
-    "jobless_claims": frozenset({"ICSA"}),
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+TREASURY_RATE_SERIES = _registered_repository_series(
+    "treasury_rates"
+)
+FED_FUNDS_RATE_SERIES = _registered_repository_series("fed_funds")
+TARGET_RANGE_SERIES = _registered_repository_series("target_range")
+MACRO_DATASET_SERIES = {
+    dataset_id: _registered_repository_series(dataset_id)
+    for dataset_id in (
+        "cpi",
+        "ppi",
+        "pce",
+        "gdp",
+        "employment",
+        "wages",
+        "nfp",
+        "jobless_claims",
+    )
 }
 GENERIC_REQUIRED_OMISSION_REASON_CODES = frozenset(
     {
@@ -108,120 +150,21 @@ class DatasetPolicy:
     provider_strategy: str = "FALLBACK"
 
 
-DATASET_POLICIES: tuple[DatasetPolicy, ...] = (
+DATASET_POLICIES: tuple[DatasetPolicy, ...] = tuple(
     DatasetPolicy(
-        "nasdaq_100",
-        "nasdaq",
-        "intraday",
-        timedelta(hours=12),
-        "INVESCO",
-        ("ALPHA_VANTAGE", "NASDAQ", "SEC"),
-        provider_strategy="CASCADE",
-    ),
-    DatasetPolicy(
-        "mega_cap_quotes",
-        "nasdaq",
-        "intraday",
-        timedelta(hours=12),
-        "YAHOO_FINANCE_CHART",
-        (
-            "STOOQ",
-            "ALPHA_VANTAGE",
-            "YAHOO_FINANCE_QUOTE",
+        dataset_id=policy.dataset_id,
+        section=policy.section,
+        frequency=policy.frequency,
+        max_age=timedelta(seconds=policy.sla_seconds),
+        primary_provider=policy.primary_provider,
+        fallback_providers=policy.fallback_providers,
+        required_for_analysis=policy.required_for_analysis,
+        canonical_repository_required=bool(
+            policy.canonical_repository
         ),
-    ),
-    DatasetPolicy(
-        "market_internals",
-        "market_internals",
-        "intraday",
-        timedelta(hours=2),
-        "TRADIER",
-    ),
-    DatasetPolicy("vix", "vix", "daily", timedelta(days=2), "FRED", ("CBOE",)),
-    DatasetPolicy("vvix", "vix", "intraday", timedelta(hours=2), "CBOE"),
-    DatasetPolicy("risk", "risk", "intraday", timedelta(hours=2), "CBOE"),
-    DatasetPolicy("treasury_rates", "rates", "daily", timedelta(days=2), "FRED"),
-    DatasetPolicy("fed_funds", "rates", "daily", timedelta(days=2), "FRED"),
-    DatasetPolicy(
-        "target_range",
-        "rates",
-        "event",
-        timedelta(days=45),
-        "FEDERAL_RESERVE",
-        ("FRED",),
-    ),
-    DatasetPolicy(
-        "fomc_expectations",
-        "fomc",
-        "intraday",
-        timedelta(hours=2),
-        "INVESTING_FED_RATE_MONITOR",
-    ),
-    DatasetPolicy("cpi", "macro", "monthly", timedelta(days=45), "BLS"),
-    DatasetPolicy("ppi", "macro", "monthly", timedelta(days=45), "BLS"),
-    DatasetPolicy("pce", "macro", "monthly", timedelta(days=45), "BEA"),
-    DatasetPolicy("gdp", "macro", "quarterly", timedelta(days=120), "BEA"),
-    DatasetPolicy("employment", "macro", "monthly", timedelta(days=45), "BLS"),
-    DatasetPolicy("wages", "macro", "monthly", timedelta(days=45), "BLS"),
-    DatasetPolicy("nfp", "macro", "monthly", timedelta(days=45), "BLS"),
-    DatasetPolicy("jobless_claims", "macro", "weekly", timedelta(days=14), "FRED"),
-    DatasetPolicy(
-        "macro_calendar",
-        "calendar",
-        "event",
-        timedelta(days=7),
-        "CANONICAL_EVENT_REPOSITORY",
-        ("INVESTING_ECONOMIC_CALENDAR", "XTB"),
-    ),
-    DatasetPolicy(
-        "flash_services_pmi",
-        "calendar",
-        "monthly",
-        timedelta(days=45),
-        "SPGLOBAL",
-        ("INVESTING_EVENT_1062",),
-    ),
-    DatasetPolicy(
-        "earnings",
-        "earnings",
-        "event",
-        timedelta(days=14),
-        "NASDAQ",
-        ("FMP_EARNINGS_CALENDAR",),
-    ),
-    DatasetPolicy(
-        "options_positioning",
-        "options_positioning",
-        "intraday",
-        timedelta(hours=2),
-        "TRADIER",
-    ),
-    DatasetPolicy("positioning", "positioning", "weekly", timedelta(days=10), "CFTC"),
-    DatasetPolicy(
-        "current_news",
-        "news",
-        "intraday",
-        timedelta(hours=24),
-        "ALPHA_VANTAGE_NEWS_SENTIMENT",
-        (
-            "GDELT_DOC_API",
-            "FEDERAL_RESERVE_RSS",
-            "BLS_RSS",
-            "BEA_RSS",
-            "YAHOO_FINANCE_RSS",
-            "MARKETWATCH_RSS",
-            "GOOGLE_NEWS_RSS",
-        ),
-        provider_strategy="FAN_IN",
-    ),
-    DatasetPolicy(
-        "market_schedule",
-        "market_schedule",
-        "event",
-        timedelta(days=370),
-        "NASDAQ_MARKET_INFO",
-        ("CME", "INVESTING_HOLIDAYS", "MARKETBEAT"),
-    ),
+        provider_strategy=policy.provider_strategy,
+    )
+    for policy in DATASET_SOURCE_POLICIES
 )
 
 
@@ -406,6 +349,7 @@ def validate_senior_analyst_payload_v1(
     *,
     now: datetime | None = None,
     require_recent_response: bool = False,
+    exact_body_size_bytes: int | None = None,
 ) -> dict[str, Any]:
     clock = _utc(now or datetime.now(UTC))
     generated = parse_datetime(payload.get("generated_at"))
@@ -450,12 +394,18 @@ def validate_senior_analyst_payload_v1(
     semantic_errors = (
         _semantic_error_count(analytics.get("macro") or {})
         + _calendar_semantic_error_count(calendar, now=clock)
+        + _earnings_policy_error_count(
+            analytics.get("earnings") or {},
+            now=clock,
+        )
     )
     invalid_mappings = sum(
         1
         for items in calendar_lists
         for item in items
         if item.get("invalid_period_mapping") is True
+    ) + _earnings_temporal_error_count(
+        analytics.get("earnings") or {}
     )
     invalid_states = _invalid_state_count(analytics)
     available_without_value = _available_without_substantive_value_count(
@@ -463,7 +413,8 @@ def validate_senior_analyst_payload_v1(
     )
     selected_value_presence_mismatches = (
         _selected_value_presence_mismatch_count(
-            payload.get("provider_accounting") or []
+            payload.get("provider_accounting") or [],
+            payload_root=payload,
         )
     )
     readiness_section_classification_mismatches = (
@@ -517,6 +468,17 @@ def validate_senior_analyst_payload_v1(
             is True
             and _nested_value(payload, "request", "refresh_mode") == "force"
         )
+    measured_payload_size = (
+        exact_body_size_bytes
+        if type(exact_body_size_bytes) is int
+        and exact_body_size_bytes >= 0
+        else len(_canonical_json(payload))
+    )
+    duplicate_large_collections = (
+        _duplicate_large_collection_count(
+            payload.get("provider_accounting") or []
+        )
+    )
     checks = {
         "response_generated_recently": response_recent,
         "expired_values_delivered": invalid_states + expired_values,
@@ -540,6 +502,14 @@ def validate_senior_analyst_payload_v1(
             required_omissions_without_reason
         ),
         "provider_accounting_valid": accounting_valid,
+        "provider_accounting_rows": len(
+            payload.get("provider_accounting") or []
+        ),
+        "duplicate_large_collections": duplicate_large_collections,
+        "payload_size_within_budget": (
+            measured_payload_size
+            <= MAX_SENIOR_ANALYST_PAYLOAD_BYTES
+        ),
     }
     content_passed = (
         checks["response_generated_recently"]
@@ -560,8 +530,10 @@ def validate_senior_analyst_payload_v1(
                 "expired_current_news",
                 "unexplained_omissions",
                 "required_dataset_omissions_without_reason",
+                "duplicate_large_collections",
             )
         )
+        and checks["payload_size_within_budget"] is True
     )
     passed = content_passed and (
         accounting_valid if require_recent_response else True
@@ -576,6 +548,8 @@ def validate_senior_analyst_payload_v1(
         ),
         "live_acceptance_evaluated": require_recent_response,
         "checks": checks,
+        "measured_payload_size_bytes": measured_payload_size,
+        "max_payload_size_bytes": MAX_SENIOR_ANALYST_PAYLOAD_BYTES,
     }
 
 
@@ -626,7 +600,13 @@ def _project_macro(
         if canonical_id in seen:
             continue
         seen.add(canonical_id)
-        assessment = _assess_datum(item, now, frequency=str(item.get("frequency") or ""))
+        assessment = _assess_datum(
+            item,
+            now,
+            dataset_id=_registered_repository_dataset_id(
+                canonical_id
+            ),
+        )
         metric = {
             "series_id": canonical_id,
             "metric_id": semantics["metric_id"],
@@ -977,12 +957,10 @@ def _project_event(
     if (
         requires_official_evidence
         and selected_fields["actual"] is not None
-        and (
-            raw.get("actual_is_official") is None
-            or not (
-                raw.get("actual_source")
-                or raw.get("publisher")
-            )
+        and not _event_actual_source_status_proven(
+            raw,
+            metric_id=metric_id,
+            lineage=lineage,
         )
     ):
         field_reason_codes.setdefault(
@@ -999,6 +977,26 @@ def _project_event(
                 if selected_field is not None
             }
         )
+    rejected_lineage_fields = {
+        alias
+        for output_field in field_reason_codes
+        for alias in {
+            "actual": {"actual"},
+            "consensus": {"consensus", "forecast"},
+            "previous": {"previous"},
+            "previous_revised": {
+                "previous_revised",
+                "revised_previous",
+            },
+        }.get(output_field, set())
+    }
+    if rejected_lineage_fields:
+        lineage = [
+            item
+            for item in lineage
+            if str(item.get("field") or "").strip().lower()
+            not in rejected_lineage_fields
+        ]
     actual = (
         None
         if "actual" in field_reason_codes
@@ -1051,6 +1049,19 @@ def _project_event(
         else None
     )
     reason = field_reason_codes.get("actual")
+    if reason is None and requires_official_evidence:
+        reason = next(
+            (
+                field_reason_codes[field]
+                for field in (
+                    "consensus",
+                    "previous",
+                    "previous_revised",
+                )
+                if field in field_reason_codes
+            ),
+            None,
+        )
     if "OCCURRENCE_FIELD_LINEAGE_MISMATCH" in set(
         field_reason_codes.values()
     ):
@@ -1061,11 +1072,12 @@ def _project_event(
         reason = "OCCURRENCE_FIELD_LINEAGE_MISMATCH"
         actual = consensus = previous = previous_revised = surprise = None
     elif not reference_period_match:
-        reason = "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH"
+        reference_reason = "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH"
+        reason = reference_reason
         field_reason_codes.update(
             {
-                "actual": reason,
-                "consensus": reason,
+                "actual": reference_reason,
+                "consensus": reference_reason,
             }
         )
         lineage = [
@@ -1126,6 +1138,10 @@ def _project_event(
         "content_valid_until": (
             raw.get("content_valid_until")
             or raw.get("valid_until")
+        ),
+        "refresh_due_at": (
+            raw.get("refresh_due_at")
+            or raw.get("next_refresh_at")
         ),
         "invalid_period_mapping": False,
         "source": _source(raw),
@@ -1261,7 +1277,11 @@ def _project_nasdaq(
                 ["trading_context"],
             )
             continue
-        assessment = _assess_datum(item, now, frequency="intraday")
+        assessment = _assess_datum(
+            item,
+            now,
+            dataset_id="mega_cap_quotes",
+        )
         if not assessment["usable"]:
             _missing(
                 missing,
@@ -1339,7 +1359,11 @@ def _project_market_internals(
     now: datetime,
     missing: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    assessment = _assess_datum(section, now, frequency="intraday")
+    assessment = _assess_datum(
+        section,
+        now,
+        dataset_id="market_internals",
+    )
     stale_quotes = int(section.get("stale_quote_count") or 0)
     if stale_quotes:
         assessment = {
@@ -1519,7 +1543,7 @@ def _project_vix(
         assessment = _assess_datum(
             raw,
             now,
-            frequency="intraday" if key == "vvix" else "daily",
+            dataset_id=key,
             section_sync=section.get("sync"),
         )
         if raw.get("value") is None:
@@ -1569,7 +1593,11 @@ def _project_risk(
     missing: list[dict[str, Any]],
 ) -> dict[str, Any]:
     raw = section.get("risk_context") if isinstance(section.get("risk_context"), dict) else {}
-    assessment = _assess_datum(raw, now, frequency="intraday")
+    assessment = _assess_datum(
+        raw,
+        now,
+        dataset_id="risk",
+    )
     derived = raw.get("derived_context") if isinstance(raw.get("derived_context"), dict) else {}
     risk_sentiment = (
         derived.get("risk_regime")
@@ -1633,7 +1661,13 @@ def _project_rates(
     for key, raw in rate_snapshot.items():
         if not isinstance(raw, dict) or not raw.get("series_id"):
             continue
-        assessment = _assess_datum(raw, now, frequency=str(raw.get("frequency") or "daily"))
+        assessment = _assess_datum(
+            raw,
+            now,
+            dataset_id=_registered_repository_dataset_id(
+                str(raw.get("series_id") or key)
+            ),
+        )
         item = {
             "series_id": str(raw.get("series_id") or key),
             "metric_id": str(raw.get("series_id") or key).lower(),
@@ -1886,8 +1920,11 @@ def _project_generic_section(
     now: datetime,
     missing: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    frequency = "weekly" if name == "positioning" else "intraday"
-    assessment = _assess_datum(section, now, frequency=frequency)
+    assessment = _assess_datum(
+        section,
+        now,
+        dataset_id=name,
+    )
     if name == "positioning":
         projected_values = {
             "cot": _project_positioning_cot(section),
@@ -1954,6 +1991,7 @@ def _project_earnings(
     now: datetime,
     missing: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    policy = MNQ_EARNINGS_SELECTION_POLICY
     nasdaq = (
         section.get("nasdaq_earnings")
         if isinstance(section.get("nasdaq_earnings"), dict)
@@ -1978,34 +2016,168 @@ def _project_earnings(
         corporate_candidates = list(corporate_earnings)
     else:
         corporate_candidates = []
+    observed_selection_counts = _observed_earnings_selection_counts(
+        corporate_earnings,
+        nasdaq,
+    )
     candidates = [
         *list(nasdaq.get("upcoming") or []),
         *corporate_candidates,
     ]
-    selected: dict[tuple[str, str], dict[str, Any]] = {}
+    window_start = now.date() - timedelta(days=policy.lookback_days)
+    window_end = now.date() + timedelta(days=policy.lookahead_days)
+    identified: dict[tuple[str, str], dict[str, Any]] = {}
+    candidate_diagnostics = {
+        "invalid_identity_or_date": 0,
+        "duplicate_occurrence": 0,
+        "expired_or_invalid_freshness": 0,
+        "freshness_rejection_reasons": {},
+    }
+    exclusions = {
+        "outside_window": 0,
+        "outside_universe": 0,
+        "bounded_limit": 0,
+        "provider_prefiltered_or_invalid": 0,
+    }
     for raw in candidates:
         if not isinstance(raw, dict):
+            candidate_diagnostics["invalid_identity_or_date"] += 1
             continue
         symbol = str(raw.get("symbol") or raw.get("ticker") or "").upper()
-        event_time = parse_datetime(
-            raw.get("event_at") or raw.get("earnings_date") or raw.get("date")
+        temporal = _earnings_temporal_fields(raw)
+        event_date = temporal.get("event_date")
+        if not symbol or not event_date:
+            candidate_diagnostics["invalid_identity_or_date"] += 1
+            continue
+        parsed_date = _date_value(event_date)
+        if parsed_date is None:
+            candidate_diagnostics["invalid_identity_or_date"] += 1
+            continue
+        freshness = _earnings_freshness(raw, now=now)
+        if freshness["deliverable"] is not True:
+            candidate_diagnostics[
+                "expired_or_invalid_freshness"
+            ] += 1
+            freshness_reason = str(
+                freshness.get("reason_code")
+                or "EARNINGS_FRESHNESS_EVIDENCE_INVALID"
+            )
+            rejection_reasons = candidate_diagnostics[
+                "freshness_rejection_reasons"
+            ]
+            rejection_reasons[freshness_reason] = (
+                int(rejection_reasons.get(freshness_reason) or 0)
+                + 1
+            )
+            continue
+        source = _source(raw)
+        eps_estimate = _number(
+            raw.get("eps_estimate")
+            if raw.get("eps_estimate") is not None
+            else raw.get("eps_consensus")
         )
-        if not symbol or not event_time:
-            continue
-        event_time = _utc(event_time)
-        if not (now - timedelta(days=1) <= event_time <= now + timedelta(days=14)):
-            continue
-        selected[(symbol, event_time.date().isoformat())] = {
+        candidate = {
             "symbol": symbol,
-            "event_at": event_time.isoformat(),
-            "timing": raw.get("timing") or raw.get("time"),
-            "eps_estimate": _number(raw.get("eps_estimate")),
+            "event_date": event_date,
+            "event_at": temporal.get("event_at"),
+            "temporal_precision": temporal["temporal_precision"],
+            "timing": temporal["timing"],
+            "eps_estimate": eps_estimate,
             "revenue_estimate": _number(raw.get("revenue_estimate")),
-            "source": _source(raw),
-            "reason_code": None,
+            "freshness": freshness["freshness"],
+            "data_as_of": freshness["data_as_of"],
+            "content_valid_until": freshness["content_valid_until"],
+            "refresh_due_at": freshness["refresh_due_at"],
+            "source": source,
+            "lineage": _earnings_field_lineage(raw),
+            "reason_code": (
+                "EARNINGS_RELEASE_TIME_NOT_AVAILABLE"
+                if temporal["temporal_precision"]
+                == policy.date_only_temporal_precision
+                else None
+            ),
         }
-    events = sorted(selected.values(), key=lambda item: (item["event_at"], item["symbol"]))
-    status = "AVAILABLE" if events else "NO_DATA"
+        key = (symbol, event_date)
+        prior = identified.get(key)
+        if prior is not None:
+            candidate_diagnostics["duplicate_occurrence"] += 1
+        if (
+            prior is None
+            or _earnings_candidate_rank(candidate)
+            > _earnings_candidate_rank(prior)
+        ):
+            identified[key] = candidate
+
+    in_window = [
+        item
+        for item in identified.values()
+        if (
+            (event_date := _date_value(item.get("event_date")))
+            is not None
+            and window_start <= event_date <= window_end
+        )
+    ]
+    exclusions["outside_window"] = len(identified) - len(in_window)
+    relevant = [
+        item
+        for item in in_window
+        if item.get("symbol") in policy.primary_symbols
+    ]
+    exclusions["outside_universe"] = len(in_window) - len(relevant)
+    relevant.sort(
+        key=lambda item: (
+            item["event_date"],
+            item["symbol"],
+        )
+    )
+    events = relevant[: policy.max_events]
+    observed_bounded_count = (
+        max(
+            observed_selection_counts["relevant_count"]
+            - observed_selection_counts["delivered_count"],
+            0,
+        )
+        if observed_selection_counts is not None
+        else 0
+    )
+    exclusions["bounded_limit"] = max(
+        len(relevant) - len(events),
+        observed_bounded_count,
+        0,
+    )
+    total_available = max(
+        len(identified),
+        (
+            observed_selection_counts["total_available"]
+            if observed_selection_counts is not None
+            else 0
+        ),
+        len(events)
+        + exclusions["outside_window"]
+        + exclusions["outside_universe"]
+        + exclusions["bounded_limit"],
+    )
+    relevant_count = max(
+        len(relevant),
+        (
+            observed_selection_counts["relevant_count"]
+            if observed_selection_counts is not None
+            else 0
+        ),
+    )
+    exclusions["provider_prefiltered_or_invalid"] = max(
+        total_available
+        - len(events)
+        - exclusions["outside_window"]
+        - exclusions["outside_universe"]
+        - exclusions["bounded_limit"],
+        0,
+    )
+    coverage = _earnings_coverage(events)
+    status, reason_code = _earnings_section_status(
+        coverage,
+        bounded_count=exclusions["bounded_limit"],
+    )
     if not events:
         _missing(
             missing,
@@ -2015,16 +2187,585 @@ def _project_earnings(
             None,
             ["trading_context"],
         )
+    metadata = _section_metadata(
+        status,
+        reason_code,
+        _latest_value(events, "data_as_of"),
+        _earliest_datetime_value(events, "content_valid_until"),
+        source=_first_delivery_field(events, "source"),
+    )
+    if events and coverage["freshness"]["ratio"] < 1.0:
+        metadata["freshness"] = "UNKNOWN"
+    metadata["refresh_due_at"] = metadata["content_valid_until"]
     return {
-        **_section_metadata(
-            status,
-            None if events else "NO_CURRENT_EARNINGS_EVENTS",
-            now.isoformat(),
-            (now + timedelta(hours=6)).isoformat(),
-            source="NASDAQ",
-        ),
+        **metadata,
+        "selection_policy": {
+            "policy_id": policy.policy_id,
+            "universe": "MNQ_PRIMARY_SYMBOLS",
+            "primary_symbols": list(policy.primary_symbols),
+            "include_nasdaq_100_components": (
+                policy.include_nasdaq_100_components
+            ),
+            "window": {
+                "lookback_days": policy.lookback_days,
+                "lookahead_days": policy.lookahead_days,
+                "max_observation_age_hours": (
+                    policy.max_observation_age_hours
+                ),
+                "start_date": window_start.isoformat(),
+                "end_date": window_end.isoformat(),
+            },
+            "sort_fields": list(policy.sort_fields),
+            "max_events": policy.max_events,
+            "minimum_fields": list(policy.minimum_fields),
+            "date_only": {
+                "event_at": None,
+                "temporal_precision": (
+                    policy.date_only_temporal_precision
+                ),
+                "timing": policy.date_only_timing,
+            },
+        },
+        "total_available": total_available,
+        "relevant_count": relevant_count,
+        "delivered_count": len(events),
+        "excluded_count": total_available - len(events),
+        "exclusion_counts": exclusions,
+        "candidate_diagnostics": candidate_diagnostics,
+        "coverage": coverage,
         "events": events,
     }
+
+
+def _observed_earnings_selection_counts(
+    *payloads: Any,
+) -> dict[str, int] | None:
+    """Read compact provider/runtime counts without reconstructing raw rows."""
+
+    keys = (
+        "total_available",
+        "relevant_count",
+        "delivered_count",
+        "excluded_count",
+    )
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        nested = payload.get("selection_counts")
+        candidates = (
+            payload,
+            nested if isinstance(nested, dict) else {},
+        )
+        for candidate in candidates:
+            if not all(key in candidate for key in keys):
+                continue
+            counts = {key: candidate.get(key) for key in keys}
+            if not all(
+                type(value) is int and value >= 0
+                for value in counts.values()
+            ):
+                continue
+            if not (
+                counts["total_available"]
+                >= counts["relevant_count"]
+                >= counts["delivered_count"]
+                and counts["excluded_count"]
+                == counts["total_available"]
+                - counts["delivered_count"]
+            ):
+                continue
+            return counts
+    return None
+
+
+def _earnings_temporal_fields(raw: dict[str, Any]) -> dict[str, Any]:
+    policy = MNQ_EARNINGS_SELECTION_POLICY
+    declared_precision = str(
+        raw.get("temporal_precision") or ""
+    ).strip().upper()
+    exact = next(
+        (
+            parsed
+            for key in (
+                "event_at",
+                "release_at",
+                "scheduled_at_utc",
+                "scheduled_at",
+            )
+            if (parsed := _time_bearing_datetime(raw.get(key))) is not None
+        ),
+        None,
+    )
+    if (
+        exact is not None
+        and (
+            declared_precision == policy.exact_temporal_precision
+            or (
+                not declared_precision
+                and any(
+                    (
+                        exact.hour,
+                        exact.minute,
+                        exact.second,
+                        exact.microsecond,
+                    )
+                )
+            )
+        )
+    ):
+        return {
+            "event_date": _utc(exact).date().isoformat(),
+            "event_at": _utc(exact).isoformat(),
+            "temporal_precision": policy.exact_temporal_precision,
+            "timing": _earnings_timing(raw),
+        }
+    event_date = next(
+        (
+            parsed
+            for key in (
+                "event_date",
+                "earnings_date",
+                "scheduled_date",
+                "date",
+            )
+            if (parsed := _date_value(raw.get(key))) is not None
+        ),
+        None,
+    )
+    if event_date is None and exact is not None:
+        event_date = _utc(exact).date()
+    return {
+        "event_date": event_date.isoformat() if event_date else None,
+        "event_at": None,
+        "temporal_precision": policy.date_only_temporal_precision,
+        "timing": policy.date_only_timing,
+    }
+
+
+def _time_bearing_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _utc(value) if value.tzinfo is not None else None
+    text = str(value or "").strip()
+    if not text or re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    if "T" not in text and ":" not in text:
+        return None
+    if not (
+        text.upper().endswith("Z")
+        or re.search(r"[+-]\d{2}:?\d{2}$", text)
+    ):
+        return None
+    parsed = parse_datetime(text)
+    return (
+        _utc(parsed)
+        if parsed is not None and parsed.tzinfo is not None
+        else None
+    )
+
+
+def _date_value(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return _utc(value).date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _earnings_timing(raw: dict[str, Any]) -> str:
+    value = str(
+        raw.get("timing")
+        or raw.get("release_session")
+        or raw.get("session")
+        or raw.get("time")
+        or ""
+    ).upper()
+    if any(token in value for token in ("BEFORE", "PRE", "BMO")):
+        return "BEFORE_MARKET"
+    if any(token in value for token in ("AFTER", "AMC")):
+        return "AFTER_CLOSE"
+    return "UNKNOWN"
+
+
+def _earnings_freshness(
+    raw: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    lifecycle = (
+        raw.get("lifecycle")
+        if isinstance(raw.get("lifecycle"), dict)
+        else {}
+    )
+    raw_statuses = {
+        str(container.get(key) or "").upper()
+        for container in (raw, lifecycle)
+        for key in (
+            "status",
+            "freshness",
+            "freshness_state",
+            "lifecycle_status",
+        )
+    }
+    data_as_of = parse_datetime(
+        raw.get("data_as_of") or lifecycle.get("data_as_of")
+    )
+    raw_content_deadlines = [
+        value
+        for value in (
+            raw.get("content_valid_until"),
+            raw.get("valid_until"),
+            lifecycle.get("content_valid_until"),
+            lifecycle.get("valid_until"),
+        )
+        if value not in (None, "")
+    ]
+    parsed_content_deadlines = [
+        parse_datetime(value)
+        for value in raw_content_deadlines
+    ]
+    content_until = (
+        min(
+            _utc(value)
+            for value in parsed_content_deadlines
+            if value is not None
+        )
+        if parsed_content_deadlines
+        and all(value is not None for value in parsed_content_deadlines)
+        else None
+    )
+    raw_refresh_deadlines = [
+        value
+        for value in (
+            raw.get("refresh_due_at"),
+            raw.get("next_refresh_at"),
+            lifecycle.get("refresh_due_at"),
+            lifecycle.get("next_refresh_at"),
+            lifecycle.get("next_refresh"),
+        )
+        if value not in (None, "")
+    ]
+    parsed_refresh_deadlines = [
+        parse_datetime(value)
+        for value in raw_refresh_deadlines
+    ]
+    refresh_due_at = (
+        min(
+            _utc(value)
+            for value in parsed_refresh_deadlines
+            if value is not None
+        )
+        if parsed_refresh_deadlines
+        and all(value is not None for value in parsed_refresh_deadlines)
+        else None
+    )
+    invalid_status = bool(
+        raw_statuses
+        & (
+            INVALID_ANALYTIC_STATES
+            | _INVALID_LIFECYCLE_STATES
+        )
+        or raw.get("currently_valid") is False
+        or lifecycle.get("currently_valid") is False
+        or raw.get("superseded_by")
+        or lifecycle.get("superseded_by")
+    )
+    missing_observation = data_as_of is None
+    invalid_validity_deadline = bool(
+        raw_content_deadlines
+        and any(value is None for value in parsed_content_deadlines)
+    )
+    invalid_refresh_deadline = bool(
+        raw_refresh_deadlines
+        and any(value is None for value in parsed_refresh_deadlines)
+    )
+    missing_validity = not raw_content_deadlines
+    missing_refresh_due = not raw_refresh_deadlines
+    future_observation = bool(
+        data_as_of and _utc(data_as_of) > now + timedelta(minutes=5)
+    )
+    old_observation = bool(
+        data_as_of
+        and now - _utc(data_as_of)
+        > timedelta(
+            hours=MNQ_EARNINGS_SELECTION_POLICY.max_observation_age_hours
+        )
+    )
+    expired = bool(content_until and _utc(content_until) <= now)
+    refresh_due = bool(
+        refresh_due_at and _utc(refresh_due_at) <= now
+    )
+    invalid_lifecycle_order = bool(
+        data_as_of
+        and content_until
+        and _utc(content_until) < _utc(data_as_of)
+    )
+    refresh_after_expiry = bool(
+        refresh_due_at
+        and content_until
+        and _utc(refresh_due_at) > _utc(content_until)
+    )
+    rejection_reason = (
+        "EARNINGS_FRESHNESS_STATE_INVALID"
+        if invalid_status
+        else "EARNINGS_OBSERVATION_TIME_NOT_AVAILABLE"
+        if missing_observation
+        else "EARNINGS_VALIDITY_DEADLINE_INVALID"
+        if invalid_validity_deadline
+        else "EARNINGS_VALIDITY_DEADLINE_NOT_AVAILABLE"
+        if missing_validity
+        else "EARNINGS_REFRESH_DUE_INVALID"
+        if invalid_refresh_deadline
+        else "EARNINGS_REFRESH_DUE_NOT_AVAILABLE"
+        if missing_refresh_due
+        else "EARNINGS_OBSERVATION_TIME_IN_FUTURE"
+        if future_observation
+        else "EARNINGS_OBSERVATION_TOO_OLD"
+        if old_observation
+        else "EARNINGS_CONTENT_EXPIRED"
+        if expired
+        else "EARNINGS_REFRESH_DUE"
+        if refresh_due
+        else "EARNINGS_LIFECYCLE_ORDER_INVALID"
+        if invalid_lifecycle_order
+        else "EARNINGS_REFRESH_AFTER_EXPIRY"
+        if refresh_after_expiry
+        else None
+    )
+    deliverable = rejection_reason is None
+    return {
+        "deliverable": deliverable,
+        "freshness": "CURRENT" if deliverable else "UNAVAILABLE",
+        "data_as_of": (
+            _utc(data_as_of).isoformat() if data_as_of else None
+        ),
+        "content_valid_until": (
+            _utc(content_until).isoformat() if content_until else None
+        ),
+        "refresh_due_at": (
+            _utc(refresh_due_at).isoformat() if refresh_due_at else None
+        ),
+        "reason_code": rejection_reason,
+    }
+
+
+def _earnings_candidate_rank(item: dict[str, Any]) -> tuple[Any, ...]:
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    return (
+        _earnings_source_quality_present(item),
+        item.get("temporal_precision") == "EXACT",
+        item.get("timing") != "UNKNOWN",
+        item.get("eps_estimate") is not None,
+        item.get("revenue_estimate") is not None,
+        item.get("freshness") == "CURRENT",
+        bool(source.get("publisher")),
+        bool(source.get("source_url")),
+        str(item.get("data_as_of") or ""),
+        hashlib.sha256(_canonical_json(item)).hexdigest(),
+    )
+
+
+def _earnings_coverage(events: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(events)
+
+    def coverage(predicate: Any) -> dict[str, Any]:
+        count = sum(1 for item in events if predicate(item))
+        return {
+            "count": count,
+            "total": total,
+            "ratio": round(count / total, 4) if total else 0.0,
+        }
+
+    return {
+        "relevant_symbols": coverage(
+            lambda item: item.get("symbol")
+            in MNQ_EARNINGS_SELECTION_POLICY.primary_symbols
+        ),
+        "event_date": coverage(
+            lambda item: _date_value(item.get("event_date")) is not None
+        ),
+        "timing": coverage(
+            lambda item: (
+                item.get("temporal_precision") == "EXACT"
+                or item.get("timing") != "UNKNOWN"
+            )
+        ),
+        "eps_estimate": coverage(
+            lambda item: _finite_scalar_number_present(
+                item.get("eps_estimate")
+            )
+        ),
+        "revenue_estimate": coverage(
+            lambda item: _finite_scalar_number_present(
+                item.get("revenue_estimate")
+            )
+        ),
+        "freshness": coverage(
+            lambda item: item.get("freshness") == "CURRENT"
+        ),
+        "source_quality": coverage(_earnings_source_quality_present),
+    }
+
+
+def _earnings_source_quality_present(item: dict[str, Any]) -> bool:
+    source = item.get("source")
+    if not isinstance(source, dict):
+        return False
+    acquisition_provider = str(
+        source.get("acquisition_provider") or ""
+    ).strip().upper()
+    policy = dataset_policy_by_id("earnings")
+    allowed_providers = {
+        policy.primary_provider,
+        *policy.fallback_providers,
+        *policy.ai_fallback_providers,
+    }
+    if (
+        acquisition_provider not in allowed_providers
+        or not source.get("publisher")
+        or not source.get("distributor")
+        or not _registered_provider_source_url(
+            acquisition_provider,
+            source.get("source_url"),
+        )
+    ):
+        return False
+    lineage = item.get("lineage")
+    if not isinstance(lineage, list):
+        return False
+    required_fields = {"event_date"}
+    if (
+        item.get("temporal_precision") == "EXACT"
+        or item.get("timing") != "UNKNOWN"
+    ):
+        required_fields.add("timing")
+    for field in ("eps_estimate", "revenue_estimate"):
+        if item.get(field) is not None:
+            required_fields.add(field)
+    return all(
+        any(
+            isinstance(evidence, dict)
+            and str(evidence.get("field") or "").strip().lower()
+            == field
+            and str(
+                evidence.get("acquisition_provider") or ""
+            ).strip().upper()
+            == acquisition_provider
+            and bool(evidence.get("publisher"))
+            and bool(evidence.get("distributor"))
+            and _registered_provider_source_url(
+                acquisition_provider,
+                evidence.get("source_url"),
+            )
+            for evidence in lineage
+        )
+        for field in required_fields
+    )
+
+
+def _earnings_field_lineage(value: dict[str, Any]) -> list[dict[str, Any]]:
+    lineage = value.get("lineage")
+    if isinstance(lineage, list):
+        observed = [
+            deepcopy(item)
+            for item in lineage
+            if isinstance(item, dict)
+        ]
+        if observed:
+            return observed
+    return _field_lineage(value)
+
+
+def _registered_provider_source_url(
+    provider_id: str,
+    value: Any,
+) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    hostname = str(parsed.hostname or "").casefold()
+    allowed_domains = _provider_source_domains(provider_id)
+    return bool(
+        parsed.scheme.casefold() == "https"
+        and hostname
+        and allowed_domains
+        and any(
+            hostname == domain or hostname.endswith(f".{domain}")
+            for domain in allowed_domains
+        )
+        and hostname not in {"localhost", "127.0.0.1", "::1"}
+        and not hostname.endswith(
+            (".test", ".invalid", ".localhost")
+        )
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def _registered_provider_source_domain(
+    provider_id: str,
+    *,
+    source_url: Any,
+    source_domain: Any,
+) -> bool:
+    parsed = urlparse(str(source_url or "").strip())
+    hostname = str(parsed.hostname or "").casefold().rstrip(".")
+    declared = str(source_domain or "").strip().casefold().lstrip(".").rstrip(".")
+    allowed_domains = _provider_source_domains(provider_id)
+    return bool(
+        _registered_provider_source_url(provider_id, source_url)
+        and declared
+        and (
+            hostname == declared
+            or hostname.endswith(f".{declared}")
+        )
+        and any(
+            declared == allowed
+            or declared.endswith(f".{allowed}")
+            for allowed in allowed_domains
+        )
+    )
+
+
+def _provider_source_domains(provider_id: str) -> set[str]:
+    try:
+        registration = provider_by_id(str(provider_id).strip().upper())
+    except KeyError:
+        return set()
+    return {
+        str(item).strip().casefold().lstrip(".").rstrip(".")
+        for item in registration.source_domains
+        if str(item).strip()
+    }
+
+
+def _earnings_section_status(
+    coverage: dict[str, Any],
+    *,
+    bounded_count: int,
+) -> tuple[str, str | None]:
+    total = int((coverage.get("event_date") or {}).get("total") or 0)
+    if total <= 0:
+        return "NO_DATA", "NO_CURRENT_EARNINGS_EVENTS"
+    if bounded_count > 0:
+        return "DEGRADED", "EARNINGS_SELECTION_BOUNDED"
+    if any(
+        float((coverage.get(field) or {}).get("ratio") or 0.0) < 1.0
+        for field in (
+            "relevant_symbols",
+            "event_date",
+            "timing",
+            "eps_estimate",
+            "revenue_estimate",
+            "freshness",
+            "source_quality",
+        )
+    ):
+        return "DEGRADED", "EARNINGS_COVERAGE_INCOMPLETE"
+    return "AVAILABLE", None
 
 
 def _project_schedule(
@@ -2100,38 +2841,101 @@ def _assess_datum(
     value: dict[str, Any],
     now: datetime,
     *,
-    frequency: str,
+    dataset_id: str | None,
     section_sync: Any = None,
 ) -> dict[str, Any]:
+    try:
+        policy = dataset_policy_by_id(str(dataset_id or ""))
+    except KeyError:
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            "DATASET_POLICY_NOT_REGISTERED",
+            value,
+            None,
+            None,
+        )
+    frequency = policy.frequency
+    policy_age = timedelta(seconds=policy.sla_seconds)
     raw_status = str(value.get("status") or "").upper()
     raw_freshness = str(value.get("freshness") or "").upper()
     lifecycle = value.get("lifecycle") if isinstance(value.get("lifecycle"), dict) else {}
     sync = section_sync if isinstance(section_sync, dict) else {}
+    lifecycle_states = {
+        str(item).upper()
+        for item in (
+            lifecycle.get("status"),
+            lifecycle.get("lifecycle_status"),
+            lifecycle.get("freshness"),
+            lifecycle.get("freshness_state"),
+        )
+        if item not in (None, "")
+    }
     lifecycle_freshness = str(
         lifecycle.get("freshness")
         or lifecycle.get("freshness_state")
+        or lifecycle.get("lifecycle_status")
+        or lifecycle.get("status")
         or sync.get("freshness")
         or ""
     ).upper()
-    data_as_of = parse_datetime(
+    raw_data_as_of = (
         value.get("data_as_of")
         or value.get("observed_at")
         or value.get("as_of")
-        or value.get("retrieved_at")
     )
+    raw_content_deadlines = [
+        item
+        for item in (
+            value.get("content_valid_until"),
+            value.get("valid_until"),
+            lifecycle.get("content_valid_until"),
+            lifecycle.get("valid_until"),
+        )
+        if item not in (None, "")
+    ]
+    parsed_content_deadlines = [
+        parse_datetime(item)
+        for item in raw_content_deadlines
+    ]
+    raw_refresh_deadlines = [
+        item
+        for item in (
+            value.get("refresh_due_at"),
+            value.get("next_refresh_at"),
+            lifecycle.get("refresh_due_at"),
+            lifecycle.get("next_refresh_at"),
+            lifecycle.get("next_refresh"),
+        )
+        if item not in (None, "")
+    ]
+    parsed_refresh_deadlines = [
+        parse_datetime(item)
+        for item in raw_refresh_deadlines
+    ]
+    data_as_of = parse_datetime(raw_data_as_of)
     retrieved = parse_datetime(value.get("retrieved_at") or value.get("last_successful_refresh_at"))
-    explicit_until = parse_datetime(
-        value.get("content_valid_until")
-        or lifecycle.get("valid_until")
-        or value.get("valid_until")
+    explicit_until = (
+        min(
+            _utc(item)
+            for item in parsed_content_deadlines
+            if item is not None
+        )
+        if parsed_content_deadlines
+        and all(item is not None for item in parsed_content_deadlines)
+        else None
     )
-    refresh_due = parse_datetime(
-        value.get("refresh_due_at")
-        or value.get("next_refresh_at")
-        or lifecycle.get("next_refresh_at")
-        or lifecycle.get("next_refresh")
+    refresh_due = (
+        min(
+            _utc(item)
+            for item in parsed_refresh_deadlines
+            if item is not None
+        )
+        if parsed_refresh_deadlines
+        and all(item is not None for item in parsed_refresh_deadlines)
+        else None
     )
-    policy_age = _policy_age(frequency)
     reference = _utc(data_as_of) if data_as_of else None
     recent_official_read = bool(
         retrieved
@@ -2146,6 +2950,46 @@ def _assess_datum(
         now=now,
         frequency=frequency,
     )
+    if raw_data_as_of not in (None, "") and data_as_of is None:
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            "DATA_AS_OF_INVALID",
+            value,
+            explicit_until,
+            refresh_due,
+        )
+    if raw_content_deadlines and explicit_until is None:
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            "CONTENT_VALID_UNTIL_INVALID",
+            value,
+            None,
+            refresh_due,
+        )
+    if raw_refresh_deadlines and refresh_due is None:
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            "REFRESH_DUE_AT_INVALID",
+            value,
+            explicit_until,
+            None,
+        )
+    if data_as_of is None:
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            "DATA_AS_OF_NOT_AVAILABLE",
+            value,
+            explicit_until,
+            refresh_due,
+        )
     if data_as_of and _utc(data_as_of) > now + timedelta(minutes=5):
         return _assessment(
             False,
@@ -2156,12 +3000,40 @@ def _assess_datum(
             explicit_until,
             refresh_due,
         )
-    if explicit_until and _utc(explicit_until) < now:
+    if explicit_until and _utc(explicit_until) <= now:
         return _assessment(
             False,
             "UNAVAILABLE",
             "UNAVAILABLE",
             "CONTENT_VALIDITY_EXPIRED",
+            value,
+            explicit_until,
+            refresh_due,
+        )
+    if refresh_due and _utc(refresh_due) <= now:
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            "REFRESH_DUE",
+            value,
+            explicit_until,
+            refresh_due,
+        )
+    lifecycle_invalid = lifecycle_states & (
+        INVALID_ANALYTIC_STATES
+        | _INVALID_LIFECYCLE_STATES
+    )
+    if (
+        lifecycle_invalid
+        or lifecycle.get("currently_valid") is False
+        or lifecycle.get("superseded_by")
+    ):
+        return _assessment(
+            False,
+            "UNAVAILABLE",
+            "UNAVAILABLE",
+            f"{_worst_state(lifecycle_invalid or {'INVALID'})}_VALUE_EXCLUDED",
             value,
             explicit_until,
             refresh_due,
@@ -2243,9 +3115,9 @@ def _assess_datum(
     else:
         freshness = "CURRENT"
         content_until = (
-            min(_utc(explicit_until), now + policy_age)
+            min(_utc(explicit_until), _utc(reference) + policy_age)
             if explicit_until
-            else now + policy_age
+            else _utc(reference) + policy_age
         )
     return _assessment(
         True,
@@ -2337,7 +3209,6 @@ def _assessment(
             value.get("data_as_of")
             or value.get("observed_at")
             or value.get("as_of")
-            or value.get("retrieved_at")
         ),
         "content_valid_until": (
             _utc(content_until).isoformat() if content_until else None
@@ -2422,6 +3293,9 @@ def _provider_accounting(
     correlation_id = manifest.get("correlation_id")
     request_started_at = manifest.get("request_started_at")
     request_completed_at = manifest.get("request_completed_at")
+    parsed_request_started_at = parse_datetime(
+        request_started_at
+    )
     evidence_origin = manifest.get("evidence_origin")
     raw_rows = manifest.get("datasets")
     raw_rows = raw_rows if isinstance(raw_rows, list) else []
@@ -2443,7 +3317,7 @@ def _provider_accounting(
         and evidence_origin == "NORMAL_APPLICATION_REQUEST"
         and manifest.get("evidence_status")
         in {"ACQUISITION_COMPLETE", "INCOMPLETE"}
-        and parse_datetime(request_started_at)
+        and parsed_request_started_at
         and parse_datetime(request_completed_at)
     )
     rows: list[dict[str, Any]] = []
@@ -2507,6 +3381,21 @@ def _provider_accounting(
                 "database_freshness_evaluation": raw.get(
                     "database_freshness_evaluation"
                 ),
+                **(
+                    {
+                        "database_lookup_summary": deepcopy(
+                            raw["database_lookup_summary"]
+                        )
+                    }
+                    if isinstance(
+                        raw.get("database_lookup_summary"),
+                        dict,
+                    )
+                    else {}
+                ),
+                "capability_acquisitions": deepcopy(
+                    raw.get("capability_acquisitions") or []
+                ),
                 "primary_provider": deepcopy(raw.get("primary_provider")),
                 "fallbacks": deepcopy(raw.get("fallbacks")),
                 "acquisition_selected_source": raw.get(
@@ -2531,7 +3420,8 @@ def _provider_accounting(
                 request_completed_at=request_completed_at,
             )
             or not _acquisition_delivery_observation_link_complete(
-                candidate
+                candidate,
+                payload_root={"analytics": analytics},
             )
         ):
             candidate["evidence_status"] = "INCOMPLETE"
@@ -2541,11 +3431,14 @@ def _provider_accounting(
             observed_at = parse_datetime(raw.get("observed_at"))
             if (
                 raw.get("database_lookup_performed") is True
+                and not raw.get("capability_acquisitions")
                 and observed_at is not None
+                and parsed_request_started_at is not None
                 and not _canonical_database_evidence_valid(
                     raw,
                     policy=policy,
                     observed_at=observed_at,
+                    request_started_at=parsed_request_started_at,
                 )
             ):
                 candidate["database_record_expired"] = None
@@ -2566,6 +3459,7 @@ def _provider_accounting(
                 correlation_id=correlation_id,
                 request_started_at=request_started_at,
                 request_completed_at=request_completed_at,
+                payload_root={"analytics": analytics},
             )
             for row in rows
         )
@@ -2606,6 +3500,7 @@ def _incomplete_provider_accounting_row(
         "database_lifecycle_status": None,
         "database_record_expired": None,
         "database_freshness_evaluation": None,
+        "capability_acquisitions": [],
         "primary_provider": {
             "provider": policy.primary_provider,
             "called": None,
@@ -2643,21 +3538,34 @@ def _delivery_evidence(
         dataset_id,
         analytics,
     )
-    delivered = (
+    resolved_delivery = (
         deepcopy(value)
         if _substantive_delivery_present(dataset_id, value)
         else None
     )
-    present = delivered is not None
+    present = resolved_delivery is not None
+    collection_path = PROVIDER_ACCOUNTING_COLLECTION_PATHS.get(
+        dataset_id
+    )
+    delivered = (
+        _delivery_collection_reference(
+            collection_path,
+            payload_root={"analytics": analytics},
+        )
+        if present
+        and collection_path
+        and isinstance(resolved_delivery, list)
+        else resolved_delivery
+    )
     section = (
         analytics.get(section_name)
         if isinstance(analytics.get(section_name), dict)
         else {}
     )
-    source = _first_delivery_field(delivered, "source")
+    source = _first_delivery_field(resolved_delivery, "source")
     if source is None:
         source = section.get("source")
-    freshness = _first_delivery_field(delivered, "freshness")
+    freshness = _first_delivery_field(resolved_delivery, "freshness")
     if freshness is None:
         freshness = (
             section.get("freshness") or "UNAVAILABLE"
@@ -2690,6 +3598,139 @@ def _delivery_evidence(
             else "FINAL_PAYLOAD_VALUE_NOT_AVAILABLE"
         ),
     }
+
+
+def _delivery_collection_reference(
+    payload_path: str | tuple[str, ...],
+    *,
+    payload_root: dict[str, Any],
+) -> dict[str, Any]:
+    paths = _collection_reference_paths(payload_path)
+    values: list[Any] = []
+    for path in paths:
+        resolved = _resolve_payload_path(payload_root, path)
+        if not isinstance(resolved, list):
+            raise RuntimeError(
+                "PROVIDER_ACCOUNTING_COLLECTION_PATH_NOT_A_LIST:"
+                f"{path}"
+            )
+        values.extend(resolved)
+    return {
+        "payload_path": paths[0] if len(paths) == 1 else list(paths),
+        "item_count": len(values),
+        "content_sha256": hashlib.sha256(
+            _canonical_json(values)
+        ).hexdigest(),
+    }
+
+
+def _collection_reference_paths(
+    value: str | tuple[str, ...],
+) -> tuple[str, ...]:
+    return (value,) if isinstance(value, str) else value
+
+
+def _resolve_payload_path(
+    payload: Any,
+    payload_path: str,
+) -> Any:
+    if (
+        not isinstance(payload, dict)
+        or not payload_path
+        or payload_path.startswith(".")
+        or payload_path.endswith(".")
+    ):
+        return _INVALID_DELIVERY_REFERENCE
+    current: Any = payload
+    for part in payload_path.split("."):
+        if (
+            not part
+            or not isinstance(current, dict)
+            or part not in current
+        ):
+            return _INVALID_DELIVERY_REFERENCE
+        current = current[part]
+    return current
+
+
+def _is_delivery_collection_reference(value: Any) -> bool:
+    return isinstance(value, dict) and "payload_path" in value
+
+
+def _resolve_accounting_delivery(
+    dataset_id: str,
+    value: Any,
+    *,
+    payload_root: dict[str, Any] | None,
+) -> Any:
+    expected_path = PROVIDER_ACCOUNTING_COLLECTION_PATHS.get(dataset_id)
+    if expected_path is not None and value is None:
+        return None
+    if not _is_delivery_collection_reference(value):
+        if expected_path is not None or isinstance(value, list):
+            return _INVALID_DELIVERY_REFERENCE
+        return value
+    if expected_path is None:
+        return _INVALID_DELIVERY_REFERENCE
+    expected_paths = _collection_reference_paths(expected_path)
+    supplied_path = value.get("payload_path")
+    supplied_paths = (
+        (supplied_path,)
+        if isinstance(supplied_path, str)
+        else tuple(supplied_path)
+        if isinstance(supplied_path, list)
+        and all(isinstance(path, str) for path in supplied_path)
+        else ()
+    )
+    if (
+        payload_root is None
+        or set(value) != {
+            "payload_path",
+            "item_count",
+            "content_sha256",
+        }
+        or supplied_paths != expected_paths
+        or (
+            len(expected_paths) == 1
+            and not isinstance(supplied_path, str)
+        )
+        or (
+            len(expected_paths) > 1
+            and not isinstance(supplied_path, list)
+        )
+        or type(value.get("item_count")) is not int
+        or value["item_count"] < 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(value.get("content_sha256") or ""),
+        )
+    ):
+        return _INVALID_DELIVERY_REFERENCE
+    resolved: list[Any] = []
+    for path in expected_paths:
+        collection = _resolve_payload_path(payload_root, path)
+        if not isinstance(collection, list):
+            return _INVALID_DELIVERY_REFERENCE
+        resolved.extend(collection)
+    if (
+        len(resolved) != value["item_count"]
+        or hashlib.sha256(_canonical_json(resolved)).hexdigest()
+        != value["content_sha256"]
+    ):
+        return _INVALID_DELIVERY_REFERENCE
+    analytics = payload_root.get("analytics")
+    if not isinstance(analytics, dict):
+        return _INVALID_DELIVERY_REFERENCE
+    # The reference attests the shared consumer node(s); dataset_id then
+    # selects the registered semantic subset instead of treating every item
+    # in a shared collection as delivered for every dataset.
+    _, dataset_delivery = _dataset_delivery_value(
+        dataset_id,
+        analytics,
+    )
+    if not isinstance(dataset_delivery, list):
+        return _INVALID_DELIVERY_REFERENCE
+    return dataset_delivery
 
 
 def _ensure_required_dataset_missing_data(
@@ -3528,7 +4569,24 @@ def _acquisition_accounting_row_complete(
     lookup = item["database_lookup_performed"]
     if policy.canonical_repository_required and not lookup:
         return False
-    if lookup:
+    capability_scoped = (
+        str(policy.provider_strategy).upper() == "FAN_IN"
+        and bool(item.get("capability_acquisitions"))
+    )
+    if capability_scoped:
+        if (
+            lookup is not True
+            or item.get("database_record_found") is not None
+            or item.get("database_record_expired") is not None
+            or item.get("database_data_as_of") is not None
+            or item.get("database_content_valid_until") is not None
+            or item.get("database_refresh_due_at") is not None
+            or item.get("database_lifecycle_status") is not None
+            or item.get("database_freshness_evaluation")
+            != "CAPABILITY_SCOPED"
+        ):
+            return False
+    elif lookup:
         if (
             type(item.get("database_record_found")) is not bool
             or type(item.get("database_record_expired")) is not bool
@@ -3544,6 +4602,7 @@ def _acquisition_accounting_row_complete(
             item,
             policy=policy,
             observed_at=observed,
+            request_started_at=started,
         ):
             return False
     elif any(
@@ -3577,7 +4636,14 @@ def _acquisition_accounting_row_complete(
             _provider_attempt_complete(attempt)
             for attempt in [primary, *fallbacks]
         )
-        and _provider_flow_valid(item, policy=policy)
+        and _provider_flow_valid(
+            item,
+            policy=policy,
+            governed_dataset_ids={
+                registered.dataset_id
+                for registered in DATASET_POLICIES
+            },
+        )
     )
 
 
@@ -3627,6 +4693,8 @@ def _flash_pmi_acquisition_observation_id(
 
 def _acquisition_delivery_observation_link_complete(
     item: Any,
+    *,
+    payload_root: dict[str, Any] | None = None,
 ) -> bool:
     if (
         not isinstance(item, dict)
@@ -3638,7 +4706,11 @@ def _acquisition_delivery_observation_link_complete(
         return False
     if item.get("selected_value_present") is not True:
         return True
-    delivered = item.get("delivered_value")
+    delivered = _resolve_accounting_delivery(
+        "flash_services_pmi",
+        item.get("delivered_value"),
+        payload_root=payload_root,
+    )
     if not isinstance(delivered, list):
         return False
     return bool(
@@ -3655,9 +4727,13 @@ def _readiness(analytics: dict[str, Any]) -> dict[str, Any]:
         for name in SECTION_NAMES
     }
     statuses = {
-        name: _readiness_section_status(
-            (analytics.get(name) or {}).get("status"),
-            value_count=value_counts[name],
+        name: (
+            _earnings_readiness_status(analytics.get(name) or {})
+            if name == "earnings"
+            else _readiness_section_status(
+                (analytics.get(name) or {}).get("status"),
+                value_count=value_counts[name],
+            )
         )
         for name in SECTION_NAMES
     }
@@ -3828,6 +4904,7 @@ def _readiness_earnings_event_present(value: Any) -> bool:
     event_time_present = any(
         _valid_timestamp_present(value.get(field))
         for field in (
+            "event_date",
             "event_at",
             "release_at",
             "earnings_date",
@@ -3836,6 +4913,26 @@ def _readiness_earnings_event_present(value: Any) -> bool:
         )
     )
     return issuer_present and event_time_present
+
+
+def _earnings_readiness_status(section: dict[str, Any]) -> str:
+    events = [
+        item
+        for item in section.get("events") or []
+        if isinstance(item, dict)
+        and item.get("symbol")
+        in MNQ_EARNINGS_SELECTION_POLICY.primary_symbols
+        and _date_value(item.get("event_date")) is not None
+    ]
+    bounded_count = max(
+        int(section.get("relevant_count") or 0) - len(events),
+        0,
+    )
+    status, _ = _earnings_section_status(
+        _earnings_coverage(events),
+        bounded_count=bounded_count,
+    )
+    return "UNAVAILABLE" if status == "NO_DATA" else status
 
 
 def _readiness_section_status(
@@ -4243,10 +5340,14 @@ def _source(value: Any) -> Any:
         or value.get("source")
         or value.get("provider")
     )
-    distributor = value.get("distribution_source") or (
+    distributor = (
+        value.get("distributor")
+        or value.get("distribution_source")
+        or (
         value.get("source")
         if publisher and value.get("source") != publisher
         else None
+        )
     )
     acquisition = (
         value.get("acquisition_provider")
@@ -4271,9 +5372,14 @@ def _field_lineage(value: Any) -> list[dict[str, Any]]:
         return [deepcopy(item) for item in raw if isinstance(item, dict)]
     if isinstance(raw, dict):
         return [
-            {"field": str(field), **deepcopy(item)}
+            {**deepcopy(item), "field": str(field)}
             for field, item in sorted(raw.items())
             if isinstance(item, dict)
+            and (
+                item.get("field") in (None, "")
+                or str(item.get("field")).strip().lower()
+                == str(field).strip().lower()
+            )
         ]
     source = _source(value)
     return [{"field": "value", "source": source}] if source else []
@@ -4306,8 +5412,19 @@ def _usable_event_field_lineage(
     }
     by_field: dict[str, list[dict[str, Any]]] = {}
     generic: list[dict[str, Any]] = []
+    occurrence_envelope = _event_occurrence_lineage_envelope(value)
     for raw in _field_lineage(value):
-        item = deepcopy(raw)
+        raw_field = str(raw.get("field") or "").strip().lower()
+        source_envelope = (
+            _event_actual_source_lineage_envelope(value)
+            if raw_field == "actual"
+            else {}
+        )
+        item = {
+            **occurrence_envelope,
+            **source_envelope,
+            **deepcopy(raw),
+        }
         field = str(item.get("field") or "").strip().lower()
         if field in {
             "actual",
@@ -4423,6 +5540,150 @@ def _usable_event_field_lineage(
     return deduplicated, rejected_reasons
 
 
+def _event_lifecycle_container(value: dict[str, Any]) -> dict[str, Any]:
+    return (
+        value.get("lifecycle")
+        if isinstance(value.get("lifecycle"), dict)
+        else {}
+    )
+
+
+def _event_lifecycle_states(value: dict[str, Any]) -> set[str]:
+    lifecycle = _event_lifecycle_container(value)
+    return {
+        str(container.get(field) or "").strip().upper()
+        for container in (value, lifecycle)
+        for field in (
+            "freshness",
+            "freshness_state",
+            "lifecycle_status",
+            "status",
+        )
+        if container.get(field) not in (None, "")
+    }
+
+
+def _event_lineage_freshness_states(
+    value: dict[str, Any],
+) -> set[str]:
+    lifecycle = _event_lifecycle_container(value)
+    states = {
+        str(item).strip().upper()
+        for item in (
+            value.get("freshness"),
+            value.get("freshness_state"),
+            lifecycle.get("freshness"),
+            lifecycle.get("freshness_state"),
+        )
+        if item not in (None, "")
+    }
+    if states:
+        return states
+    return {
+        str(item).strip().upper()
+        for item in (
+            lifecycle.get("lifecycle_status"),
+            lifecycle.get("status"),
+        )
+        if item not in (None, "")
+    }
+
+
+def _event_lineage_has_timestamp(
+    value: dict[str, Any],
+    fields: tuple[str, ...],
+) -> bool:
+    lifecycle = _event_lifecycle_container(value)
+    return any(
+        container.get(field) not in (None, "")
+        for container in (value, lifecycle)
+        for field in fields
+    )
+
+
+def _event_occurrence_lineage_envelope(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    lifecycle = _event_lifecycle_container(value)
+    envelope: dict[str, Any] = {}
+    freshness = next(
+        (
+            item
+            for item in (
+                value.get("freshness_state"),
+                value.get("freshness"),
+                lifecycle.get("freshness_state"),
+                lifecycle.get("freshness"),
+            )
+            if item not in (None, "")
+        ),
+        None,
+    )
+    if freshness is not None:
+        envelope["freshness"] = freshness
+    for field, candidates in {
+        "content_valid_until": (
+            value.get("content_valid_until"),
+            lifecycle.get("content_valid_until"),
+        ),
+        "valid_until": (
+            value.get("valid_until"),
+            lifecycle.get("valid_until"),
+        ),
+        "refresh_due_at": (
+            value.get("refresh_due_at"),
+            lifecycle.get("refresh_due_at"),
+        ),
+        "next_refresh_at": (
+            value.get("next_refresh_at"),
+            lifecycle.get("next_refresh_at"),
+            lifecycle.get("next_refresh"),
+        ),
+    }.items():
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if item not in (None, "")
+            ),
+            None,
+        )
+        if candidate is not None:
+            envelope[field] = candidate
+    return envelope
+
+
+def _event_actual_source_lineage_envelope(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    envelope: dict[str, Any] = {}
+    for field, candidates in {
+        "source_url": (
+            value.get("actual_source_url"),
+            value.get("source_url"),
+        ),
+        "source_domain": (
+            value.get("actual_source_domain"),
+            value.get("source_domain"),
+        ),
+        "acquisition_provider": (
+            value.get("actual_acquisition_provider"),
+            value.get("acquisition_provider"),
+        ),
+    }.items():
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if item not in (None, "")
+            ),
+            None,
+        )
+        if candidate is not None:
+            envelope[field] = candidate
+    return envelope
+
+
 def _event_field_lineage_binding_reason(
     lineage: dict[str, Any],
     *,
@@ -4438,6 +5699,8 @@ def _event_field_lineage_binding_reason(
         for item in expected_occurrence_ids
         if item not in (None, "")
     }
+    if not expected_occurrences:
+        return "EVENT_OCCURRENCE_NOT_PROVEN"
     observed_occurrences = {
         str(lineage[key])
         for key in (
@@ -4535,15 +5798,128 @@ def _event_field_lineage_binding_reason(
             return "FIELD_LINEAGE_FREQUENCY_NOT_PROVEN"
         if expected_basis != observed_basis:
             return "FIELD_LINEAGE_FREQUENCY_MISMATCH"
-    if (
-        output_field == "actual"
-        and spec is not None
-        and spec.transformation != "level"
+    if spec is not None:
+        observed_frequency = str(
+            lineage.get("frequency") or ""
+        ).strip().lower()
+        if not observed_frequency:
+            return "FIELD_LINEAGE_FREQUENCY_NOT_PROVEN"
+        if (
+            expected_basis is None
+            and observed_frequency != spec.frequency
+        ):
+            return "FIELD_LINEAGE_FREQUENCY_MISMATCH"
+        asserted_transformation = str(
+            lineage.get("transformation") or ""
+        ).strip()
+        if (
+            asserted_transformation
+            and asserted_transformation != spec.transformation
+        ):
+            return "FIELD_LINEAGE_TRANSFORMATION_MISMATCH"
+    validation = (
+        lineage.get("validation")
+        if isinstance(lineage.get("validation"), dict)
+        else {}
+    )
+    validation_statuses = {
+        str(item).strip().upper()
+        for item in (
+            validation.get("status"),
+            lineage.get("validation_status"),
+            lineage.get("verification_status"),
+        )
+        if item not in (None, "")
+    }
+    accepted_validation_states = {
+        "ACCEPTED",
+        "APPROVED",
+        "DETERMINISTIC_VERIFIED",
+        "FIELD_LEVEL_VALIDATED",
+        "PASSED",
+        "VALID",
+        "VERIFIED",
+    }
+    if not validation_statuses:
+        return "FIELD_LINEAGE_VALIDATION_NOT_PROVEN"
+    if not validation_statuses <= accepted_validation_states:
+        return "FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED"
+    freshness_states = _event_lineage_freshness_states(lineage)
+    if not freshness_states:
+        return "FIELD_LINEAGE_FRESHNESS_NOT_PROVEN"
+    if not freshness_states <= {
+        "CURRENT",
+        "CURRENT_LATEST_OFFICIAL_RELEASE",
+        "CURRENT_RELEASE",
+        "FRESH",
+        "VALID",
+    }:
+        return "FIELD_LINEAGE_CONTENT_NOT_CURRENT"
+    if not _event_lineage_has_timestamp(
+        lineage,
+        ("content_valid_until", "valid_until"),
     ):
-        if lineage.get("source_series_id") != spec.source_series_id:
+        return "FIELD_LINEAGE_CONTENT_VALIDITY_NOT_PROVEN"
+    if not _event_lineage_has_timestamp(
+        lineage,
+        ("refresh_due_at", "next_refresh_at", "next_refresh"),
+    ):
+        return "FIELD_LINEAGE_REFRESH_DUE_NOT_PROVEN"
+    if output_field == "actual" and spec is not None:
+        expected_provider = _source_identity(spec.provider_id)
+        observed_provider = _source_identity(lineage.get("source"))
+        if not observed_provider:
+            return "FIELD_LINEAGE_SOURCE_NOT_PROVEN"
+        if observed_provider != expected_provider:
+            return "FIELD_LINEAGE_SOURCE_PROVIDER_MISMATCH"
+        acquisition_provider = str(
+            lineage.get("acquisition_provider")
+            or spec.provider_id
+        ).strip().upper()
+        source_url = lineage.get("source_url")
+        if source_url in (None, ""):
+            return "FIELD_LINEAGE_SOURCE_URL_NOT_PROVEN"
+        if not _registered_provider_source_url(
+            acquisition_provider,
+            source_url,
+        ):
+            return "FIELD_LINEAGE_SOURCE_URL_MISMATCH"
+        if _source_identity(acquisition_provider) != expected_provider:
+            originator_url = (
+                lineage.get("canonical_url")
+                or lineage.get("source_originator_url")
+            )
+            if originator_url in (None, ""):
+                return "FIELD_LINEAGE_ORIGINATOR_URL_NOT_PROVEN"
+            if not _registered_provider_source_url(
+                spec.provider_id,
+                originator_url,
+            ):
+                return "FIELD_LINEAGE_ORIGINATOR_URL_MISMATCH"
+        source_domain = lineage.get("source_domain")
+        if (
+            source_domain not in (None, "")
+            and not _registered_provider_source_domain(
+                acquisition_provider,
+                source_url=source_url,
+                source_domain=source_domain,
+            )
+        ):
+            return "FIELD_LINEAGE_SOURCE_DOMAIN_MISMATCH"
+        source_series_id = str(
+            lineage.get("source_series_id") or ""
+        ).strip()
+        if not source_series_id:
             return "FIELD_LINEAGE_SOURCE_SERIES_NOT_PROVEN"
-        if lineage.get("transformation") != spec.transformation:
+        if source_series_id != spec.source_series_id:
+            return "FIELD_LINEAGE_SOURCE_SERIES_MISMATCH"
+        transformation = str(
+            lineage.get("transformation") or ""
+        ).strip()
+        if not transformation:
             return "FIELD_LINEAGE_TRANSFORMATION_NOT_PROVEN"
+        if transformation != spec.transformation:
+            return "FIELD_LINEAGE_TRANSFORMATION_MISMATCH"
     return None
 
 
@@ -4642,20 +6018,27 @@ def _assess_event_lineage_candidates(
 
 _MISSING = object()
 
-
-def _event_lineage_value(value: dict[str, Any]) -> Any:
-    if "value" in value and value.get("value") not in (None, ""):
-        return value["value"]
-    for field in (
+_EVENT_LINEAGE_VALUE_FIELD_KEYS = frozenset(
+    {
         "actual",
         "consensus",
         "forecast",
         "previous",
         "previous_revised",
         "revised_previous",
+    }
+)
+
+
+def _event_lineage_value(value: dict[str, Any]) -> Any:
+    if "value" in value and value.get("value") not in (None, ""):
+        return value["value"]
+    declared_field = str(value.get("field") or "").strip().lower()
+    if (
+        declared_field in _EVENT_LINEAGE_VALUE_FIELD_KEYS
+        and value.get(declared_field) not in (None, "")
     ):
-        if value.get(field) not in (None, ""):
-            return value[field]
+        return value[declared_field]
     return _MISSING
 
 
@@ -4684,16 +6067,7 @@ def _event_lineage_rejection_reason(
     now: datetime,
 ) -> str | None:
     reasons: list[str] = []
-    states = {
-        str(value.get(field) or "").strip().upper()
-        for field in (
-            "freshness",
-            "freshness_state",
-            "lifecycle_status",
-            "status",
-        )
-        if value.get(field) not in (None, "")
-    }
+    states = _event_lifecycle_states(value)
     invalid_lifecycle_states = (
         _INVALID_LIFECYCLE_STATES
         | {"EXHAUSTED_NO_DATA"}
@@ -4713,6 +6087,7 @@ def _event_lineage_rejection_reason(
         for item in (
             validation.get("status"),
             value.get("validation_status"),
+            value.get("verification_status"),
         )
         if item not in (None, "")
     }
@@ -4731,17 +6106,21 @@ def _event_lineage_rejection_reason(
     ):
         reasons.append("FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED")
 
-    for field in ("content_valid_until", "valid_until"):
-        raw_timestamp = value.get(field)
+    lifecycle = _event_lifecycle_container(value)
+    for container, field in (
+        (value, "content_valid_until"),
+        (value, "valid_until"),
+        (lifecycle, "content_valid_until"),
+        (lifecycle, "valid_until"),
+    ):
+        raw_timestamp = container.get(field)
         if raw_timestamp in (None, ""):
             continue
         content_valid_until = parse_datetime(raw_timestamp)
         if content_valid_until is None:
             reasons.append("FIELD_LINEAGE_TIMESTAMP_INVALID")
             continue
-        if (
-            _utc(content_valid_until) < now
-        ):
+        if _utc(content_valid_until) <= now:
             reasons.append("FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED")
 
     for field in ("data_as_of", "observed_at"):
@@ -4757,8 +6136,14 @@ def _event_lineage_rejection_reason(
         ):
             reasons.append("FIELD_LINEAGE_REJECTED_FUTURE")
 
-    for field in ("refresh_due_at", "next_refresh_at"):
-        raw_timestamp = value.get(field)
+    for container, field in (
+        (value, "refresh_due_at"),
+        (value, "next_refresh_at"),
+        (lifecycle, "refresh_due_at"),
+        (lifecycle, "next_refresh_at"),
+        (lifecycle, "next_refresh"),
+    ):
+        raw_timestamp = container.get(field)
         if raw_timestamp in (None, ""):
             continue
         refresh_due_at = parse_datetime(raw_timestamp)
@@ -4774,25 +6159,34 @@ def _worst_event_lineage_reason(reasons: Iterable[str]) -> str:
     priority = {
         "FIELD_LINEAGE_REJECTED_FUTURE": 0,
         "FIELD_LINEAGE_VALIDATION_NOT_ACCEPTED": 1,
-        "FIELD_LINEAGE_TIMESTAMP_INVALID": 2,
-        "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED": 3,
-        "FIELD_LINEAGE_REFRESH_DUE": 4,
-        "FIELD_LINEAGE_CONTENT_NOT_CURRENT": 5,
-        "FIELD_LINEAGE_VALUE_NOT_RECONCILED": 6,
-        "OCCURRENCE_FIELD_LINEAGE_MISMATCH": 7,
-        "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH": 8,
-        "FIELD_LINEAGE_METRIC_MISMATCH": 9,
-        "FIELD_LINEAGE_FREQUENCY_MISMATCH": 10,
-        "FIELD_LINEAGE_OCCURRENCE_NOT_PROVEN": 11,
-        "FIELD_LINEAGE_METRIC_NOT_PROVEN": 12,
-        "EVENT_REFERENCE_PERIOD_NOT_PROVEN": 13,
-        "FIELD_LINEAGE_REFERENCE_PERIOD_NOT_PROVEN": 14,
-        "FIELD_LINEAGE_FREQUENCY_NOT_PROVEN": 15,
-        "FIELD_LINEAGE_VALUE_NOT_PROVEN": 16,
-        "FIELD_LINEAGE_SOURCE_NOT_PROVEN": 17,
-        "FIELD_LINEAGE_SOURCE_SERIES_NOT_PROVEN": 18,
-        "FIELD_LINEAGE_TRANSFORMATION_NOT_PROVEN": 19,
-        "FIELD_SPECIFIC_LINEAGE_NOT_AVAILABLE": 20,
+        "FIELD_LINEAGE_VALIDATION_NOT_PROVEN": 2,
+        "FIELD_LINEAGE_FRESHNESS_NOT_PROVEN": 3,
+        "FIELD_LINEAGE_CONTENT_VALIDITY_NOT_PROVEN": 4,
+        "FIELD_LINEAGE_REFRESH_DUE_NOT_PROVEN": 5,
+        "FIELD_LINEAGE_TIMESTAMP_INVALID": 6,
+        "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED": 7,
+        "FIELD_LINEAGE_REFRESH_DUE": 8,
+        "FIELD_LINEAGE_CONTENT_NOT_CURRENT": 9,
+        "FIELD_LINEAGE_VALUE_NOT_RECONCILED": 10,
+        "OCCURRENCE_FIELD_LINEAGE_MISMATCH": 11,
+        "REFERENCE_PERIOD_FIELD_LINEAGE_MISMATCH": 12,
+        "FIELD_LINEAGE_METRIC_MISMATCH": 13,
+        "FIELD_LINEAGE_FREQUENCY_MISMATCH": 14,
+        "FIELD_LINEAGE_OCCURRENCE_NOT_PROVEN": 15,
+        "FIELD_LINEAGE_METRIC_NOT_PROVEN": 16,
+        "EVENT_REFERENCE_PERIOD_NOT_PROVEN": 17,
+        "FIELD_LINEAGE_REFERENCE_PERIOD_NOT_PROVEN": 18,
+        "FIELD_LINEAGE_FREQUENCY_NOT_PROVEN": 19,
+        "FIELD_LINEAGE_VALUE_NOT_PROVEN": 20,
+        "FIELD_LINEAGE_SOURCE_NOT_PROVEN": 21,
+        "FIELD_LINEAGE_SOURCE_URL_NOT_PROVEN": 22,
+        "FIELD_LINEAGE_SOURCE_URL_MISMATCH": 23,
+        "FIELD_LINEAGE_ORIGINATOR_URL_NOT_PROVEN": 24,
+        "FIELD_LINEAGE_ORIGINATOR_URL_MISMATCH": 25,
+        "FIELD_LINEAGE_SOURCE_DOMAIN_MISMATCH": 26,
+        "FIELD_LINEAGE_SOURCE_SERIES_NOT_PROVEN": 27,
+        "FIELD_LINEAGE_TRANSFORMATION_NOT_PROVEN": 28,
+        "FIELD_SPECIFIC_LINEAGE_NOT_AVAILABLE": 29,
     }
     return min(
         (str(reason) for reason in reasons),
@@ -4825,17 +6219,6 @@ def _datum_has_value(value: dict[str, Any]) -> bool:
             "lineage",
         }
     )
-
-
-def _policy_age(frequency: str) -> timedelta:
-    return {
-        "intraday": timedelta(hours=2),
-        "daily": timedelta(days=2),
-        "weekly": timedelta(days=14),
-        "monthly": timedelta(days=45),
-        "quarterly": timedelta(days=120),
-        "event": timedelta(days=370),
-    }.get(frequency.lower(), timedelta(hours=24))
 
 
 def _worst_state(values: set[str]) -> str:
@@ -4985,20 +6368,53 @@ def _explicit_available_null_count(value: Any) -> int:
     return 0
 
 
-def _selected_value_presence_mismatch_count(rows: Any) -> int:
+def _selected_value_presence_mismatch_count(
+    rows: Any,
+    *,
+    payload_root: dict[str, Any] | None = None,
+) -> int:
     if not isinstance(rows, list):
         return 0
-    return sum(
-        1
-        for item in rows
-        if isinstance(item, dict)
-        and isinstance(item.get("selected_value_present"), bool)
-        and item["selected_value_present"]
-        != _substantive_delivery_present(
-            str(item.get("dataset_id") or ""),
+    mismatches = 0
+    for item in rows:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(
+                item.get("selected_value_present"),
+                bool,
+            )
+        ):
+            continue
+        dataset_id = str(item.get("dataset_id") or "")
+        resolved = _resolve_accounting_delivery(
+            dataset_id,
             item.get("delivered_value"),
+            payload_root=payload_root,
         )
-    )
+        if resolved is _INVALID_DELIVERY_REFERENCE:
+            mismatches += 1
+            continue
+        if item["selected_value_present"] != (
+            _substantive_delivery_present(dataset_id, resolved)
+        ):
+            mismatches += 1
+    return mismatches
+
+
+def _duplicate_large_collection_count(rows: Any) -> int:
+    if not isinstance(rows, list):
+        return 0
+    count = 0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        delivered = item.get("delivered_value")
+        if (
+            isinstance(delivered, list)
+            and not _is_delivery_collection_reference(delivered)
+        ):
+            count += 1
+    return count
 
 
 def _expired_or_future_delivered_value_count(
@@ -5029,6 +6445,182 @@ def _expired_or_future_delivered_value_count(
             for item in value
         )
     return count
+
+
+def _earnings_policy_error_count(
+    section: Any,
+    *,
+    now: datetime,
+) -> int:
+    if not isinstance(section, dict):
+        return 1
+    policy = MNQ_EARNINGS_SELECTION_POLICY
+    declared = (
+        section.get("selection_policy")
+        if isinstance(section.get("selection_policy"), dict)
+        else {}
+    )
+    window = (
+        declared.get("window")
+        if isinstance(declared.get("window"), dict)
+        else {}
+    )
+    expected_window_start = (
+        now.date() - timedelta(days=policy.lookback_days)
+    ).isoformat()
+    expected_window_end = (
+        now.date() + timedelta(days=policy.lookahead_days)
+    ).isoformat()
+    errors = int(
+        declared.get("policy_id") != policy.policy_id
+        or declared.get("primary_symbols")
+        != list(policy.primary_symbols)
+        or declared.get("include_nasdaq_100_components")
+        is not policy.include_nasdaq_100_components
+        or declared.get("sort_fields") != list(policy.sort_fields)
+        or declared.get("max_events") != policy.max_events
+        or declared.get("minimum_fields")
+        != list(policy.minimum_fields)
+        or window.get("lookback_days") != policy.lookback_days
+        or window.get("lookahead_days") != policy.lookahead_days
+        or window.get("max_observation_age_hours")
+        != policy.max_observation_age_hours
+        or window.get("start_date") != expected_window_start
+        or window.get("end_date") != expected_window_end
+    )
+    events = section.get("events")
+    if not isinstance(events, list) or any(
+        not isinstance(item, dict) for item in events
+    ):
+        return errors + 1
+    total = section.get("total_available")
+    relevant = section.get("relevant_count")
+    delivered = section.get("delivered_count")
+    excluded = section.get("excluded_count")
+    counts_valid = bool(
+        all(
+            type(value) is int and value >= 0
+            for value in (
+                total,
+                relevant,
+                delivered,
+                excluded,
+            )
+        )
+        and total >= relevant >= delivered
+        and delivered == len(events)
+        and delivered <= policy.max_events
+        and excluded == total - delivered
+    )
+    if not counts_valid:
+        errors += 1
+    exclusions = (
+        section.get("exclusion_counts")
+        if isinstance(section.get("exclusion_counts"), dict)
+        else {}
+    )
+    if (
+        set(exclusions)
+        != {
+            "outside_window",
+            "outside_universe",
+            "bounded_limit",
+            "provider_prefiltered_or_invalid",
+        }
+        or any(type(value) is not int or value < 0 for value in exclusions.values())
+        or (
+            type(excluded) is int
+            and sum(exclusions.values()) != excluded
+        )
+    ):
+        errors += 1
+    identities: list[tuple[str, str]] = []
+    for item in events:
+        symbol = str(item.get("symbol") or "")
+        event_date = _date_value(item.get("event_date"))
+        if (
+            symbol not in policy.primary_symbols
+            or event_date is None
+            or not (
+                now.date() - timedelta(days=policy.lookback_days)
+                <= event_date
+                <= now.date() + timedelta(days=policy.lookahead_days)
+            )
+        ):
+            errors += 1
+        lifecycle = _earnings_freshness(item, now=now)
+        if (
+            lifecycle["deliverable"] is not True
+            or item.get("freshness") != "CURRENT"
+            or item.get("data_as_of") != lifecycle["data_as_of"]
+            or item.get("content_valid_until")
+            != lifecycle["content_valid_until"]
+            or item.get("refresh_due_at")
+            != lifecycle["refresh_due_at"]
+        ):
+            errors += 1
+        identities.append(
+            (
+                event_date.isoformat() if event_date else "",
+                symbol,
+            )
+        )
+    if identities != sorted(identities) or len(identities) != len(
+        set(identities)
+    ):
+        errors += 1
+    expected_coverage = _earnings_coverage(events)
+    if section.get("coverage") != expected_coverage:
+        errors += 1
+    bounded_count = (
+        int(exclusions.get("bounded_limit") or 0)
+        if exclusions
+        else 0
+    )
+    expected_status, expected_reason = _earnings_section_status(
+        expected_coverage,
+        bounded_count=bounded_count,
+    )
+    if (
+        section.get("status") != expected_status
+        or section.get("reason_code") != expected_reason
+    ):
+        errors += 1
+    return errors
+
+
+def _earnings_temporal_error_count(section: Any) -> int:
+    if not isinstance(section, dict):
+        return 1
+    errors = 0
+    for item in section.get("events") or []:
+        if not isinstance(item, dict):
+            errors += 1
+            continue
+        precision = str(item.get("temporal_precision") or "")
+        event_date = _date_value(item.get("event_date"))
+        timing = str(item.get("timing") or "")
+        if precision == "DATE_ONLY":
+            if (
+                event_date is None
+                or item.get("event_at") is not None
+                or timing != "UNKNOWN"
+            ):
+                errors += 1
+            continue
+        if precision == "EXACT":
+            event_at = _time_bearing_datetime(item.get("event_at"))
+            if (
+                event_at is None
+                or event_date is None
+                or _utc(event_at).date() != event_date
+                or timing
+                not in {"UNKNOWN", "BEFORE_MARKET", "AFTER_CLOSE"}
+            ):
+                errors += 1
+            continue
+        errors += 1
+    return errors
 
 
 def _semantic_error_count(macro: dict[str, Any]) -> int:
@@ -5064,6 +6656,21 @@ def _calendar_semantic_error_count(
             if not isinstance(event, dict):
                 continue
             identity = _calendar_event_identity(event)
+            if (
+                _event_lineage_rejection_reason(event, now=now)
+                is not None
+                and any(
+                    event.get(field) not in (None, "")
+                    for field in (
+                        "actual",
+                        "consensus",
+                        "previous",
+                        "previous_revised",
+                    )
+                )
+            ):
+                invalid_occurrences.add(identity)
+                continue
             metric_id = str(event.get("metric_id") or "").strip().lower()
             if metric_semantics_mismatch_reason(
                 metric_id,
@@ -5150,16 +6757,10 @@ def _calendar_semantic_error_count(
                     break
                 if (
                     output_field == "actual"
-                    and (
-                        event.get("actual_is_official") is None
-                        or not event.get("actual_source")
-                        or not any(
-                            _event_lineage_source_matches(
-                                item,
-                                event.get("actual_source"),
-                            )
-                            for item in matched_candidates
-                        )
+                    and not _event_actual_source_status_proven(
+                        event,
+                        metric_id=metric_id,
+                        lineage=matched_candidates,
                     )
                 ):
                     invalid_occurrences.add(identity)
@@ -5184,11 +6785,11 @@ def _event_lineage_source_matches(
     lineage: dict[str, Any],
     expected_source: Any,
 ) -> bool:
-    expected = str(expected_source or "").strip().casefold()
+    expected = _source_identity(expected_source)
     if not expected:
         return False
     observed = {
-        str(lineage.get(field) or "").strip().casefold()
+        _source_identity(lineage.get(field))
         for field in (
             "source",
             "publisher",
@@ -5200,6 +6801,74 @@ def _event_lineage_source_matches(
         if lineage.get(field) not in (None, "")
     }
     return expected in observed
+
+
+def _event_actual_source_status_proven(
+    event: dict[str, Any],
+    *,
+    metric_id: str,
+    lineage: Iterable[dict[str, Any]],
+) -> bool:
+    actual_source = (
+        event.get("actual_source")
+        or event.get("publisher")
+    )
+    if not actual_source:
+        return False
+    actual_lineage = [
+        item
+        for item in lineage
+        if str(item.get("field") or "").strip().lower() == "actual"
+    ]
+    if event.get("actual_is_official") is True:
+        spec = OFFICIAL_METRICS.get(metric_id)
+        return bool(
+            spec is not None
+            and _source_identity(actual_source)
+            == _source_identity(spec.provider_id)
+            and any(
+                _event_lineage_source_matches(item, actual_source)
+                and _source_identity(
+                    item.get("acquisition_provider")
+                    or spec.provider_id
+                )
+                == _source_identity(spec.provider_id)
+                for item in actual_lineage
+            )
+        )
+    if (
+        event.get("actual_is_official") is not False
+        or metric_id != "flash_services_pmi"
+    ):
+        return False
+    policy = dataset_policy_by_id("flash_services_pmi")
+    observed_source = _source_identity(actual_source)
+    allowed_fallbacks = {
+        _source_identity(provider_id)
+        for provider_id in policy.fallback_providers
+    }
+    return bool(
+        observed_source in allowed_fallbacks
+        and any(
+            _source_identity(item.get("acquisition_provider"))
+            == observed_source
+            and _source_identity(
+                item.get("source") or item.get("publisher")
+            )
+            == _source_identity(
+                OFFICIAL_METRICS[metric_id].provider_id
+            )
+            for item in actual_lineage
+        )
+    )
+
+
+def _source_identity(value: Any) -> str:
+    return re.sub(
+        r"[^a-z0-9]+",
+        "",
+        str(value or "").casefold(),
+    )
 
 
 def _post_release_probability_count(fomc: dict[str, Any], now: datetime) -> int:
@@ -5257,6 +6926,10 @@ def _provider_accounting_valid(
     if (
         expected != observed
         or len(rows) != len(expected)
+        or not _shared_acquisition_links_valid(
+            rows,
+            governed_dataset_ids=expected,
+        )
     ):
         return False
     for item in rows:
@@ -5266,6 +6939,7 @@ def _provider_accounting_valid(
             correlation_id=correlation_id,
             request_started_at=request_started_at,
             request_completed_at=request_completed_at,
+            payload_root={"analytics": analytics},
         ):
             return False
         expected_delivery = _delivery_evidence(
@@ -5295,6 +6969,7 @@ def _request_accounting_row_complete(
     correlation_id: Any,
     request_started_at: Any,
     request_completed_at: Any,
+    payload_root: dict[str, Any] | None = None,
 ) -> bool:
     required = {
         "dataset_id",
@@ -5340,15 +7015,23 @@ def _request_accounting_row_complete(
             item.get("delivery_missing_reason_codes"),
             list,
         )
-        or (
-            item.get("selected_value_present")
-            != _substantive_delivery_present(
-                str(item.get("dataset_id") or ""),
-                item.get("delivered_value"),
-            )
-        )
         or str(item.get("reason_code") or "").upper()
         in {"DB_VALID_REUSED", "SOURCE_SELECTED_FROM_SAME_REQUEST"}
+    ):
+        return False
+    dataset_id = str(item.get("dataset_id") or "")
+    resolved_delivery = _resolve_accounting_delivery(
+        dataset_id,
+        item.get("delivered_value"),
+        payload_root=payload_root,
+    )
+    if (
+        resolved_delivery is _INVALID_DELIVERY_REFERENCE
+        or item.get("selected_value_present")
+        != _substantive_delivery_present(
+            dataset_id,
+            resolved_delivery,
+        )
     ):
         return False
     observed_at = parse_datetime(item.get("observed_at"))
@@ -5413,7 +7096,24 @@ def _request_accounting_row_complete(
             return False
     if not item.get("database_freshness_evaluation"):
         return False
-    if item["database_lookup_performed"]:
+    capability_scoped = (
+        str(policy.provider_strategy).upper() == "FAN_IN"
+        and bool(item.get("capability_acquisitions"))
+    )
+    if capability_scoped:
+        if (
+            item["database_lookup_performed"] is not True
+            or item.get("database_record_found") is not None
+            or item.get("database_record_expired") is not None
+            or item.get("database_data_as_of") is not None
+            or item.get("database_content_valid_until") is not None
+            or item.get("database_refresh_due_at") is not None
+            or item.get("database_lifecycle_status") is not None
+            or item.get("database_freshness_evaluation")
+            != "CAPABILITY_SCOPED"
+        ):
+            return False
+    elif item["database_lookup_performed"]:
         if (
             type(item.get("database_record_found")) is not bool
             or type(item.get("database_record_expired")) is not bool
@@ -5429,6 +7129,7 @@ def _request_accounting_row_complete(
             item,
             policy=policy,
             observed_at=observed_at,
+            request_started_at=started_at,
         ):
             return False
     elif any(
@@ -5444,8 +7145,18 @@ def _request_accounting_row_complete(
     ) or item.get("database_freshness_evaluation") != "NOT_LOOKED_UP":
         return False
     return bool(
-        _provider_flow_valid(item, policy=policy)
-        and _acquisition_delivery_observation_link_complete(item)
+        _provider_flow_valid(
+            item,
+            policy=policy,
+            governed_dataset_ids={
+                registered.dataset_id
+                for registered in DATASET_POLICIES
+            },
+        )
+        and _acquisition_delivery_observation_link_complete(
+            item,
+            payload_root=payload_root,
+        )
         and item.get("payload_freshness")
         and not (
             item["selected_value_present"]

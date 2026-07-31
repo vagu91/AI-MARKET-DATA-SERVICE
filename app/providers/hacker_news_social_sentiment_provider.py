@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -47,30 +46,24 @@ class HackerNewsSocialSentimentProvider:
                 response.raise_for_status()
                 payload = response.json()
         except TimeoutError:
-            return await self._fetch_rss_fallback(started, "algolia_timeout")
+            return _status(
+                "provider_timeout",
+                "algolia_timeout;rss_fallback_disabled_uncertified_runtime_leaf",
+                started,
+                self.settings.hacker_news_algolia_url,
+            )
         except Exception as exc:
-            fallback = await self._fetch_rss_fallback(started, str(exc) or "algolia_failed")
-            if fallback.get("status") == "found":
-                return fallback
-            return _status("provider_failed", str(exc) or "hacker_news_social_sentiment_failed", started, self.settings.hacker_news_algolia_url)
+            return _status(
+                "provider_failed",
+                (
+                    f"{str(exc) or 'algolia_failed'};"
+                    "rss_fallback_disabled_uncertified_runtime_leaf"
+                ),
+                started,
+                self.settings.hacker_news_algolia_url,
+            )
         items = [_normalize_hit(hit) for hit in payload.get("hits") or [] if isinstance(hit, dict)]
         return build_social_sentiment(items, started=started, source_url=self.settings.hacker_news_algolia_url, ttl_minutes=self.settings.social_sentiment_ttl_minutes)
-
-    async def _fetch_rss_fallback(self, started: datetime, reason: str) -> dict[str, Any]:
-        try:
-            async with httpx.AsyncClient(timeout=max(float(self.settings.social_sentiment_timeout_seconds), 2.0)) as client:
-                response = await client.get(self.settings.hacker_news_rss_url)
-                response.raise_for_status()
-        except Exception:
-            return _status("provider_timeout", "hacker_news_social_sentiment_timeout", started, self.settings.hacker_news_algolia_url)
-        items = _parse_hn_rss(response.text)
-        result = build_social_sentiment(items, started=started, source_url=self.settings.hacker_news_rss_url, ttl_minutes=self.settings.social_sentiment_ttl_minutes)
-        result["provider"] = "hacker_news_rss_social_sentiment"
-        warnings = list(result.get("warnings") or [])
-        warnings.append(f"algolia_fallback:{reason}")
-        result["warnings"] = warnings
-        return result
-
 
 def build_social_sentiment(items: list[dict[str, Any]], *, started: datetime, source_url: str, ttl_minutes: int) -> dict[str, Any]:
     deduped: dict[str, dict[str, Any]] = {}
@@ -164,22 +157,6 @@ def _normalize_hit(hit: dict[str, Any]) -> dict[str, Any]:
         "comment_count": hit.get("num_comments") or 0,
         "created_at": hit.get("created_at"),
     }
-
-
-def _parse_hn_rss(text: str) -> list[dict[str, Any]]:
-    try:
-        root = ET.fromstring(text)
-    except ET.ParseError:
-        return []
-    items = []
-    for item in root.findall(".//item"):
-        title = normalize_text(item.findtext("title") or "")
-        link = item.findtext("link")
-        pub_date = item.findtext("pubDate")
-        if not title:
-            continue
-        items.append({"object_id": link or title, "title": title, "url": link, "author": None, "points": 0, "comment_count": 0, "created_at": pub_date})
-    return items
 
 
 def _score_item(item: dict[str, Any]) -> dict[str, Any]:

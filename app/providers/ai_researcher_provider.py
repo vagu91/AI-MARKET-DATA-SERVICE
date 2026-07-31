@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
-import asyncio
+import threading
 from datetime import UTC, datetime
 from datetime import timedelta
 from pathlib import Path
@@ -56,17 +59,12 @@ class AIResearcherProvider:
             return [], {"status": "skipped", "warning": "ai_researcher_disabled"}
         selected = events[: min(self.settings.ai_researcher_max_events, self.settings.ai_researcher_max_macro_events)]
         if self.settings.ai_researcher_mode == "codex_cli":
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(self._codex_cli, selected),
-                    timeout=max(float(self.settings.timeout_ai_research_seconds), 1.0),
-                )
-            except TimeoutError:
-                return [], {
-                    "status": "provider_failed",
-                    "failure_reason": "ai_research_timeout",
-                    "timeout_seconds": self.settings.timeout_ai_research_seconds,
-                }
+            # `_codex_cli` owns the Popen watchdog and does not return until its
+            # process group has been reaped (or reports fail-closed evidence).
+            # Cancelling `to_thread` with an outer wait_for would leave the
+            # worker thread and its child process running after this method
+            # returned a synthetic timeout.
+            return await asyncio.to_thread(self._codex_cli, selected)
         if self.settings.ai_researcher_mode == "openai_api":
             try:
                 return await asyncio.wait_for(
@@ -131,6 +129,9 @@ class AIResearcherProvider:
         )
         validate_isolated_command(command, final_prompt, cwd=workspace)
         started = perf_counter()
+        subprocess_timeout_seconds = _bounded_codex_subprocess_timeout(
+            self.settings
+        )
         cwd = workspace
         run_info: dict[str, Any] = {
             "command": _safe_command(command),
@@ -152,7 +153,11 @@ class AIResearcherProvider:
                 diagnostics.event_json(
                     event_id,
                     "command.json",
-                    {"command": _safe_command(command), "cwd": str(cwd), "timeout_seconds": self.settings.codex_research_timeout_seconds},
+                    {
+                        "command": _safe_command(command),
+                        "cwd": str(cwd),
+                        "timeout_seconds": subprocess_timeout_seconds,
+                    },
                 )
             diagnostics.write_json("run_summary.json", {**run_info, "started_at": now_iso(), "events": events})
         if (
@@ -171,32 +176,16 @@ class AIResearcherProvider:
             _record_diagnostic_failure(diagnostics, events, run_info)
             return [], run_info
         try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                input=final_prompt,
-                timeout=self.settings.codex_research_timeout_seconds,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=safe_subprocess_environment(),
+            completed, process_attestation, timeout_error = (
+                _run_attested_codex_subprocess(
+                    command,
+                    cwd=cwd,
+                    prompt=final_prompt,
+                    timeout_seconds=subprocess_timeout_seconds,
+                    output_path=output_path,
+                )
             )
-        except subprocess.TimeoutExpired as exc:
-            run_info.update(
-                {
-                    "status": "timeout",
-                    "duration_ms": int((perf_counter() - started) * 1000),
-                    "timeout_seconds": self.settings.codex_research_timeout_seconds,
-                    "stdout": _brief(exc.stdout),
-                    "stderr": _brief(exc.stderr),
-                    "error": redact_sensitive(str(exc)),
-                }
-            )
-            diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
-            _record_diagnostic_failure(diagnostics, events, run_info)
-            return [], {**run_info, "status": "provider_failed", "failure_reason": "codex_cli_timeout"}
+            run_info.update(process_attestation)
         except (FileNotFoundError, PermissionError, OSError) as exc:
             category, retryable = classify_codex_failure(
                 exit_code=None,
@@ -216,6 +205,21 @@ class AIResearcherProvider:
                     "retry_classification": (
                         "RETRYABLE" if retryable else "NON_RETRYABLE"
                     ),
+                }
+            )
+            diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
+            _record_diagnostic_failure(diagnostics, events, run_info)
+            return [], run_info
+        if timeout_error is not None:
+            run_info.update(
+                {
+                    "status": "provider_failed",
+                    "duration_ms": int((perf_counter() - started) * 1000),
+                    "timeout_seconds": subprocess_timeout_seconds,
+                    "stdout": _brief(completed.stdout),
+                    "stderr": _brief(completed.stderr),
+                    "error": redact_sensitive(timeout_error),
+                    "failure_reason": "codex_cli_timeout",
                 }
             )
             diagnostics_path.write_text(json.dumps(run_info, indent=2, default=str), encoding="utf-8")
@@ -818,6 +822,198 @@ def _extract_first_json_object(text: str) -> str | None:
             if depth == 0:
                 return text[start : index + 1]
     return None
+
+
+def _bounded_codex_subprocess_timeout(settings: Settings) -> float:
+    """Leave the async watchdog time to reap the owned subprocess cleanly."""
+
+    watchdog = max(float(settings.timeout_ai_research_seconds), 1.0)
+    configured = max(float(settings.codex_research_timeout_seconds), 1.0)
+    if watchdog <= 1.0:
+        return 1.0
+    cleanup_grace = min(5.0, max(1.0, watchdog * 0.1))
+    return max(1.0, min(configured, watchdog - cleanup_grace))
+
+
+def _run_attested_codex_subprocess(
+    command: list[str],
+    *,
+    cwd: Path,
+    prompt: str,
+    timeout_seconds: float,
+    output_path: Path,
+) -> tuple[
+    subprocess.CompletedProcess[str],
+    dict[str, Any],
+    str | None,
+]:
+    """Run one isolated Codex process and attest the exact observed boundary."""
+
+    popen_kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": safe_subprocess_environment(),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    process = subprocess.Popen(command, **popen_kwargs)
+    stdin_pipe = process.stdin
+    if stdin_pipe is None:  # pragma: no cover - Popen configuration is fixed.
+        process.kill()
+        raise OSError("Codex subprocess stdin pipe was not created")
+
+    def write_prompt() -> None:
+        try:
+            stdin_pipe.write(prompt)
+            stdin_pipe.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                stdin_pipe.close()
+            except OSError:
+                pass
+
+    # Windows' ``communicate(input=...)`` writes synchronously before it starts
+    # enforcing its timeout. A child that never reads stdin could therefore
+    # bypass the watchdog. Keep stdin ownership in a daemon writer and let the
+    # main thread enforce the process deadline immediately.
+    process.stdin = None
+    prompt_writer = threading.Thread(
+        target=write_prompt,
+        name=f"legacy-codex-stdin-{process.pid}",
+        daemon=True,
+    )
+    prompt_writer.start()
+    timeout_error: str | None = None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        timeout_error = str(exc)
+        stdout = _subprocess_text(exc.output)
+        stderr = _subprocess_text(exc.stderr)
+        _terminate_codex_process_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            stdout = _subprocess_text(cleanup_exc.output) or stdout
+            stderr = _subprocess_text(cleanup_exc.stderr) or stderr
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired as final_exc:
+                stdout = _subprocess_text(final_exc.output) or stdout
+                stderr = _subprocess_text(final_exc.stderr) or stderr
+    finally:
+        prompt_writer.join(timeout=1)
+
+    stdout = _subprocess_text(stdout)
+    stderr = _subprocess_text(stderr)
+    output_observed = output_path.is_file()
+    try:
+        output_bytes = output_path.read_bytes() if output_observed else b""
+    except OSError:
+        output_observed = False
+        output_bytes = b""
+    command_bytes = json.dumps(
+        _safe_command(command),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    completed = subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    return (
+        completed,
+        {
+            "process_observed": True,
+            "process_id": process.pid,
+            "exit_code": process.returncode,
+            "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+            "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+            "output_size_bytes": len(output_bytes),
+            "output_observed": output_observed,
+            "command_sha256": hashlib.sha256(command_bytes).hexdigest(),
+            "process_terminated": process.poll() is not None,
+        },
+        timeout_error,
+    )
+
+
+def _terminate_codex_process_group(process: subprocess.Popen[str]) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        if os.name == "nt":
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if process.poll() is None:
+                killer: subprocess.Popen[str] | None = None
+                try:
+                    killer = subprocess.Popen(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    killer.wait(timeout=10)
+                except (OSError, subprocess.TimeoutExpired):
+                    if killer is not None and killer.poll() is None:
+                        try:
+                            killer.kill()
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+                    if killer is not None:
+                        try:
+                            killer.wait(timeout=2)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+    finally:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return process.poll() is not None
+
+
+def _subprocess_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def _resolve_command(command: str) -> list[str] | None:

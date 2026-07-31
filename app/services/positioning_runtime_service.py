@@ -4,13 +4,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from app.core.config import Settings
-from app.providers.aaii_sentiment_provider import AaiiSentimentProvider
-from app.providers.cftc_cot_provider import CftcCotProvider
 from app.services.data_freshness_service import (
     CanonicalFreshnessResult,
     DataFreshnessService,
 )
 from app.services.market_fact_repository import MarketFactRepository
+from app.services.provider_adapter_factory import create_registered_adapter
 from app.services.provider_observation_repository import ProviderObservationRepository
 
 
@@ -32,8 +31,8 @@ class PositioningRuntimeService:
             clock=self.clock,
         )
         self.observations = ProviderObservationRepository(settings)
-        self.cot_provider = CftcCotProvider(settings)
-        self.aaii_provider = AaiiSentimentProvider(settings)
+        self.cot_provider = create_registered_adapter("CFTC", settings)
+        self.aaii_provider = create_registered_adapter("AAII", settings)
 
     async def cot(self, *, refresh: str = "false", run_id: str | None = None) -> dict[str, Any]:
         cached = self.facts.get_valid_facts_by_type(
@@ -103,18 +102,28 @@ class PositioningRuntimeService:
         )
 
     async def aaii(self, *, refresh: str = "false", run_id: str | None = None) -> dict[str, Any]:
-        cached = [] if refresh == "force" else self.facts.get_valid_facts_by_type("aaii_sentiment")
+        cached = self.facts.get_valid_facts_by_type("aaii_sentiment")
+        cache_rejection_reason = None
+        if cached and not _aaii_cache_provenance_valid(cached[0]):
+            cache_rejection_reason = "AAII_CACHE_PROVENANCE_NOT_CERTIFIED"
+            cached = []
         if cached:
             raw = cached[0].get("raw_payload")
             if isinstance(raw, dict):
-                raw["cache_status"] = "hit"
-                return raw
+                return {**raw, "cache_status": "hit"}
         if refresh == "false":
-            return _aaii_status("not_found", "aaii_not_in_db_refresh_false")
+            return {
+                **_aaii_status("not_found", "aaii_not_in_db_refresh_false"),
+                "cache_rejection_reason": cache_rejection_reason,
+            }
         result = await self.aaii_provider.fetch()
         self._record("aaii_sentiment", result, run_id=run_id)
         self._save("sentiment:aaii", "aaii_sentiment", result, source="AAII")
-        return {**result, "cache_status": "miss"}
+        return {
+            **result,
+            "cache_status": "miss",
+            "cache_rejection_reason": cache_rejection_reason,
+        }
 
     def _save(self, fact_key: str, fact_type: str, result: dict[str, Any], *, source: str) -> None:
         now_value = self.clock()
@@ -274,3 +283,21 @@ def _aaii_status(status: str, reason: str) -> dict[str, Any]:
         "warnings": [reason],
         "errors": [],
     }
+
+
+def _aaii_cache_provenance_valid(row: dict[str, Any]) -> bool:
+    """Only reuse AAII observations produced by the certified direct-HTTP leaf."""
+
+    raw = row.get("raw_payload")
+    if not isinstance(raw, dict):
+        return False
+    diagnostics = raw.get("diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    return bool(
+        str(row.get("source") or "").strip().upper() == "AAII"
+        and str(raw.get("source") or "").strip().upper() == "AAII"
+        and str(raw.get("source_url") or "").strip()
+        == "https://www.aaii.com/sentimentsurvey"
+        and diagnostics.get("browser_attempted") is not True
+        and diagnostics.get("browser_success") is not True
+    )

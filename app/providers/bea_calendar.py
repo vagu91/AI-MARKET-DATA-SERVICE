@@ -36,6 +36,8 @@ MONTHS = {
 
 class BeaReleaseScheduleProvider(BaseProvider):
     source = "BEA Release Schedule"
+    canonical_source = "BEA"
+    query_scope = "bea_release_occurrence"
     provider_type = ProviderType.SCRAPER
     reliability = 0.84
     cache_key = "provider:bea_release_schedule:events:v2"

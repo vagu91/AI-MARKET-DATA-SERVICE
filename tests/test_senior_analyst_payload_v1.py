@@ -5,11 +5,13 @@ import json
 import subprocess
 import sys
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import app.services.provider_capability_registry as provider_registry
 from app.main import app
 from app.api.routes import _consumer_projection
 from app.services.senior_analyst_projection_v1 import (
@@ -33,6 +35,7 @@ SNAPSHOT_98_FIXTURE_PAYLOAD_SHA256 = (
     "6b9db5776477882109401abbba301014d3a3c15d44a741acdbfab020e9307d2e"
 )
 FIXED_NOW = datetime(2026, 7, 29, 18, 17, 25, tzinfo=UTC)
+NEW_HOME_SALES_OCCURRENCE_ID = "xtb:146392:2026-07-24"
 REQUIRED_METADATA = {
     "status",
     "freshness",
@@ -188,7 +191,12 @@ def test_snapshot_98_reproduces_before_defects_and_passes_projection_gate() -> N
     assert result["live_acceptance_evaluated"] is False
     assert not _walk_invalid_states(payload["analytics"])
     assert payload["quality_gate"]["live_acceptance"] == "PENDING"
-    assert payload["readiness"]["status"] == "PARTIAL"
+    assert payload["readiness"]["status"] == "UNAVAILABLE"
+    assert (
+        payload["readiness"]["calculated_from_delivered_payload"]
+        is True
+    )
+    assert payload["readiness"]["available_section_count"] == 0
 
 
 def test_snapshot_98_projection_is_byte_deterministic_and_fixed_point() -> None:
@@ -343,7 +351,7 @@ def test_calendar_deduplicates_and_never_combines_occurrences_for_surprise() -> 
 def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
     source = _synthetic_sync()
     release = FIXED_NOW - timedelta(days=5)
-    occurrence_id = "xtb:new-home-sales:2026-07"
+    occurrence_id = NEW_HOME_SALES_OCCURRENCE_ID
     source["sections"]["event_calendar"] = {
         "recently_released_events": [
             {
@@ -359,10 +367,21 @@ def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
                 "consensus": 610.0,
                 "previous": 580.0,
                 "freshness": "CURRENT_RELEASE",
+                "content_valid_until": (
+                    FIXED_NOW + timedelta(days=1)
+                ).isoformat(),
+                "refresh_due_at": (
+                    FIXED_NOW + timedelta(hours=12)
+                ).isoformat(),
                 "source": "XTB Economic Calendar",
                 "field_lineage": {
                     "actual": {
                         "source": "FRED",
+                        "acquisition_provider": "FRED",
+                        "source_url": (
+                            "https://fred.stlouisfed.org/series/HSN1F"
+                        ),
+                        "source_domain": "fred.stlouisfed.org",
                         "occurrence_id": occurrence_id,
                         "metric_id": "new_home_sales",
                         "source_series_id": "HSN1F",
@@ -402,6 +421,7 @@ def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
     assert event["actual_source"] == "FRED"
     assert event["consensus"] is None
     assert event["previous"] is None
+    assert event["previous_revised"] is None
     assert event["surprise_absolute"] is None
     assert {
         item["field"]
@@ -436,6 +456,748 @@ def test_released_event_excludes_values_with_only_stale_field_lineage() -> None:
         payload,
         now=FIXED_NOW,
     )["checks"]["semantic_mapping_errors"] == 0
+
+
+def _new_home_sales_payload(
+    *,
+    actual_source: str = "FRED",
+    actual_is_official: bool = True,
+    lineage_source: str = "FRED",
+    source_series_id: str = "HSN1F",
+    frequency: str = "monthly",
+    transformation: str = "level",
+    include_occurrence: bool = True,
+    lineage_content_valid_until: str | None = None,
+    include_validation: bool = True,
+    include_freshness: bool = True,
+    include_content_valid_until: bool = True,
+    include_refresh_due_at: bool = True,
+    acquisition_provider: str = "FRED",
+    source_url: str = "https://fred.stlouisfed.org/series/HSN1F",
+    source_domain: str = "fred.stlouisfed.org",
+    include_acquisition_provider: bool = True,
+    include_source_url: bool = True,
+    include_source_domain: bool = True,
+) -> dict:
+    release = FIXED_NOW - timedelta(days=5)
+    occurrence_id = NEW_HOME_SALES_OCCURRENCE_ID
+    source = _synthetic_sync()
+    event = {
+                "occurrence_id": occurrence_id,
+                "metric_id": "new_home_sales",
+                "name": "New Home Sales",
+                "release_at": release.isoformat(),
+                "reference_period": "2026-06",
+                "release_status": "RELEASED",
+                "actual": 628.0,
+                "actual_is_official": actual_is_official,
+                "actual_source": actual_source,
+                "source": "XTB Economic Calendar",
+                "field_lineage": {
+                    "actual": {
+                        "field": "actual",
+                        "source": lineage_source,
+                        "occurrence_id": occurrence_id,
+                        "metric_id": "new_home_sales",
+                        "source_series_id": source_series_id,
+                        "transformation": transformation,
+                        "reference_period": "2026-06",
+                        "frequency": frequency,
+                        "value": 628.0,
+                    }
+                },
+    }
+    if include_freshness:
+        event["freshness"] = "CURRENT_RELEASE"
+        event["field_lineage"]["actual"]["freshness"] = (
+            "CURRENT_RELEASE"
+        )
+    if include_content_valid_until:
+        event["content_valid_until"] = (
+            FIXED_NOW + timedelta(days=1)
+        ).isoformat()
+    if include_refresh_due_at:
+        event["refresh_due_at"] = (
+            FIXED_NOW + timedelta(hours=12)
+        ).isoformat()
+    if include_validation:
+        event["field_lineage"]["actual"]["validation"] = {
+            "status": "VERIFIED"
+        }
+    if include_acquisition_provider:
+        event["field_lineage"]["actual"][
+            "acquisition_provider"
+        ] = acquisition_provider
+    if include_source_url:
+        event["field_lineage"]["actual"]["source_url"] = source_url
+    if include_source_domain:
+        event["field_lineage"]["actual"][
+            "source_domain"
+        ] = source_domain
+    if not include_occurrence:
+        event.pop("occurrence_id")
+    if lineage_content_valid_until is not None:
+        event["field_lineage"]["actual"][
+            "content_valid_until"
+        ] = lineage_content_valid_until
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [event]
+    }
+    return build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+
+def _source_bound_calendar_event(provider_id: str) -> dict:
+    cases = {
+        "FRED": {
+            "metric_id": "new_home_sales",
+            "name": "New Home Sales",
+            "reference_period": "2026-06",
+            "actual": 628.0,
+            "actual_source": "FRED",
+            "actual_is_official": True,
+            "lineage_source": "FRED",
+            "source_series_id": "HSN1F",
+            "transformation": "level",
+            "source_url": (
+                "https://fred.stlouisfed.org/series/HSN1F"
+            ),
+            "source_domain": "fred.stlouisfed.org",
+        },
+        "BEA": {
+            "metric_id": "headline_pce_yoy",
+            "name": "PCE A/A",
+            "reference_period": "2026-06",
+            "actual": 2.8,
+            "actual_source": "BEA",
+            "actual_is_official": True,
+            "lineage_source": "BEA",
+            "source_series_id": "BEA:PCE_PRICE_INDEX",
+            "transformation": "pct_change_yoy",
+            "source_url": (
+                "https://www.bea.gov/data/consumer-spending/main"
+            ),
+            "source_domain": "bea.gov",
+        },
+        "SPGLOBAL": {
+            "metric_id": "flash_services_pmi",
+            "name": "Flash Services PMI",
+            "reference_period": "2026-07",
+            "actual": 53.6,
+            "actual_source": "S&P Global",
+            "actual_is_official": True,
+            "lineage_source": "S&P Global",
+            "source_series_id": (
+                "SPGLOBAL:US:FLASH_SERVICES_PMI"
+            ),
+            "transformation": "level",
+            "source_url": (
+                "https://www.pmi.spglobal.com/"
+                "Public/Home/PressRelease"
+            ),
+            "source_domain": "pmi.spglobal.com",
+        },
+        "INVESTING_EVENT_1062": {
+            "metric_id": "flash_services_pmi",
+            "name": "Flash Services PMI",
+            "reference_period": "2026-07",
+            "actual": 53.6,
+            "actual_source": "INVESTING_EVENT_1062",
+            "actual_is_official": False,
+            "lineage_source": "S&P Global",
+            "source_series_id": (
+                "SPGLOBAL:US:FLASH_SERVICES_PMI"
+            ),
+            "transformation": "level",
+            "source_url": (
+                "https://endpoints.investing.com/"
+                "economic-calendar-service/api/calendar/events/1062"
+            ),
+            "canonical_url": (
+                "https://www.pmi.spglobal.com/"
+                "Public/Home/PressRelease"
+            ),
+            "source_domain": "endpoints.investing.com",
+        },
+    }
+    case = cases[provider_id]
+    occurrence_id = f"source-binding:{provider_id.lower()}"
+    return {
+        "occurrence_id": occurrence_id,
+        "metric_id": case["metric_id"],
+        "name": case["name"],
+        "release_at": (FIXED_NOW - timedelta(days=1)).isoformat(),
+        "reference_period": case["reference_period"],
+        "release_status": "RELEASED",
+        "actual": case["actual"],
+        "actual_source": case["actual_source"],
+        "actual_is_official": case["actual_is_official"],
+        "freshness": "CURRENT_RELEASE",
+        "content_valid_until": (
+            FIXED_NOW + timedelta(days=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            FIXED_NOW + timedelta(hours=12)
+        ).isoformat(),
+        "source": "Canonical Economic Calendar",
+        "field_lineage": {
+            "actual": {
+                "field": "actual",
+                "occurrence_id": occurrence_id,
+                "metric_id": case["metric_id"],
+                "reference_period": case["reference_period"],
+                "frequency": "monthly",
+                "source": case["lineage_source"],
+                "acquisition_provider": provider_id,
+                "source_series_id": case["source_series_id"],
+                "transformation": case["transformation"],
+                "source_url": case["source_url"],
+                **(
+                    {"canonical_url": case["canonical_url"]}
+                    if case.get("canonical_url")
+                    else {}
+                ),
+                "source_domain": case["source_domain"],
+                "freshness": "CURRENT_RELEASE",
+                "value": case["actual"],
+                "validation": {"status": "VERIFIED"},
+            }
+        },
+    }
+
+
+def _project_calendar_event(raw_event: dict) -> dict:
+    source = _synthetic_sync()
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [raw_event]
+    }
+    return build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "provider_id",
+    ("FRED", "BEA", "SPGLOBAL", "INVESTING_EVENT_1062"),
+)
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    (
+        ("missing_url", "FIELD_LINEAGE_SOURCE_URL_NOT_PROVEN"),
+        ("http_url", "FIELD_LINEAGE_SOURCE_URL_MISMATCH"),
+        ("foreign_host", "FIELD_LINEAGE_SOURCE_URL_MISMATCH"),
+        (
+            "foreign_domain",
+            "FIELD_LINEAGE_SOURCE_DOMAIN_MISMATCH",
+        ),
+    ),
+)
+def test_calendar_actual_source_binding_is_fail_closed_in_projection_and_validator(
+    provider_id: str,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    raw_event = _source_bound_calendar_event(provider_id)
+    baseline = _project_calendar_event(deepcopy(raw_event))
+    baseline_event = baseline["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert baseline_event["actual"] == raw_event["actual"]
+
+    raw_lineage = raw_event["field_lineage"]["actual"]
+    if mutation == "missing_url":
+        raw_lineage.pop("source_url")
+    elif mutation == "http_url":
+        raw_lineage["source_url"] = raw_lineage[
+            "source_url"
+        ].replace("https://", "http://", 1)
+    elif mutation == "foreign_host":
+        raw_lineage["source_url"] = "https://evil.example/release"
+    else:
+        raw_lineage["source_domain"] = "evil.example"
+
+    projected = _project_calendar_event(raw_event)
+    projected_event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert projected_event["actual"] is None
+    assert projected_event["reason_code"] == expected_reason
+
+    validator_event = baseline_event
+    validator_lineage = validator_event["lineage"][0]
+    if mutation == "missing_url":
+        validator_lineage.pop("source_url")
+    elif mutation == "http_url":
+        validator_lineage["source_url"] = validator_lineage[
+            "source_url"
+        ].replace("https://", "http://", 1)
+    elif mutation == "foreign_host":
+        validator_lineage["source_url"] = "https://evil.example/release"
+    else:
+        validator_lineage["source_domain"] = "evil.example"
+    result = validate_senior_analyst_payload_v1(
+        baseline,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 1
+
+
+@pytest.mark.parametrize(
+    "provider_id",
+    ("FRED", "BEA", "SPGLOBAL", "INVESTING_EVENT_1062"),
+)
+def test_calendar_actual_source_domain_is_derived_from_registered_url(
+    provider_id: str,
+) -> None:
+    raw_event = _source_bound_calendar_event(provider_id)
+    raw_event["field_lineage"]["actual"].pop("source_domain")
+
+    projected = _project_calendar_event(raw_event)
+    event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+
+    assert event["actual"] == raw_event["actual"]
+    result = validate_senior_analyst_payload_v1(
+        projected,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 0
+
+
+def test_investing_fallback_binds_originator_separately_from_acquisition() -> None:
+    raw_event = _source_bound_calendar_event("INVESTING_EVENT_1062")
+    baseline = _project_calendar_event(deepcopy(raw_event))
+    assert baseline["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]["actual"] == 53.6
+
+    raw_event["field_lineage"]["actual"]["source"] = "Investing.com"
+    projected = _project_calendar_event(raw_event)
+    event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert event["actual"] is None
+    assert event["reason_code"] == (
+        "FIELD_LINEAGE_SOURCE_PROVIDER_MISMATCH"
+    )
+
+    validator_event = baseline["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    validator_event["lineage"][0]["source"] = "Investing.com"
+    result = validate_senior_analyst_payload_v1(
+        baseline,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    (
+        (
+            "missing_originator_url",
+            "FIELD_LINEAGE_ORIGINATOR_URL_NOT_PROVEN",
+        ),
+        (
+            "foreign_originator_url",
+            "FIELD_LINEAGE_ORIGINATOR_URL_MISMATCH",
+        ),
+    ),
+)
+def test_investing_fallback_requires_registered_originator_url(
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    raw_event = _source_bound_calendar_event("INVESTING_EVENT_1062")
+    baseline = _project_calendar_event(deepcopy(raw_event))
+    baseline_event = baseline["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert baseline_event["actual"] == 53.6
+
+    raw_lineage = raw_event["field_lineage"]["actual"]
+    if mutation == "missing_originator_url":
+        raw_lineage.pop("canonical_url")
+    else:
+        raw_lineage["canonical_url"] = "https://evil.example/release"
+    projected = _project_calendar_event(raw_event)
+    projected_event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert projected_event["actual"] is None
+    assert projected_event["reason_code"] == expected_reason
+
+    validator_lineage = baseline_event["lineage"][0]
+    if mutation == "missing_originator_url":
+        validator_lineage.pop("canonical_url")
+    else:
+        validator_lineage["canonical_url"] = (
+            "https://evil.example/release"
+        )
+    result = validate_senior_analyst_payload_v1(
+        baseline,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 1
+
+
+def test_field_lineage_value_key_must_match_the_declared_field() -> None:
+    raw_event = _source_bound_calendar_event("FRED")
+    raw_lineage = raw_event["field_lineage"]["actual"]
+    raw_lineage["previous"] = raw_lineage.pop("value")
+    projected = _project_calendar_event(raw_event)
+    event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert event["actual"] is None
+    assert event["reason_code"] == "FIELD_LINEAGE_VALUE_NOT_PROVEN"
+
+    payload = _project_calendar_event(
+        _source_bound_calendar_event("FRED")
+    )
+    validator_lineage = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]["lineage"][0]
+    validator_lineage["previous"] = validator_lineage.pop("value")
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 1
+
+
+@pytest.mark.parametrize("target", ("event", "lineage"))
+@pytest.mark.parametrize(
+    "state_field",
+    ("status", "lifecycle_status", "freshness", "freshness_state"),
+)
+@pytest.mark.parametrize("state", ("STALE", "EXPIRED"))
+def test_nested_lifecycle_aliases_are_fail_closed_in_projection_and_validator(
+    target: str,
+    state_field: str,
+    state: str,
+) -> None:
+    raw_event = _source_bound_calendar_event("FRED")
+    raw_target = (
+        raw_event
+        if target == "event"
+        else raw_event["field_lineage"]["actual"]
+    )
+    raw_target["lifecycle"] = {state_field: state}
+    projected = _project_calendar_event(raw_event)
+    event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert event["actual"] is None
+    assert event["reason_code"] == "FIELD_LINEAGE_CONTENT_NOT_CURRENT"
+
+    payload = _project_calendar_event(
+        _source_bound_calendar_event("FRED")
+    )
+    validator_event = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    validator_target = (
+        validator_event
+        if target == "event"
+        else validator_event["lineage"][0]
+    )
+    validator_target["lifecycle"] = {state_field: state}
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 1
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "contradictory_name"),
+    (
+        ("FRED", "PCE A/A"),
+        ("BEA", "New Home Sales"),
+        ("SPGLOBAL", "New Home Sales"),
+        ("INVESTING_EVENT_1062", "PCE A/A"),
+    ),
+)
+def test_calendar_metric_family_mismatch_is_fail_closed_in_projection_and_validator(
+    provider_id: str,
+    contradictory_name: str,
+) -> None:
+    raw_event = _source_bound_calendar_event(provider_id)
+    baseline = _project_calendar_event(deepcopy(raw_event))
+    raw_event["name"] = contradictory_name
+    projected = _project_calendar_event(raw_event)
+    event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert event["actual"] is None
+    assert event["reason_code"] == "EVENT_METRIC_FAMILY_MISMATCH"
+    assert validate_senior_analyst_payload_v1(
+        projected,
+        now=FIXED_NOW,
+    )["checks"]["semantic_mapping_errors"] == 1
+
+    validator_event = baseline["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    validator_event["name"] = contradictory_name
+    result = validate_senior_analyst_payload_v1(
+        baseline,
+        now=FIXED_NOW,
+    )
+    assert result["checks"]["semantic_mapping_errors"] == 1
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "localized_name"),
+    (
+        ("FRED", "Vendita case nuove"),
+        ("SPGLOBAL", "Indice PMI dei servizi"),
+        ("INVESTING_EVENT_1062", "Indice PMI dei servizi"),
+    ),
+)
+def test_registered_localized_event_family_aliases_remain_valid(
+    provider_id: str,
+    localized_name: str,
+) -> None:
+    raw_event = _source_bound_calendar_event(provider_id)
+    raw_event["name"] = localized_name
+    payload = _project_calendar_event(raw_event)
+    event = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert event["actual"] == raw_event["actual"]
+    assert event["reason_code"] is None
+    assert validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )["checks"]["semantic_mapping_errors"] == 0
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_reason"),
+    [
+        (
+            {"source_series_id": "BOGUS_SERIES"},
+            "FIELD_LINEAGE_SOURCE_SERIES_MISMATCH",
+        ),
+        (
+            {
+                "actual_source": "CENSUS",
+                "lineage_source": "CENSUS",
+            },
+            "FIELD_LINEAGE_SOURCE_PROVIDER_MISMATCH",
+        ),
+        (
+            {"frequency": "daily"},
+            "FIELD_LINEAGE_FREQUENCY_MISMATCH",
+        ),
+        (
+            {"transformation": "pct_change_mom"},
+            "FIELD_LINEAGE_TRANSFORMATION_MISMATCH",
+        ),
+        (
+            {"actual_is_official": False},
+            "ACTUAL_OFFICIAL_STATUS_NOT_PROVEN",
+        ),
+        (
+            {"include_occurrence": False},
+            "EVENT_OCCURRENCE_NOT_PROVEN",
+        ),
+        (
+            {
+                "lineage_content_valid_until": (
+                    FIXED_NOW.isoformat()
+                )
+            },
+            "FIELD_LINEAGE_CONTENT_VALIDITY_EXPIRED",
+        ),
+        (
+            {"include_validation": False},
+            "FIELD_LINEAGE_VALIDATION_NOT_PROVEN",
+        ),
+        (
+            {"include_freshness": False},
+            "FIELD_LINEAGE_FRESHNESS_NOT_PROVEN",
+        ),
+        (
+            {"include_content_valid_until": False},
+            "FIELD_LINEAGE_CONTENT_VALIDITY_NOT_PROVEN",
+        ),
+        (
+            {"include_refresh_due_at": False},
+            "FIELD_LINEAGE_REFRESH_DUE_NOT_PROVEN",
+        ),
+        (
+            {"include_source_url": False},
+            "FIELD_LINEAGE_SOURCE_URL_NOT_PROVEN",
+        ),
+        (
+            {"source_url": "http://fred.stlouisfed.org/series/HSN1F"},
+            "FIELD_LINEAGE_SOURCE_URL_MISMATCH",
+        ),
+        (
+            {"source_url": "https://evil.example/series/HSN1F"},
+            "FIELD_LINEAGE_SOURCE_URL_MISMATCH",
+        ),
+        (
+            {"source_domain": "evil.example"},
+            "FIELD_LINEAGE_SOURCE_DOMAIN_MISMATCH",
+        ),
+    ],
+)
+def test_new_home_sales_projection_requires_exact_official_binding(
+    values: dict,
+    expected_reason: str,
+) -> None:
+    payload = _new_home_sales_payload(**values)
+    event = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+
+    assert event["actual"] is None
+    assert event["actual_is_official"] is None
+    assert event["actual_source"] is None
+    assert event["lineage"] == []
+    assert event["reason_code"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda event: event["lineage"][0].update(
+            {"source_series_id": "BOGUS_SERIES"}
+        ),
+        lambda event: (
+            event.update({"actual_source": "CENSUS"}),
+            event["lineage"][0].update({"source": "CENSUS"}),
+        ),
+        lambda event: event["lineage"][0].update(
+            {"frequency": "daily"}
+        ),
+        lambda event: event["lineage"][0].update(
+            {"transformation": "pct_change_mom"}
+        ),
+        lambda event: event.update(
+            {"actual_is_official": False}
+        ),
+        lambda event: event.pop("occurrence_id"),
+        lambda event: event["lineage"][0].update(
+            {"content_valid_until": FIXED_NOW.isoformat()}
+        ),
+        lambda event: event["lineage"][0].pop("validation"),
+        lambda event: event["lineage"][0].pop("freshness"),
+        lambda event: event["lineage"][0].pop(
+            "content_valid_until"
+        ),
+        lambda event: event["lineage"][0].pop("refresh_due_at"),
+        lambda event: event["lineage"][0].pop("source_url"),
+        lambda event: event["lineage"][0].update(
+            {"source_url": "http://fred.stlouisfed.org/series/HSN1F"}
+        ),
+        lambda event: event["lineage"][0].update(
+            {"source_url": "https://evil.example/series/HSN1F"}
+        ),
+        lambda event: event["lineage"][0].update(
+            {"source_domain": "evil.example"}
+        ),
+    ],
+)
+def test_validator_rejects_mutated_new_home_sales_official_binding(
+    mutate,
+) -> None:
+    payload = _new_home_sales_payload()
+    event = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    assert event["actual"] == 628.0
+    mutate(event)
+
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+
+    assert result["checks"]["semantic_mapping_errors"] == 1
+    assert result["status"] == "FAIL"
+
+
+def test_new_home_previous_with_wrong_frequency_is_fail_closed() -> None:
+    baseline = _new_home_sales_payload()
+    raw_event = deepcopy(
+        baseline["analytics"]["calendar"][
+            "latest_released_events"
+        ][0]
+    )
+    raw_event["previous"] = 600.0
+    raw_event["lineage"].append(
+        {
+            "field": "previous",
+            "occurrence_id": raw_event["occurrence_id"],
+            "metric_id": "new_home_sales",
+            "reference_period": "2026-05",
+            "frequency": "daily",
+            "transformation": "pct_change_yoy",
+            "source": "XTB Economic Calendar",
+            "value": 600.0,
+            "validation": {"status": "VERIFIED"},
+        }
+    )
+    source = _synthetic_sync()
+    source["sections"]["event_calendar"] = {
+        "recently_released_events": [raw_event]
+    }
+
+    projected = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+    event = projected["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+
+    assert event["actual"] == 628.0
+    assert event["previous"] is None
+    assert {
+        item["field"] for item in event["lineage"]
+    } == {"actual"}
+    assert event["reason_code"] == (
+        "FIELD_LINEAGE_FREQUENCY_MISMATCH"
+    )
+
+
+def test_validator_rejects_delivered_previous_with_wrong_frequency() -> None:
+    payload = _new_home_sales_payload()
+    event = payload["analytics"]["calendar"][
+        "latest_released_events"
+    ][0]
+    event["previous"] = 600.0
+    event["lineage"].append(
+        {
+            "field": "previous",
+            "occurrence_id": event["occurrence_id"],
+            "metric_id": "new_home_sales",
+            "reference_period": "2026-05",
+            "frequency": "daily",
+            "transformation": "pct_change_yoy",
+            "source": "XTB Economic Calendar",
+            "value": 600.0,
+            "validation": {"status": "VERIFIED"},
+        }
+    )
+
+    result = validate_senior_analyst_payload_v1(
+        payload,
+        now=FIXED_NOW,
+    )
+
+    assert result["checks"]["semantic_mapping_errors"] == 1
+    assert result["status"] == "FAIL"
 
 
 def test_live_pce_yoy_mom_mismatch_is_fail_closed() -> None:
@@ -717,6 +1479,23 @@ def test_validator_requires_pce_metric_and_field_specific_proof(
         now=now,
     )
     actual = 2.8 if metric_id.endswith("_yoy") else 0.2
+    for item in lineage:
+        item.setdefault("freshness", "CURRENT_RELEASE")
+        item.setdefault(
+            "content_valid_until",
+            (now + timedelta(days=1)).isoformat(),
+        )
+        item.setdefault(
+            "refresh_due_at",
+            (now + timedelta(hours=12)).isoformat(),
+        )
+        if item.get("field") == "actual":
+            item.setdefault("acquisition_provider", "BEA")
+            item.setdefault(
+                "source_url",
+                "https://www.bea.gov/data/consumer-spending/main",
+            )
+            item.setdefault("source_domain", "bea.gov")
     payload["analytics"]["calendar"]["latest_released_events"] = [
         {
             "occurrence_id": "pce-proof",
@@ -807,6 +1586,13 @@ def test_validator_requires_exact_previous_occurrence_period_and_basis(
         "source": "XTB Economic Calendar",
         "value": 2.7,
         "validation": {"status": "VERIFIED"},
+        "freshness": "CURRENT_RELEASE",
+        "content_valid_until": (
+            now + timedelta(days=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            now + timedelta(hours=12)
+        ).isoformat(),
         **lineage_updates,
     }
     payload["analytics"]["calendar"]["latest_released_events"] = [
@@ -1266,6 +2052,12 @@ def test_explicit_provider_occurrence_crosswalk_is_accepted() -> None:
                 "actual_source": "S&P Global",
                 "forecast": 51.3,
                 "freshness": "CURRENT_RELEASE",
+                "content_valid_until": (
+                    FIXED_NOW + timedelta(days=1)
+                ).isoformat(),
+                "refresh_due_at": (
+                    FIXED_NOW + timedelta(hours=12)
+                ).isoformat(),
                 "field_lineage": {
                     "actual": {
                         "occurrence_id": 552847,
@@ -1273,18 +2065,34 @@ def test_explicit_provider_occurrence_crosswalk_is_accepted() -> None:
                         "reference_period": "2026-07",
                         "frequency": "monthly",
                         "source": "S&P Global",
-                        "freshness": "CURRENT_RELEASE",
-                        "value": 53.6,
-                    },
+                        "acquisition_provider": "SPGLOBAL",
+                        "source_url": (
+                            "https://www.pmi.spglobal.com/"
+                            "Public/Home/PressRelease"
+                        ),
+                        "source_domain": "pmi.spglobal.com",
+                        "source_series_id": (
+                            "SPGLOBAL:US:FLASH_SERVICES_PMI"
+                        ),
+                        "transformation": "level",
+                            "freshness": "CURRENT_RELEASE",
+                            "value": 53.6,
+                            "validation": {
+                                "status": "VERIFIED"
+                            },
+                        },
                     "forecast": {
                         "occurrence_id": "canonical-occurrence-a",
                         "metric_id": "flash_services_pmi",
                         "reference_period": "2026-07",
                         "frequency": "monthly",
                         "source": "S&P Global",
-                        "freshness": "CURRENT_RELEASE",
-                        "value": 51.3,
-                    },
+                            "freshness": "CURRENT_RELEASE",
+                            "value": 51.3,
+                            "validation": {
+                                "status": "VERIFIED"
+                            },
+                        },
                 },
             }
         ]
@@ -1974,6 +2782,191 @@ def test_projection_excludes_positioning_with_only_metadata() -> None:
         and item["reason_code"]
         == "POSITIONING_VALUE_NOT_AVAILABLE"
         for item in payload["missing_data"]
+    )
+
+
+def test_projection_uses_dynamic_dataset_sla_and_not_retrieval_time(
+    monkeypatch,
+) -> None:
+    policies = tuple(
+        replace(policy, sla_seconds=5 * 24 * 60 * 60)
+        if policy.dataset_id == "positioning"
+        else policy
+        for policy in provider_registry.DATASET_SOURCE_POLICIES
+    )
+    monkeypatch.setattr(
+        provider_registry,
+        "DATASET_SOURCE_POLICIES",
+        policies,
+    )
+    source = _synthetic_sync()
+    source["sections"]["positioning"] = {
+        "status": "AVAILABLE",
+        "freshness": "CURRENT",
+        "source": "CFTC",
+        "data_as_of": (
+            FIXED_NOW - timedelta(days=6)
+        ).isoformat(),
+        "retrieved_at": FIXED_NOW.isoformat(),
+        "content_valid_until": (
+            FIXED_NOW + timedelta(days=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            FIXED_NOW + timedelta(hours=1)
+        ).isoformat(),
+        "cot": {
+            "nasdaq_100": {
+                "report_date": "2026-07-23",
+                "open_interest": 100,
+            }
+        },
+    }
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    assert (
+        payload["analytics"]["positioning"]["reason_code"]
+        == "DATASET_SLA_EXCEEDED"
+    )
+
+    source["sections"]["positioning"].pop("data_as_of")
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    assert (
+        payload["analytics"]["positioning"]["reason_code"]
+        == "DATA_AS_OF_NOT_AVAILABLE"
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamp_patch", "expected_reason"),
+    [
+        (
+            {
+                "refresh_due_at": (
+                    FIXED_NOW - timedelta(seconds=1)
+                ).isoformat()
+            },
+            "REFRESH_DUE",
+        ),
+        ({"data_as_of": "not-a-date"}, "DATA_AS_OF_INVALID"),
+        (
+            {"content_valid_until": "not-a-date"},
+            "CONTENT_VALID_UNTIL_INVALID",
+        ),
+        (
+            {"refresh_due_at": "not-a-date"},
+            "REFRESH_DUE_AT_INVALID",
+        ),
+    ],
+)
+def test_projection_rejects_due_or_invalid_explicit_timestamps(
+    timestamp_patch: dict[str, str],
+    expected_reason: str,
+) -> None:
+    source = _synthetic_sync()
+    positioning = {
+        "status": "AVAILABLE",
+        "freshness": "CURRENT",
+        "source": "CFTC",
+        "data_as_of": (
+            FIXED_NOW - timedelta(days=1)
+        ).isoformat(),
+        "content_valid_until": (
+            FIXED_NOW + timedelta(days=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            FIXED_NOW + timedelta(hours=1)
+        ).isoformat(),
+        "cot": {
+            "nasdaq_100": {
+                "report_date": "2026-07-28",
+                "open_interest": 100,
+            }
+        },
+    }
+    positioning.update(timestamp_patch)
+    source["sections"]["positioning"] = positioning
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    projected = payload["analytics"]["positioning"]
+    assert projected["status"] == "UNAVAILABLE"
+    assert projected["freshness"] == "UNAVAILABLE"
+    assert projected["reason_code"] == expected_reason
+    assert projected["cot"] == {}
+    assert any(
+        item["field"] == "positioning"
+        and item["reason_code"] == expected_reason
+        for item in payload["missing_data"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "expected_reason"),
+    [
+        (
+            {
+                "valid_until": (
+                    FIXED_NOW - timedelta(seconds=1)
+                ).isoformat(),
+            },
+            "CONTENT_VALIDITY_EXPIRED",
+        ),
+        (
+            {
+                "next_refresh_at": (
+                    FIXED_NOW - timedelta(seconds=1)
+                ).isoformat(),
+            },
+            "REFRESH_DUE",
+        ),
+    ],
+)
+def test_generic_deadline_aliases_cannot_hide_an_expired_record(
+    lifecycle: dict,
+    expected_reason: str,
+) -> None:
+    source = _synthetic_sync()
+    source["sections"]["positioning"] = {
+        "status": "AVAILABLE",
+        "freshness": "CURRENT",
+        "source": "CFTC",
+        "data_as_of": (
+            FIXED_NOW - timedelta(days=1)
+        ).isoformat(),
+        "content_valid_until": (
+            FIXED_NOW + timedelta(days=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            FIXED_NOW + timedelta(hours=1)
+        ).isoformat(),
+        "lifecycle": lifecycle,
+        "cot": {
+            "nasdaq_100": {
+                "report_date": "2026-07-28",
+                "open_interest": 100,
+            }
+        },
+    }
+
+    payload = build_senior_analyst_payload_v1(
+        source,
+        now=FIXED_NOW,
+    )
+
+    assert (
+        payload["analytics"]["positioning"]["reason_code"]
+        == expected_reason
     )
 
 

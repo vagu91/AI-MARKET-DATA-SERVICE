@@ -199,7 +199,18 @@ def test_worker_rejects_preexisting_disabled_job_before_backend(tmp_path: Path) 
 
 async def test_real_async_due_scan_wiring_enqueues_residual_ai_once(
     tmp_path: Path,
+    monkeypatch: Any,
 ) -> None:
+    monkeypatch.setattr(
+        "app.services.lifecycle_due_resolver."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,

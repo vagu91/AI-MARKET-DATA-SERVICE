@@ -42,10 +42,16 @@ class CboeRiskIndicesProvider:
                         url,
                         now=datetime.now(UTC),
                     )
-                    if normalized.get("status") == "quarantined":
-                        errors.append(f"{key}_future_timestamp_quarantined")
-                    else:
-                        results[key] = normalized
+                    if normalized.get("status") != "found":
+                        reason = str(
+                            (normalized.get("validation") or {}).get(
+                                "reason"
+                            )
+                            or "quote_rejected"
+                        )
+                        errors.append(f"{key}_{reason}")
+                        continue
+                    results[key] = normalized
                 except TimeoutError:
                     errors.append(f"{key}_timeout")
                 except Exception as exc:
@@ -68,6 +74,9 @@ class CboeRiskIndicesProvider:
                 except Exception as exc:
                     errors.append(f"{key}_history_failed:{exc or type(exc).__name__}")
         retrieved_at = datetime.now(UTC).replace(microsecond=0)
+        valid_until = _iso(
+            retrieved_at + timedelta(minutes=15)
+        )
         return {
             "status": "found" if results else "provider_failed",
             "provider": self.source,
@@ -75,7 +84,9 @@ class CboeRiskIndicesProvider:
             "source_url": "https://cdn.cboe.com/api/global/delayed_quotes/",
             "retrieved_at": _iso(retrieved_at),
             "data_as_of": _aggregate_data_as_of(results),
-            "valid_until": _iso(retrieved_at + timedelta(minutes=15)),
+            "valid_until": valid_until,
+            "content_valid_until": valid_until,
+            "refresh_due_at": valid_until,
             "indices": results,
             "history": histories,
             "diagnostics": {
@@ -99,14 +110,84 @@ def _normalize(
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     data = payload.get("data") or {}
-    timestamp = _timestamp(payload.get("timestamp"))
+    last_trade_time = (
+        data.get("last_trade_time")
+        or payload.get("last_trade_time")
+    )
+    provider_timestamp = (
+        payload.get("timestamp")
+        or payload.get("provider_timestamp")
+        or data.get("provider_timestamp")
+    )
+    record_date = (
+        data.get("record_date")
+        or payload.get("record_date")
+        or data.get("data_as_of")
+        or payload.get("data_as_of")
+    )
+    observation_candidates = (
+        last_trade_time,
+        provider_timestamp,
+        record_date,
+    )
+    timestamp = next(
+        (
+            parsed
+            for value in observation_candidates
+            if (parsed := _timestamp(value)) is not None
+        ),
+        None,
+    )
+    if timestamp is None:
+        observation_supplied = any(
+            value not in (None, "")
+            for value in observation_candidates
+        )
+        reason = (
+            "provider_observation_time_invalid"
+            if observation_supplied
+            else "provider_observation_time_not_proved"
+        )
+        return {
+            "status": "not_found",
+            "canonical_series_id": key.upper(),
+            "provider_symbol": (
+                data.get("symbol") or payload.get("symbol")
+            ),
+            "current_price": None,
+            "last_trade_time": last_trade_time,
+            "provider_timestamp": provider_timestamp,
+            "record_date": record_date,
+            "data_as_of": None,
+            "retrieved_at": _iso(now),
+            "valid_from": None,
+            "valid_until": None,
+            "freshness": "UNKNOWN",
+            "stale": None,
+            "source": "CBOE",
+            "source_url": url,
+            "reliability": 0.0,
+            "is_official_source": True,
+            "validation": {
+                "status": "rejected",
+                "reason": reason,
+            },
+            "warnings": [reason],
+        }
     if timestamp and timestamp > now + timedelta(minutes=5):
         return {
             "status": "quarantined",
             "canonical_series_id": key.upper(),
             "current_price": None,
-            "provider_timestamp": payload.get("timestamp"),
+            "last_trade_time": last_trade_time,
+            "provider_timestamp": provider_timestamp,
+            "record_date": record_date,
+            "data_as_of": None,
             "retrieved_at": _iso(now),
+            "valid_from": None,
+            "valid_until": None,
+            "freshness": "UNKNOWN",
+            "stale": None,
             "source": "CBOE",
             "source_url": url,
             "reliability": 0.0,
@@ -119,7 +200,9 @@ def _normalize(
         }
     stale = bool(timestamp and now - timestamp > timedelta(hours=2))
     unreliable_ohl = key == "skew" and any(float(data.get(field) or 0) == 0.0 for field in ("open", "high", "low"))
+    valid_until = _iso(now + timedelta(minutes=15))
     return {
+        "status": "found",
         "canonical_series_id": key.upper(),
         "provider_symbol": data.get("symbol") or payload.get("symbol"),
         "security_type": data.get("security_type"),
@@ -131,11 +214,15 @@ def _normalize(
         "previous_close": _float(data.get("prev_day_close")),
         "change": _float(data.get("price_change")),
         "percentage_change": _float(data.get("price_change_percent")),
-        "last_trade_time": data.get("last_trade_time"),
-        "provider_timestamp": payload.get("timestamp"),
+        "last_trade_time": last_trade_time,
+        "provider_timestamp": provider_timestamp,
+        "record_date": record_date,
+        "data_as_of": _iso(timestamp),
         "retrieved_at": _iso(now),
-        "valid_from": _iso(timestamp or now),
-        "valid_until": _iso(now + timedelta(minutes=15)),
+        "valid_from": _iso(timestamp),
+        "valid_until": valid_until,
+        "content_valid_until": valid_until,
+        "refresh_due_at": valid_until,
         "source": "CBOE",
         "source_url": url,
         "delayed": True,
@@ -176,7 +263,7 @@ def _aggregate_data_as_of(
             observed := _timestamp(
                 item.get("last_trade_time")
                 or item.get("provider_timestamp")
-                or item.get("valid_from")
+                or item.get("record_date")
                 or item.get("data_as_of")
             )
         )
@@ -216,9 +303,19 @@ def _timestamp(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace(" ", "T")).replace(tzinfo=UTC)
+        parsed = datetime.fromisoformat(
+            str(value)
+            .strip()
+            .replace("Z", "+00:00")
+            .replace(" ", "T")
+        )
     except ValueError:
         return None
+    return (
+        parsed.astimezone(UTC)
+        if parsed.tzinfo
+        else parsed.replace(tzinfo=UTC)
+    )
 
 
 def _iso(value: datetime) -> str:

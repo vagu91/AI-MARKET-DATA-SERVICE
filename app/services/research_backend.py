@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+import hashlib
 import json
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import httpx
 
 from app.core.config import Settings
+from app.services.codex_runtime_contract import (
+    agentic_research_output_schema,
+    validate_output_schema,
+    validate_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -23,6 +29,8 @@ class ResearchBackendResult:
     tool_events: tuple[dict[str, Any], ...] = ()
     duration_ms: int = 0
     model: str | None = None
+    transport_attestation: dict[str, Any] = field(default_factory=dict)
+    output_path: str | None = None
 
 
 class ResearchBackendContractError(ValueError):
@@ -100,6 +108,12 @@ class OpenAIResponsesResearchBackend:
         response = self.request_sender(request)
         duration_ms = int((time.perf_counter() - started) * 1000)
         payload = _responses_payload(response)
+        schema = agentic_research_output_schema(effective_budget)
+        try:
+            validate_output_schema(schema)
+            validate_payload(payload, schema)
+        except ValueError as exc:
+            raise ResearchBackendContractError(str(exc)) from exc
         usage = dict(response.get("usage") or {})
         invocation_id = str(response.get("id") or f"openai-{run.get('run_id')}")
         if event_observer:
@@ -252,6 +266,94 @@ def normalize_backend_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "error_taxonomy": "shared",
     }
     return normalized
+
+
+def project_backend_claim_fields(
+    payload: dict[str, Any],
+    *,
+    required_fields: tuple[str, ...],
+    acquisition_provider: str,
+) -> list[dict[str, Any]]:
+    """Project atomic claims into auditable capability-field observations.
+
+    The backend contract is claim-oriented.  Capability auditing is
+    field-oriented, so this projection preserves each claim as a separate
+    observation and creates lineage only from evidence attached to that same
+    claim.  It never fills a missing field from another claim or from model
+    prose.
+    """
+
+    observations: list[dict[str, Any]] = []
+    supported = {str(field).strip() for field in required_fields if field}
+    aliases = {"event_start_at": "event_at", "reference_period": "period"}
+    for claim in payload.get("claims") or ():
+        if not isinstance(claim, dict):
+            continue
+        semantics = str(claim.get("field_semantics") or "").strip()
+        metric_id = str(claim.get("metric_id") or "").strip()
+        projected_values: list[tuple[str, Any]] = []
+        for field_name in supported:
+            source_field = aliases.get(field_name, field_name)
+            if source_field in claim:
+                projected_values.append((field_name, claim[source_field]))
+            elif field_name in {semantics, metric_id} and "value" in claim:
+                projected_values.append((field_name, claim["value"]))
+        if not projected_values:
+            continue
+        evidence_rows = [
+            evidence
+            for evidence in claim.get("evidence") or ()
+            if isinstance(evidence, dict)
+            and str(
+                evidence.get("canonical_url")
+                or evidence.get("source_url")
+                or ""
+            ).strip()
+        ]
+        for field_name, value in projected_values:
+            lineage = [
+                {
+                    "_audit_claim_evidence": True,
+                    "field": field_name,
+                    "value_sha256": hashlib.sha256(
+                        json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "publisher": evidence.get("publisher"),
+                    "distributor": acquisition_provider,
+                    "acquisition_provider": acquisition_provider,
+                    "source_url": (
+                        evidence.get("canonical_url")
+                        or evidence.get("source_url")
+                    ),
+                    "evidence_text": evidence.get("evidence_text"),
+                    "metric_id": metric_id or None,
+                    "frequency": claim.get("frequency"),
+                    "unit": claim.get("unit"),
+                    "occurrence_id": claim.get("event_key"),
+                    "reference_period": claim.get("period"),
+                }
+                for evidence in evidence_rows
+            ]
+            observations.append(
+                {
+                    "metric_id": metric_id or None,
+                    "field_semantics": semantics or None,
+                    field_name: value,
+                    f"{field_name}_lineage": lineage,
+                    "occurrence_id": claim.get("event_key"),
+                    "reference_period": claim.get("period"),
+                    "frequency": claim.get("frequency"),
+                    "unit": claim.get("unit"),
+                    "reason_code": claim.get("reason_code"),
+                }
+            )
+    return observations
 
 
 def _responses_payload(response: dict[str, Any]) -> dict[str, Any]:

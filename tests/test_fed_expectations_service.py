@@ -76,6 +76,7 @@ def provider_payload(*, retrieved_at: str = "2026-07-11T12:00:00Z", total=(64.6,
         "official_fed_source": False,
         "retrieved_at": retrieved_at,
         "valid_until": "2026-07-11T13:00:00Z",
+        "refresh_due_at": "2026-07-11T13:00:00Z",
         "provider_calls": 1,
         "cache_used": False,
         "meetings": [
@@ -430,7 +431,10 @@ def test_repository_append_readback_provenance_distribution_and_history_survive(
 
 
 def test_force_persists_reads_back_and_materializes(tmp_path) -> None:
-    service = FedExpectationsService(settings(tmp_path))
+    service = FedExpectationsService(
+        settings(tmp_path),
+        clock=lambda: NOW,
+    )
     result = service.snapshot(
         refresh="force",
         provider_payload=provider_payload(),
@@ -449,10 +453,16 @@ def test_force_persists_reads_back_and_materializes(tmp_path) -> None:
 
 def test_restart_refresh_false_is_db_only_and_preserves_payload(tmp_path) -> None:
     cfg = settings(tmp_path)
-    forced = FedExpectationsService(cfg).snapshot(
+    forced = FedExpectationsService(
+        cfg,
+        clock=lambda: NOW,
+    ).snapshot(
         refresh="force", provider_payload=provider_payload(), macro_snapshot=macro_snapshot(), event_calendar=event_calendar()
     )
-    cached = FedExpectationsService(cfg).snapshot(
+    cached = FedExpectationsService(
+        cfg,
+        clock=lambda: NOW,
+    ).snapshot(
         refresh="false",
         provider_payload={"meetings": [{"must_not_be_used": True}]},
         macro_snapshot={},
@@ -468,11 +478,16 @@ def test_restart_refresh_false_is_db_only_and_preserves_payload(tmp_path) -> Non
 
 def test_auto_uses_fresh_cache_and_does_not_replace_it(tmp_path) -> None:
     cfg = settings(tmp_path)
-    payload = provider_payload(retrieved_at=datetime.now(UTC).isoformat())
-    payload["valid_until"] = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-    service = FedExpectationsService(cfg)
+    payload = provider_payload(retrieved_at=NOW.isoformat())
+    payload["valid_until"] = (
+        NOW + timedelta(hours=1)
+    ).isoformat()
+    service = FedExpectationsService(cfg, clock=lambda: NOW)
     service.snapshot(refresh="force", provider_payload=payload, macro_snapshot=macro_snapshot(), event_calendar=event_calendar())
-    cached = FedExpectationsService(cfg).snapshot(
+    cached = FedExpectationsService(
+        cfg,
+        clock=lambda: NOW,
+    ).snapshot(
         refresh="auto", provider_payload={"status": "failed"}, macro_snapshot={}, event_calendar={}
     )
 
@@ -544,6 +559,9 @@ def test_force_uses_provider_after_canonical_record_expires(
     refreshed_payload["valid_until"] = (
         observed_at[0] + timedelta(hours=1)
     ).isoformat()
+    refreshed_payload["refresh_due_at"] = (
+        observed_at[0] + timedelta(hours=1)
+    ).isoformat()
 
     refreshed = service.snapshot(
         refresh="force",
@@ -562,17 +580,248 @@ def test_force_uses_provider_after_canonical_record_expires(
     assert FedExpectationsRepository(cfg).count() == 2
 
 
-def test_failure_does_not_overwrite_last_known_good(tmp_path) -> None:
+def test_fomc_lookup_does_not_promote_retrieval_to_data_as_of(
+    tmp_path,
+) -> None:
+    row = canonicalize_investing_monitor(
+        provider_payload(),
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+        now=NOW,
+    )
+    row.pop("data_as_of")
+
+    class Repository:
+        def latest(self):
+            return row
+
+    service = FedExpectationsService(
+        settings(tmp_path),
+        repository=Repository(),
+        clock=lambda: NOW,
+    )
+
+    _latest, freshness = service.lookup_canonical()
+
+    assert freshness.found is True
+    assert freshness.usable is False
+    assert freshness.evaluation == "MISSING_DATA_AS_OF"
+    assert freshness.reason_code == (
+        "CANONICAL_RECORD_TIME_NOT_PROVED"
+    )
+
+
+def test_expired_last_known_good_is_not_delivered_after_provider_failure(
+    tmp_path,
+) -> None:
     cfg = settings(tmp_path)
-    service = FedExpectationsService(cfg)
+    observed_at = [NOW]
+    service = FedExpectationsService(
+        cfg,
+        clock=lambda: observed_at[0],
+    )
     service.snapshot(refresh="force", provider_payload=provider_payload(), macro_snapshot=macro_snapshot(), event_calendar=event_calendar())
+    observed_at[0] = NOW + timedelta(hours=2)
     fallback = service.snapshot(
         refresh="force", provider_payload={"status": "provider_failed", "meetings": []}, macro_snapshot={}, event_calendar={}
     )
 
-    assert fallback["source_summary"]["last_known_good_used"] is True
-    assert fallback["diagnostics"]["last_known_good_used"] is True
+    assert fallback["status"] == "not_found"
+    assert fallback["meetings"] == []
+    assert fallback["reason_code"] == "FED_EXPECTATIONS_NOT_AVAILABLE"
+    assert fallback["source_summary"]["last_known_good_used"] is False
+    assert fallback["diagnostics"]["last_known_good_used"] is False
     assert FedExpectationsRepository(cfg).count() == 1
+
+
+def test_refresh_false_does_not_deliver_expired_canonical_fomc(
+    tmp_path,
+) -> None:
+    cfg = settings(tmp_path)
+    FedExpectationsService(
+        cfg,
+        clock=lambda: NOW,
+    ).snapshot(
+        refresh="force",
+        provider_payload=provider_payload(),
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+    )
+    service = FedExpectationsService(
+        cfg,
+        clock=lambda: NOW + timedelta(hours=2),
+    )
+
+    result = service.snapshot(
+        refresh="false",
+        provider_payload={
+            "status": "must_not_be_used",
+            "meetings": [{"must_not_be_used": True}],
+        },
+        macro_snapshot={},
+        event_calendar={},
+    )
+
+    assert result["status"] == "not_found"
+    assert result["meetings"] == []
+    assert result["reason_code"] == (
+        "CANONICAL_CONTENT_VALID_UNTIL_EXPIRED"
+    )
+    assert result["diagnostics"]["cache_used"] is False
+    assert service.last_database_lookup["found"] is True
+    assert service.last_database_lookup["expired"] is True
+
+
+def test_old_monitor_observation_retrieved_now_is_fail_closed() -> None:
+    payload = provider_payload(
+        retrieved_at=NOW.isoformat(),
+    )
+    payload["valid_until"] = (
+        NOW + timedelta(hours=1)
+    ).isoformat()
+    payload["meetings"][0]["updated_at"] = (
+        NOW - timedelta(hours=3)
+    ).isoformat()
+
+    result = canonicalize_investing_monitor(
+        payload,
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+        now=NOW,
+    )
+
+    assert result["status"] == "not_found"
+    assert result["meetings"] == []
+    assert result["data_as_of"] == (
+        NOW - timedelta(hours=3)
+    ).isoformat().replace("+00:00", "Z")
+    assert result["reason_code"] == (
+        "FED_EXPECTATIONS_OBSERVATION_OUTSIDE_SLA"
+    )
+    assert result["quality"]["stale_snapshot_count"] == 1
+
+
+def test_top_level_timestamp_cannot_mask_old_meeting_observation() -> None:
+    payload = provider_payload(
+        retrieved_at=NOW.isoformat(),
+    )
+    payload["data_as_of"] = NOW.isoformat()
+    payload["valid_until"] = (
+        NOW + timedelta(hours=1)
+    ).isoformat()
+    payload["meetings"][0]["updated_at"] = (
+        NOW - timedelta(days=3)
+    ).isoformat()
+
+    result = canonicalize_investing_monitor(
+        payload,
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+        now=NOW,
+    )
+
+    assert result["status"] == "not_found"
+    assert result["meetings"] == []
+    assert result["data_as_of"] == (
+        NOW - timedelta(days=3)
+    ).isoformat().replace("+00:00", "Z")
+    assert result["stale"] is True
+    assert result["reason_code"] == (
+        "FED_EXPECTATIONS_OBSERVATION_OUTSIDE_SLA"
+    )
+
+
+def test_top_level_timestamp_cannot_replace_missing_meeting_observation() -> None:
+    payload = provider_payload(
+        retrieved_at=NOW.isoformat(),
+    )
+    payload["data_as_of"] = NOW.isoformat()
+    payload["valid_until"] = (
+        NOW + timedelta(hours=1)
+    ).isoformat()
+    payload["meetings"][0].pop("updated_at")
+
+    result = canonicalize_investing_monitor(
+        payload,
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+        now=NOW,
+    )
+
+    assert result["status"] == "not_found"
+    assert result["meetings"] == []
+    assert result["data_as_of"] is None
+    assert result["stale"] is True
+    assert (
+        "fed_expectations_meeting_observation_not_proved"
+        in result["warnings"]
+    )
+
+
+def test_missing_provider_lifecycle_is_not_invented() -> None:
+    payload = provider_payload()
+    payload.pop("retrieved_at")
+    payload.pop("valid_until")
+
+    result = canonicalize_investing_monitor(
+        payload,
+        macro_snapshot=macro_snapshot(),
+        event_calendar=event_calendar(),
+        now=NOW,
+    )
+
+    assert result["status"] == "not_found"
+    assert result["meetings"] == []
+    assert result["retrieved_at"] is None
+    assert result["valid_until"] is None
+    assert result["age_minutes"] is None
+    assert (
+        "fed_expectations_lifecycle_evidence_not_proved"
+        in result["warnings"]
+    )
+
+
+def test_proven_fomc_occurrence_mismatch_is_excluded() -> None:
+    payload = provider_payload()
+    payload["meetings"][0]["meeting_date"] = "2026-09-16"
+    payload["meetings"][0]["meeting_at"] = (
+        "2026-09-16T14:00:00-04:00"
+    )
+    official_calendar = {
+        "fed_communications": [
+            {
+                "event_id": "fed-september",
+                "name": "Federal Open Market Committee Meeting",
+                "category": "FOMC",
+                "date": "2026-09-17",
+                "time_utc": "2026-09-17T18:00:00Z",
+                "source": "Federal Reserve Calendar",
+            },
+            {
+                "event_id": "fed-december",
+                "name": "Federal Open Market Committee Meeting",
+                "category": "FOMC",
+                "date": "2026-12-16",
+                "time_utc": "2026-12-16T19:00:00Z",
+                "source": "Federal Reserve Calendar",
+            },
+        ]
+    }
+
+    result = canonicalize_investing_monitor(
+        payload,
+        macro_snapshot=macro_snapshot(),
+        event_calendar=official_calendar,
+        now=NOW,
+    )
+
+    assert result["status"] == "not_found"
+    assert result["meetings"] == []
+    assert result["source_summary"]["selected_source"] is None
+    assert "meeting_mapping_failed" in result["warnings"]
+    assert result["diagnostics"][
+        "invalid_distribution_count"
+    ] == 1
 
 
 def test_http_block_contains_required_sections_and_no_trading_logic(tmp_path) -> None:

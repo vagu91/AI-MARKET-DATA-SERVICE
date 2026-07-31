@@ -38,6 +38,10 @@ SOURCE_RANKS = {
 
 logger = logging.getLogger(__name__)
 
+_RISK_INTRADAY_MAX_AGE = timedelta(hours=2)
+_RISK_CLOSED_MAX_AGE = timedelta(hours=24)
+_RISK_WEEKEND_MAX_AGE = timedelta(hours=72)
+
 
 class RiskContextNormalizationService:
     def __init__(self, settings: Settings) -> None:
@@ -110,12 +114,50 @@ class RiskContextNormalizationService:
             logger.warning("risk_temporal_alignment_degraded", extra={"stale": False, "fallback_reason": "temporal_misalignment", "duration_ms": None})
         logger.info("risk_derived_metrics_calculated", extra={"metric": "risk_context", "value": quality.get("quality_score"), "freshness": alignment.get("market_session_status")})
         timestamps = [
-            value
-            for value in (vix.get("data_as_of"), vvix.get("data_as_of"), skew.get("data_as_of"), curve.get("data_as_of"), put_call.get("data_as_of"))
-            if value
+            parsed
+            for item in (vix, vvix, skew, curve, put_call)
+            if (
+                item.get("status") in {"found", "partial"}
+                and item.get("data_as_of")
+            )
+            if (
+                parsed := _metric_datetime(
+                    item.get("data_as_of")
+                )
+            )
         ]
         retrieved_at = _iso(now)
-        valid_until = _iso(now + timedelta(minutes=self.settings.risk_context_ttl_minutes))
+        ttl_deadline = now + timedelta(
+            minutes=self.settings.risk_context_ttl_minutes
+        )
+        content_deadlines = [
+            parsed
+            for item in (vix, vvix, skew, curve, put_call)
+            if item.get("status") in {"found", "partial"}
+            if (
+                parsed := _metric_datetime(
+                    item.get("content_valid_until")
+                    or item.get("valid_until")
+                )
+            )
+        ]
+        refresh_deadlines = [
+            parsed
+            for item in (vix, vvix, skew, curve, put_call)
+            if item.get("status") in {"found", "partial"}
+            if (
+                parsed := _metric_datetime(
+                    item.get("refresh_due_at")
+                    or item.get("next_refresh_at")
+                )
+            )
+        ]
+        valid_until = _iso(
+            min([ttl_deadline, *content_deadlines])
+        )
+        refresh_due_at = _iso(
+            min([ttl_deadline, *refresh_deadlines])
+        )
         diagnostics = build_diagnostics(
             risk_indices=risk_indices,
             vix_futures=vix_futures,
@@ -130,10 +172,15 @@ class RiskContextNormalizationService:
         )
         return {
             "status": "available" if composite == "COMPLETE" else "partial" if composite == "PARTIAL" else "degraded" if composite == "DEGRADED" else "not_found",
-            "data_as_of": max(timestamps, default=None),
+            "data_as_of": (
+                _iso(min(timestamps))
+                if timestamps
+                else None
+            ),
             "retrieved_at": retrieved_at,
             "valid_until": valid_until,
-            "next_refresh_at": valid_until,
+            "refresh_due_at": refresh_due_at,
+            "next_refresh_at": refresh_due_at,
             "age_minutes": 0.0,
             "stale": False,
             "market_session_status": market_session_status(now),
@@ -192,18 +239,51 @@ def normalize_risk_index(
 ) -> dict[str, Any]:
     value = _positive_float(raw.get("current_price"))
     previous = _positive_float(raw.get("previous_close"))
-    observed = _metric_datetime(raw.get("last_trade_time") or raw.get("provider_timestamp") or raw.get("retrieved_at"))
+    observation_value = (
+        raw.get("last_trade_time")
+        or raw.get("provider_timestamp")
+        or raw.get("record_date")
+        or raw.get("data_as_of")
+    )
+    observed = _metric_datetime(observation_value)
     warnings = list(raw.get("warnings") or [])
     errors: list[str] = []
+    declared_stale = bool(raw.get("stale")) or str(
+        raw.get("freshness") or ""
+    ).upper() in {"STALE", "EXPIRED"}
     if value is None:
         errors.append("invalid_value")
-    if observed and observed > now + timedelta(minutes=5):
+    if observed is None:
+        errors.append(
+            "invalid_timestamp"
+            if observation_value not in (None, "")
+            else "observation_time_not_proved"
+        )
+        value = None
+    elif observed > now + timedelta(minutes=5):
         errors.append("invalid_timestamp")
+        value = None
+    elif not _risk_observation_usable(observed, now=now):
+        errors.append("observation_outside_risk_sla")
+        value = None
+    elif not _risk_lifecycle_usable(raw, now=now):
+        errors.append("observation_lifecycle_expired")
+        value = None
+    elif declared_stale:
+        errors.append("provider_marked_observation_stale")
         value = None
     stats = historical_statistics(value, history, min_points=history_min)
     if stats["percentile_1y"] is None:
         warnings.append("history_insufficient")
-    stale = bool(raw.get("stale"))
+    stale = declared_stale or bool(
+        observed is not None
+        and (
+            not _risk_observation_usable(observed, now=now)
+            or not _risk_lifecycle_usable(raw, now=now)
+        )
+    )
+    if value is None:
+        previous = None
     regime = relative_regime(stats.get("percentile_1y"), high_label="ELEVATED_RELATIVE")
     change = raw.get("change")
     if change is None and value is not None and previous is not None:
@@ -223,13 +303,26 @@ def normalize_risk_index(
         "previous_close": previous,
         "change": change,
         "change_pct": change_pct,
-        "data_as_of": _iso(observed) if observed else raw.get("retrieved_at"),
+        "data_as_of": _iso(observed) if observed else None,
         "source": raw.get("source") or "CBOE",
         "source_url": raw.get("source_url"),
         "provider_type": "OFFICIAL_EXCHANGE_DELAYED_QUOTE",
         "retrieved_at": raw.get("retrieved_at"),
-        "valid_until": None,
-        "freshness": "STALE" if stale else "RECENT",
+        "valid_until": (
+            raw.get("content_valid_until")
+            or raw.get("valid_until")
+        ),
+        "refresh_due_at": (
+            raw.get("refresh_due_at")
+            or raw.get("next_refresh_at")
+        ),
+        "freshness": (
+            "STALE"
+            if stale
+            else "RECENT"
+            if value is not None
+            else "UNKNOWN"
+        ),
         "reliability": raw.get("reliability") or 0.0,
         "confidence": 0.9 if value is not None and not stale else 0.55 if value is not None else 0.0,
         "is_official_source": bool(raw.get("is_official_source", True)),
@@ -248,9 +341,39 @@ def normalize_vix(
 ) -> dict[str, Any]:
     raw = (macro_snapshot.get("financial_conditions") or {}).get("VIXCLS") or {}
     value = _positive_float(raw.get("value"))
+    observed = _metric_datetime(raw.get("data_as_of"))
+    errors: list[str] = []
+    declared_stale = str(
+        raw.get("freshness") or ""
+    ).upper() in {"STALE", "EXPIRED"}
+    if value is None:
+        errors.append("vix_not_available")
+    if observed is None:
+        errors.append("vix_observation_time_not_proved")
+        value = None
+    elif not _risk_observation_usable(observed, now=now):
+        errors.append("vix_observation_outside_risk_sla")
+        value = None
+    elif not _risk_lifecycle_usable(raw, now=now):
+        errors.append("vix_observation_lifecycle_expired")
+        value = None
+    elif declared_stale:
+        errors.append("vix_provider_marked_observation_stale")
+        value = None
     stats = historical_statistics(value, history, min_points=history_min)
-    previous = history[-2]["value"] if len(history) >= 2 else None
+    previous = (
+        history[-2]["value"]
+        if value is not None and len(history) >= 2
+        else None
+    )
     change = round(value - previous, 6) if value is not None and previous is not None else None
+    stale = declared_stale or bool(
+        observed is not None
+        and (
+            not _risk_observation_usable(observed, now=now)
+            or not _risk_lifecycle_usable(raw, now=now)
+        )
+    )
     return {
         "status": "found" if value is not None else "not_found",
         "symbol": "VIX",
@@ -258,22 +381,42 @@ def normalize_vix(
         "previous_close": previous,
         "change": change,
         "change_pct": round(change / previous * 100, 6) if change is not None and previous else None,
-        "data_as_of": raw.get("data_as_of"),
+        "data_as_of": _iso(observed) if observed else None,
         "source": raw.get("source") or "FRED",
         "source_url": raw.get("source_url") or "https://fred.stlouisfed.org/series/VIXCLS",
         "provider_type": raw.get("provider_type") or "OFFICIAL_MACRO_API",
         "retrieved_at": raw.get("retrieved_at"),
         "valid_until": raw.get("valid_until"),
-        "freshness": "LAST_SESSION" if value is not None and str(raw.get("freshness") or "UNKNOWN").upper() == "UNKNOWN" else raw.get("freshness"),
+        "content_valid_until": (
+            raw.get("content_valid_until")
+            or raw.get("valid_until")
+        ),
+        "refresh_due_at": (
+            raw.get("refresh_due_at")
+            or raw.get("next_refresh_at")
+        ),
+        "freshness": (
+            "STALE"
+            if stale
+            else "LAST_SESSION"
+            if (
+                value is not None
+                and str(raw.get("freshness") or "UNKNOWN").upper()
+                == "UNKNOWN"
+            )
+            else raw.get("freshness")
+            if value is not None
+            else "UNKNOWN"
+        ),
         "reliability": raw.get("reliability") or 0.95 if value is not None else 0.0,
         "confidence": raw.get("reliability") or 0.95 if value is not None else 0.0,
         "is_official_source": bool(raw.get("actual_is_official")) or str(raw.get("source") or "FRED").upper() == "FRED",
         "cache_status": raw.get("cache_status") or "DB",
-        "stale": str(raw.get("freshness") or "").upper() in {"STALE", "EXPIRED"},
+        "stale": stale,
         **stats,
         "relative_regime": relative_regime(stats.get("percentile_1y"), high_label="ELEVATED_RELATIVE"),
         "warnings": ["history_insufficient"] if stats["percentile_1y"] is None else [],
-        "errors": [] if value is not None else ["vix_not_available"],
+        "errors": list(dict.fromkeys(errors)),
     }
 
 
@@ -357,6 +500,70 @@ def normalize_vix_curve(
         row["last_price"] = price
         row["tenor"] = f"M{len(valid) + 1}"
         valid.append(row)
+    source_observed = _metric_datetime(
+        source_payload.get("data_as_of")
+    )
+    contract_observations = [
+        (
+            _metric_datetime(item.get("data_as_of"))
+            or source_observed
+        )
+        for item in valid
+    ]
+    observation_evidence = [
+        item
+        for item in (
+            source_observed,
+            *contract_observations,
+        )
+        if item is not None
+    ]
+    observed = (
+        min(observation_evidence)
+        if observation_evidence
+        else None
+    )
+    declared_stale = bool(source_payload.get("stale")) or str(
+        source_payload.get("freshness") or ""
+    ).upper() in {"STALE", "EXPIRED"}
+    observation_usable = bool(
+        valid
+        and len(contract_observations) == len(valid)
+        and all(contract_observations)
+        and observation_evidence
+        and all(
+            _risk_observation_usable(item, now=now)
+            for item in observation_evidence
+        )
+        and _risk_lifecycle_usable(source_payload, now=now)
+        and all(
+            (
+                _risk_lifecycle_usable(item, now=now)
+                if _risk_lifecycle_evidence_present(item)
+                else True
+            )
+            for item in valid
+        )
+        and not declared_stale
+    )
+    observation_error = None
+    if valid and observed is None:
+        observation_error = "curve_observation_time_not_proved"
+    elif valid and not observation_usable:
+        observation_error = (
+            "curve_provider_marked_observation_stale"
+            if declared_stale
+            else "curve_observation_lifecycle_expired"
+            if not _risk_lifecycle_usable(
+                source_payload,
+                now=now,
+            )
+            else "curve_observation_outside_risk_sla"
+        )
+    if valid and not observation_usable:
+        invalid += len(valid)
+        valid = []
+
     m1 = valid[0] if valid else None
     m2 = valid[1] if len(valid) > 1 else None
     m3 = valid[2] if len(valid) > 2 else None
@@ -365,7 +572,7 @@ def normalize_vix_curve(
     spread_pct = round((m2["last_price"] / m1["last_price"] - 1) * 100, 6) if m1 and m2 else None
     adjacent = [round((b["last_price"] / a["last_price"] - 1) * 100, 6) for a, b in zip(valid, valid[1:])]
     structure = classify_curve(adjacent, tolerance_pct=flat_tolerance_pct)
-    data_as_of = source_payload.get("data_as_of") or (m1.get("data_as_of") if m1 else None)
+    data_as_of = _iso(observed) if observed else None
     return {
         "status": "found" if len(valid) >= 2 else "partial" if valid else "not_found",
         "spot": vix_spot,
@@ -387,11 +594,25 @@ def normalize_vix_curve(
         "data_as_of": data_as_of,
         "retrieved_at": source_payload.get("retrieved_at"),
         "valid_until": source_payload.get("valid_until"),
+        "content_valid_until": (
+            source_payload.get("content_valid_until")
+            or source_payload.get("valid_until")
+        ),
+        "refresh_due_at": (
+            source_payload.get("refresh_due_at")
+            or source_payload.get("next_refresh_at")
+        ),
         "source": source_payload.get("source"),
         "source_url": source_payload.get("source_url"),
         "provider_type": "OFFICIAL_EXCHANGE_SETTLEMENT",
         "is_official_source": bool(source_payload.get("is_official_source")),
-        "freshness": "LAST_SESSION",
+        "freshness": (
+            "LAST_SESSION"
+            if valid
+            else "STALE"
+            if observed
+            else "UNKNOWN"
+        ),
         "reliability": 0.96 if valid else 0.0,
         "confidence": 0.94 if len(valid) >= 2 else 0.55 if valid else 0.0,
         "cache_status": "provider",
@@ -403,7 +624,7 @@ def normalize_vix_curve(
             "adjacent_spreads_pct": adjacent,
         },
         "warnings": ["partial_curve_missing_m2"] if len(valid) == 1 else [],
-        "errors": [],
+        "errors": [observation_error] if observation_error else [],
     }
 
 
@@ -427,7 +648,22 @@ def normalize_put_call(
     history_min: int,
     now: datetime,
 ) -> dict[str, Any]:
-    ratios = [dict(item) for item in cboe_ratios]
+    rejected_observations = 0
+    ratios = []
+    for source_item in cboe_ratios:
+        item = dict(source_item)
+        if (
+            str(item.get("freshness") or "").upper()
+            in {"STALE", "EXPIRED"}
+            or not _risk_lifecycle_usable(item, now=now)
+            or not _risk_observation_usable(
+                item.get("data_as_of"),
+                now=now,
+            )
+        ):
+            rejected_observations += 1
+            continue
+        ratios.append(item)
     qqq_rows = qqq_put_call_ratios(qqq_options, now=now)
     ratios.extend(qqq_rows)
     for item in ratios:
@@ -458,16 +694,37 @@ def normalize_put_call(
             item["warnings"] = list(dict.fromkeys([*(item.get("warnings") or []), "history_insufficient"]))
     ratios.sort(key=lambda item: item["ratio_id"])
     by_id = {item["ratio_id"]: item for item in ratios}
-    timestamps = [item.get("data_as_of") for item in ratios if item.get("data_as_of")]
+    timestamps = [
+        parsed
+        for item in ratios
+        if item.get("data_as_of")
+        if (
+            parsed := _metric_datetime(
+                item.get("data_as_of")
+            )
+        )
+    ]
     return {
         "status": "found" if ratios else "not_found",
         "ratios": ratios,
         "by_id": by_id,
         "ratio_count": len(ratios),
-        "data_as_of": max(timestamps, default=None),
+        "data_as_of": (
+            _iso(min(timestamps))
+            if timestamps
+            else None
+        ),
         "scope_coverage_pct": round(min(len({item["ratio_id"] for item in ratios}) / 7 * 100, 100.0), 4),
-        "warnings": [],
-        "errors": [],
+        "warnings": (
+            ["put_call_observation_rejected"]
+            if rejected_observations
+            else []
+        ),
+        "errors": (
+            ["put_call_observation_outside_risk_sla"]
+            if rejected_observations
+            else []
+        ),
     }
 
 
@@ -476,6 +733,13 @@ def qqq_put_call_ratios(payload: dict[str, Any], *, now: datetime) -> list[dict[
     observed = payload.get("observed_aggregates") or payload.get("aggregates") or {}
     values = global_values or observed
     if not values:
+        return []
+    if (
+        bool(payload.get("stale"))
+        or str(payload.get("freshness") or "").upper()
+        in {"STALE", "EXPIRED"}
+        or not _risk_lifecycle_usable(payload, now=now)
+    ):
         return []
     complete = global_values is not None and bool((global_values.get("scope") or {}).get("full_chain_complete", True))
     rows = []
@@ -496,6 +760,13 @@ def qqq_put_call_ratios(payload: dict[str, Any], *, now: datetime) -> list[dict[
         if put_number < 0 or call_number <= 0:
             continue
         retrieved = payload.get("retrieved_at") or _iso(now)
+        data_as_of = _qqq_data_as_of(
+            (payload.get("snapshot") or {}).get(
+                "source_timestamp"
+            )
+        )
+        if not _risk_observation_usable(data_as_of, now=now):
+            continue
         rows.append(
             {
                 "ratio_id": f"qqq_{basis}_put_call",
@@ -504,12 +775,20 @@ def qqq_put_call_ratios(payload: dict[str, Any], *, now: datetime) -> list[dict[
                 "put_value": put_number,
                 "call_value": call_number,
                 "ratio": round(put_number / call_number, 6),
-                "data_as_of": _qqq_data_as_of((payload.get("snapshot") or {}).get("source_timestamp"), retrieved),
+                "data_as_of": data_as_of,
                 "source": "Nasdaq QQQ Option Chain",
                 "source_url": payload.get("source_url"),
                 "provider_type": "EXCHANGE_DISTRIBUTED_PARTIAL_CHAIN" if not complete else "EXCHANGE_DISTRIBUTED_CHAIN",
                 "retrieved_at": retrieved,
                 "valid_until": payload.get("valid_until"),
+                "content_valid_until": (
+                    payload.get("content_valid_until")
+                    or payload.get("valid_until")
+                ),
+                "refresh_due_at": (
+                    payload.get("refresh_due_at")
+                    or payload.get("next_refresh_at")
+                ),
                 "freshness": "RECENT",
                 "reliability": 0.82 if complete else 0.58,
                 "confidence": 0.8 if complete else 0.5,
@@ -594,7 +873,7 @@ def calculate_temporal_alignment(
     for item in metrics:
         if item.get("status") == "not_found":
             continue
-        parsed = _metric_datetime(item.get("data_as_of") or item.get("retrieved_at"))
+        parsed = _metric_datetime(item.get("data_as_of"))
         if parsed:
             timestamps.append(parsed)
     if not timestamps:
@@ -854,7 +1133,92 @@ def _metric_datetime(value: Any) -> datetime | None:
     return datetime.combine(parsed_date, time(21, 0), tzinfo=UTC)
 
 
-def _qqq_data_as_of(value: Any, fallback: str) -> str:
+def _risk_observation_usable(
+    value: Any,
+    *,
+    now: datetime,
+) -> bool:
+    observed = (
+        value
+        if isinstance(value, datetime)
+        else _metric_datetime(value)
+    )
+    if observed is None:
+        return False
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    current = now if now.tzinfo else now.replace(tzinfo=UTC)
+    if observed > current + timedelta(minutes=5):
+        return False
+    session = market_session_status(current)
+    eastern_hour = (current.hour - 4) % 24
+    weekend_transition = bool(
+        current.weekday() >= 5
+        or (current.weekday() == 0 and eastern_hour < 9)
+    )
+    if weekend_transition:
+        max_age = _RISK_WEEKEND_MAX_AGE
+    elif session == "market_closed":
+        max_age = _RISK_CLOSED_MAX_AGE
+    else:
+        max_age = _RISK_INTRADAY_MAX_AGE
+    return current - observed <= max_age
+
+
+def _risk_lifecycle_usable(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    current = now if now.tzinfo else now.replace(tzinfo=UTC)
+    content_deadline = next(
+        (
+            payload.get(field)
+            for field in (
+                "content_valid_until",
+                "valid_until",
+            )
+            if payload.get(field) not in (None, "")
+        ),
+        None,
+    )
+    if content_deadline is None:
+        return False
+    refresh_deadline = next(
+        (
+            payload.get(field)
+            for field in (
+                "refresh_due_at",
+                "next_refresh_at",
+            )
+            if payload.get(field) not in (None, "")
+        ),
+        None,
+    )
+    if refresh_deadline is None:
+        return False
+    for raw in (content_deadline, refresh_deadline):
+        deadline = _metric_datetime(raw)
+        if deadline is None or current >= deadline:
+            return False
+    return True
+
+
+def _risk_lifecycle_evidence_present(
+    payload: dict[str, Any],
+) -> bool:
+    return any(
+        payload.get(field) not in (None, "")
+        for field in (
+            "content_valid_until",
+            "valid_until",
+            "refresh_due_at",
+            "next_refresh_at",
+        )
+    )
+
+
+def _qqq_data_as_of(value: Any) -> str | None:
     text = str(value or "").strip()
     match = re.search(r"AS OF\s+([A-Z]{3}\s+\d{1,2},\s+\d{4})", text, flags=re.I)
     if match:
@@ -863,7 +1227,7 @@ def _qqq_data_as_of(value: Any, fallback: str) -> str:
         except ValueError:
             pass
     parsed = _metric_datetime(value)
-    return parsed.date().isoformat() if parsed else fallback
+    return _iso(parsed) if parsed else None
 
 
 def _iso(value: datetime) -> str:

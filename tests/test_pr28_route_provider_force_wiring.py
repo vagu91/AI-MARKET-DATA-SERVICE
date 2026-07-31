@@ -533,15 +533,17 @@ def _seed_senior_canonical_facts(cfg: Settings) -> None:
                 "stocks": [
                     {
                         "symbol": "NVDA",
-                        "price": 150.0,
+                        "last_price": 150.0,
                         "change_pct": 1.2,
                     },
                     {
                         "symbol": "MSFT",
-                        "price": 510.0,
+                        "last_price": 510.0,
                         "change_pct": -0.2,
                     },
                 ],
+                "tracked_count": 2,
+                "resolved_count": 2,
                 "data_quality": {
                     "tracked_count": 2,
                     "resolved_count": 2,
@@ -1484,7 +1486,13 @@ def test_real_senior_route_emits_request_scoped_accounting_on_two_force_requests
         "provider_accounting_valid"
     ] is False
 
-    assert fred_calls == fred_after_first
+    second_fred_calls = fred_calls[len(fred_after_first) :]
+    assert "HSN1F" in fred_after_first
+    assert second_fred_calls == [
+        series_id
+        for series_id in fred_after_first
+        if series_id != "HSN1F"
+    ]
     assert sp_calls == sp_after_first
     assert (
         network_calls_after_second == network_calls_after_first

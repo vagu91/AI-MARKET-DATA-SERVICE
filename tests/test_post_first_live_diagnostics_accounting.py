@@ -8,10 +8,10 @@ import pytest
 from app.core.config import Settings
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.diagnostics_service import (
-    NEWS_ACCOUNTING_PROVIDER_NAMES,
     DiagnosticsService,
     _calendar_catch_up_succeeded,
     _calendar_primary_acquisition_succeeded,
+    _news_accounting_provider_names,
     _select_current_news_database_candidate,
 )
 from app.services.request_provider_accounting import (
@@ -83,7 +83,7 @@ def test_calendar_catch_up_rejects_incomplete_or_unproved_coverage(
 def _news_accounts() -> list[dict[str, object]]:
     accounts: list[dict[str, object]] = []
     for index, actual_name in enumerate(
-        NEWS_ACCOUNTING_PROVIDER_NAMES.values()
+        _news_accounting_provider_names().values()
     ):
         called = index == 1
         accounts.append(
@@ -112,7 +112,7 @@ def _news_cache_accounts() -> list[dict[str, object]]:
             ),
             "execution_origin": "CACHE_DECISION",
         }
-        for actual_name in NEWS_ACCOUNTING_PROVIDER_NAMES.values()
+        for actual_name in _news_accounting_provider_names().values()
     ]
 
 

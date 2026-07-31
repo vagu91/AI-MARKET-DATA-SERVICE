@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +13,7 @@ from app.models.common import Freshness, ProviderResult, ProviderType
 from app.providers.base import ProviderError, metadata
 from app.providers.sp_global_pmi import SERIES_ID, SpGlobalPmiProvider
 from app.services.deterministic_actual_resolver import DeterministicActualResolver
+from app.services.event_driven_lifecycle_service import DatumLifecycle
 from app.services.lifecycle_due_resolver import (
     MacroActualLifecycleProviderAdapter,
     _official_actual_datum,
@@ -20,6 +21,8 @@ from app.services.lifecycle_due_resolver import (
 from app.services.official_actual_semantics import normalize_reference_period
 from app.services.provider_force_actual_reconciliation_service import (
     ProviderForceActualReconciliationService,
+    _persisted_actual_field_lineage,
+    _same_acquisition_identity,
 )
 
 
@@ -51,12 +54,15 @@ class OfficialFred:
             ),
             data={
                 "HSN1F": {
+                    "series_id": "HSN1F",
                     "official_adapter": True,
                     "provider_adapter": "FRED_OFFICIAL_API",
                     "source": "FRED",
                     "source_url": "https://fred.stlouisfed.org/series/HSN1F",
                     "canonical_url": "https://fred.stlouisfed.org/series/HSN1F",
                     "source_domain": "fred.stlouisfed.org",
+                    "frequency": "monthly",
+                    "units": "thousands_annual_rate",
                     "seasonal_adjustment": "SAAR",
                     "observations": [
                         {"period": "2026-05", "value": "618"},
@@ -333,7 +339,39 @@ HOME_OCCURRENCE = "xtb:146392:2026-07-24"
 def _new_home_persisted_payload(
     *,
     audit_occurrence: str = HOME_OCCURRENCE,
+    complete_lineage: bool = True,
+    lineage_source_url: str = (
+        "https://fred.stlouisfed.org/series/HSN1F"
+    ),
 ) -> dict:
+    lineage = {
+        "occurrence_id": HOME_OCCURRENCE,
+        "source": "FRED",
+        "publisher": "FRED",
+        "source_url": lineage_source_url,
+        "source_field": "actual",
+        "source_series_id": "HSN1F",
+        "metric_id": "new_home_sales",
+        "frequency": "monthly",
+        "transformation": "level",
+        "reference_period": "2026-06",
+        "value": "628",
+        "freshness": "CURRENT_RELEASE",
+        "content_valid_until": (
+            NOW + timedelta(days=30)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW + timedelta(days=20)
+        ).isoformat(),
+        "validation_status": "accepted",
+    }
+    if not complete_lineage:
+        for field in (
+            "transformation",
+            "content_valid_until",
+            "refresh_due_at",
+        ):
+            lineage.pop(field)
     return {
         "occurrence_id": HOME_OCCURRENCE,
         "event_id": HOME_OCCURRENCE,
@@ -349,21 +387,14 @@ def _new_home_persisted_payload(
             "https://fred.stlouisfed.org/series/HSN1F"
         ),
         "actual_is_official": True,
-        "source_lineage": [
-            {
-                "source": "FRED",
-                "publisher": "FRED",
-                "source_url": (
-                    "https://fred.stlouisfed.org/series/HSN1F"
-                ),
-                "source_field": "actual",
-                "source_series_id": "HSN1F",
-                "metric_id": "new_home_sales",
-                "frequency": "monthly",
-                "reference_period": "2026-06",
-                "validation_status": "accepted",
-            }
-        ],
+        "freshness_state": "CURRENT_RELEASE",
+        "content_valid_until": (
+            NOW + timedelta(days=30)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW + timedelta(days=20)
+        ).isoformat(),
+        "source_lineage": [lineage],
         "actual_resolution": {
             "occurrence_id": audit_occurrence,
             "mapping_selected": "new_home_sales",
@@ -381,7 +412,11 @@ def _new_home_persisted_payload(
     }
 
 
-def _reuse_service(payload: dict) -> ProviderForceActualReconciliationService:
+def _reuse_service(
+    payload: dict,
+    *,
+    resolver=None,
+) -> ProviderForceActualReconciliationService:
     service = object.__new__(ProviderForceActualReconciliationService)
     service.clock = lambda: NOW
     service.lifecycle = SimpleNamespace(
@@ -399,15 +434,190 @@ def _reuse_service(payload: dict) -> ProviderForceActualReconciliationService:
         economic_event_records=lambda **_kwargs: []
     )
     service.lifecycle_resolver = SimpleNamespace(
-        resolve=lambda _item: pytest.fail(
-            "valid canonical actual must not call a provider"
+        resolve=(
+            resolver
+            if resolver is not None
+            else lambda _item: pytest.fail(
+                "valid canonical actual must not call a provider"
+            )
         )
     )
     service.accounting_collector = None
     service.force_refresh = True
     service.request_id = "request-new-home"
     service.correlation_id = "request-new-home"
+    service.coverage_write_count = 0
+    service.generation_id = "generation-new-home"
+    service.telemetry = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
     return service
+
+
+def _fresh_new_home_lifecycle() -> DatumLifecycle:
+    return DatumLifecycle(
+        entity_type="macro_actual",
+        entity_key=HOME_OCCURRENCE,
+        trigger_class="TRIGGER",
+        freshness_state="FRESH",
+        observed_at=NOW.isoformat(),
+        data_as_of="2026-06-01T00:00:00+00:00",
+        published_at=RELEASED.isoformat(),
+        event_at=RELEASED.isoformat(),
+        valid_from=RELEASED.isoformat(),
+        valid_until=(NOW + timedelta(days=30)).isoformat(),
+        next_refresh_at=(NOW + timedelta(days=20)).isoformat(),
+        next_retry_at=None,
+        superseded_by=None,
+        refresh_reason="official_macro_actual_resolved",
+        materiality_fingerprint="new-home-provider-test",
+        source_lineage=(),
+        acquisition_method="api_provider",
+        retry_class=None,
+        retry_policy={},
+        negative_cache_key=None,
+        negative_cache_expires_at=None,
+        session_state=None,
+        triggering_event=None,
+        fields_attempted=("actual",),
+        attempt_count=1,
+    )
+
+
+def test_official_lineage_must_match_candidate_acquisition_provider() -> None:
+    candidate = {
+        "source": "FRED",
+        "source_series_id": "HSN1F",
+        "transformation": "level",
+        "frequency": "monthly",
+        "reference_period": "2026-06",
+        "acquisition_provider": "FRED",
+        "distribution_source": "FRED",
+    }
+    lineage = {
+        "source": "FRED",
+        "source_series_id": "HSN1F",
+        "transformation": "level",
+        "frequency": "monthly",
+        "reference_period": "2026-06",
+        "acquisition_provider": "UNRELATED_PROVIDER",
+        "distributor": "UNRELATED_PROVIDER",
+    }
+
+    assert _same_acquisition_identity(
+        lineage,
+        evidence=candidate,
+        candidate=candidate,
+        field="actual",
+    ) is False
+
+
+def test_current_registered_pmi_fallback_lineage_is_reusable() -> None:
+    valid_until = (NOW + timedelta(days=30)).isoformat()
+    refresh_due_at = (NOW + timedelta(days=20)).isoformat()
+    payload = {
+        "occurrence_id": "xtb:pmi:2026-07",
+        "actual": 53.6,
+        "actual_source": "INVESTING_EVENT_1062",
+        "actual_is_official": False,
+        "reference_period": "2026-07",
+        "source_lineage": [
+            {
+                "occurrence_id": "xtb:pmi:2026-07",
+                "source_field": "actual",
+                "metric_id": "flash_services_pmi",
+                "value": 53.6,
+                "source": "S&P Global",
+                "publisher": "S&P Global",
+                "acquisition_provider": "INVESTING_EVENT_1062",
+                "distributor": "Investing.com",
+                "source_url": (
+                    "https://endpoints.investing.com/pd-instruments/"
+                    "v1/calendars/economic/events/1062/occurrences"
+                ),
+                "canonical_url": (
+                    "https://www.pmi.spglobal.com/Public/"
+                    "Home/PressRelease"
+                ),
+                "source_series_id": (
+                    "SPGLOBAL:US:FLASH_SERVICES_PMI"
+                ),
+                "transformation": "level",
+                "frequency": "monthly",
+                "reference_period": "2026-07",
+                "validation_status": "accepted",
+                "freshness": "CURRENT_RELEASE",
+                "content_valid_until": valid_until,
+                "refresh_due_at": refresh_due_at,
+            }
+        ],
+    }
+
+    lineage = _persisted_actual_field_lineage(
+        payload,
+        persisted_audit={
+            "occurrence_id": "xtb:pmi:2026-07",
+            "mapping_selected": "flash_services_pmi",
+        },
+        occurrence_id="xtb:pmi:2026-07",
+        mapping_selected="flash_services_pmi",
+        delivered_actual=53.6,
+        now=NOW,
+    )
+
+    assert lineage is not None
+    assert lineage["acquisition_provider"] == "INVESTING_EVENT_1062"
+
+
+def _fresh_new_home_resolver(calls: list[dict]):
+    def resolve(item: dict) -> dict:
+        calls.append(item)
+        candidate = {
+            "value": "628",
+            "actual": "628",
+            "event_metric_id": "new_home_sales",
+            "metric_id": "new_home_sales",
+            "source_series_id": "HSN1F",
+            "transformation": "level",
+            "reference_period": "2026-06",
+            "frequency": "monthly",
+            "unit": "thousands_annual_rate",
+            "source": "FRED",
+            "publisher": "FRED",
+            "acquisition_provider": "FRED",
+            "distribution_source": "FRED",
+            "source_url": (
+                "https://fred.stlouisfed.org/series/HSN1F"
+            ),
+            "validation_status": "accepted",
+        }
+        datum = _official_actual_datum(
+            item["payload"],
+            candidate=candidate,
+            canonical_key=HOME_OCCURRENCE,
+            release=RELEASED,
+        )
+        return {
+            "status": "RESOLVED",
+            "reason": "official_macro_actual_resolved",
+            "reason_code": "OFFICIAL_ACTUAL_RESOLVED",
+            "datum": datum,
+            "candidate": candidate,
+            "candidate_validation": "accepted",
+            "provider": "FRED",
+            "source_series": "HSN1F",
+            "provider_call_count": 1,
+            "provider_request_attempted": True,
+            "provider_attempts": [
+                {
+                    "provider": "FRED",
+                    "called": True,
+                    "attempts": 1,
+                    "result": "SUCCESS",
+                }
+            ],
+            "lifecycle": _fresh_new_home_lifecycle(),
+        }
+
+    return resolve
 
 
 def _new_home_contract() -> dict:
@@ -449,25 +659,123 @@ def test_valid_db_reuse_restores_exact_occurrence_actual_lineage() -> None:
     assert actual_lineage["source_series_id"] == "HSN1F"
     assert actual_lineage["metric_id"] == "new_home_sales"
     assert actual_lineage["frequency"] == "monthly"
+    assert actual_lineage["transformation"] == "level"
+    assert actual_lineage["freshness"] == "CURRENT_RELEASE"
+    assert actual_lineage["validation_status"] == "accepted"
+    assert actual_lineage["content_valid_until"] == (
+        NOW + timedelta(days=30)
+    ).isoformat()
+    assert actual_lineage["refresh_due_at"] == (
+        NOW + timedelta(days=20)
+    ).isoformat()
     projected = prepared["contract"]["macro_actuals"]["items"][0]
     assert projected["actual"] == 628
     assert projected["actual_source"] == "FRED"
     assert projected["field_lineage"]["actual"] == actual_lineage
 
 
-def test_db_reuse_rejects_actual_lineage_from_another_occurrence() -> None:
+def test_incomplete_db_actual_lineage_enters_provider_resolution() -> None:
+    calls: list[dict] = []
     prepared = _reuse_service(
-        _new_home_persisted_payload(
-            audit_occurrence="xtb:other:2026-07-24"
-        )
+        _new_home_persisted_payload(complete_lineage=False),
+        resolver=_fresh_new_home_resolver(calls),
     ).prepare(_new_home_contract())
 
     event = prepared["contract"]["event_calendar"][
         "critical_macro_events"
     ][0]
-    enrichment = event.get("enrichment") or {}
-    assert "actual" not in (
-        enrichment.get("field_lineage") or {}
+    assert len(calls) == 1
+    assert calls[0]["payload"]["actual"] is None
+    assert calls[0]["payload"]["actual_source"] is None
+    assert calls[0]["payload"]["actual_is_official"] is None
+    assert calls[0]["payload"]["source_lineage"] == []
+
+    actual_lineage = event["enrichment"]["field_lineage"]["actual"]
+    assert event["actual"] == "628"
+    assert actual_lineage["occurrence_id"] == HOME_OCCURRENCE
+    assert actual_lineage["value"] == "628"
+    assert actual_lineage["source"] == "FRED"
+    assert actual_lineage["transformation"] == "level"
+    assert actual_lineage["freshness"] == "CURRENT_RELEASE"
+    assert actual_lineage["freshness_state"] == "CURRENT_RELEASE"
+    assert actual_lineage["validation_status"] == "accepted"
+    assert actual_lineage["content_valid_until"] == (
+        NOW + timedelta(days=30)
+    ).isoformat()
+    assert actual_lineage["refresh_due_at"] == (
+        NOW + timedelta(days=20)
+    ).isoformat()
+
+    audit = prepared["audit"]["occurrences"][0]
+    assert audit["occurrence_id"] == HOME_OCCURRENCE
+    assert audit["resolver_invoked"] is True
+    assert prepared["audit"]["resolver_invocation_count"] == 1
+    assert audit["reclaim_reason"] == (
+        "CANONICAL_ACTUAL_FIELD_EVIDENCE_INCOMPLETE"
     )
-    assert "macro_actuals" not in prepared["contract"]
-    assert prepared["audit"]["occurrences"] == []
+
+
+def test_wrong_source_domain_db_actual_enters_provider_resolution() -> None:
+    calls: list[dict] = []
+    prepared = _reuse_service(
+        _new_home_persisted_payload(
+            lineage_source_url="https://evil.example/series/HSN1F",
+        ),
+        resolver=_fresh_new_home_resolver(calls),
+    ).prepare(_new_home_contract())
+
+    assert len(calls) == 1
+    assert calls[0]["payload"]["actual"] is None
+    event = prepared["contract"]["event_calendar"][
+        "critical_macro_events"
+    ][0]
+    assert event["actual"] == "628"
+    assert prepared["audit"]["occurrences"][0]["reclaim_reason"] == (
+        "CANONICAL_ACTUAL_FIELD_EVIDENCE_INCOMPLETE"
+    )
+
+
+def test_nested_expired_db_actual_enters_provider_resolution() -> None:
+    calls: list[dict] = []
+    payload = _new_home_persisted_payload()
+    payload["source_lineage"][0]["lifecycle"] = {
+        "status": "EXPIRED",
+        "content_valid_until": (
+            NOW - timedelta(minutes=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW - timedelta(minutes=1)
+        ).isoformat(),
+    }
+
+    prepared = _reuse_service(
+        payload,
+        resolver=_fresh_new_home_resolver(calls),
+    ).prepare(_new_home_contract())
+
+    assert len(calls) == 1
+    assert calls[0]["payload"]["actual"] is None
+    assert prepared["audit"]["occurrences"][0]["reclaim_reason"] == (
+        "CANONICAL_ACTUAL_FIELD_EVIDENCE_INCOMPLETE"
+    )
+
+
+def test_db_actual_audit_from_another_occurrence_is_not_reused() -> None:
+    calls: list[dict] = []
+    prepared = _reuse_service(
+        _new_home_persisted_payload(
+            audit_occurrence="xtb:other:2026-07-24"
+        ),
+        resolver=_fresh_new_home_resolver(calls),
+    ).prepare(_new_home_contract())
+
+    assert len(calls) == 1
+    event = prepared["contract"]["event_calendar"][
+        "critical_macro_events"
+    ][0]
+    actual_lineage = event["enrichment"]["field_lineage"]["actual"]
+    assert actual_lineage["occurrence_id"] == HOME_OCCURRENCE
+    assert prepared["audit"]["occurrences"][0][
+        "resolver_invoked"
+    ] is True
+    assert prepared["audit"]["resolver_invocation_count"] == 1

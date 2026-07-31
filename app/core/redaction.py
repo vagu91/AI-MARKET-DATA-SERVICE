@@ -26,16 +26,22 @@ SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?:bearer\s+)?([A-Za-z0-9_\-./+=]{8,})"
 )
 SENSITIVE_KEYS = {
+    "access_token",
     "api_key",
     "apikey",
     "authorization",
+    "client_secret",
     "cookie",
     "credentials",
+    "id_token",
     "key",
     "openai_api_key",
     "password",
+    "proxy_authorization",
+    "refresh_token",
     "registrationkey",
     "secret",
+    "set_cookie",
     "token",
     "userid",
 }
@@ -77,5 +83,12 @@ def _is_sensitive_key(value: Any) -> bool:
     return (
         normalized in SENSITIVE_KEYS
         or normalized.endswith(("_api_key", "_password", "_secret", "_token"))
-        or normalized.startswith(("authorization_", "cookie_"))
+        or normalized.startswith(
+            (
+                "authorization_",
+                "cookie_",
+                "proxy_authorization_",
+                "set_cookie_",
+            )
+        )
     )

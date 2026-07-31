@@ -30,6 +30,8 @@ MONTH_NAMES = {
 
 class FederalReserveCalendarProvider(BaseProvider):
     source = "Federal Reserve Calendar"
+    canonical_source = "FED"
+    query_scope = "fomc_occurrence"
     provider_type = ProviderType.SCRAPER
     reliability = 0.86
     cache_key = "provider:federal_reserve_calendar:events:v2"
