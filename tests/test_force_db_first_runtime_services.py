@@ -9,6 +9,7 @@ import app.services.risk_context_runtime_service as risk_runtime_module
 from app.core.config import Settings
 from app.models.common import Freshness, ProviderMetadata, ProviderType
 from app.models.macro import MacroLatestResponse
+from app.providers.cboe_risk_indices_provider import _aggregate_data_as_of
 from app.services.data_freshness_service import DataFreshnessService
 from app.services.diagnostics_service import (
     DiagnosticsService,
@@ -46,6 +47,21 @@ def _settings(tmp_path) -> Settings:
         ai_worker_enabled=False,
         enable_ai_researcher=False,
     )
+
+
+def test_cboe_aggregate_data_as_of_prefers_earliest_last_trade_time() -> None:
+    assert _aggregate_data_as_of(
+        {
+            "vvix": {
+                "last_trade_time": "2026-07-30T16:15:01Z",
+                "provider_timestamp": "2026-07-31T05:26:00Z",
+            },
+            "skew": {
+                "last_trade_time": "2026-07-30T17:00:21Z",
+                "provider_timestamp": "2026-07-31T05:26:00Z",
+            },
+        }
+    ) == "2026-07-30T16:15:01Z"
 
 
 def _cot_payload(
@@ -718,6 +734,84 @@ async def test_multi_source_propagates_observed_database_lifecycle(
 
     assert calls == 0
     assert result["database_lookup"]["lifecycle_status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_cboe_cache_uses_observation_time_not_recent_retrieval(
+    tmp_path,
+) -> None:
+    service = MultiSourceRuntimeService(_settings(tmp_path))
+    now = datetime.now(UTC).replace(microsecond=0)
+    stale_observation = now - timedelta(hours=3)
+    service._save_fact(
+        "cboe_risk_indices",
+        FACT_TYPES["cboe_risk_indices"],
+        {
+            "status": "found",
+            "source": "CBOE",
+            "retrieved_at": now.isoformat(),
+            "data_as_of": now.isoformat(),
+            "valid_until": (now + timedelta(hours=1)).isoformat(),
+            "next_refresh_at": (
+                now + timedelta(hours=1)
+            ).isoformat(),
+            "indices": {
+                "vvix": {
+                    "current_price": 90.0,
+                    "provider_timestamp": now.isoformat(),
+                    "last_trade_time": stale_observation.isoformat(),
+                },
+                "skew": {
+                    "current_price": 150.0,
+                    "provider_timestamp": now.isoformat(),
+                    "last_trade_time": stale_observation.isoformat(),
+                },
+            },
+            "warnings": [],
+            "errors": [],
+        },
+        source="CBOE",
+    )
+    calls = 0
+
+    async def current_fetch() -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "found",
+            "source": "CBOE",
+            "retrieved_at": now.isoformat(),
+            "valid_until": (now + timedelta(minutes=15)).isoformat(),
+            "indices": {
+                "vvix": {
+                    "current_price": 91.0,
+                    "provider_timestamp": now.isoformat(),
+                    "last_trade_time": now.isoformat(),
+                }
+            },
+            "warnings": [],
+            "errors": [],
+        }
+
+    result = await service._run_provider(
+        "cboe_risk_indices",
+        FACT_TYPES["cboe_risk_indices"],
+        current_fetch,
+        item_count=lambda payload: len(payload.get("indices") or {}),
+        enabled=True,
+        source="CBOE",
+        refresh="force",
+    )
+
+    assert calls == 1
+    assert result["attempted"] is True
+    assert result["provider_calls"] == 1
+    assert result["cache_used"] is False
+    assert result["database_lookup"]["expired"] is True
+    assert result["database_lookup"]["freshness"] == "SLA_EXPIRED"
+    assert result["database_lookup"]["data_as_of"] == (
+        stale_observation.isoformat()
+    )
 
 
 def test_expired_runtime_cache_hit_is_not_a_valid_database_selection() -> None:

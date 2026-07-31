@@ -67,13 +67,15 @@ class CboeRiskIndicesProvider:
                     errors.append(f"{key}_history_timeout")
                 except Exception as exc:
                     errors.append(f"{key}_history_failed:{exc or type(exc).__name__}")
+        retrieved_at = datetime.now(UTC).replace(microsecond=0)
         return {
             "status": "found" if results else "provider_failed",
             "provider": self.source,
             "source": self.source,
             "source_url": "https://cdn.cboe.com/api/global/delayed_quotes/",
-            "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            "valid_until": (datetime.now(UTC) + timedelta(minutes=15)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "retrieved_at": _iso(retrieved_at),
+            "data_as_of": _aggregate_data_as_of(results),
+            "valid_until": _iso(retrieved_at + timedelta(minutes=15)),
             "indices": results,
             "history": histories,
             "diagnostics": {
@@ -162,6 +164,25 @@ def parse_index_history_csv(text: str, *, key: str, limit: int = 260) -> list[di
         rows.append({"data_as_of": data_as_of, "value": value})
     rows.sort(key=lambda item: item["data_as_of"])
     return rows[-max(int(limit), 1):]
+
+
+def _aggregate_data_as_of(
+    results: dict[str, dict[str, Any]],
+) -> str | None:
+    observations = [
+        observed
+        for item in results.values()
+        if (
+            observed := _timestamp(
+                item.get("last_trade_time")
+                or item.get("provider_timestamp")
+                or item.get("valid_from")
+                or item.get("data_as_of")
+            )
+        )
+        is not None
+    ]
+    return _iso(min(observations)) if observations else None
 
 
 def _status(status: str, reason: str, started: datetime) -> dict[str, Any]:

@@ -26,6 +26,7 @@ from app.services.market_fact_repository import MarketFactRepository, now_iso
 from app.services.data_freshness_service import (
     CanonicalFreshnessResult,
     DataFreshnessService,
+    parse_datetime,
 )
 from app.services.positioning_runtime_service import PositioningRuntimeService
 from app.services.provider_observation_repository import ProviderObservationRepository
@@ -523,8 +524,12 @@ class MultiSourceRuntimeService:
             allow_stale=True,
         )
         cached_row = cached[0] if cached else None
-        database_lookup = self.freshness.evaluate_canonical(
+        freshness_row = _provider_cache_freshness_row(
+            name,
             cached_row,
+        )
+        database_lookup = self.freshness.evaluate_canonical(
+            freshness_row,
             max_age=PROVIDER_CACHE_MAX_AGE[name],
             data_reference_mode="point_in_time",
         )
@@ -679,7 +684,11 @@ class MultiSourceRuntimeService:
 
     def _save_fact(self, name: str, fact_type: str, result: dict[str, Any], *, source: str) -> int:
         retrieved_at = result.get("retrieved_at") or now_iso()
-        data_as_of = result.get("data_as_of") or retrieved_at
+        data_as_of = (
+            _provider_payload_data_as_of(name, result)
+            or result.get("data_as_of")
+            or retrieved_at
+        )
         valid_until = result.get("valid_until") or (
             datetime.now(UTC)
             + PROVIDER_CACHE_MAX_AGE[name]
@@ -1040,7 +1049,11 @@ def _canonical_runtime_result(
 ) -> dict[str, Any]:
     output = dict(result)
     retrieved_at = output.get("retrieved_at") or now_iso()
-    data_as_of = output.get("data_as_of") or retrieved_at
+    data_as_of = (
+        _provider_payload_data_as_of(name, output)
+        or output.get("data_as_of")
+        or retrieved_at
+    )
     valid_until = output.get("valid_until") or (
         datetime.now(UTC) + PROVIDER_CACHE_MAX_AGE[name]
     ).replace(microsecond=0).isoformat()
@@ -1060,6 +1073,54 @@ def _canonical_runtime_result(
         }
     )
     return output
+
+
+def _provider_cache_freshness_row(
+    name: str,
+    row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not row:
+        return row
+    raw = (
+        row.get("raw_payload")
+        if isinstance(row.get("raw_payload"), dict)
+        else row.get("raw_payload_json")
+        if isinstance(row.get("raw_payload_json"), dict)
+        else {}
+    )
+    data_as_of = _provider_payload_data_as_of(name, raw)
+    if data_as_of is None:
+        return row
+    return {
+        **row,
+        # This request-scoped cache lookup must be evaluated against the
+        # provider observation, not the time at which stale content happened
+        # to be retrieved or persisted.
+        "database_data_as_of": data_as_of,
+    }
+
+
+def _provider_payload_data_as_of(
+    name: str,
+    payload: dict[str, Any],
+) -> str | None:
+    if name != "cboe_risk_indices":
+        return None
+    observations: list[datetime] = []
+    for item in (payload.get("indices") or {}).values():
+        if not isinstance(item, dict):
+            continue
+        observed = parse_datetime(
+            item.get("last_trade_time")
+            or item.get("provider_timestamp")
+            or item.get("valid_from")
+            or item.get("data_as_of")
+        )
+        if observed is not None:
+            observations.append(observed)
+    if not observations:
+        return None
+    return min(observations).astimezone(UTC).isoformat()
 
 
 def _skipped_runtime_block(
