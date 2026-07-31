@@ -2551,6 +2551,36 @@ def test_unobserved_field_never_inherits_response_freshness(
     )
 
     assert field_checks[target.field_key("actual")]["freshness_valid"] is None
+    row = {
+        "field_results": {
+            "actual": {
+                "checks": field_checks[target.field_key("actual")],
+            }
+        }
+    }
+    capability = SimpleNamespace(
+        audit_only_fields=(),
+        **target.capability,
+    )
+    provider = SimpleNamespace(**target.registration)
+    assert (
+        _normalized_check_derivation_errors(
+            row,
+            capability=capability,
+            provider=provider,
+            normalized_response=payload,
+            checked_at="2026-07-31T12:00:00Z",
+        )
+        == ()
+    )
+    row["field_results"]["actual"]["checks"]["freshness_valid"] = True
+    assert _normalized_check_derivation_errors(
+        row,
+        capability=capability,
+        provider=provider,
+        normalized_response=payload,
+        checked_at="2026-07-31T12:00:00Z",
+    ) == ("actual:CHECKS_NOT_DERIVED_FROM_NORMALIZED_RESPONSE",)
 
 
 def test_exported_field_evidence_uses_only_field_bound_lifecycle(

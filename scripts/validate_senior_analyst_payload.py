@@ -2339,7 +2339,6 @@ def _normalized_check_derivation_errors(
             metric_id=capability.metric_id,
             field_name=field_name,
         )
-        owner_value = owner if owner is not None else normalized_response
         expected: dict[str, bool | None] = {
             "schema_valid": _field_schema_check(
                 check_target,
@@ -2353,12 +2352,16 @@ def _normalized_check_derivation_errors(
         if provider.provider_type != "AI":
             expected.update(
                 {
-                    "freshness_valid": _freshness_check(
-                        owner_value,
-                        target=check_target,
-                        field_name=field_name,
-                        field_value=value,
-                        now=observed_at,
+                    "freshness_valid": (
+                        None
+                        if not field_observed
+                        else _freshness_check(
+                            owner,
+                            target=check_target,
+                            field_name=field_name,
+                            field_value=value,
+                            now=observed_at,
+                        )
                     ),
                     "semantic_mapping_valid": _semantic_check(
                         check_target,
