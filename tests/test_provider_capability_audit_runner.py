@@ -179,6 +179,47 @@ def test_runner_system_net_http_smoke_is_real_and_performs_no_request() -> None:
     assert "PROVIDER_AUDIT_PS51_HTTPCLIENT_NO_NETWORK_PASS" in completed.stdout
 
 
+def test_runner_process_exit_code_is_observable_under_windows_powershell_51(
+    tmp_path: Path,
+) -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "$null = $Process.Handle" in source
+    stdout_path = tmp_path / "python-version.stdout.log"
+    stderr_path = tmp_path / "python-version.stderr.log"
+    python = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+    escaped_python = str(python).replace("'", "''")
+    escaped_stdout = str(stdout_path).replace("'", "''")
+    escaped_stderr = str(stderr_path).replace("'", "''")
+    escaped_repo = str(REPO_ROOT).replace("'", "''")
+    command = (
+        "$ErrorActionPreference='Stop';"
+        f"$python='{escaped_python}';"
+        f"$stdout='{escaped_stdout}';"
+        f"$stderr='{escaped_stderr}';"
+        "$process=Start-Process -FilePath $python -WindowStyle Hidden "
+        "-PassThru -WorkingDirectory "
+        f"'{escaped_repo}' "
+        "-ArgumentList '--version' "
+        "-RedirectStandardOutput $stdout "
+        "-RedirectStandardError $stderr;"
+        "$null=$process.Handle;"
+        "while(-not $process.HasExited){"
+        "Start-Sleep -Milliseconds 25;$process.Refresh()};"
+        "$process.WaitForExit();"
+        "$exitCode=$process.ExitCode;"
+        "if($null-eq $exitCode){throw 'process exit code unavailable'};"
+        "if([int]$exitCode-ne 0){throw \"unexpected exit code $exitCode\"};"
+        "'PROVIDER_AUDIT_PS51_EXIT_CODE_PASS'"
+    )
+
+    completed = _run_powershell(command)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PROVIDER_AUDIT_PS51_EXIT_CODE_PASS" in completed.stdout
+    assert "Python " in stdout_path.read_text(encoding="utf-8")
+    assert stderr_path.read_text(encoding="utf-8") == ""
+
+
 def test_python_entry_point_help_is_offline_and_documents_filters() -> None:
     completed = subprocess.run(
         [str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"), str(ENTRY_POINT), "--help"],

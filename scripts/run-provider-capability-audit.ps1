@@ -195,6 +195,9 @@ try {
         -ArgumentList $ArgumentLine `
         -RedirectStandardOutput $RunnerStdout `
         -RedirectStandardError $RunnerStderr
+    # Windows PowerShell 5.1 can lose ExitCode after a fast process exit unless
+    # the native process handle is acquired while the child is still alive.
+    $null = $Process.Handle
     $ParentProcessId = [int]$Process.Id
     Add-ObservedProcessIdentity -ProcessId $ParentProcessId
     $ParentStartTicks = [long]$ObservedProcessStartTicks[$ParentProcessId]
@@ -210,7 +213,11 @@ try {
         throw "Provider Capability Audit exceeded its bounded runtime."
     }
     $Process.WaitForExit()
-    if ($Process.ExitCode -ne 0) {
+    $ProcessExitCode = $Process.ExitCode
+    if ($null -eq $ProcessExitCode) {
+        throw "Provider Capability Audit process exit code was unavailable."
+    }
+    if ([int]$ProcessExitCode -ne 0) {
         $details = if (Test-Path -LiteralPath $RunnerStderr -PathType Leaf) {
             Get-Content -LiteralPath $RunnerStderr -Raw
         }
