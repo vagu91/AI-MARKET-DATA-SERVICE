@@ -51,6 +51,7 @@ from app.services.provider_capability_audit import (  # noqa: E402
     ProbeRequest,
     ProviderCapabilityAuditEngine,
     _configuration_reasons,
+    normalized_field_observation,
 )
 from app.services.provider_capability_registry import (  # noqa: E402
     DATASET_SOURCE_POLICIES,
@@ -616,10 +617,12 @@ class IsolatedRegistryProbeExecutor:
             capture.exchanges,
             registration,
         )
+        checked_at = datetime.now(UTC)
         checks, field_checks = _evidence_checks(
             request,
             normalized,
             lineage_exchanges,
+            observed_at=checked_at,
         )
         if status not in {"OK", "SUCCESS"}:
             checks = {name: None for name in checks}
@@ -635,6 +638,37 @@ class IsolatedRegistryProbeExecutor:
                 _capture_mode_configuration(request)
             ),
         }
+        if (
+            _expected_capture_mode(request) == "HTTPX"
+            and capture.attempts > 0
+            and not capture.exchanges
+        ):
+            # A provider may catch the transport exception internally and
+            # return its own failure envelope.  The patched HTTPX send method
+            # still proves that a real request was attempted, so retain that
+            # request-scoped evidence instead of misclassifying it as an
+            # uncaptured acquisition.
+            status = HealthStatus.DOWN.value
+            http_status = None
+            checks = {name: None for name in checks}
+            field_checks = {}
+            transport_reasons = [
+                *transport_reasons,
+                "PROVIDER_TRANSPORT_FAILED",
+            ]
+            capture_evidence = {
+                "capture_mode": "HTTPX",
+                "capture_mode_expected": "HTTPX",
+                "capture_verified": True,
+                "capture_attestation": {
+                    "attempted_send_count": capture.attempts,
+                    "response_exchange_count": 0,
+                    "failure_reason_code": "PROVIDER_TRANSPORT_FAILED",
+                },
+                "capture_mode_configuration": (
+                    _capture_mode_configuration(request)
+                ),
+            }
         capture_attestation = capture_evidence.get("capture_attestation")
         if (
             isinstance(capture_attestation, Mapping)
@@ -721,10 +755,12 @@ class IsolatedRegistryProbeExecutor:
                     request,
                     normalized,
                     lineage_exchanges,
+                    observed_at=checked_at,
                 ),
                 "source_url_verifications": source_url_verifications,
             },
             network_exchanges=lineage_exchanges,
+            checked_at=checked_at.isoformat(),
         )
 
     async def _verify_ai_source_urls(
@@ -1100,6 +1136,12 @@ def _safe_composite_runtime_adapter_probe(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    checked_at = datetime.now(UTC)
+    checks, field_checks = _evidence_checks(
+        request,
+        normalized,
+        observed_at=checked_at,
+    )
     attestation = {
         "database_snapshot_isolated": request.database_snapshot_path is not None,
         "sandbox_root": str(request.sandbox_root.resolve()),
@@ -1112,15 +1154,8 @@ def _safe_composite_runtime_adapter_probe(
         normalized_response=normalized,
         latency_ms=0.0,
         attempts=1,
-        checks={
-            "transport_valid": True,
-            "schema_valid": None,
-            "completeness_valid": None,
-            "freshness_valid": None,
-            "semantic_mapping_valid": None,
-            "occurrence_match_valid": None,
-            "lineage_valid": None,
-        },
+        checks=checks,
+        field_checks=field_checks,
         evidence={
             "real_adapter_invoked": True,
             "probe_dispatch_status": "REAL_ADAPTER",
@@ -1132,7 +1167,14 @@ def _safe_composite_runtime_adapter_probe(
             "capture_mode_expected": "LOCAL_SANDBOX",
             "capture_verified": True,
             "capture_attestation": attestation,
+            "fields": _extract_field_evidence(
+                request,
+                normalized,
+                (),
+                observed_at=checked_at,
+            ),
         },
+        checked_at=checked_at.isoformat(),
     )
 
 
@@ -1212,6 +1254,12 @@ async def _runtime_source_component_probe(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    checked_at = datetime.now(UTC)
+    checks, field_checks = _evidence_checks(
+        request,
+        normalized,
+        observed_at=checked_at,
+    )
     return ProbeOutcome(
         configured=True,
         transport_status="SUCCESS",
@@ -1219,15 +1267,8 @@ async def _runtime_source_component_probe(
         normalized_response=normalized,
         latency_ms=0.0,
         attempts=1,
-        checks={name: None for name in (
-            "transport_valid",
-            "schema_valid",
-            "completeness_valid",
-            "freshness_valid",
-            "semantic_mapping_valid",
-            "occurrence_match_valid",
-            "lineage_valid",
-        )},
+        checks=checks,
+        field_checks=field_checks,
         evidence={
             "real_adapter_invoked": True,
             "probe_dispatch_status": "REAL_ADAPTER",
@@ -1244,7 +1285,14 @@ async def _runtime_source_component_probe(
                 "runtime_component_method_observed": True,
                 "external_source_attempted": False,
             },
+            "fields": _extract_field_evidence(
+                request,
+                normalized,
+                (),
+                observed_at=checked_at,
+            ),
         },
+        checked_at=checked_at.isoformat(),
     )
 
 
@@ -1935,6 +1983,8 @@ def _evidence_checks(
     request: ProbeRequest,
     normalized: Any,
     exchanges: Sequence[CapturedHttpExchange] = (),
+    *,
+    observed_at: datetime | None = None,
 ) -> tuple[dict[str, bool | None], dict[str, dict[str, bool | None]]]:
     global_checks: dict[str, bool | None] = {
         "transport_valid": True,
@@ -2017,6 +2067,7 @@ def _evidence_checks(
                         target=target,
                         field_name=field_name,
                         field_value=value,
+                        now=observed_at,
                     )
                 ),
                 "semantic_mapping_valid": semantic,
@@ -3232,6 +3283,8 @@ def _extract_field_evidence(
     request: ProbeRequest,
     normalized: Any,
     exchanges: Sequence[CapturedHttpExchange],
+    *,
+    observed_at: datetime | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
     for target in request.targets:
@@ -3410,6 +3463,7 @@ def _extract_field_evidence(
                         target=target,
                         field_name=field_name,
                         field_value=value,
+                        now=observed_at,
                     )
                     is True
                 ),
@@ -4642,15 +4696,12 @@ def _find_target_field_observation(
     target: Any,
     field_name: str,
 ) -> tuple[bool, Any, Any]:
-    scopes, identities_observed = _target_scopes(value, str(target.metric_id))
-    for scope in scopes:
-        field_value, owner = _find_field(scope, field_name)
-        if owner is not None:
-            return True, field_value, owner
-    if identities_observed:
-        return False, None, None
-    field_value, owner = _find_field(value, field_name)
-    return owner is not None, field_value, owner
+    return normalized_field_observation(
+        value,
+        target_id=str(target.target_id),
+        metric_id=str(target.metric_id),
+        field_name=field_name,
+    )
 
 
 def _explicit_null_reason(owner: Any) -> str | None:

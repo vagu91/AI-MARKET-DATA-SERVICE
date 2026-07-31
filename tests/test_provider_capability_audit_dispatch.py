@@ -224,6 +224,99 @@ def test_census_dispatch_uses_explicit_registered_probe_query_ids() -> None:
     assert kwargs["period"]
 
 
+@pytest.mark.asyncio
+async def test_census_period_correlation_is_recomputed_by_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CensusProvider:
+        def __init__(self, settings: Settings) -> None:
+            self.settings = settings
+
+        async def fetch(
+            self,
+            *,
+            period: str | None = None,
+            datasets: tuple[str, ...] | None = None,
+        ) -> dict[str, Any]:
+            assert period
+            assert datasets == ("RESCONST",)
+
+            def handler(_: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, json={})
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                response = await client.get(
+                    "https://api.example.test/census-period"
+                )
+                return response.json()
+
+    census = provider_by_id("CENSUS")
+    capability = next(
+        item
+        for item in census.capabilities
+        if item.metric_id == "CENSUS:RESCONST:BUILDING_PERMITS"
+    )
+    registration = replace(
+        census,
+        adapter_path="tests.fake:CensusProvider",
+        capabilities=(capability,),
+    )
+    monkeypatch.setattr(
+        audit_script,
+        "_load_symbol",
+        lambda _: CensusProvider,
+    )
+    settings = _settings(tmp_path)
+    execution = await ProviderCapabilityAuditEngine(
+        (registration,),
+        audit_script.IsolatedRegistryProbeExecutor(settings),
+        settings=settings,
+    ).run(
+        run_id="20260731T120000Z",
+        sandbox_root=tmp_path / "sandbox",
+    )
+    row = execution.report["results"][0]
+    acquisition = execution.report["acquisitions"][0]
+    correlation = acquisition["request_correlations"][
+        row["capability_id"]
+    ]
+
+    assert correlation["reference_parameter"] == "period"
+    assert correlation["expected_reference_period"] == "2026-07"
+    errors = validate_capability_result_derivations(
+        row,
+        capability,
+        registration,
+        require_bound_evidence=True,
+        normalized_response={},
+        acquisition=acquisition,
+    )
+    assert not any(
+        error.endswith("REQUEST_CORRELATION_IDENTITY_MISMATCH")
+        for error in errors
+    )
+
+    tampered = json.loads(json.dumps(acquisition))
+    tampered["request_correlations"][row["capability_id"]][
+        "expected_reference_period"
+    ] = "2026-06"
+    forged_errors = validate_capability_result_derivations(
+        row,
+        capability,
+        registration,
+        require_bound_evidence=True,
+        normalized_response={},
+        acquisition=tampered,
+    )
+    assert any(
+        error.endswith("REQUEST_CORRELATION_IDENTITY_MISMATCH")
+        for error in forged_errors
+    )
+
+
 def test_runtime_adapter_probe_plan_covers_every_constructed_event_adapter(
     tmp_path: Path,
 ) -> None:
@@ -264,6 +357,61 @@ def test_runtime_adapter_probe_plan_covers_every_constructed_event_adapter(
         "app.providers.event_enrichment:PlaywrightDailyFXProvider",
         "app.providers.event_enrichment:PlaywrightForexFactoryProvider",
     } <= planned
+
+
+@pytest.mark.asyncio
+async def test_runtime_source_negative_control_emits_derived_field_checks(
+    tmp_path: Path,
+) -> None:
+    class ResearchSourceGateway:
+        def acquire_many(self, *_: Any) -> list[Any]:
+            return []
+
+    registration = provider_by_id("CODEX_CLI_RESEARCH_BACKEND")
+    settings = _settings(tmp_path, research_backend="codex_cli")
+    targets = select_capability_targets(
+        (registration,),
+        AuditFilters(),
+        settings=settings,
+    )
+    capability_requests = build_probe_requests(
+        targets,
+        run_id="20260731T120000Z",
+        sandbox_root=tmp_path / "sandbox",
+        database_snapshot_path=None,
+        settings=settings,
+    )
+    request = next(
+        item
+        for item in build_runtime_adapter_probe_requests(
+            targets,
+            capability_requests,
+            run_id="20260731T120000Z",
+            sandbox_root=tmp_path / "sandbox",
+            database_snapshot_path=None,
+            settings=settings,
+        )
+        if item.adapter_path
+        == "app.services.research_source_gateway:ResearchSourceGateway"
+    )
+
+    outcome = await audit_script._runtime_source_component_probe(  # noqa: SLF001
+        ResearchSourceGateway(),
+        request,
+        adapter_path=request.adapter_path,
+    )
+
+    assert outcome.transport_status == "SUCCESS"
+    assert outcome.checked_at
+    assert set(outcome.field_checks) == {
+        request.targets[0].field_key(field_name)
+        for field_name in request.targets[0].fields
+    }
+    assert all(
+        checks["schema_valid"] is False
+        and checks["completeness_valid"] is False
+        for checks in outcome.field_checks.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -468,6 +616,31 @@ class _NoTransportProvider:
         return _valid_atomic_payload()
 
 
+class _CaughtTransportFailureProvider:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def fetch(self) -> dict[str, Any]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError(
+                "offline controlled transport failure",
+                request=request,
+            )
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await client.get("https://api.example.test/unreachable")
+        except httpx.TransportError:
+            return {
+                "status": "provider_error",
+                "failure_type": "network_error",
+                "actual": None,
+            }
+        raise AssertionError("controlled transport failure was not observed")
+
+
 class _FailsBeforeSendProvider:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -560,6 +733,50 @@ async def test_external_adapter_cannot_certify_without_captured_acquisition(
         check is None
         for check in result["field_results"]["actual"]["checks"].values()
     )
+
+
+@pytest.mark.asyncio
+async def test_caught_httpx_failure_retains_real_attempt_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        audit_script,
+        "_load_symbol",
+        lambda _: _CaughtTransportFailureProvider,
+    )
+    settings = _settings(tmp_path)
+
+    execution = await ProviderCapabilityAuditEngine(
+        (_registration(),),
+        audit_script.IsolatedRegistryProbeExecutor(settings),
+        settings=settings,
+    ).run(sandbox_root=tmp_path / "sandbox")
+
+    acquisition = execution.report["acquisitions"][0]
+    result = execution.report["results"][0]
+    assert acquisition["transport_status"] == "DOWN"
+    assert acquisition["attempts"] == 1
+    assert acquisition["network_exchange_count"] == 0
+    assert acquisition["capture_mode"] == "HTTPX"
+    assert acquisition["capture_verified"] is True
+    assert acquisition["capture_attestation"] == {
+        "attempted_send_count": 1,
+        "failure_reason_code": "PROVIDER_TRANSPORT_FAILED",
+        "response_exchange_count": 0,
+    }
+    assert _capture_attestation_valid(
+        acquisition,
+        provider=SimpleNamespace(
+            provider_id="DIRECT",
+            provider_type="OFFICIAL_API",
+            capture_mode="HTTPX",
+            configuration_setting=None,
+        ),
+    )
+    assert result["health_status"] == "DOWN"
+    assert result["eligible_as_primary"] is False
+    assert result["eligible_as_fallback"] is False
 
 
 def test_subprocess_capture_requires_an_observed_process_result() -> None:
@@ -2653,6 +2870,39 @@ async def test_shared_batch_cannot_certify_metric_missing_from_observed_response
     )
 
 
+def test_field_observation_is_bound_to_exact_target_id() -> None:
+    target = SimpleNamespace(
+        target_id="DIRECT|macro|headline_pce_yoy",
+        metric_id="headline_pce_yoy",
+    )
+    normalized = {
+        "observations": [
+            {
+                "target_id": target.target_id,
+                "metric_id": target.metric_id,
+                "actual": 2.6,
+            },
+            {
+                "target_id": "OTHER|macro|headline_pce_yoy",
+                "metric_id": target.metric_id,
+                "actual": 99.0,
+            },
+        ]
+    }
+
+    observed, value, owner = (
+        audit_script._find_target_field_observation(  # noqa: SLF001
+            normalized,
+            target,
+            "actual",
+        )
+    )
+
+    assert observed is True
+    assert value == 2.6
+    assert owner["target_id"] == target.target_id
+
+
 @pytest.mark.asyncio
 async def test_registered_local_projection_hook_invokes_real_transform_offline(
     tmp_path: Path,
@@ -2709,6 +2959,14 @@ async def test_legacy_earnings_local_probe_attests_fmp_only_wrapper(
     assert "OCCURRENCE_MATCH_VALID_FAILED" in row["reason_codes"]
     assert row["eligible_as_primary"] is False
     assert row["eligible_as_fallback"] is False
+    runtime_row = execution.report["runtime_adapter_results"][0]
+    assert runtime_row["runtime_adapter_path"] == registration.adapter_path
+    assert runtime_row["health_status"] == "UNUSABLE"
+    assert all(
+        field_result["checks"]["schema_valid"] is False
+        and field_result["checks"]["completeness_valid"] is False
+        for field_result in runtime_row["field_results"].values()
+    )
 
 
 @pytest.mark.asyncio

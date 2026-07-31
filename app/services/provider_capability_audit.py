@@ -96,6 +96,11 @@ PRIMARY_ROLES = frozenset(
 FALLBACK_ROLES = frozenset({"FALLBACK", "AI_FALLBACK", "PRIMARY"})
 FIELD_OBSERVATION_SCHEMA_VERSION = "provider-capability-field-observation-v1"
 _NORMALIZED_RESPONSE_NOT_SUPPLIED = object()
+_REFERENCE_PARAMETER_BY_PROVIDER = {
+    "CENSUS": "period",
+    "INVESTING_EVENT_1062": "expected_period",
+    "SPGLOBAL": "expected_period",
+}
 
 
 @dataclass(frozen=True)
@@ -3691,6 +3696,13 @@ def _bound_field_evidence_errors(
     terminal_reason = str(
         _value(registration, "terminal_audit_reason", None) or ""
     ).strip()
+    provider_type = str(
+        _value(target, "provider_type", None)
+        or _value(registration, "provider_type", None)
+        or row.get("provider_type")
+        or ""
+    )
+    ai_provider = _is_ai_provider(provider_type)
     if terminal_reason and row.get("configured") is True:
         if _bound_terminal_audit_context_valid(
             row=row,
@@ -3729,18 +3741,13 @@ def _bound_field_evidence_errors(
         "metric_id": metric_id,
         "correlation_kind": (
             "SYNTHETIC_OCCURRENCE"
-            if _is_ai_provider(
-                str(
-                    _value(registration, "provider_type", None)
-                    or row.get("provider_type")
-                    or ""
-                )
-            )
+            if ai_provider
             else "TARGET_REQUEST"
         ),
         "expected_occurrence_id": None,
         "expected_reference_period": None,
     }
+    accepted_correlations: list[Mapping[str, Any]]
     if canonical_correlation["correlation_kind"] == "SYNTHETIC_OCCURRENCE":
         canonical_correlation["expected_occurrence_id"] = (
             "provider-audit:"
@@ -3752,13 +3759,36 @@ def _bound_field_evidence_errors(
                 str(acquisition.get("run_id") or "")
             )
         )
+        accepted_correlations = [canonical_correlation]
+    else:
+        accepted_correlations = [dict(canonical_correlation)]
+        reference_parameter = _REFERENCE_PARAMETER_BY_PROVIDER.get(
+            provider_id
+        )
+        if reference_parameter:
+            canonical_correlation["reference_parameter"] = (
+                reference_parameter
+            )
+            canonical_correlation["expected_reference_period"] = (
+                _audit_reference_period(
+                    str(acquisition.get("run_id") or "")
+                )[:7]
+            )
+            accepted_correlations.append(canonical_correlation)
     if recomputed_request_key != acquisition.get("request_key"):
         errors = [f"{prefix}REQUEST_KEY_NOT_BOUND_TO_RUN"]
     else:
         errors = []
-    if not isinstance(expected_request_correlation, Mapping) or any(
-        expected_request_correlation.get(key) != value
-        for key, value in canonical_correlation.items()
+    if (
+        not isinstance(expected_request_correlation, Mapping)
+        or not any(
+            set(expected_request_correlation) == set(candidate)
+            and all(
+                expected_request_correlation.get(key) == value
+                for key, value in candidate.items()
+            )
+            for candidate in accepted_correlations
+        )
     ):
         errors.append(f"{prefix}REQUEST_CORRELATION_IDENTITY_MISMATCH")
     expected_identity = {
@@ -3935,31 +3965,32 @@ def _bound_field_evidence_errors(
             errors.append(
                 f"{prefix}SCHEMA_NOT_DERIVED_FROM_NORMALIZED_FIELD"
             )
-        expected_freshness = (
-            True
-            if field_observed and value is None and null_reason
-            else _bound_freshness_valid(
-                owner,
+        if not ai_provider:
+            expected_freshness = (
+                True
+                if field_observed and value is None and null_reason
+                else _bound_freshness_valid(
+                    owner,
+                    target=target,
+                    field_name=field_name,
+                    value=value,
+                    checked_at=row.get("checked_at"),
+                )
+            )
+            if checks.get("freshness_valid") != expected_freshness:
+                errors.append(
+                    f"{prefix}FRESHNESS_NOT_DERIVED_FROM_FIELD_LIFECYCLE"
+                )
+            expected_semantic = _bound_semantic_valid(
                 target=target,
+                owner=owner,
                 field_name=field_name,
                 value=value,
-                checked_at=row.get("checked_at"),
             )
-        )
-        if checks.get("freshness_valid") != expected_freshness:
-            errors.append(
-                f"{prefix}FRESHNESS_NOT_DERIVED_FROM_FIELD_LIFECYCLE"
-            )
-        expected_semantic = _bound_semantic_valid(
-            target=target,
-            owner=owner,
-            field_name=field_name,
-            value=value,
-        )
-        if checks.get("semantic_mapping_valid") != expected_semantic:
-            errors.append(
-                f"{prefix}SEMANTIC_MAPPING_NOT_DERIVED_FROM_FIELD_CONTRACT"
-            )
+            if checks.get("semantic_mapping_valid") != expected_semantic:
+                errors.append(
+                    f"{prefix}SEMANTIC_MAPPING_NOT_DERIVED_FROM_FIELD_CONTRACT"
+                )
     if (
         acquisition.get("normalized_response_sha256") is not None
         and stable_sha256(normalized_response)

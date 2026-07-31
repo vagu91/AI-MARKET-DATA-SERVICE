@@ -1305,6 +1305,39 @@ def test_httpx_failed_attempt_attestation_is_terminal_not_eligible() -> None:
     ) is False
 
 
+def test_unselected_configuration_variant_is_valid_not_configured_evidence() -> None:
+    provider = provider_by_id("OPENAI_RESPONSES_RESEARCH")
+    acquisition = {
+        "configured": False,
+        "capture_mode": None,
+        "capture_mode_expected": None,
+        "capture_verified": None,
+        "capture_attestation": None,
+        "capture_attestation_sha256": None,
+        "capture_mode_configuration": {
+            "setting": "research_backend",
+            "value": "codex_cli",
+        },
+        "probe_dispatch_status": "NOT_CONFIGURED",
+        "reason_codes": [
+            (
+                "PROVIDER_CONFIGURATION_VARIANT_NOT_SELECTED:"
+                "research_backend=openai_api"
+            )
+        ],
+    }
+
+    assert acceptance._capture_attestation_valid(
+        acquisition,
+        provider=provider,
+    )
+    acquisition["reason_codes"] = ["PROVIDER_NOT_CONFIGURED"]
+    assert not acceptance._capture_attestation_valid(
+        acquisition,
+        provider=provider,
+    )
+
+
 def test_fallback_validator_does_not_reuse_wildcard_repository_result(
     full_audit: OfflineAuditRun,
 ) -> None:

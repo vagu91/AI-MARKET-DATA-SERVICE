@@ -2413,7 +2413,16 @@ def _capture_attestation_valid(
             expected_value = str(
                 getattr(provider, "configuration_value", None) or ""
             ).strip().lower()
-            if configured_value != expected_value:
+            variant_not_selected = bool(
+                acquisition.get("configured") is False
+                and configured_value != expected_value
+                and (
+                    "PROVIDER_CONFIGURATION_VARIANT_NOT_SELECTED:"
+                    f"{configuration_setting}={expected_value}"
+                )
+                in set(acquisition.get("reason_codes") or ())
+            )
+            if configured_value != expected_value and not variant_not_selected:
                 return False
             registered_expected = str(
                 getattr(provider, "capture_mode", None) or ""
