@@ -127,6 +127,9 @@ function Publish-LatestAcceptance {
     $temporary = Join-Path $destinationDirectory (
         ".senior-analyst-live-latest.$([Guid]::NewGuid().ToString('N')).tmp"
     )
+    $backup = Join-Path $destinationDirectory (
+        ".senior-analyst-live-latest.$([Guid]::NewGuid().ToString('N')).bak"
+    )
     try {
         $latest = [ordered]@{
             result = "PASS"
@@ -142,13 +145,19 @@ function Publish-LatestAcceptance {
             [Text.UTF8Encoding]::new($false)
         )
         if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-            [IO.File]::Replace($temporary, $Destination, $null)
+            # Windows PowerShell 5.1/.NET Framework rejects a null backup
+            # path even though newer runtimes accept it. A same-directory
+            # backup keeps File.Replace atomic and is removed below.
+            [IO.File]::Replace($temporary, $Destination, $backup)
         } else {
             [IO.File]::Move($temporary, $Destination)
         }
     } finally {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) {
             Remove-Item -LiteralPath $temporary -Force
+        }
+        if (Test-Path -LiteralPath $backup -PathType Leaf) {
+            Remove-Item -LiteralPath $backup -Force
         }
     }
 }
