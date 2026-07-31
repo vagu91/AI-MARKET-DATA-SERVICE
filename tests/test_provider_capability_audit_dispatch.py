@@ -189,6 +189,39 @@ def test_capability_dispatch_uses_dataset_specific_runtime_surfaces() -> None:
     assert targeted_kwargs["events"][0].category == "PCE"
 
 
+def test_census_dispatch_uses_explicit_registered_probe_query_ids() -> None:
+    class Adapter:
+        async def fetch(self, *, period=None, datasets=None):
+            return period, datasets
+
+    housing_starts = SimpleNamespace(
+        provider_id="CENSUS",
+        provider_type="OFFICIAL_GOVERNMENT",
+        dataset_id="macro_calendar",
+        metric_id="CENSUS:RESCONST:HOUSING_STARTS",
+        frequency="monthly",
+        capability=SimpleNamespace(probe_query_id="RESCONST"),
+    )
+    building_permits = SimpleNamespace(
+        provider_id="CENSUS",
+        provider_type="OFFICIAL_GOVERNMENT",
+        dataset_id="macro_calendar",
+        metric_id="CENSUS:RESCONST:BUILDING_PERMITS",
+        frequency="monthly",
+        capability=SimpleNamespace(probe_query_id="RESCONST"),
+    )
+
+    method, kwargs = audit_script._select_probe_method(  # noqa: SLF001
+        Adapter(),
+        housing_starts,
+        targets=(housing_starts, building_permits),
+    )
+
+    assert method is not None
+    assert kwargs["datasets"] == ("RESCONST",)
+    assert kwargs["period"]
+
+
 def test_runtime_adapter_probe_plan_covers_every_constructed_event_adapter(
     tmp_path: Path,
 ) -> None:
@@ -1488,6 +1521,14 @@ async def test_research_tool_budget_fails_on_second_unique_attempt(
 
     assert outcome.transport_status == "UNUSABLE"
     assert outcome.reason_codes == ("RESEARCH_TOOL_BUDGET_EXCEEDED",)
+    assert outcome.attempts == 1
+    assert outcome.evidence["real_adapter_invoked"] is True
+    assert outcome.evidence["probe_dispatch_status"] == "REAL_ADAPTER"
+    assert outcome.evidence["capture_verified"] is False
+    assert outcome.evidence["dispatch_observation"][
+        "budget_stop_observed"
+    ] is True
+    assert outcome.evidence["dispatch_observation"]["events_observed"] == 2
 
 
 class _SourceClaimResearchBackend:

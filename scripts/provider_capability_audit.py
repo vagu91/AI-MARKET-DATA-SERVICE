@@ -126,6 +126,23 @@ class _AuditBackendProxy:
                         status=HealthStatus.UNUSABLE,
                         reason_code="RESEARCH_TOOL_BUDGET_EXCEEDED",
                     )
+                    error.dispatch_observation = {
+                        "schema_version": (
+                            "provider-audit-dispatch-observation-v1"
+                        ),
+                        "origin": "BACKEND_EVENT_OBSERVER",
+                        "backend_class": type(self._backend).__qualname__,
+                        "budget_stop_observed": True,
+                        "events_observed": len(self.observed_tool_events),
+                        "search_attempts": counts["search"],
+                        "source_open_attempts": counts["source_open"],
+                        "event_sha256": [
+                            _stable_sha256(
+                                redact_payload(_json_safe(observed_event))
+                            )
+                            for observed_event in self.observed_tool_events
+                        ],
+                    }
                     self.last_error = error
                     raise error
             if callable(downstream_observer):
@@ -483,6 +500,9 @@ class IsolatedRegistryProbeExecutor:
                         "adapter_constructed": True,
                     }
                     return outcome
+                dispatch_observation = _validated_dispatch_observation(
+                    getattr(exc, "dispatch_observation", None)
+                )
                 return _failed_transport_outcome(
                     request,
                     capture,
@@ -491,6 +511,9 @@ class IsolatedRegistryProbeExecutor:
                     exc.reason_code,
                     type(exc).__name__,
                     dispatch_status=(
+                        "REAL_ADAPTER"
+                        if dispatch_observation is not None
+                        else
                         "FAILED"
                         if exc.reason_code
                         in {
@@ -499,6 +522,7 @@ class IsolatedRegistryProbeExecutor:
                         }
                         else "REAL_ADAPTER"
                     ),
+                    dispatch_observation=dispatch_observation,
                 )
             except Exception as exc:
                 return _failed_transport_outcome(
@@ -1873,9 +1897,26 @@ def _select_probe_method(
         elif name == "period":
             kwargs[name] = current.strftime("%Y-%m")
         elif name == "datasets":
-            kwargs[name] = tuple(
-                item.metric_id for item in (targets or (target,))
-            )
+            selected_targets = tuple(targets or (target,))
+            if provider_id == "CENSUS":
+                query_ids = tuple(
+                    str(
+                        getattr(
+                            getattr(item, "capability", None),
+                            "probe_query_id",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    for item in selected_targets
+                )
+                if not all(query_ids):
+                    return None, {}
+                kwargs[name] = tuple(dict.fromkeys(query_ids))
+            else:
+                kwargs[name] = tuple(
+                    item.metric_id for item in selected_targets
+                )
         elif name == "cik":
             kwargs[name] = "0000914208"
         elif name == "listed_class_symbols":
@@ -4388,6 +4429,7 @@ def _failed_transport_outcome(
     error_kind: str,
     *,
     dispatch_status: str = "REAL_ADAPTER",
+    dispatch_observation: Mapping[str, Any] | None = None,
 ) -> ProbeOutcome:
     last_exchange = capture.exchanges[-1] if capture.exchanges else None
     expected_mode = _expected_capture_mode(request)
@@ -4396,7 +4438,10 @@ def _failed_transport_outcome(
         expected_mode == "LOCAL_SANDBOX"
         and dispatch_status == "REAL_ADAPTER"
     )
-    dispatch_observed = captured_attempt or local_invocation
+    event_stream_dispatch = dispatch_observation is not None
+    dispatch_observed = (
+        captured_attempt or local_invocation or event_stream_dispatch
+    )
     effective_dispatch_status = (
         dispatch_status if dispatch_observed else "FAILED"
     )
@@ -4408,7 +4453,7 @@ def _failed_transport_outcome(
         raw_response=last_exchange.response_body if last_exchange else None,
         normalized_response=None,
         latency_ms=round((time.perf_counter() - started) * 1000, 3),
-        attempts=capture.attempts,
+        attempts=max(capture.attempts, 1 if event_stream_dispatch else 0),
         error_kind=error_kind,
         reason_codes=(reason_code,),
         checks={
@@ -4453,12 +4498,53 @@ def _failed_transport_outcome(
                 or local_invocation
             )
             else None,
+            "dispatch_observation": dispatch_observation,
             "capture_mode_configuration": (
                 _capture_mode_configuration(request)
             ),
         },
         network_exchanges=tuple(capture.exchanges),
     )
+
+
+def _validated_dispatch_observation(
+    value: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    events_observed = value.get("events_observed")
+    search_attempts = value.get("search_attempts")
+    source_open_attempts = value.get("source_open_attempts")
+    event_hashes = value.get("event_sha256")
+    if (
+        value.get("schema_version")
+        != "provider-audit-dispatch-observation-v1"
+        or value.get("origin") != "BACKEND_EVENT_OBSERVER"
+        or value.get("budget_stop_observed") is not True
+        or type(events_observed) is not int
+        or events_observed < 1
+        or type(search_attempts) is not int
+        or type(source_open_attempts) is not int
+        or max(search_attempts, source_open_attempts) <= 1
+        or not isinstance(event_hashes, list)
+        or len(event_hashes) != events_observed
+        or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[0-9a-f]{64}", item) is None
+            for item in event_hashes
+        )
+    ):
+        return None
+    return {
+        "schema_version": str(value["schema_version"]),
+        "origin": str(value["origin"]),
+        "backend_class": str(value.get("backend_class") or ""),
+        "budget_stop_observed": True,
+        "events_observed": events_observed,
+        "search_attempts": search_attempts,
+        "source_open_attempts": source_open_attempts,
+        "event_sha256": list(event_hashes),
+    }
 
 
 def _request_settings(
