@@ -46,6 +46,7 @@ from app.services.source_policy_service import SourcePolicyService
 from scripts import provider_capability_audit as audit_script
 from scripts.validate_senior_analyst_payload import (
     _capture_attestation_valid,
+    _normalized_check_derivation_errors,
     _terminal_runtime_failure_without_transport,
 )
 
@@ -2660,6 +2661,112 @@ def test_occurrence_requires_exact_request_and_provider_correlation() -> None:
     ) is False
 
 
+def test_normalized_replay_retains_registered_provider_identity() -> None:
+    capability = SimpleNamespace(
+        dataset_id="macro",
+        metric_id="headline_pce_yoy",
+        supported_fields=("actual",),
+        audit_only_fields=(),
+        frequency="monthly",
+        transformation="identity",
+        field_validator_id="validate.official_actual.v1",
+        canonical_metric_ids=(),
+    )
+    provider = SimpleNamespace(
+        provider_id="DIRECT",
+        provider_type="OFFICIAL_API",
+    )
+    target = SimpleNamespace(
+        provider_id=provider.provider_id,
+        provider_type=provider.provider_type,
+        dataset_id=capability.dataset_id,
+        metric_id=capability.metric_id,
+        frequency=capability.frequency,
+        transformation=capability.transformation,
+        field_validator_id=capability.field_validator_id,
+        capability=capability,
+        registration=provider,
+    )
+    target_id = (
+        f"{provider.provider_id}|"
+        f"{capability.dataset_id}|{capability.metric_id}"
+    )
+    normalized = {
+        "actual": 2.6,
+        "metric_id": capability.metric_id,
+        "frequency": capability.frequency,
+        "transformation": capability.transformation,
+        "unit": "percent",
+        "occurrence_id": "missing-provider:2026-06",
+        "reference_period": "2026-06",
+        "expected_reference_period": "2026-06",
+        "lifecycle_verified": True,
+    }
+    observed, value, owner = (
+        audit_script._find_target_field_observation(  # noqa: SLF001
+            normalized,
+            SimpleNamespace(
+                target_id=target_id,
+                metric_id=capability.metric_id,
+            ),
+            "actual",
+        )
+    )
+    checked_at = datetime(2026, 7, 31, 12, tzinfo=UTC)
+    checks = {
+        "transport_valid": True,
+        "schema_valid": audit_script._field_schema_check(  # noqa: SLF001
+            target,
+            "actual",
+            normalized,
+            owner,
+            value,
+        ),
+        "completeness_valid": observed and value is not None,
+        "freshness_valid": audit_script._freshness_check(  # noqa: SLF001
+            owner,
+            target=target,
+            field_name="actual",
+            field_value=value,
+            now=checked_at,
+        ),
+        "semantic_mapping_valid": audit_script._semantic_check(  # noqa: SLF001
+            target,
+            owner,
+            normalized,
+            field_name="actual",
+            value=value,
+        ),
+        "occurrence_match_valid": audit_script._occurrence_check(  # noqa: SLF001
+            target,
+            owner,
+            normalized,
+            expected_correlation={
+                "provider_id": provider.provider_id,
+                "target_id": target_id,
+            },
+            field_name="actual",
+        ),
+        "lineage_valid": audit_script._lineage_check(  # noqa: SLF001
+            "actual",
+            owner,
+            normalized,
+        ),
+    }
+
+    assert checks["occurrence_match_valid"] is False
+    assert (
+        _normalized_check_derivation_errors(
+            {"field_results": {"actual": {"checks": checks}}},
+            capability=capability,
+            provider=provider,
+            normalized_response=normalized,
+            checked_at=checked_at,
+        )
+        == ()
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutation", "expected_check"),
@@ -2901,6 +3008,42 @@ def test_field_observation_is_bound_to_exact_target_id() -> None:
     assert observed is True
     assert value == 2.6
     assert owner["target_id"] == target.target_id
+
+
+def test_field_observation_is_stable_after_canonical_json_sorting() -> None:
+    target = SimpleNamespace(
+        target_id="DIRECT|macro|headline_pce_yoy",
+        metric_id="headline_pce_yoy",
+    )
+    normalized = {
+        "z_branch": {
+            "metric_id": target.metric_id,
+            "actual": 99.0,
+        },
+        "a_branch": {
+            "metric_id": target.metric_id,
+            "actual": 2.6,
+        },
+    }
+    persisted = json.loads(
+        json.dumps(normalized, sort_keys=True)
+    )
+
+    before = audit_script._find_target_field_observation(  # noqa: SLF001
+        normalized,
+        target,
+        "actual",
+    )
+    after = audit_script._find_target_field_observation(  # noqa: SLF001
+        persisted,
+        target,
+        "actual",
+    )
+
+    assert before[0] is True
+    assert before[1] == 2.6
+    assert after[1] == before[1]
+    assert after[2] == before[2]
 
 
 @pytest.mark.asyncio

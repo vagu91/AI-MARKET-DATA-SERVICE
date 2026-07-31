@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2301,6 +2302,17 @@ def _normalized_check_derivation_errors(
         f"{provider.provider_id}|"
         f"{capability.dataset_id}|{capability.metric_id}"
     )
+    check_target = SimpleNamespace(
+        provider_id=provider.provider_id,
+        provider_type=provider.provider_type,
+        dataset_id=capability.dataset_id,
+        metric_id=capability.metric_id,
+        frequency=capability.frequency,
+        transformation=capability.transformation,
+        field_validator_id=capability.field_validator_id,
+        capability=capability,
+        registration=provider,
+    )
     observed_at = parse_datetime(checked_at)
     field_results = row.get("field_results")
     if not isinstance(field_results, dict):
@@ -2330,7 +2342,7 @@ def _normalized_check_derivation_errors(
         owner_value = owner if owner is not None else normalized_response
         expected: dict[str, bool | None] = {
             "schema_valid": _field_schema_check(
-                capability,
+                check_target,
                 field_name,
                 normalized_response,
                 owner if field_observed else None,
@@ -2343,20 +2355,20 @@ def _normalized_check_derivation_errors(
                 {
                     "freshness_valid": _freshness_check(
                         owner_value,
-                        target=capability,
+                        target=check_target,
                         field_name=field_name,
                         field_value=value,
                         now=observed_at,
                     ),
                     "semantic_mapping_valid": _semantic_check(
-                        capability,
+                        check_target,
                         owner if field_observed else None,
                         normalized_response,
                         field_name=field_name,
                         value=value,
                     ),
                     "occurrence_match_valid": _occurrence_check(
-                        capability,
+                        check_target,
                         owner if field_observed else None,
                         normalized_response,
                     ),

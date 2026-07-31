@@ -5811,15 +5811,29 @@ def _normalized_field(value: Any, field_name: str) -> tuple[bool, Any, Any]:
                 continue
             seen.add(identity)
         if isinstance(current, Mapping):
-            for key, item in current.items():
+            items = sorted(
+                current.items(),
+                key=lambda pair: (
+                    str(pair[0]).casefold(),
+                    str(pair[0]),
+                ),
+            )
+            for key, item in items:
                 normalized_key = str(key).casefold()
                 if (
                     normalized_key in aliases
                     or normalized_key.replace("_", "") in aliases
                 ):
                     return True, item, current
-                if isinstance(item, (Mapping, list, tuple)):
-                    stack.append(item)
+            stack.extend(
+                reversed(
+                    [
+                        item
+                        for _key, item in items
+                        if isinstance(item, (Mapping, list, tuple))
+                    ]
+                )
+            )
         elif isinstance(current, (list, tuple)):
             stack.extend(reversed(current))
     return False, None, None
@@ -5855,7 +5869,14 @@ def _normalized_target_scopes(
             continue
         seen.add(identity)
         if isinstance(current, Mapping):
-            for key, item in current.items():
+            items = sorted(
+                current.items(),
+                key=lambda pair: (
+                    str(pair[0]).casefold(),
+                    str(pair[0]),
+                ),
+            )
+            for key, item in items:
                 key_text = str(key).strip().casefold()
                 item_text = str(item).strip().casefold()
                 if key_text in target_keys and item not in (None, ""):
@@ -5878,10 +5899,17 @@ def _normalized_target_scopes(
                 ):
                     identities_observed = True
                     metric_matches.append(item)
-                if isinstance(item, (Mapping, list, tuple)):
-                    stack.append(item)
+            stack.extend(
+                reversed(
+                    [
+                        item
+                        for _key, item in items
+                        if isinstance(item, (Mapping, list, tuple))
+                    ]
+                )
+            )
         else:
-            stack.extend(current)
+            stack.extend(reversed(current))
     return (
         exact_target_matches or metric_matches,
         identities_observed,
