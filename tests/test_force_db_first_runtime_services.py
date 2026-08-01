@@ -606,6 +606,62 @@ async def test_expired_vix_attempts_fred_before_cboe_fallback(
 
 
 @pytest.mark.asyncio
+async def test_vix_recent_retrieval_does_not_revalidate_old_close(
+    tmp_path,
+) -> None:
+    cfg = _settings(tmp_path)
+    sequence: list[str] = []
+    valid_rows = [
+        _macro_fact(
+            series_id,
+            valid_until=NOW + timedelta(hours=1),
+        )
+        for dataset_id, query in _macro_repository_queries().items()
+        for series_id in _required_macro_dataset_series(
+            dataset_id,
+            query=query,
+        )
+    ]
+    old_vix = _macro_fact(
+        "VIXCLS",
+        valid_until=NOW + timedelta(hours=1),
+    )
+    old_observation = NOW - timedelta(hours=25)
+    old_vix["release_at"] = old_observation.isoformat()
+    old_vix["retrieved_at"] = NOW.isoformat()
+    old_vix["raw_payload"]["data_as_of"] = (
+        old_observation.isoformat()
+    )
+    diagnostics = object.__new__(DiagnosticsService)
+    diagnostics.settings = cfg
+    diagnostics.freshness = DataFreshnessService(
+        cfg,
+        clock=lambda: NOW,
+    )
+    diagnostics.facts = _MacroFacts([*valid_rows, old_vix])
+    fred = _FailedFredVixService(sequence)
+    diagnostics.macro_service = fred
+    diagnostics._save_macro = lambda _macro: 0
+
+    fact, freshness = diagnostics._vix_database_lookup()
+    _macro, quality = await diagnostics._macro_db_first(
+        force=True,
+        vix_preflight=(fact, freshness),
+    )
+
+    assert fact == old_vix
+    assert freshness.found is True
+    assert freshness.usable is False
+    assert freshness.expired is True
+    assert freshness.evaluation == "INVALID_LIFECYCLE"
+    assert freshness.reason_code == "CANONICAL_LIFECYCLE_STALE"
+    assert freshness.lifecycle == "STALE"
+    assert fred.requested_series == {"FRED": ("VIXCLS",)}
+    assert sequence == ["FRED:VIXCLS"]
+    assert quality["vix_provider_evidence"]["called"] is True
+
+
+@pytest.mark.asyncio
 async def test_risk_force_refreshes_expired_database_record(
     tmp_path,
     monkeypatch,

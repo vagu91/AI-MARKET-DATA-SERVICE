@@ -1209,6 +1209,51 @@ def test_mixed_delivery_detects_ai_source_in_field_lineage() -> None:
     ) == 2
 
 
+def test_deterministic_rss_source_with_ai_url_is_not_ai_usage() -> None:
+    payload = {
+        "analytics": {
+            "news": {
+                "current_news": [
+                    {
+                        "article_id": "observed-live-regression",
+                        "headline": (
+                            "WealthStack Roundup: Worthy Analyzes $1B "
+                            "in Client Income as Tax Tech Grows"
+                        ),
+                        "published_at": "2026-07-31T23:29:18+00:00",
+                        "source": {
+                            "publisher": "Wealth Management",
+                            "distributor": "Yahoo Finance",
+                            "acquisition_provider": "Yahoo Finance RSS",
+                            "source_url": (
+                                "https://finance.yahoo.com/technology/ai/"
+                                "articles/wealthstack-roundup-worthy-"
+                                "analyzes-1b-161836774.html"
+                            ),
+                        },
+                    }
+                ]
+            }
+        },
+        "provider_accounting": [
+            {
+                "dataset_id": "current_news",
+                "acquisition_selected_source": "Yahoo Finance RSS",
+                "delivered_value": {
+                    "payload_path": "analytics.news.current_news",
+                    "item_count": 1,
+                },
+            }
+        ],
+    }
+
+    assert acceptance._delivered_ai_field_usages(payload) == set()
+    assert acceptance._ai_used_without_certification(
+        payload,
+        report={"results": []},
+    ) == 0
+
+
 @pytest.mark.parametrize(
     "lineage",
     [

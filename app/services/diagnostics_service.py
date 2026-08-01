@@ -64,6 +64,9 @@ from app.services.force_generation_staging_service import (
     ForceGenerationStaging,
 )
 from app.services.risk_context_runtime_service import RiskContextRuntimeService
+from app.services.risk_context_normalization_service import (
+    _risk_observation_usable,
+)
 from app.services.research_scheduler_service import ResearchSchedulerService
 from app.services.social_sentiment_service import SocialSentimentService
 from app.services.temporal_domain_service import exact_occurrence_key, reconcile_calendar_events
@@ -1455,12 +1458,39 @@ class DiagnosticsService:
             )
         ]
         fact = _matching_macro_fact(rows, query.series_ids)
+        freshness = self._vix_canonical_freshness(fact)
+        return fact, freshness
+
+    def _vix_canonical_freshness(
+        self,
+        fact: dict[str, Any] | None,
+    ) -> CanonicalFreshnessResult:
         freshness = self.freshness.evaluate_canonical(
             fact,
             max_age=_dataset_sla("vix"),
             data_reference_mode="point_in_time",
         )
-        return fact, freshness
+        if not freshness.usable or fact is None:
+            return freshness
+        observation = fact.get("release_at") or freshness.data_as_of
+        if _risk_observation_usable(
+            observation,
+            now=self.freshness.clock(),
+        ):
+            return freshness
+        return CanonicalFreshnessResult(
+            found=freshness.found,
+            usable=False,
+            expired=True,
+            complete=freshness.complete,
+            evaluation="INVALID_LIFECYCLE",
+            reason_code="CANONICAL_LIFECYCLE_STALE",
+            data_as_of=freshness.data_as_of,
+            content_valid_until=freshness.content_valid_until,
+            refresh_due_at=freshness.refresh_due_at,
+            lifecycle="STALE",
+            evaluated_at=freshness.evaluated_at,
+        )
 
     async def _macro_db_first(
         self,
@@ -1640,10 +1670,8 @@ class DiagnosticsService:
             )
             if (
                 read_back_vix is not None
-                and self.freshness.evaluate_canonical(
+                and self._vix_canonical_freshness(
                     read_back_vix,
-                    max_age=_dataset_sla("vix"),
-                    data_reference_mode="point_in_time",
                 ).usable
             ):
                 read_back.append(read_back_vix)

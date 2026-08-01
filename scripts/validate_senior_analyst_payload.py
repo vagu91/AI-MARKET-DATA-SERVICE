@@ -1205,16 +1205,29 @@ def _field_lineage_entries(
 
 
 def _provider_identity_values(value: dict[str, Any]) -> list[Any]:
-    return [
-        value.get(key)
-        for key in (
-            "acquisition_provider",
-            "provider_id",
-            "provider_type",
-            "source",
-        )
-        if value.get(key) not in (None, "")
-    ]
+    identities: list[Any] = []
+    for key in (
+        "acquisition_provider",
+        "provider_id",
+        "provider_type",
+        "publisher",
+        "distributor",
+        "source",
+    ):
+        observed = value.get(key)
+        if observed in (None, ""):
+            continue
+        if isinstance(observed, dict):
+            identities.extend(_provider_identity_values(observed))
+        elif isinstance(observed, list):
+            for item in observed:
+                if isinstance(item, dict):
+                    identities.extend(_provider_identity_values(item))
+                elif item not in (None, ""):
+                    identities.append(item)
+        else:
+            identities.append(observed)
+    return identities
 
 
 def _nested_ai_provider(
@@ -1257,7 +1270,7 @@ def _resolve_ai_provider_identity(
         is not None
     }
     generic_ai_signal = any(
-        "AI" in str(item or "").upper() for item in observed
+        _explicit_ai_identity_signal(item) for item in observed
     )
     default_ai = (
         default_provider
@@ -1286,6 +1299,13 @@ def _resolve_ai_provider_identity(
     if registered_non_ai:
         return None
     return default_provider
+
+
+def _explicit_ai_identity_signal(value: Any) -> bool:
+    text = str(value or "").strip().upper()
+    if not text or "://" in text:
+        return False
+    return bool(re.search(r"(^|[^A-Z0-9])AI([^A-Z0-9]|$)", text))
 
 
 def _registered_provider_id(value: Any) -> str | None:
