@@ -11,6 +11,9 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.services.official_actual_semantics import (
+    metric_change_basis_from_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +258,9 @@ def xtb_event_datetimes(event_date: date, short_time: Any, offset_value: Any) ->
 
 def classify_xtb_event(title: str, indicator_id: Any, evaluation_method: Any, unit: Any) -> tuple[str, str | None]:
     text = _normalized(title)
-    frequency = "mom" if any(token in text for token in ("m m", "mensile", "month over month")) else "yoy" if any(token in text for token in ("a a", "y y", "annuale", "year over year")) else None
+    frequency = metric_change_basis_from_text(
+        f"{title} {evaluation_method or ''}"
+    )
     core = any(token in text for token in ("core", "di fondo", "base"))
     if "cpi" in text or "consumer price index" in text or "prezzi al consumo" in text:
         metric = f"{'core' if core else 'headline'}_cpi_{frequency}" if frequency else None
@@ -263,6 +268,9 @@ def classify_xtb_event(title: str, indicator_id: Any, evaluation_method: Any, un
     if "ppi" in text or "producer price index" in text or "prezzi alla produzione" in text:
         metric = f"{'core' if core else 'headline'}_ppi_{frequency}" if frequency else None
         return ("CORE_PPI" if core else "PPI") + (f"_{frequency.upper()}" if frequency else ""), metric
+    if "pce" in text or "personal consumption expenditure" in text:
+        metric = f"{'core' if core else 'headline'}_pce_{frequency}" if frequency else None
+        return ("CORE_PCE" if core else "PCE") + (f"_{frequency.upper()}" if frequency else ""), metric
     if "initial jobless claims" in text or "richieste iniziali" in text or "sussidi di disoccupazione" in text:
         return "INITIAL_JOBLESS_CLAIMS", "initial_jobless_claims"
     mappings = (

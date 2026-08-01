@@ -9,6 +9,10 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.core.config import Settings
+from app.core.senior_analyst_policy import (
+    MNQ_EARNINGS_SELECTION_POLICY,
+    MNQ_PRIMARY_SYMBOLS,
+)
 from app.infrastructure.persistence.provider_cache_repository import ProviderCacheProtocol
 from app.models.common import Freshness, ProviderResult, ProviderType
 from app.providers.base import BaseProvider, ProviderDisabled, ProviderError, metadata
@@ -21,20 +25,7 @@ from app.providers.deterministic import (
 
 
 NEW_YORK = ZoneInfo("America/New_York")
-EARNINGS_SYMBOLS = (
-    "MSFT",
-    "NVDA",
-    "AAPL",
-    "AMZN",
-    "META",
-    "GOOGL",
-    "GOOG",
-    "AVGO",
-    "TSLA",
-    "AMD",
-    "NFLX",
-    "COST",
-)
+EARNINGS_SYMBOLS = MNQ_PRIMARY_SYMBOLS
 SESSION_CODES = {"bmo": "BMO", "amc": "AMC", "dmh": "DMH"}
 
 
@@ -67,7 +58,9 @@ class FinnhubProvider(BaseProvider):
     async def fetch(self) -> ProviderResult:
         now = self.clock()
         start = now.date()
-        end = start + timedelta(days=14)
+        end = start + timedelta(
+            days=MNQ_EARNINGS_SELECTION_POLICY.lookahead_days
+        )
         earnings = await self.earnings_calendar(start=start, end=end)
         return ProviderResult(
             metadata=metadata(
@@ -150,6 +143,7 @@ class FinnhubProvider(BaseProvider):
         )
         rows = as_list(payload, field_name="earningsCalendar")
         output: list[dict[str, Any]] = []
+        retrieved_at = self.clock()
         for row in rows:
             symbol = _symbol(row.get("symbol"))
             if symbol not in requested_symbols:
@@ -157,20 +151,35 @@ class FinnhubProvider(BaseProvider):
             event_date = _date(row.get("date"))
             if event_date is None or not start <= event_date <= end:
                 continue
-            session = SESSION_CODES.get(str(row.get("hour") or "").lower(), "DMH")
+            session = SESSION_CODES.get(
+                str(row.get("hour") or "").lower(),
+                "UNKNOWN",
+            )
             occurrence_id = f"FINNHUB:EARNINGS:{symbol}:{event_date.isoformat()}:{session}"
-            event_at = _earnings_event_time(event_date, session)
+            refresh_due_at = _earnings_refresh_due(event_date, session)
             eps_actual = _nullable_number(row.get("epsActual"))
             eps_estimate = _nullable_number(row.get("epsEstimate"))
             revenue_actual = _nullable_number(row.get("revenueActual"))
             revenue_estimate = _nullable_number(row.get("revenueEstimate"))
+            content_valid_until = (
+                refresh_due_at + timedelta(hours=48)
+                if eps_actual is not None or revenue_actual is not None
+                else refresh_due_at
+            )
             output.append(
                 {
                     "occurrence_id": occurrence_id,
                     "symbol": symbol,
                     "scheduled_date": event_date.isoformat(),
+                    "event_date": event_date.isoformat(),
                     "session": session,
-                    "event_at": event_at.isoformat(),
+                    "timing": session,
+                    "event_at": None,
+                    "temporal_precision": (
+                        "SESSION_ONLY"
+                        if session in {"BMO", "AMC", "DMH"}
+                        else MNQ_EARNINGS_SELECTION_POLICY.date_only_temporal_precision
+                    ),
                     "eps_actual": eps_actual,
                     "eps_estimate": eps_estimate,
                     "revenue_actual": revenue_actual,
@@ -183,16 +192,20 @@ class FinnhubProvider(BaseProvider):
                         else "SCHEDULED"
                     ),
                     "source": self.source,
+                    "publisher": "Finnhub",
+                    "distributor": "Finnhub",
+                    "acquisition_provider": "FINNHUB",
                     "source_url": request["source_url"],
                     "source_domain": "finnhub.io",
                     "authority_tier": 3,
-                    "retrieved_at": self.clock().isoformat(),
-                    "valid_until": (
-                        event_at + timedelta(hours=48)
-                        if eps_actual is not None or revenue_actual is not None
-                        else event_at
-                    ).isoformat(),
-                    "next_refresh_at": event_at.isoformat(),
+                    "retrieved_at": retrieved_at.isoformat(),
+                    "data_as_of": retrieved_at.isoformat(),
+                    "valid_until": content_valid_until.isoformat(),
+                    "content_valid_until": (
+                        content_valid_until.isoformat()
+                    ),
+                    "next_refresh_at": refresh_due_at.isoformat(),
+                    "refresh_due_at": refresh_due_at.isoformat(),
                     "freshness_state": "CURRENT",
                     "trigger_class": (
                         "TRIGGER"
@@ -201,13 +214,45 @@ class FinnhubProvider(BaseProvider):
                     ),
                     "request_fingerprint": request["request_fingerprint"],
                     "raw_payload_hash": safe_payload_hash(row),
+                    "lineage": [
+                        {
+                            "field": field,
+                            "source": self.source,
+                            "source_field": source_field,
+                            "publisher": "Finnhub",
+                            "distributor": "Finnhub",
+                            "acquisition_provider": "FINNHUB",
+                            "source_url": request["source_url"],
+                        }
+                        for field, source_field in {
+                            "symbol": "symbol",
+                            "event_date": "date",
+                            "timing": "hour",
+                            "eps_actual": "epsActual",
+                            "eps_estimate": "epsEstimate",
+                            "revenue_actual": "revenueActual",
+                            "revenue_estimate": "revenueEstimate",
+                        }.items()
+                    ],
                 }
             )
         telemetry.accepted = len(output)
         telemetry.rejected = len(rows) - len(output)
         for item in output:
             item["telemetry"] = telemetry.as_dict()
-        return _deduplicate(output, lambda item: str(item["occurrence_id"]))
+        deduplicated = _deduplicate(
+            output,
+            lambda item: str(item["occurrence_id"]),
+        )
+        if symbols is None:
+            deduplicated.sort(
+                key=lambda item: tuple(
+                    str(item.get(field) or "")
+                    for field in MNQ_EARNINGS_SELECTION_POLICY.sort_fields
+                )
+            )
+            return deduplicated
+        return deduplicated
 
     async def company_news(
         self,
@@ -309,8 +354,13 @@ def _date(value: Any) -> date | None:
         return None
 
 
-def _earnings_event_time(event_date: date, session: str) -> datetime:
-    local_time = {"BMO": time(8), "AMC": time(16, 15), "DMH": time(12)}[session]
+def _earnings_refresh_due(event_date: date, session: str) -> datetime:
+    local_time = {
+        "BMO": time(8),
+        "AMC": time(16, 15),
+        "DMH": time(12),
+        "UNKNOWN": time(23, 59, 59),
+    }[session]
     return datetime.combine(event_date, local_time, NEW_YORK).astimezone(UTC)
 
 

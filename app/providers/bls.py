@@ -54,12 +54,23 @@ class BlsProvider(BaseProvider):
         super().__init__(cache)
         self.settings = settings
 
-    async def fetch(self) -> ProviderResult:
+    async def fetch(
+        self,
+        *,
+        series_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> ProviderResult:
         if not self.settings.bls_enabled:
             raise ProviderDisabled("BLS provider is disabled")
+        selected_series = [
+            series_id
+            for series_id in (series_ids or BLS_SERIES)
+            if series_id in BLS_SERIES
+        ]
+        if not selected_series:
+            raise RuntimeError("BLS requested series set is empty")
         end_year = datetime.now(UTC).year
         body: dict[str, object] = {
-            "seriesid": list(BLS_SERIES.keys()),
+            "seriesid": selected_series,
             "startyear": str(end_year - BLS_HISTORY_YEARS),
             "endyear": str(end_year),
         }
@@ -77,7 +88,10 @@ class BlsProvider(BaseProvider):
         if payload.get("status") != "REQUEST_SUCCEEDED":
             message = "; ".join(str(item) for item in (payload.get("message") or [])) or "BLS request was not processed"
             if _is_bls_daily_threshold(message) and self.settings.fred_api_key:
-                return await self._fetch_via_fred_fallback(message)
+                return await self._fetch_via_fred_fallback(
+                    message,
+                    series_ids=selected_series,
+                )
             raise RuntimeError(message)
 
         series: dict[str, dict[str, object]] = {}
@@ -145,14 +159,22 @@ class BlsProvider(BaseProvider):
             data=series,
         )
 
-    async def _fetch_via_fred_fallback(self, reason: str) -> ProviderResult:
+    async def _fetch_via_fred_fallback(
+        self,
+        reason: str,
+        *,
+        series_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> ProviderResult:
         data: dict[str, dict[str, object]] = {}
         latest_as_of: datetime | None = None
         async with httpx.AsyncClient(
             timeout=self.settings.fred_timeout_seconds,
             follow_redirects=False,
         ) as client:
+            selected = set(series_ids or BLS_FRED_FALLBACK_SERIES)
             for bls_series_id, fred_series_id in BLS_FRED_FALLBACK_SERIES.items():
+                if bls_series_id not in selected:
+                    continue
                 response = await client.get(
                     f"{self.settings.fred_base_url}/series/observations",
                     params={

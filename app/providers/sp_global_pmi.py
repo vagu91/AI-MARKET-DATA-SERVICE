@@ -72,9 +72,13 @@ class SpGlobalPmiProvider(BaseProvider):
             release_date=release_date,
         )
         retrieved_at = datetime.now(UTC)
+        content_sha256 = hashlib.sha256(response.content).hexdigest().upper()
+        current_observation = parsed["observations"][-1]
         parsed.update(
             {
                 "series_id": SERIES_ID,
+                "value": current_observation["value"],
+                "data_as_of": parsed["period"],
                 "source": self.source,
                 "source_url": url,
                 "canonical_url": url,
@@ -85,8 +89,19 @@ class SpGlobalPmiProvider(BaseProvider):
                 "units": "index_points",
                 "seasonal_adjustment": "SA",
                 "retrieved_at": retrieved_at.isoformat(),
+                "lineage": [
+                    {
+                        "field": "observations",
+                        "source": self.source,
+                        "source_series_id": SERIES_ID,
+                        "source_url": url,
+                        "reference_period": parsed["period"],
+                        "content_sha256": content_sha256,
+                        "normalization": "exact_public_release_parser",
+                    }
+                ],
                 "raw_lineage_redacted": {
-                    "content_sha256": hashlib.sha256(response.content).hexdigest().upper(),
+                    "content_sha256": content_sha256,
                     "source_url": url,
                     "release_date": release_date,
                 },

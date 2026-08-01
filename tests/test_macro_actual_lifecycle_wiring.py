@@ -420,6 +420,15 @@ def test_real_wiring_routes_bea_metric_to_official_bea_provider(
 ) -> None:
     settings = cfg(tmp_path)
     event = occurrence(metric_id="headline_pce_mom")
+    event.update(
+        {
+            "provider": "BEA Release Calendar",
+            "name": "PCE M/M",
+            "category": "PCE",
+            "source": "BEA Release Calendar",
+            "source_url": "https://www.bea.gov/news/schedule",
+        }
+    )
     official = _ControlledBeaProvider()
     resolver, _ = wired_resolver(
         settings,
@@ -450,7 +459,7 @@ def test_calendar_row_never_promotes_its_unverified_actual(
     result = resolver.resolve(seed_due(settings, event))
 
     assert result["status"] == "NO_DATA"
-    assert result["ai_eligible"] is True
+    assert result["ai_eligible"] is False
     assert result.get("datum") is None
 
 
@@ -475,7 +484,7 @@ def test_partial_official_resolution_exposes_only_residual_fields(
     assert result["status"] == "PARTIAL"
     assert result["datum"]["actual"] == "1.0"
     assert result["missing_fields"] == ["consensus"]
-    assert result["ai_eligible"] is True
+    assert result["ai_eligible"] is False
 
 
 def test_occurrence_beyond_retry_deadline_is_no_data_without_ai(

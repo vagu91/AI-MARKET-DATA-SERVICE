@@ -1,5 +1,6 @@
 import asyncio
 from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -19,6 +20,9 @@ from app.models.nasdaq import Relevance
 from app.providers.alpha_vantage import ensure_alpha_payload_ok
 from app.providers.base import BaseProvider, metadata
 from app.providers.calendar_utils import REQUEST_HEADERS
+from app.services.provider_capability_registry import (
+    dataset_runtime_provider_order,
+)
 from app.services.market_news_repository import MarketNewsRepository
 from app.services.news_intelligence_service import (
     extract_page_metadata,
@@ -57,6 +61,32 @@ class MetadataRedirectError(RuntimeError):
         self.reason_code = reason_code
 
 
+class _NewsRequestCallEvidence:
+    """Per-invocation evidence of provider HTTP attempts."""
+
+    def __init__(self) -> None:
+        self._calls: Counter[str] = Counter()
+
+    def record_call(self, provider: str) -> None:
+        self._calls[provider] += 1
+
+    def calls(self, provider: str) -> int:
+        return int(self._calls[provider])
+
+
+@dataclass(frozen=True, slots=True)
+class _NewsProviderRuntimeSpec:
+    provider_id: str
+    provider: str
+    provider_type: ProviderType
+    reliability: float
+    enabled_field: str
+    url_field: str | None
+    dispatch: str
+    limit_field: str
+    query_mode: str | None = None
+
+
 class NewsProvider(BaseProvider):
     source = "Market News"
     provider_type = ProviderType.API
@@ -87,43 +117,36 @@ class NewsProvider(BaseProvider):
     ) -> ProviderResult:
         requested_limit = max(int(limit), 1)
         query = " OR ".join(symbols + ["Federal Reserve", "Nasdaq", "QQQ"])
+        provider_specs = _news_runtime_provider_specs()
+        loop = asyncio.get_running_loop()
+        total_budget, acquisition_budget = _news_request_budgets(
+            self.settings
+        )
+        internal_deadline = loop.time() + total_budget
+        execution_evidence = _NewsRequestCallEvidence()
         async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
-            tasks: list[Any] = []
-            if self.settings.alpha_vantage_api_key:
-                tasks.append(
-                    self._fetch_alpha_vantage(
-                        client=client,
-                        symbols=symbols,
-                        limit=min(
-                            requested_limit,
-                            self.settings.news_alpha_vantage_limit,
-                        ),
-                        recency_days=recency_days,
-                    )
-                )
-            if self.settings.news_gdelt_enabled:
-                tasks.append(
-                    self._fetch_gdelt(
-                        client=client,
-                        symbols=symbols,
-                        query=query,
-                        limit=min(requested_limit, self.settings.news_gdelt_limit),
-                        recency_days=recency_days,
-                    )
-                )
-            if self.settings.news_rss_enabled:
-                tasks.extend(
-                    self._rss_tasks(
-                        client=client,
-                        symbols=symbols,
-                        limit=min(
-                            requested_limit,
-                            self.settings.news_rss_limit_per_feed,
-                        ),
-                        recency_days=recency_days,
-                    )
-                )
-            batches = list(await asyncio.gather(*tasks)) if tasks else []
+            task_specs = self._provider_tasks(
+                provider_specs=provider_specs,
+                client=client,
+                symbols=symbols,
+                query=query,
+                requested_limit=requested_limit,
+                recency_days=recency_days,
+                execution_evidence=execution_evidence,
+            )
+            observed_batches = await _bounded_news_provider_batches(
+                task_specs,
+                provider_specs=provider_specs,
+                execution_evidence=execution_evidence,
+                limit=requested_limit,
+                timeout_seconds=acquisition_budget,
+            )
+            batches = _complete_news_provider_batches(
+                observed_batches,
+                settings=self.settings,
+                limit=requested_limit,
+                provider_specs=provider_specs,
+            )
             if self.network_observer is not None:
                 self.network_observer.register_provider_batches(batches)
             articles = [
@@ -135,6 +158,10 @@ class NewsProvider(BaseProvider):
                 client,
                 articles,
                 batches=batches,
+                timeout_seconds=max(
+                    internal_deadline - loop.time() - 0.05,
+                    0.0,
+                ),
             )
             articles, post_enrichment_outside = _partition_recency(
                 articles,
@@ -217,6 +244,85 @@ class NewsProvider(BaseProvider):
             )
             result.data["data_quality"] = quality
         return self._store_and_return(result)
+
+    def _provider_tasks(
+        self,
+        *,
+        provider_specs: tuple[_NewsProviderRuntimeSpec, ...],
+        client: httpx.AsyncClient,
+        symbols: list[str],
+        query: str,
+        requested_limit: int,
+        recency_days: int,
+        execution_evidence: _NewsRequestCallEvidence,
+    ) -> list[tuple[str, Any]]:
+        tasks: list[tuple[str, Any]] = []
+        for spec in provider_specs:
+            if not bool(
+                getattr(self.settings, spec.enabled_field, False)
+            ):
+                continue
+            url = (
+                getattr(self.settings, spec.url_field, None)
+                if spec.url_field
+                else None
+            )
+            if spec.url_field and not url:
+                continue
+            provider_limit = min(
+                requested_limit,
+                int(getattr(self.settings, spec.limit_field)),
+            )
+            if spec.dispatch == "ALPHA_VANTAGE":
+                awaitable = self._fetch_alpha_vantage(
+                    client=client,
+                    symbols=symbols,
+                    limit=provider_limit,
+                    recency_days=recency_days,
+                    execution_evidence=execution_evidence,
+                )
+            elif spec.dispatch == "GDELT":
+                awaitable = self._fetch_gdelt(
+                    client=client,
+                    symbols=symbols,
+                    query=query,
+                    limit=provider_limit,
+                    recency_days=recency_days,
+                    execution_evidence=execution_evidence,
+                )
+            elif spec.dispatch == "RSS":
+                params = (
+                    {
+                        "q": f"{' OR '.join(symbols)} Nasdaq",
+                        "hl": "en-US",
+                        "gl": "US",
+                        "ceid": "US:en",
+                    }
+                    if spec.query_mode == "GOOGLE_NEWS"
+                    else {}
+                )
+                awaitable = _fetch_one_rss_feed(
+                    client=client,
+                    source=spec.provider,
+                    url=str(url),
+                    params=params,
+                    reliability=spec.reliability,
+                    symbols=symbols,
+                    limit=provider_limit,
+                    recency_days=recency_days,
+                    timeout=min(
+                        float(self.settings.http_timeout_seconds),
+                        4.0,
+                    ),
+                    execution_evidence=execution_evidence,
+                )
+            else:
+                raise RuntimeError(
+                    "NEWS_RUNTIME_DISPATCH_UNMAPPED:"
+                    f"{spec.provider_id}:{spec.dispatch}"
+                )
+            tasks.append((spec.provider, awaitable))
+        return tasks
 
     def _store_and_return(self, result: ProviderResult) -> ProviderResult:
         if not isinstance(result.data, dict):
@@ -597,9 +703,12 @@ class NewsProvider(BaseProvider):
         symbols: list[str],
         limit: int,
         recency_days: int,
+        execution_evidence: _NewsRequestCallEvidence | None = None,
     ) -> dict[str, Any]:
         provider = "Alpha Vantage NEWS_SENTIMENT"
         try:
+            if execution_evidence is not None:
+                execution_evidence.record_call(provider)
             response = await client.get(
                 self.settings.alpha_vantage_base_url,
                 params={
@@ -667,6 +776,7 @@ class NewsProvider(BaseProvider):
         query: str,
         limit: int,
         recency_days: int,
+        execution_evidence: _NewsRequestCallEvidence | None = None,
     ) -> dict[str, Any]:
         provider = "GDELT Doc API"
         attempts = 0
@@ -674,6 +784,8 @@ class NewsProvider(BaseProvider):
             while True:
                 attempts += 1
                 try:
+                    if execution_evidence is not None:
+                        execution_evidence.record_call(provider)
                     response = await client.get(
                         self.settings.gdelt_doc_api_url,
                         params={
@@ -769,50 +881,13 @@ class NewsProvider(BaseProvider):
                 ),
             )
 
-    def _rss_tasks(
-        self,
-        *,
-        client: httpx.AsyncClient,
-        symbols: list[str],
-        limit: int,
-        recency_days: int,
-    ) -> list[Any]:
-        query = f"{' OR '.join(symbols)} Nasdaq"
-        feeds = [
-            ("Federal Reserve RSS", self.settings.federal_reserve_rss_url, {}, 0.76),
-            ("BLS RSS", self.settings.bls_rss_url, {}, 0.86),
-            ("BEA RSS", self.settings.bea_rss_url, {}, 0.86),
-            ("Yahoo Finance RSS", self.settings.yahoo_finance_rss_url, {}, 0.58),
-            ("MarketWatch RSS", self.settings.marketwatch_rss_url, {}, 0.56),
-            (
-                "Google News RSS",
-                self.settings.google_news_rss_url,
-                {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
-                0.64,
-            ),
-        ]
-        return [
-            _fetch_one_rss_feed(
-                client=client,
-                source=source,
-                url=url,
-                params=params,
-                reliability=reliability,
-                symbols=symbols,
-                limit=limit,
-                recency_days=recency_days,
-                timeout=min(float(self.settings.http_timeout_seconds), 4.0),
-            )
-            for source, url, params, reliability in feeds
-            if url
-        ]
-
     async def _enrich_missing_metadata(
         self,
         client: httpx.AsyncClient,
         articles: list[dict[str, object]],
         *,
         batches: list[dict[str, Any]],
+        timeout_seconds: float | None = None,
     ) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
         per_provider_count: Counter[str] = Counter()
@@ -958,7 +1033,66 @@ class NewsProvider(BaseProvider):
                 if batch.get("metadata_enrichment_status") != "PARTIAL":
                     batch["metadata_enrichment_status"] = "COMPLETE"
 
-        await asyncio.gather(*(enrich(article) for article in candidates))
+        tasks = {
+            asyncio.create_task(enrich(article)): article
+            for article in candidates
+        }
+        if not tasks:
+            return articles
+        if timeout_seconds is None:
+            await asyncio.gather(*tasks)
+            return articles
+
+        _, pending = await asyncio.wait(
+            tasks,
+            timeout=max(float(timeout_seconds), 0.0),
+        )
+        pending_articles = [tasks[task] for task in pending]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for article in pending_articles:
+            provider = str(
+                article.get("acquisition_provider")
+                or article.get("provider")
+                or article.get("provider_type")
+                or "UNKNOWN"
+            )
+            batch = next(
+                (
+                    item
+                    for item in batches
+                    if str(item.get("provider")) == provider
+                ),
+                None,
+            )
+            if batch is None:
+                continue
+            record_id = str(
+                article.get("raw_record_id")
+                or article.get("provider_record_id")
+                or ""
+            )
+            existing = {
+                str(item.get("record_id"))
+                for item in batch.get("metadata_enrichment_results") or []
+            }
+            if record_id in existing:
+                continue
+            batch["metadata_enrichment_status"] = "PARTIAL"
+            batch.setdefault("warnings", []).append(
+                f"{provider} metadata_enrichment_deadline"
+            )
+            batch.setdefault("metadata_enrichment_results", []).append(
+                {
+                    "record_id": record_id,
+                    "status": "FAILED",
+                    "reason_code": "METADATA_ENRICHMENT_DEADLINE",
+                    "error_type": "TimeoutError",
+                    "error": "request-scoped metadata deadline reached",
+                }
+            )
         return articles
 
 
@@ -973,8 +1107,11 @@ async def _fetch_one_rss_feed(
     limit: int,
     recency_days: int,
     timeout: float,
+    execution_evidence: _NewsRequestCallEvidence | None = None,
 ) -> dict[str, Any]:
     try:
+        if execution_evidence is not None:
+            execution_evidence.record_call(source)
         response = await client.get(
             url,
             params=params,
@@ -1789,6 +1926,313 @@ def _partition_recency(
     return filtered, outside
 
 
+_NEWS_PROVIDER_RUNTIME_SPECS = {
+    "ALPHA_VANTAGE_NEWS_SENTIMENT": _NewsProviderRuntimeSpec(
+        provider_id="ALPHA_VANTAGE_NEWS_SENTIMENT",
+        provider="Alpha Vantage NEWS_SENTIMENT",
+        provider_type=ProviderType.API,
+        reliability=0.74,
+        enabled_field="alpha_vantage_api_key",
+        url_field=None,
+        dispatch="ALPHA_VANTAGE",
+        limit_field="news_alpha_vantage_limit",
+    ),
+    "GDELT_DOC_API": _NewsProviderRuntimeSpec(
+        provider_id="GDELT_DOC_API",
+        provider="GDELT Doc API",
+        provider_type=ProviderType.API,
+        reliability=0.66,
+        enabled_field="news_gdelt_enabled",
+        url_field=None,
+        dispatch="GDELT",
+        limit_field="news_gdelt_limit",
+    ),
+    "FEDERAL_RESERVE_RSS": _NewsProviderRuntimeSpec(
+        provider_id="FEDERAL_RESERVE_RSS",
+        provider="Federal Reserve RSS",
+        provider_type=ProviderType.RSS,
+        reliability=0.76,
+        enabled_field="news_rss_enabled",
+        url_field="federal_reserve_rss_url",
+        dispatch="RSS",
+        limit_field="news_rss_limit_per_feed",
+    ),
+    "BLS_RSS": _NewsProviderRuntimeSpec(
+        provider_id="BLS_RSS",
+        provider="BLS RSS",
+        provider_type=ProviderType.RSS,
+        reliability=0.86,
+        enabled_field="news_rss_enabled",
+        url_field="bls_rss_url",
+        dispatch="RSS",
+        limit_field="news_rss_limit_per_feed",
+    ),
+    "BEA_RSS": _NewsProviderRuntimeSpec(
+        provider_id="BEA_RSS",
+        provider="BEA RSS",
+        provider_type=ProviderType.RSS,
+        reliability=0.86,
+        enabled_field="news_rss_enabled",
+        url_field="bea_rss_url",
+        dispatch="RSS",
+        limit_field="news_rss_limit_per_feed",
+    ),
+    "YAHOO_FINANCE_RSS": _NewsProviderRuntimeSpec(
+        provider_id="YAHOO_FINANCE_RSS",
+        provider="Yahoo Finance RSS",
+        provider_type=ProviderType.RSS,
+        reliability=0.58,
+        enabled_field="news_rss_enabled",
+        url_field="yahoo_finance_rss_url",
+        dispatch="RSS",
+        limit_field="news_rss_limit_per_feed",
+    ),
+    "MARKETWATCH_RSS": _NewsProviderRuntimeSpec(
+        provider_id="MARKETWATCH_RSS",
+        provider="MarketWatch RSS",
+        provider_type=ProviderType.RSS,
+        reliability=0.56,
+        enabled_field="news_rss_enabled",
+        url_field="marketwatch_rss_url",
+        dispatch="RSS",
+        limit_field="news_rss_limit_per_feed",
+    ),
+    "GOOGLE_NEWS_RSS": _NewsProviderRuntimeSpec(
+        provider_id="GOOGLE_NEWS_RSS",
+        provider="Google News RSS",
+        provider_type=ProviderType.RSS,
+        reliability=0.64,
+        enabled_field="news_rss_enabled",
+        url_field="google_news_rss_url",
+        dispatch="RSS",
+        limit_field="news_rss_limit_per_feed",
+        query_mode="GOOGLE_NEWS",
+    ),
+}
+
+
+def _news_runtime_provider_specs() -> tuple[
+    _NewsProviderRuntimeSpec,
+    ...,
+]:
+    provider_ids = dataset_runtime_provider_order(
+        "current_news",
+        _NEWS_PROVIDER_RUNTIME_SPECS,
+    )
+    return tuple(
+        _NEWS_PROVIDER_RUNTIME_SPECS[provider_id]
+        for provider_id in provider_ids
+    )
+
+
+class _NewsProviderSpecsView:
+    """Legacy tuple view resolved from the current policy on every access."""
+
+    @staticmethod
+    def _values() -> tuple[
+        tuple[str, ProviderType, float, str, str | None],
+        ...,
+    ]:
+        return tuple(
+            (
+                spec.provider,
+                spec.provider_type,
+                spec.reliability,
+                spec.enabled_field,
+                spec.url_field,
+            )
+            for spec in _news_runtime_provider_specs()
+        )
+
+    def __iter__(self):
+        return iter(self._values())
+
+    def __len__(self) -> int:
+        return len(self._values())
+
+    def __getitem__(self, index):
+        return self._values()[index]
+
+
+# Imported by NasdaqDataService for cache-accounting validation. This is a
+# dynamic compatibility view, not a module-import policy snapshot.
+NEWS_PROVIDER_SPECS = _NewsProviderSpecsView()
+
+
+def _news_request_budgets(settings: Settings) -> tuple[float, float]:
+    wrapper_budget = max(
+        float(settings.timeout_news_seconds),
+        1.0,
+    )
+    wrapper_grace = min(
+        1.0,
+        max(0.1, wrapper_budget * 0.1),
+    )
+    total_budget = max(wrapper_budget - wrapper_grace, 0.1)
+    acquisition_budget = max(total_budget * 0.7, 0.05)
+    return total_budget, min(acquisition_budget, total_budget)
+
+
+async def _bounded_news_provider_batches(
+    task_specs: list[tuple[str, Any]],
+    *,
+    provider_specs: tuple[_NewsProviderRuntimeSpec, ...],
+    execution_evidence: _NewsRequestCallEvidence,
+    limit: int,
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    if not task_specs:
+        return []
+
+    task_by_provider = {
+        provider: asyncio.create_task(awaitable)
+        for provider, awaitable in task_specs
+    }
+    _, pending = await asyncio.wait(
+        task_by_provider.values(),
+        timeout=max(float(timeout_seconds), 0.0),
+    )
+    pending_providers = {
+        provider
+        for provider, task in task_by_provider.items()
+        if task in pending
+    }
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    batches: list[dict[str, Any]] = []
+    for provider, task in task_by_provider.items():
+        provider_type, reliability = _news_provider_identity(
+            provider,
+            provider_specs=provider_specs,
+        )
+        calls = execution_evidence.calls(provider)
+        if provider in pending_providers:
+            if calls:
+                batches.append(
+                    _failed_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        error=TimeoutError(
+                            "request-scoped news fan-in deadline reached"
+                        ),
+                        calls=calls,
+                        status="TEMPORARILY_UNAVAILABLE",
+                        reason_code=(
+                            f"{_provider_reason_prefix(provider)}"
+                            "_FAN_IN_DEADLINE"
+                        ),
+                    )
+                )
+            else:
+                batches.append(
+                    _observed_skip_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        reason_code=(
+                            f"{_provider_reason_prefix(provider)}"
+                            "_FAN_IN_DEADLINE_BEFORE_ATTEMPT"
+                        ),
+                    )
+                )
+            continue
+        try:
+            batches.append(task.result())
+        except Exception as exc:
+            if calls:
+                batches.append(
+                    _failed_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        error=exc,
+                        calls=calls,
+                    )
+                )
+            else:
+                batches.append(
+                    _observed_skip_provider_batch(
+                        provider=provider,
+                        provider_type=provider_type,
+                        reliability=reliability,
+                        limit=limit,
+                        reason_code=(
+                            f"{_provider_reason_prefix(provider)}"
+                            "_EXECUTION_FAILED_BEFORE_ATTEMPT"
+                        ),
+                    )
+                )
+    return batches
+
+
+def _news_provider_identity(
+    provider: str,
+    *,
+    provider_specs: tuple[_NewsProviderRuntimeSpec, ...] | None = None,
+) -> tuple[ProviderType, float]:
+    for spec in provider_specs or _news_runtime_provider_specs():
+        if spec.provider == provider:
+            return spec.provider_type, spec.reliability
+    raise ValueError(f"unknown news provider: {provider}")
+
+
+def _provider_reason_prefix(provider: str) -> str:
+    return re.sub(
+        r"[^A-Z0-9]+",
+        "_",
+        provider.upper(),
+    ).strip("_")
+
+
+def _complete_news_provider_batches(
+    batches: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    limit: int,
+    provider_specs: tuple[_NewsProviderRuntimeSpec, ...] | None = None,
+) -> list[dict[str, Any]]:
+    specs = provider_specs or _news_runtime_provider_specs()
+    output = list(batches)
+    observed = {
+        str(batch.get("provider"))
+        for batch in batches
+        if batch.get("provider")
+    }
+    for spec in specs:
+        if spec.provider in observed:
+            continue
+        enabled = bool(
+            getattr(settings, spec.enabled_field, False)
+        )
+        url_configured = bool(
+            getattr(settings, spec.url_field, None)
+        ) if spec.url_field else True
+        reason = (
+            "PROVIDER_URL_NOT_CONFIGURED"
+            if enabled and not url_configured
+            else "PROVIDER_CREDENTIAL_NOT_CONFIGURED"
+            if spec.provider_id == "ALPHA_VANTAGE_NEWS_SENTIMENT"
+            else "PROVIDER_DISABLED_BY_CONFIGURATION"
+        )
+        output.append(
+            _not_called_provider_batch(
+                provider=spec.provider,
+                provider_type=spec.provider_type,
+                reliability=spec.reliability,
+                limit=limit,
+                reason_code=reason,
+            )
+        )
+    return output
+
+
 def _provider_batch(
     *,
     provider: str,
@@ -1869,6 +2313,76 @@ def _provider_batch(
         "errors": [],
         "_articles": articles,
     }
+
+
+def _not_called_provider_batch(
+    *,
+    provider: str,
+    provider_type: ProviderType,
+    reliability: float,
+    limit: int,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "provider_type": provider_type.value,
+        "status": "NOT_CONFIGURED",
+        "availability_status": "NOT_CONFIGURED",
+        "coverage_status": "NOT_CONFIGURED",
+        "reason_code": reason_code,
+        "temporary": False,
+        "reliability": reliability,
+        "calls": 0,
+        "pages": 0,
+        "retry_count": 0,
+        "metadata_enrichment_calls": 0,
+        "metadata_enrichment_required": False,
+        "metadata_enrichment_status": "NOT_REQUIRED",
+        "metadata_enrichment_results": [],
+        "per_provider_limit": limit,
+        "pagination_supported": False,
+        "pagination_complete": True,
+        "coverage_reason": reason_code,
+        "raw_capture_status": "NOT_ACQUIRED",
+        "raw_capture": [],
+        "raw_record_ids": [],
+        "raw_count": 0,
+        "parsed_record_ids": [],
+        "parsed_count": 0,
+        "technical_rejections": [],
+        "explicit_out_of_scope": [],
+        "persistence_rejections": [],
+        "exact_technical_duplicates": [],
+        "persisted_record_ids": [],
+        "warnings": [],
+        "errors": [],
+        "_articles": [],
+    }
+
+
+def _observed_skip_provider_batch(
+    *,
+    provider: str,
+    provider_type: ProviderType,
+    reliability: float,
+    limit: int,
+    reason_code: str,
+) -> dict[str, Any]:
+    batch = _not_called_provider_batch(
+        provider=provider,
+        provider_type=provider_type,
+        reliability=reliability,
+        limit=limit,
+        reason_code=reason_code,
+    )
+    batch.update(
+        {
+            "status": "NOT_CALLED",
+            "availability_status": "NOT_CALLED",
+            "coverage_status": "NOT_CALLED",
+        }
+    )
+    return batch
 
 
 def _failed_provider_batch(

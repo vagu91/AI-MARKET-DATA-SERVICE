@@ -324,7 +324,13 @@ def test_disabled_scheduler_suppresses_ai_even_with_explicit_context(
 
 def test_trusted_enabled_scheduler_entrypoint_passes_explicit_context(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,
@@ -336,7 +342,10 @@ def test_trusted_enabled_scheduler_entrypoint_passes_explicit_context(
     state = {
         "research_scheduler": scheduler,
         "lifecycle_due_resolver": SimpleNamespace(
-            resolve=lambda _: {"status": "EXHAUSTED"}
+            resolve=lambda _: {
+                "status": "EXHAUSTED",
+                "ai_eligible": True,
+            }
         ),
     }
     result = asyncio.run(run_lifecycle_due_scan(state))

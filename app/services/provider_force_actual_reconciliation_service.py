@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from app.core.config import Settings
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessPolicy,
+    evaluate_canonical_freshness,
+    parse_datetime,
+)
 from app.services.deterministic_actual_resolver import (
     official_actual_mapping,
 )
@@ -14,9 +20,20 @@ from app.services.event_driven_lifecycle_service import (
     LifecycleRepository,
     compute_datum_lifecycle,
 )
+from app.services.market_fact_repository import MarketFactRepository
 from app.services.observability_contract_service import TelemetryRepository
 from app.services.official_actual_semantics import (
+    OFFICIAL_METRICS,
     normalize_reference_period,
+)
+from app.services.provider_capability_registry import (
+    dataset_policy_by_id,
+    provider_by_id,
+)
+from app.services.request_provider_accounting import (
+    RequestProviderAccountingCollector,
+    _observed_lifecycle_skip_flow_valid,
+    provider_attempt,
 )
 
 
@@ -25,6 +42,39 @@ CALENDAR_SECTIONS = (
     "fed_communications",
     "other_economic_events",
 )
+FLASH_SERVICES_PMI_DATASET_ID = "flash_services_pmi"
+_ACCEPTED_FIELD_VALIDATION_STATES = frozenset(
+    {
+        "accepted",
+        "approved",
+        "deterministic_verified",
+        "field_level_validated",
+        "passed",
+        "valid",
+        "verified",
+    }
+)
+_CURRENT_FIELD_FRESHNESS_STATES = frozenset(
+    {
+        "CURRENT",
+        "CURRENT_LATEST_OFFICIAL_RELEASE",
+        "CURRENT_RELEASE",
+        "FRESH",
+    }
+)
+
+
+def _flash_services_pmi_provider_order() -> tuple[str, ...]:
+    policy = dataset_policy_by_id(FLASH_SERVICES_PMI_DATASET_ID)
+    order = (
+        policy.primary_provider,
+        *policy.fallback_providers,
+    )
+    if not order[0] or len(order) != len(set(order)):
+        raise RuntimeError(
+            "FLASH_SERVICES_PMI_PROVIDER_POLICY_INVALID"
+        )
+    return order
 
 
 class ProviderForceActualReconciliationService:
@@ -38,16 +88,33 @@ class ProviderForceActualReconciliationService:
         clock: Callable[[], datetime] | None = None,
         generation_id: str | None = None,
         coverage_write_count: int = 0,
+        accounting_collector: (
+            RequestProviderAccountingCollector | None
+        ) = None,
+        force_refresh: bool = False,
     ) -> None:
         self.settings = settings
         self.lifecycle_resolver = lifecycle_resolver
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lifecycle = LifecycleRepository(settings, clock=self.clock)
+        self.facts = MarketFactRepository(settings, clock=self.clock)
         self.telemetry = TelemetryRepository(settings)
         self.generation_id = generation_id
         self.coverage_write_count = max(
             int(coverage_write_count),
             0,
+        )
+        self.accounting_collector = accounting_collector
+        self.force_refresh = force_refresh
+        self.request_id = (
+            accounting_collector.request_id
+            if accounting_collector is not None
+            else None
+        )
+        self.correlation_id = (
+            accounting_collector.correlation_id
+            if accounting_collector is not None
+            else None
         )
 
     def prepare(
@@ -57,6 +124,9 @@ class ProviderForceActualReconciliationService:
         now = self.clock()
         output = dict(contract)
         events = _contract_occurrences(output)
+        canonical_events = _canonical_occurrences(
+            self.facts.economic_event_records(country="US")
+        )
         lifecycle_by_key = {
             str(item.get("entity_key") or ""): item
             for item in self.lifecycle.list_items()
@@ -70,77 +140,145 @@ class ProviderForceActualReconciliationService:
         audits: list[dict[str, Any]] = []
 
         for occurrence_id, contract_event in events.items():
+            canonical_event = canonical_events.get(occurrence_id)
+            if canonical_event is not None:
+                contract_event = _merge_canonical_occurrence(
+                    contract_event,
+                    canonical_event,
+                )
+                output = _replace_occurrence(
+                    output,
+                    occurrence_id=occurrence_id,
+                    event=contract_event,
+                )
             mapping = official_actual_mapping(contract_event)
             if mapping is None:
                 continue
-            existing = lifecycle_by_key.get(occurrence_id)
+            existing = _merge_canonical_lifecycle_evidence(
+                lifecycle_by_key.get(occurrence_id),
+                canonical_event,
+                observed_at=now,
+            )
             existing_payload = (
                 dict((existing or {}).get("payload") or {})
                 if isinstance((existing or {}).get("payload"), dict)
                 else {}
             )
             lifecycle_before = _lifecycle_before(existing)
+            actual_evidence_repair_required = False
             if contract_event.get("actual") not in (None, ""):
                 persisted_audit = existing_payload.get(
                     "actual_resolution"
                 )
-                if isinstance(persisted_audit, dict):
-                    enrichment = dict(
-                        contract_event.get("enrichment") or {}
-                    )
-                    enrichment["summary"] = {
-                        **dict(enrichment.get("summary") or {}),
-                        "actual_resolution": persisted_audit,
-                    }
-                    output = _replace_occurrence(
-                        output,
-                        occurrence_id=occurrence_id,
-                        event={
-                            **contract_event,
-                            **{
-                                key: existing_payload.get(key)
-                                for key in (
-                                    "comparison_lineage",
-                                    "release_status",
-                                    "status",
-                                    "actual_source",
-                                    "actual_source_url",
-                                    "actual_is_official",
-                                    "source_lineage",
-                                    "acquisition_method",
-                                    "freshness_state",
-                                    "time_utc",
-                                    "release_at",
-                                )
-                                if existing_payload.get(key)
-                                not in (None, "")
-                            },
-                            "freshness_state": (
-                                existing_payload.get("freshness_state")
-                                or "CURRENT_RELEASE"
+                if _persisted_actual_audit_matches_occurrence(
+                    persisted_audit,
+                    payload=existing_payload,
+                    occurrence_id=occurrence_id,
+                    mapping_selected=mapping["metric_id"],
+                ):
+                    persisted_actual_lineage = (
+                        _persisted_actual_field_lineage(
+                            existing_payload,
+                            persisted_audit=persisted_audit,
+                            occurrence_id=occurrence_id,
+                            mapping_selected=mapping["metric_id"],
+                            delivered_actual=contract_event.get(
+                                "actual"
                             ),
-                            "actual_resolution": persisted_audit,
-                            "enrichment": enrichment,
-                        },
+                            now=now,
+                        )
                     )
-                    audits.append(dict(persisted_audit))
-                continue
+                    if persisted_actual_lineage is not None:
+                        enrichment = dict(
+                            contract_event.get("enrichment") or {}
+                        )
+                        field_lineage = dict(
+                            enrichment.get("field_lineage") or {}
+                        )
+                        field_lineage["actual"] = (
+                            persisted_actual_lineage
+                        )
+                        enrichment["field_lineage"] = field_lineage
+                        enrichment["summary"] = {
+                            **dict(enrichment.get("summary") or {}),
+                            "actual_resolution": persisted_audit,
+                        }
+                        output = _replace_occurrence(
+                            output,
+                            occurrence_id=occurrence_id,
+                            event={
+                                **contract_event,
+                                **{
+                                    key: existing_payload.get(key)
+                                    for key in (
+                                        "comparison_lineage",
+                                        "release_status",
+                                        "status",
+                                        "actual_source",
+                                        "actual_source_url",
+                                        "actual_is_official",
+                                        "source_lineage",
+                                        "acquisition_method",
+                                        "freshness_state",
+                                        "time_utc",
+                                        "release_at",
+                                        "content_valid_until",
+                                        "refresh_due_at",
+                                        "valid_until",
+                                        "next_refresh_at",
+                                    )
+                                    if existing_payload.get(key)
+                                    not in (None, "")
+                                },
+                                "freshness_state": (
+                                    existing_payload.get(
+                                        "freshness_state"
+                                    )
+                                    or "CURRENT_RELEASE"
+                                ),
+                                "actual_resolution": persisted_audit,
+                                "enrichment": enrichment,
+                            },
+                        )
+                        audits.append(
+                            _request_scoped_database_audit(
+                                persisted_audit,
+                                occurrence_id=occurrence_id,
+                                lifecycle_before=lifecycle_before,
+                                mapping_selected=mapping["metric_id"],
+                                observed_at=now,
+                                value_present=True,
+                                request_id=self.request_id,
+                                correlation_id=self.correlation_id,
+                            )
+                        )
+                        continue
+                # A value without complete, field-specific canonical evidence
+                # is not a reusable DB hit.  Keep the DB lookup observable but
+                # remove the unproven delivery value before entering the normal
+                # deterministic resolver/provider path.
+                actual_evidence_repair_required = True
             release = parse_datetime(
                 contract_event.get("release_at")
                 or contract_event.get("scheduled_at_utc")
                 or contract_event.get("time_utc")
             )
             if release is None or release > now:
-                self._emit_decision(
-                    occurrence_id=occurrence_id,
-                    lifecycle_before=lifecycle_before,
-                    eligibility="FUTURE_NOT_DUE",
-                    reclaim_reason="occurrence_not_published",
-                    resolver_invoked=False,
-                    provider_attempted=False,
-                    source_series=mapping["source_series"],
-                    reconciliation_outcome="SKIPPED",
-                    reason_code="OCCURRENCE_NOT_PUBLISHED",
+                audits.append(
+                    self._emit_decision(
+                        occurrence_id=occurrence_id,
+                        lifecycle_before=lifecycle_before,
+                        eligibility="FUTURE_NOT_DUE",
+                        reclaim_reason="occurrence_not_published",
+                        resolver_invoked=False,
+                        provider_attempted=False,
+                        provider=mapping["provider"],
+                        mapping_selected=mapping["metric_id"],
+                        source_series=mapping["source_series"],
+                        reconciliation_outcome="SKIPPED",
+                        reason_code="OCCURRENCE_NOT_PUBLISHED",
+                        observed_at=now,
+                    )
                 )
                 continue
             payload = dict(
@@ -161,29 +299,73 @@ class ProviderForceActualReconciliationService:
                     release_date=release,
                 ),
             }
+            if actual_evidence_repair_required:
+                payload = _without_unproven_actual(payload)
             eligibility, reclaim_reason = _eligibility(
                 existing,
                 now=now,
+                force_refresh=self.force_refresh,
+                request_id=self.request_id,
+                correlation_id=self.correlation_id,
             )
+            if actual_evidence_repair_required:
+                eligibility = "RECLAIMABLE"
+                reclaim_reason = (
+                    "CANONICAL_ACTUAL_FIELD_EVIDENCE_INCOMPLETE"
+                )
             if eligibility != "RECLAIMABLE":
                 persisted = payload.get("actual_resolution")
+                if _same_request_provider_audit(
+                    persisted,
+                    request_id=self.request_id,
+                    correlation_id=self.correlation_id,
+                ):
+                    reused_audit = {
+                        **dict(persisted),
+                        "occurrence_id": occurrence_id,
+                        "lifecycle_before": lifecycle_before,
+                        "eligibility": eligibility,
+                        "reclaim_reason": reclaim_reason,
+                        "mapping_selected": mapping["metric_id"],
+                        "reconciliation_outcome": (
+                            "SAME_REQUEST_PROVIDER_EVIDENCE_REUSED"
+                        ),
+                        "finalization_status": "NO_OP",
+                        "canonical_write_count": 0,
+                        "lifecycle_write_count": 0,
+                        "coverage_write_count": 0,
+                        "snapshot_write_count": 0,
+                        "outbox_write_count": 0,
+                    }
+                    output = _replace_occurrence(
+                        output,
+                        occurrence_id=occurrence_id,
+                        event=payload,
+                    )
+                    audits.append(reused_audit)
+                    self._emit_prepared(reused_audit)
+                    continue
                 if isinstance(persisted, dict):
                     output = _replace_occurrence(
                         output,
                         occurrence_id=occurrence_id,
                         event=payload,
                     )
-                    audits.append(dict(persisted))
-                self._emit_decision(
-                    occurrence_id=occurrence_id,
-                    lifecycle_before=lifecycle_before,
-                    eligibility=eligibility,
-                    reclaim_reason=reclaim_reason,
-                    resolver_invoked=False,
-                    provider_attempted=False,
-                    source_series=mapping["source_series"],
-                    reconciliation_outcome="SKIPPED",
-                    reason_code=reclaim_reason,
+                audits.append(
+                    self._emit_decision(
+                        occurrence_id=occurrence_id,
+                        lifecycle_before=lifecycle_before,
+                        eligibility=eligibility,
+                        reclaim_reason=reclaim_reason,
+                        resolver_invoked=False,
+                        provider_attempted=False,
+                        provider=mapping["provider"],
+                        mapping_selected=mapping["metric_id"],
+                        source_series=mapping["source_series"],
+                        reconciliation_outcome="SKIPPED",
+                        reason_code=reclaim_reason,
+                        observed_at=now,
+                    )
                 )
                 continue
 
@@ -195,6 +377,9 @@ class ProviderForceActualReconciliationService:
                 "fields_attempted": ["actual"],
                 "payload": payload,
                 "resolution_mode": "prepare_atomic_provider_force",
+                "force_refresh": self.force_refresh,
+                "request_id": self.request_id,
+                "correlation_id": self.correlation_id,
             }
             result = self.lifecycle_resolver.resolve(item)
             status = str(result.get("status") or "NO_DATA").upper()
@@ -217,8 +402,16 @@ class ProviderForceActualReconciliationService:
                     else "OFFICIAL_ACTUAL_UNAVAILABLE"
                 )
             )
+            provider_attempts = _request_scoped_provider_attempts(
+                result.get("provider_attempts") or [],
+                request_id=self.request_id,
+                correlation_id=self.correlation_id,
+                observed_at=now,
+            )
             audit = {
                 "occurrence_id": occurrence_id,
+                "request_id": self.request_id,
+                "correlation_id": self.correlation_id,
                 "lifecycle_before": lifecycle_before,
                 "eligibility": eligibility,
                 "reclaim_reason": reclaim_reason,
@@ -241,6 +434,13 @@ class ProviderForceActualReconciliationService:
                 ),
                 "provider_request_attempted": bool(
                     result.get("provider_request_attempted")
+                ),
+                "provider_attempts": provider_attempts,
+                "provider_negative_cache_hit": bool(
+                    result.get("provider_negative_cache_hit")
+                ),
+                "provider_negative_cache_bypassed": bool(
+                    result.get("provider_negative_cache_bypassed")
                 ),
                 "provider_http_outcome": result.get(
                     "provider_http_outcome"
@@ -302,7 +502,7 @@ class ProviderForceActualReconciliationService:
                     or payload.get("source_url")
                 )
                 publisher = (
-                    result["datum"].get("actual_source")
+                    result["datum"].get("publisher")
                     or result["datum"].get("source")
                 )
                 datum = {
@@ -359,6 +559,23 @@ class ProviderForceActualReconciliationService:
                     now=now,
                     reason_code=reason_code,
                     terminal=work_status == "EXHAUSTED_NO_DATA",
+                )
+            datum = {
+                **datum,
+                "valid_until": lifecycle.valid_until,
+                "next_refresh_at": lifecycle.next_refresh_at,
+                "content_valid_until": lifecycle.valid_until,
+                "refresh_due_at": lifecycle.next_refresh_at,
+            }
+            if resolved:
+                datum = _complete_same_acquisition_field_lineage(
+                    datum,
+                    candidate=candidate,
+                    audit=audit,
+                    lifecycle=lifecycle,
+                    occurrence_id=occurrence_id,
+                    mapping_selected=mapping["metric_id"],
+                    now=now,
                 )
             resolved_items.append((lifecycle, datum, work_status))
             canonical_reconciliations.append(
@@ -429,12 +646,283 @@ class ProviderForceActualReconciliationService:
                 reconciliation_audit
             )
             output["data_quality"] = data_quality
+        self._record_flash_pmi_accounting(
+            contract=output,
+            audits=audits,
+        )
         return {
             "contract": output,
             "resolved_items": resolved_items,
             "canonical_reconciliations": canonical_reconciliations,
             "audit": reconciliation_audit,
         }
+
+    def _record_flash_pmi_accounting(
+        self,
+        *,
+        contract: dict[str, Any],
+        audits: list[dict[str, Any]],
+    ) -> None:
+        collector = self.accounting_collector
+        if collector is None:
+            return
+        provider_order = _flash_services_pmi_provider_order()
+        primary_provider_id = provider_order[0]
+        fallback_provider_ids = provider_order[1:]
+        occurrences_by_id = {
+            occurrence_id: event
+            for occurrence_id, event in _contract_occurrences(
+                contract
+            ).items()
+            if (
+                (official_actual_mapping(event) or {}).get(
+                    "metric_id"
+                )
+                == "flash_services_pmi"
+            )
+        }
+        occurrences = list(occurrences_by_id.values())
+        relevant = [
+            item
+            for item in audits
+            if item.get("mapping_selected") == "flash_services_pmi"
+        ]
+        observed_at = parse_datetime(
+            getattr(
+                self,
+                "clock",
+                lambda: datetime.now(UTC),
+            )()
+        ) or datetime.now(UTC)
+        target = _latest_flash_services_occurrence(
+            occurrences,
+            observed_at=observed_at,
+        )
+        target_id = str(
+            (target or {}).get("occurrence_id")
+            or (target or {}).get("event_id")
+            or ""
+        )
+        target_audit = next(
+            (
+                item
+                for item in relevant
+                if str(item.get("occurrence_id") or "")
+                == target_id
+            ),
+            None,
+        )
+        raw_attempts = [
+            dict(attempt)
+            for attempt in (
+                (target_audit or {}).get("provider_attempts")
+                or []
+            )
+            if isinstance(attempt, dict)
+        ]
+        attempts_by_provider = {
+            str(item.get("provider") or ""): item
+            for item in raw_attempts
+        }
+        provider_calls = int(
+            (target_audit or {}).get("provider_call_count")
+            or 0
+        )
+        selected = (
+            target
+            if target
+            and target.get("actual") not in (None, "")
+            else None
+        )
+        lifecycle_before = (
+            (target_audit or {}).get("lifecycle_before")
+            if isinstance(
+                (target_audit or {}).get("lifecycle_before"),
+                dict,
+            )
+            else None
+        )
+        db_found = lifecycle_before is not None
+        data_as_of = (
+            target.get("release_at")
+            or target.get("reference_period")
+            if target
+            else None
+        )
+        database_row = (
+            {
+                "database_data_as_of": data_as_of,
+                "database_content_valid_until": (
+                    lifecycle_before.get("valid_until")
+                ),
+                "database_refresh_due_at": (
+                    lifecycle_before.get("next_refresh_at")
+                ),
+                "database_lifecycle_status": lifecycle_before.get(
+                    "freshness_state"
+                ),
+            }
+            if db_found and lifecycle_before
+            else None
+        )
+        database_decision = evaluate_canonical_freshness(
+            database_row,
+            policy=CanonicalFreshnessPolicy(
+                max_age=timedelta(days=45),
+                data_reference_mode="official_release",
+            ),
+            observed_at=observed_at,
+        )
+        database_valid = bool(
+            db_found and database_decision.usable
+        )
+        if database_valid:
+            primary = provider_attempt(
+                primary_provider_id,
+                called=False,
+                attempts=0,
+                result="NOT_CALLED",
+                not_called_reason="VALID_DATABASE_RECORD_SELECTED",
+                execution_origin="CACHE_DECISION",
+            )
+            fallbacks = [
+                provider_attempt(
+                    provider_id,
+                    called=False,
+                    attempts=0,
+                    result="NOT_CALLED",
+                    not_called_reason=(
+                        "VALID_DATABASE_RECORD_SELECTED"
+                    ),
+                    execution_origin="CACHE_DECISION",
+                )
+                for provider_id in fallback_provider_ids
+            ]
+        else:
+            primary = _actual_attempt(
+                primary_provider_id,
+                attempts_by_provider.get(primary_provider_id),
+                skipped_reason=(
+                    "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                    if not occurrences
+                    else "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+                ),
+            )
+            fallbacks = []
+            for index, provider_id in enumerate(
+                fallback_provider_ids,
+                start=1,
+            ):
+                prior_success = next(
+                    (
+                        prior_index
+                        for prior_index, prior_provider_id in enumerate(
+                            provider_order[:index]
+                        )
+                        if _actual_result_succeeded(
+                            attempts_by_provider.get(
+                                prior_provider_id,
+                                {},
+                            ).get("result")
+                        )
+                    ),
+                    None,
+                )
+                fallbacks.append(
+                    _actual_attempt(
+                        provider_id,
+                        attempts_by_provider.get(provider_id),
+                        skipped_reason=(
+                            "NO_FLASH_SERVICES_PMI_OCCURRENCE"
+                            if not occurrences
+                            else "PRIMARY_SUCCEEDED"
+                            if prior_success == 0
+                            else "PRIOR_PROVIDER_SUCCEEDED"
+                            if prior_success is not None
+                            else (
+                                "PROVIDER_ATTEMPT_EVIDENCE_MISSING"
+                            )
+                        ),
+                    )
+                )
+        evidence_complete = bool(
+            target is not None
+            and target_audit is not None
+            and _audit_correlated(
+                target_audit,
+                request_id=collector.request_id,
+                correlation_id=collector.correlation_id,
+            )
+            and database_decision.complete
+            and (
+                database_valid
+                or _actual_provider_chain_complete(
+                    raw_attempts,
+                    provider_calls=provider_calls,
+                    request_id=collector.request_id,
+                    correlation_id=collector.correlation_id,
+                )
+            )
+        )
+        collector.record(
+            "flash_services_pmi",
+            acquisition_id=(
+                "flash_services_pmi_actual_resolution:"
+                f"{target_id or 'NO_OCCURRENCE'}"
+            ),
+            shared_dataset_ids=("flash_services_pmi",),
+            database_lookup_performed=True,
+            database_lookup_reason=(
+                "OFFICIAL_ACTUAL_CANDIDATE_DATABASE_LOOKUP"
+            ),
+            database_record_found=db_found,
+            database_data_as_of=data_as_of if db_found else None,
+            database_content_valid_until=(
+                database_decision.content_valid_until
+                if db_found
+                else None
+            ),
+            database_refresh_due_at=(
+                database_decision.refresh_due_at
+                if db_found
+                else None
+            ),
+            database_lifecycle_status=(
+                lifecycle_before.get("freshness_state")
+                if lifecycle_before
+                else None
+            ),
+            database_record_expired=(
+                database_decision.expired
+                if db_found
+                else False
+            ),
+            database_freshness_evaluation=(
+                database_decision.evaluation
+                if db_found
+                else "NOT_FOUND"
+            ),
+            primary_provider=primary,
+            fallbacks=fallbacks,
+            acquisition_selected_source=(
+                (target_audit or {}).get("provider_attempted")
+                or selected.get("actual_source")
+                or selected.get("acquisition_provider")
+                if selected
+                else None
+            ),
+            acquisition_reason_code=(
+                "FLASH_SERVICES_PMI_DELIVERABLE_ACQUIRED"
+                if selected
+                else "FLASH_SERVICES_PMI_NOT_DUE"
+                if target is None
+                else "FLASH_SERVICES_PMI_ALL_PROVIDERS_FAILED"
+                if _provider_chain_all_failed(raw_attempts)
+                else "FLASH_SERVICES_PMI_VALUE_NOT_AVAILABLE"
+            ),
+            observed_at=observed_at,
+            evidence_complete=evidence_complete,
+        )
 
     def _emit_prepared(self, audit: dict[str, Any]) -> None:
         try:
@@ -466,18 +954,48 @@ class ProviderForceActualReconciliationService:
         reclaim_reason: str,
         resolver_invoked: bool,
         provider_attempted: bool,
+        provider: str,
+        mapping_selected: str,
         source_series: str | None,
         reconciliation_outcome: str,
         reason_code: str,
+        observed_at: datetime,
     ) -> dict[str, Any]:
+        providers = (
+            list(_flash_services_pmi_provider_order())
+            if mapping_selected == FLASH_SERVICES_PMI_DATASET_ID
+            else [provider]
+        )
+        provider_attempts = _request_scoped_provider_attempts(
+            [
+                {
+                    "provider": item,
+                    "called": False,
+                    "attempts": 0,
+                    "result": "NOT_CALLED",
+                    "not_called_reason": reason_code,
+                    "execution_origin": "OBSERVED_SKIP",
+                }
+                for item in providers
+            ],
+            request_id=self.request_id,
+            correlation_id=self.correlation_id,
+            observed_at=observed_at,
+        )
         audit = {
             "occurrence_id": occurrence_id,
+            "request_id": self.request_id,
+            "correlation_id": self.correlation_id,
             "lifecycle_before": lifecycle_before,
             "eligibility": eligibility,
             "reclaim_reason": reclaim_reason,
             "resolver_invoked": resolver_invoked,
+            "mapping_selected": mapping_selected,
             "provider_attempted": provider_attempted,
             "provider_call_count": 0,
+            "provider_request_attempted": False,
+            "provider_attempts": provider_attempts,
+            "provider_http_outcome": "NOT_CALLED",
             "source_series": source_series,
             "reconciliation_outcome": reconciliation_outcome,
             "generation_id": self.generation_id,
@@ -488,6 +1006,9 @@ class ProviderForceActualReconciliationService:
             "snapshot_write_count": 0,
             "outbox_write_count": 0,
             "reason_code": reason_code,
+            "attempted_at": observed_at.replace(
+                microsecond=0
+            ).isoformat(),
         }
         self._emit_prepared(audit)
         return audit
@@ -514,6 +1035,143 @@ def _contract_occurrences(
             if occurrence_id:
                 selected[occurrence_id] = dict(event)
     return selected
+
+
+def _canonical_occurrences(
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        occurrence_id = str(
+            record.get("occurrence_id")
+            or record.get("event_id")
+            or ""
+        )
+        if occurrence_id:
+            selected[occurrence_id] = dict(record)
+    return selected
+
+
+def _merge_canonical_occurrence(
+    projected: dict[str, Any],
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(projected)
+    for field, value in canonical.items():
+        if value not in (None, "", [], {}):
+            merged[field] = value
+    projected_enrichment = (
+        dict(projected.get("enrichment") or {})
+        if isinstance(projected.get("enrichment"), dict)
+        else {}
+    )
+    canonical_enrichment = (
+        dict(canonical.get("enrichment") or {})
+        if isinstance(canonical.get("enrichment"), dict)
+        else {}
+    )
+    merged["enrichment"] = {
+        **projected_enrichment,
+        **{
+            field: value
+            for field, value in canonical_enrichment.items()
+            if field != "field_lineage"
+            if value not in (None, "", [], {})
+        },
+    }
+    projected_field_lineage = (
+        dict(projected_enrichment.get("field_lineage") or {})
+        if isinstance(
+            projected_enrichment.get("field_lineage"), dict
+        )
+        else {}
+    )
+    canonical_field_lineage = (
+        dict(canonical_enrichment.get("field_lineage") or {})
+        if isinstance(
+            canonical_enrichment.get("field_lineage"), dict
+        )
+        else {}
+    )
+    if projected_field_lineage or canonical_field_lineage:
+        merged["enrichment"]["field_lineage"] = {
+            **projected_field_lineage,
+            **canonical_field_lineage,
+        }
+    return merged
+
+
+def _merge_canonical_lifecycle_evidence(
+    lifecycle: dict[str, Any] | None,
+    canonical: dict[str, Any] | None,
+    *,
+    observed_at: datetime,
+) -> dict[str, Any] | None:
+    if canonical is None:
+        return lifecycle
+    output = dict(lifecycle or {})
+    prior_payload = (
+        dict(output.get("payload") or {})
+        if isinstance(output.get("payload"), dict)
+        else {}
+    )
+    payload = _merge_canonical_occurrence(
+        prior_payload,
+        canonical,
+    )
+    output["payload"] = payload
+    for target, candidates in {
+        "valid_until": (
+            "content_valid_until",
+            "valid_until",
+        ),
+        "next_refresh_at": (
+            "refresh_due_at",
+            "next_refresh_at",
+        ),
+        "next_retry_at": ("next_retry_at",),
+        "negative_cache_expires_at": (
+            "negative_cache_expires_at",
+        ),
+    }.items():
+        value = next(
+            (
+                payload.get(field)
+                for field in candidates
+                if payload.get(field) not in (None, "")
+            ),
+            None,
+        )
+        if value is not None:
+            output[target] = value
+    if (
+        not lifecycle
+        or str(lifecycle.get("work_status") or "").upper()
+        == "SUPERSEDED"
+    ):
+        actual = payload.get("actual")
+        audit = payload.get("actual_resolution")
+        valid_until = parse_datetime(output.get("valid_until"))
+        refresh_due_at = parse_datetime(
+            output.get("next_refresh_at")
+        )
+        if actual not in (None, ""):
+            output["freshness_state"] = "CURRENT_RELEASE"
+            output["work_status"] = "COMPLETED"
+        elif (
+            isinstance(audit, dict)
+            and audit.get("actual_still_missing") is True
+            and valid_until is not None
+            and refresh_due_at is not None
+            and valid_until > observed_at
+            and refresh_due_at > observed_at
+        ):
+            output["freshness_state"] = "FRESH_NO_DATA"
+            output["work_status"] = "COMPLETED"
+        output["superseded_by"] = None
+    return output
 
 
 def _replace_occurrence(
@@ -544,6 +1202,1111 @@ def _replace_occurrence(
     return output
 
 
+def _actual_attempt(
+    provider: str,
+    raw: dict[str, Any] | None,
+    *,
+    skipped_reason: str,
+) -> dict[str, Any]:
+    if raw is not None:
+        if raw.get("called") is False:
+            attempt = provider_attempt(
+                provider,
+                called=False,
+                attempts=0,
+                result=str(raw.get("result") or "NOT_CALLED"),
+                not_called_reason=(
+                    str(raw.get("not_called_reason") or "")
+                    or skipped_reason
+                ),
+                execution_origin=str(
+                    raw.get("execution_origin")
+                    or "OBSERVED_SKIP"
+                ),
+            )
+        else:
+            attempt = provider_attempt(
+                provider,
+                called=True,
+                attempts=max(int(raw.get("attempts") or 0), 1),
+                result=str(raw.get("result") or "UNKNOWN"),
+                execution_origin="PROVIDER_CALL",
+            )
+        attempt.update(
+            {
+                key: raw.get(key)
+                for key in (
+                    "request_id",
+                    "correlation_id",
+                    "observed_at",
+                )
+                if raw.get(key) not in (None, "")
+            }
+        )
+        return attempt
+    return provider_attempt(
+        provider,
+        called=False,
+        attempts=0,
+        result="NOT_CALLED",
+        not_called_reason=skipped_reason,
+        execution_origin="OBSERVED_SKIP",
+    )
+
+
+def _request_scoped_provider_attempts(
+    attempts: Any,
+    *,
+    request_id: str | None,
+    correlation_id: str | None,
+    observed_at: datetime,
+) -> list[dict[str, Any]]:
+    timestamp = observed_at.replace(microsecond=0).isoformat()
+    output: list[dict[str, Any]] = []
+    for raw in attempts if isinstance(attempts, (list, tuple)) else []:
+        if not isinstance(raw, dict) or not raw.get("provider"):
+            continue
+        attempt_count = max(int(raw.get("attempts") or 0), 0)
+        called = (
+            raw.get("called")
+            if type(raw.get("called")) is bool
+            else attempt_count > 0
+        )
+        execution_origin = str(
+            raw.get("execution_origin")
+            or ("PROVIDER_CALL" if called else "OBSERVED_SKIP")
+        )
+        normalized = provider_attempt(
+            str(raw["provider"]),
+            called=called,
+            attempts=max(attempt_count, 1) if called else 0,
+            result=str(raw.get("result") or "UNKNOWN"),
+            not_called_reason=(
+                None
+                if called
+                else str(
+                    raw.get("not_called_reason")
+                    or "PROVIDER_NOT_CALLED"
+                )
+            ),
+            execution_origin=execution_origin,
+        )
+        normalized.update(
+            {
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "observed_at": str(raw.get("observed_at") or timestamp),
+            }
+        )
+        output.append(normalized)
+    return output
+
+
+def _latest_flash_services_occurrence(
+    occurrences: list[dict[str, Any]],
+    *,
+    observed_at: datetime,
+) -> dict[str, Any] | None:
+    if not occurrences:
+        return None
+    floor = datetime.min.replace(tzinfo=UTC)
+    ceiling = datetime.max.replace(tzinfo=UTC)
+    released = [
+        item
+        for item in occurrences
+        if (
+            parse_datetime(
+                item.get("release_at")
+                or item.get("scheduled_at_utc")
+                or item.get("time_utc")
+            )
+            or ceiling
+        )
+        <= observed_at
+    ]
+    if released:
+        return max(
+            released,
+            key=lambda item: (
+                parse_datetime(
+                    item.get("release_at")
+                    or item.get("scheduled_at_utc")
+                    or item.get("time_utc")
+                )
+                or floor,
+                str(
+                    item.get("occurrence_id")
+                    or item.get("event_id")
+                    or ""
+                ),
+            ),
+        )
+    return min(
+        occurrences,
+        key=lambda item: (
+            parse_datetime(
+                item.get("release_at")
+                or item.get("scheduled_at_utc")
+                or item.get("time_utc")
+            )
+            or ceiling,
+            str(
+                item.get("occurrence_id")
+                or item.get("event_id")
+                or ""
+            ),
+        ),
+    )
+
+
+def _actual_provider_chain_complete(
+    attempts: list[dict[str, Any]],
+    *,
+    provider_calls: int,
+    request_id: str,
+    correlation_id: str,
+) -> bool:
+    expected_order = list(_flash_services_pmi_provider_order())
+    providers = [
+        str(item.get("provider") or "")
+        for item in attempts
+    ]
+    primary_only = providers == expected_order[:1]
+    full_chain = providers == expected_order
+    if not primary_only and not full_chain:
+        return False
+    if any(
+        item.get("request_id") != request_id
+        or item.get("correlation_id") != correlation_id
+        or parse_datetime(item.get("observed_at")) is None
+        for item in attempts
+    ):
+        return False
+    if (
+        full_chain
+        and provider_calls == 0
+        and _observed_lifecycle_skip_flow_valid(attempts)
+    ):
+        return True
+    primary = attempts[0]
+    if primary.get("called") is not True:
+        return False
+    observed_calls = sum(
+        max(int(item.get("attempts") or 0), 1)
+        for item in attempts
+        if item.get("called") is not False
+    )
+    if provider_calls != observed_calls:
+        return False
+    if primary_only and not full_chain:
+        return _actual_result_succeeded(primary.get("result"))
+
+    success_seen = False
+    for attempt in attempts:
+        if success_seen:
+            if attempt.get("called") is not False:
+                return False
+            continue
+        if attempt.get("called") is not True:
+            return False
+        success_seen = _actual_result_succeeded(
+            attempt.get("result")
+        )
+    return True
+
+
+def _provider_chain_all_failed(
+    attempts: list[dict[str, Any]],
+) -> bool:
+    expected_order = list(_flash_services_pmi_provider_order())
+    return bool(
+        [
+            str(item.get("provider") or "")
+            for item in attempts
+        ]
+        == expected_order
+        and all(
+            item.get("called") is True
+            and not _actual_result_succeeded(item.get("result"))
+            for item in attempts
+        )
+    )
+
+
+def _audit_correlated(
+    audit: dict[str, Any],
+    *,
+    request_id: str,
+    correlation_id: str,
+) -> bool:
+    return bool(
+        audit.get("request_id") == request_id
+        and audit.get("correlation_id") == correlation_id
+    )
+
+
+def _actual_result_succeeded(value: Any) -> bool:
+    result = str(value or "").upper()
+    return bool(
+        any(
+            token in result
+            for token in ("SUCCESS", "FOUND", "AVAILABLE", "VALID")
+        )
+        and not any(
+            token in result
+            for token in (
+                "FAIL",
+                "ERROR",
+                "NO_DATA",
+                "NOT_AVAILABLE",
+                "UNAVAILABLE",
+                "TIMEOUT",
+            )
+        )
+    )
+
+
+def _persisted_actual_audit_matches_occurrence(
+    value: Any,
+    *,
+    payload: dict[str, Any],
+    occurrence_id: str,
+    mapping_selected: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("occurrence_id") or "") != occurrence_id:
+        return False
+    if (
+        str(value.get("mapping_selected") or "")
+        != mapping_selected
+    ):
+        return False
+    payload_occurrence = str(
+        payload.get("occurrence_id")
+        or payload.get("event_id")
+        or ""
+    )
+    return payload_occurrence == occurrence_id
+
+
+def _persisted_actual_field_lineage(
+    payload: dict[str, Any],
+    *,
+    persisted_audit: Any,
+    occurrence_id: str,
+    mapping_selected: str,
+    delivered_actual: Any,
+    now: datetime,
+) -> dict[str, Any] | None:
+    if not _persisted_actual_audit_matches_occurrence(
+        persisted_audit,
+        payload=payload,
+        occurrence_id=occurrence_id,
+        mapping_selected=mapping_selected,
+    ):
+        return None
+    persisted_actual = payload.get("actual")
+    if (
+        persisted_actual in (None, "")
+        or delivered_actual in (None, "")
+        or not _same_field_value(
+            persisted_actual,
+            delivered_actual,
+        )
+    ):
+        return None
+
+    candidates: list[dict[str, Any]] = []
+    enrichment = (
+        payload.get("enrichment")
+        if isinstance(payload.get("enrichment"), dict)
+        else {}
+    )
+    for container in (
+        enrichment.get("field_lineage"),
+        payload.get("field_lineage"),
+        (
+            payload.get("lineage", {}).get("field_lineage")
+            if isinstance(payload.get("lineage"), dict)
+            else None
+        ),
+    ):
+        if not isinstance(container, dict):
+            continue
+        actual = container.get("actual")
+        if isinstance(actual, dict):
+            candidates.append(dict(actual))
+
+    source_lineage = payload.get("source_lineage")
+    if isinstance(source_lineage, dict):
+        source_lineage = [source_lineage]
+    if isinstance(source_lineage, list):
+        candidates.extend(
+            dict(item)
+            for item in source_lineage
+            if isinstance(item, dict)
+        )
+
+    spec = OFFICIAL_METRICS.get(mapping_selected)
+    if spec is None:
+        return None
+    actual_is_official = payload.get("actual_is_official")
+    persisted_actual_source = _source_identity(
+        payload.get("actual_source")
+    )
+    registered_fallback = None
+    if actual_is_official is False:
+        policy = dataset_policy_by_id(mapping_selected)
+        registered_fallback = next(
+            (
+                provider_id
+                for provider_id in policy.fallback_providers
+                if _source_identity(provider_id)
+                == persisted_actual_source
+            ),
+            None,
+        )
+        if (
+            mapping_selected != FLASH_SERVICES_PMI_DATASET_ID
+            or registered_fallback is None
+        ):
+            return None
+    elif actual_is_official is not True:
+        return None
+    elif persisted_actual_source != _source_identity(spec.provider_id):
+        return None
+    for candidate in candidates:
+        source_field = str(
+            candidate.get("source_field") or ""
+        ).strip().lower()
+        if source_field not in {"actual", "current"}:
+            continue
+        candidate_occurrence = str(
+            candidate.get("occurrence_id")
+            or candidate.get("canonical_event_key")
+            or ""
+        )
+        if candidate_occurrence != occurrence_id:
+            continue
+        if (
+            str(candidate.get("metric_id") or "")
+            != mapping_selected
+        ):
+            continue
+        if (
+            str(candidate.get("frequency") or "").strip().lower()
+            != spec.frequency
+            or str(candidate.get("source_series_id") or "").strip()
+            != spec.source_series_id
+            or str(candidate.get("transformation") or "").strip()
+            != spec.transformation
+        ):
+            continue
+        candidate_value = candidate.get("value")
+        if candidate_value in (None, "") or not _same_field_value(
+            candidate_value,
+            persisted_actual,
+        ):
+            continue
+        lineage_sources = {
+            _source_identity(candidate.get(field))
+            for field in (
+                "source",
+                "publisher",
+                "source_originator",
+            )
+            if candidate.get(field) not in (None, "")
+        }
+        if (
+            not lineage_sources
+            or _source_identity(spec.provider_id) not in lineage_sources
+        ):
+            continue
+        lineage_acquisition_sources = {
+            _source_identity(candidate.get(field))
+            for field in (
+                "acquisition_provider",
+                "distributor",
+                "distribution_source",
+            )
+            if candidate.get(field) not in (None, "")
+        }
+        if actual_is_official is True and (
+            (
+                persisted_actual_source
+                not in lineage_sources | lineage_acquisition_sources
+            )
+            or (
+                lineage_acquisition_sources
+                and persisted_actual_source
+                not in lineage_acquisition_sources
+            )
+        ):
+            continue
+        if actual_is_official is False and (
+            registered_fallback is None
+            or _source_identity(registered_fallback)
+            not in lineage_acquisition_sources
+        ):
+            continue
+        official_domains = provider_by_id(spec.provider_id).source_domains
+        if actual_is_official is True:
+            official_urls = tuple(
+                candidate.get(field)
+                for field in ("source_url", "canonical_url")
+                if candidate.get(field) not in (None, "")
+            )
+            if (
+                not official_urls
+                or any(
+                    not _https_url_matches_domains(
+                        value,
+                        official_domains,
+                    )
+                    for value in official_urls
+                )
+            ):
+                continue
+        else:
+            assert registered_fallback is not None
+            fallback_domains = provider_by_id(
+                registered_fallback
+            ).source_domains
+            if not _https_url_matches_domains(
+                candidate.get("source_url"),
+                fallback_domains,
+            ) or not _https_url_matches_domains(
+                candidate.get("canonical_url"),
+                official_domains,
+            ):
+                continue
+        if not _field_validation_accepted(candidate):
+            continue
+        lifecycle_evidence = (
+            candidate.get("lifecycle")
+            if isinstance(candidate.get("lifecycle"), dict)
+            else {}
+        )
+        freshness_states = {
+            str(container.get(field) or "").strip().upper()
+            for container, fields in (
+                (
+                    candidate,
+                    (
+                        "freshness",
+                        "freshness_state",
+                        "lifecycle_status",
+                    ),
+                ),
+                (
+                    lifecycle_evidence,
+                    (
+                        "status",
+                        "lifecycle_status",
+                        "freshness",
+                        "freshness_state",
+                    ),
+                ),
+            )
+            for field in fields
+            if container.get(field) not in (None, "")
+        }
+        if (
+            not freshness_states
+            or not freshness_states
+            <= _CURRENT_FIELD_FRESHNESS_STATES
+        ):
+            continue
+        content_valid_until = _effective_lineage_deadline(
+            candidate,
+            fields=("content_valid_until", "valid_until"),
+        )
+        refresh_due_at = _effective_lineage_deadline(
+            candidate,
+            fields=("refresh_due_at", "next_refresh_at"),
+        )
+        normalized_now = _utc_datetime(now)
+        if (
+            content_valid_until is None
+            or refresh_due_at is None
+            or normalized_now is None
+            or content_valid_until <= normalized_now
+            or refresh_due_at <= normalized_now
+            or refresh_due_at > content_valid_until
+        ):
+            continue
+        observed_period = normalize_reference_period(
+            candidate.get("reference_period") or candidate.get("period"),
+            frequency=spec.frequency,
+        )
+        expected_period = normalize_reference_period(
+            payload.get("reference_period") or payload.get("period"),
+            frequency=spec.frequency,
+        )
+        if not observed_period or observed_period != expected_period:
+            continue
+        return {
+            **candidate,
+            "occurrence_id": occurrence_id,
+            "field_semantics": "actual",
+            "source_field": "actual",
+            "value": persisted_actual,
+        }
+    return None
+
+
+def _without_unproven_actual(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = {
+        **payload,
+        "actual": None,
+        "actual_source": None,
+        "actual_source_url": None,
+        "actual_is_official": None,
+    }
+    for container_name in ("field_lineage",):
+        container = sanitized.get(container_name)
+        if isinstance(container, dict):
+            sanitized[container_name] = {
+                key: value
+                for key, value in container.items()
+                if str(key).strip().lower() != "actual"
+            }
+    enrichment = (
+        dict(sanitized.get("enrichment") or {})
+        if isinstance(sanitized.get("enrichment"), dict)
+        else {}
+    )
+    if enrichment:
+        enrichment["actual"] = None
+        field_lineage = enrichment.get("field_lineage")
+        if isinstance(field_lineage, dict):
+            enrichment["field_lineage"] = {
+                key: value
+                for key, value in field_lineage.items()
+                if str(key).strip().lower() != "actual"
+            }
+        sanitized["enrichment"] = enrichment
+    lineage = sanitized.get("lineage")
+    if isinstance(lineage, dict) and isinstance(
+        lineage.get("field_lineage"), dict
+    ):
+        sanitized["lineage"] = {
+            **lineage,
+            "field_lineage": {
+                key: value
+                for key, value in lineage["field_lineage"].items()
+                if str(key).strip().lower() != "actual"
+            },
+        }
+    source_lineage = sanitized.get("source_lineage")
+    if isinstance(source_lineage, list):
+        sanitized["source_lineage"] = [
+            item
+            for item in source_lineage
+            if not isinstance(item, dict)
+            or str(
+                item.get("source_field")
+                or item.get("field_semantics")
+                or item.get("field")
+                or ""
+            ).strip().lower()
+            not in {"actual", "current"}
+        ]
+    return sanitized
+
+
+def _complete_same_acquisition_field_lineage(
+    datum: dict[str, Any],
+    *,
+    candidate: dict[str, Any] | None,
+    audit: dict[str, Any],
+    lifecycle: DatumLifecycle,
+    occurrence_id: str,
+    mapping_selected: str,
+    now: datetime,
+) -> dict[str, Any]:
+    if (
+        not isinstance(candidate, dict)
+        or not _candidate_validation_accepted(candidate, audit)
+        or str(lifecycle.freshness_state).upper() != "FRESH"
+    ):
+        return datum
+    content_valid_until = _utc_datetime(lifecycle.valid_until)
+    refresh_due_at = _utc_datetime(lifecycle.next_refresh_at)
+    normalized_now = _utc_datetime(now)
+    if (
+        content_valid_until is None
+        or refresh_due_at is None
+        or normalized_now is None
+        or content_valid_until <= normalized_now
+        or refresh_due_at <= normalized_now
+        or refresh_due_at > content_valid_until
+    ):
+        return datum
+
+    enrichment = (
+        dict(datum.get("enrichment") or {})
+        if isinstance(datum.get("enrichment"), dict)
+        else {}
+    )
+    raw_field_lineage = enrichment.get("field_lineage")
+    if not isinstance(raw_field_lineage, dict):
+        return datum
+    field_lineage = dict(raw_field_lineage)
+    updated_fields: dict[str, dict[str, Any]] = {}
+    for field, raw_lineage in field_lineage.items():
+        if not isinstance(raw_lineage, dict):
+            continue
+        lineage = dict(raw_lineage)
+        if not _lineage_belongs_to_candidate_acquisition(
+            field=str(field),
+            lineage=lineage,
+            candidate=candidate,
+            occurrence_id=occurrence_id,
+            mapping_selected=mapping_selected,
+        ):
+            continue
+        updated_fields[str(field)] = {
+            **lineage,
+            "validation_status": "accepted",
+            "freshness": "CURRENT_RELEASE",
+            "freshness_state": "CURRENT_RELEASE",
+            "content_valid_until": content_valid_until.isoformat(),
+            "refresh_due_at": refresh_due_at.isoformat(),
+            **(
+                {"data_as_of": lifecycle.data_as_of}
+                if lifecycle.data_as_of not in (None, "")
+                else {}
+            ),
+        }
+    if not updated_fields:
+        return datum
+
+    field_lineage.update(updated_fields)
+    enrichment["field_lineage"] = field_lineage
+    output = {**datum, "enrichment": enrichment}
+    if isinstance(datum.get("field_lineage"), dict):
+        output["field_lineage"] = {
+            **dict(datum["field_lineage"]),
+            **updated_fields,
+        }
+    source_lineage = datum.get("source_lineage")
+    if isinstance(source_lineage, list) and "actual" in updated_fields:
+        output["source_lineage"] = [
+            (
+                dict(updated_fields["actual"])
+                if isinstance(item, dict)
+                and str(
+                    item.get("source_field")
+                    or item.get("field_semantics")
+                    or item.get("field")
+                    or ""
+                ).strip().lower()
+                in {"actual", "current"}
+                and _lineage_occurrence_matches(
+                    item,
+                    occurrence_id=occurrence_id,
+                )
+                else item
+            )
+            for item in source_lineage
+        ]
+    return output
+
+
+def _lineage_belongs_to_candidate_acquisition(
+    *,
+    field: str,
+    lineage: dict[str, Any],
+    candidate: dict[str, Any],
+    occurrence_id: str,
+    mapping_selected: str,
+) -> bool:
+    normalized_field = field.strip().lower()
+    if not _lineage_occurrence_matches(
+        lineage,
+        occurrence_id=occurrence_id,
+    ):
+        return False
+    if str(lineage.get("metric_id") or "") != mapping_selected:
+        return False
+    expected_value: Any = None
+    evidence: dict[str, Any] = candidate
+    candidate_field_lineage = (
+        candidate.get("field_lineage")
+        if isinstance(candidate.get("field_lineage"), dict)
+        else {}
+    )
+    if normalized_field == "actual":
+        expected_value = candidate.get("value")
+        if expected_value in (None, ""):
+            expected_value = candidate.get("actual")
+    elif (
+        normalized_field == "previous"
+        and lineage.get("derivation")
+        == "previous_official_series_observation"
+    ):
+        expected_value = candidate.get("previous")
+    elif normalized_field in {
+        "consensus",
+        "forecast",
+        "previous",
+        "previous_revised",
+        "revised_previous",
+    }:
+        aliases = {
+            "consensus": ("consensus", "forecast"),
+            "forecast": ("forecast", "consensus"),
+            "previous": ("previous",),
+            "previous_revised": (
+                "previous_revised",
+                "revised_previous",
+            ),
+            "revised_previous": (
+                "revised_previous",
+                "previous_revised",
+            ),
+        }[normalized_field]
+        evidence = next(
+            (
+                dict(candidate_field_lineage[alias])
+                for alias in aliases
+                if isinstance(candidate_field_lineage.get(alias), dict)
+            ),
+            {},
+        )
+        if not evidence:
+            return False
+        expected_value = next(
+            (
+                candidate.get(alias)
+                for alias in aliases
+                if candidate.get(alias) not in (None, "")
+            ),
+            None,
+        )
+    if expected_value in (None, ""):
+        return False
+    lineage_value = lineage.get("value")
+    if lineage_value in (None, "") or not _same_field_value(
+        lineage_value,
+        expected_value,
+    ):
+        return False
+    return _same_acquisition_identity(
+        lineage,
+        evidence=evidence,
+        candidate=candidate,
+        field=normalized_field,
+    )
+
+
+def _same_acquisition_identity(
+    lineage: dict[str, Any],
+    *,
+    evidence: dict[str, Any],
+    candidate: dict[str, Any],
+    field: str,
+) -> bool:
+    derived_official_field = field in {"actual", "previous"} and (
+        field == "actual"
+        or lineage.get("derivation")
+        == "previous_official_series_observation"
+    )
+    if derived_official_field:
+        expected_series = candidate.get("source_series_id")
+        expected_transformation = candidate.get("transformation")
+        expected_frequency = candidate.get("frequency")
+        expected_period = (
+            candidate.get("previous_reference_period")
+            if field == "previous"
+            else candidate.get("reference_period")
+            or candidate.get("period")
+        )
+        expected_source = _source_identity(
+            candidate.get("source") or candidate.get("publisher")
+        )
+        if (
+            expected_series in (None, "")
+            or expected_transformation in (None, "")
+            or expected_frequency in (None, "")
+            or expected_period in (None, "")
+            or not expected_source
+        ):
+            return False
+        if (
+            str(lineage.get("source_series_id") or "")
+            != str(expected_series)
+            or str(lineage.get("transformation") or "")
+            != str(expected_transformation)
+            or str(lineage.get("frequency") or "").strip().lower()
+            != str(expected_frequency).strip().lower()
+        ):
+            return False
+        observed_period = normalize_reference_period(
+            lineage.get("reference_period") or lineage.get("period"),
+            frequency=str(expected_frequency),
+        )
+        normalized_expected_period = normalize_reference_period(
+            expected_period,
+            frequency=str(expected_frequency),
+        )
+        lineage_sources = {
+            _source_identity(lineage.get(key))
+            for key in ("source", "publisher", "source_originator")
+            if lineage.get(key) not in (None, "")
+        }
+        expected_acquisition = _source_identity(
+            candidate.get("acquisition_provider")
+        )
+        expected_distribution = _source_identity(
+            candidate.get("distribution_source")
+        )
+        lineage_acquisition = {
+            _source_identity(lineage.get(key))
+            for key in (
+                "acquisition_provider",
+                "distributor",
+                "distribution_source",
+            )
+            if lineage.get(key) not in (None, "")
+        }
+        return bool(
+            observed_period
+            and observed_period == normalized_expected_period
+            and expected_source in lineage_sources
+            and (
+                not expected_acquisition
+                or expected_acquisition in lineage_acquisition
+            )
+            and (
+                not expected_distribution
+                or expected_distribution in lineage_acquisition
+            )
+        )
+
+    evidence_sources = {
+        _source_identity(evidence.get(key))
+        for key in (
+            "source",
+            "publisher",
+            "distributor",
+            "acquisition_provider",
+        )
+        if evidence.get(key) not in (None, "")
+    }
+    lineage_sources = {
+        _source_identity(lineage.get(key))
+        for key in (
+            "source",
+            "publisher",
+            "distributor",
+            "acquisition_provider",
+        )
+        if lineage.get(key) not in (None, "")
+    }
+    if not evidence_sources or not evidence_sources & lineage_sources:
+        return False
+    for key in (
+        "source_series_id",
+        "transformation",
+        "frequency",
+        "reference_period",
+    ):
+        expected = evidence.get(key)
+        if expected not in (None, "") and str(
+            lineage.get(key) or ""
+        ) != str(expected):
+            return False
+    validation_states = {
+        str(value).strip().lower()
+        for value in (
+            evidence.get("validation_status"),
+            evidence.get("verification_status"),
+        )
+        if value not in (None, "")
+    }
+    return not validation_states or bool(
+        validation_states <= _ACCEPTED_FIELD_VALIDATION_STATES
+    )
+
+
+def _lineage_occurrence_matches(
+    lineage: dict[str, Any],
+    *,
+    occurrence_id: str,
+) -> bool:
+    return str(
+        lineage.get("occurrence_id")
+        or lineage.get("canonical_event_key")
+        or ""
+    ) == occurrence_id
+
+
+def _candidate_validation_accepted(
+    candidate: dict[str, Any],
+    audit: dict[str, Any],
+) -> bool:
+    statuses = {
+        str(value).strip().lower()
+        for value in (
+            candidate.get("validation_status"),
+            audit.get("candidate_validation"),
+        )
+        if value not in (None, "")
+    }
+    return bool(
+        statuses
+        and statuses <= _ACCEPTED_FIELD_VALIDATION_STATES
+    )
+
+
+def _field_validation_accepted(value: dict[str, Any]) -> bool:
+    validation = (
+        value.get("validation")
+        if isinstance(value.get("validation"), dict)
+        else {}
+    )
+    statuses = {
+        str(item).strip().lower()
+        for item in (
+            value.get("validation_status"),
+            value.get("verification_status"),
+            validation.get("status"),
+        )
+        if item not in (None, "")
+    }
+    return bool(
+        statuses
+        and statuses <= _ACCEPTED_FIELD_VALIDATION_STATES
+    )
+
+
+def _effective_lineage_deadline(
+    value: dict[str, Any],
+    *,
+    fields: tuple[str, ...],
+) -> datetime | None:
+    lifecycle = (
+        value.get("lifecycle")
+        if isinstance(value.get("lifecycle"), dict)
+        else {}
+    )
+    raw_values = [
+        container.get(field)
+        for container in (value, lifecycle)
+        for field in fields
+        if container.get(field) not in (None, "")
+    ]
+    if not raw_values:
+        return None
+    parsed = [_utc_datetime(item) for item in raw_values]
+    if any(item is None for item in parsed):
+        return None
+    return min(item for item in parsed if item is not None)
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    parsed = value if isinstance(value, datetime) else parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _source_identity(value: Any) -> str:
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def _https_url_matches_domains(
+    value: Any,
+    domains: tuple[str, ...],
+) -> bool:
+    if not domains or value in (None, ""):
+        return False
+    try:
+        parsed = urlsplit(str(value))
+    except ValueError:
+        return False
+    hostname = str(parsed.hostname or "").casefold().rstrip(".")
+    return bool(
+        parsed.scheme.casefold() == "https"
+        and hostname
+        and not parsed.username
+        and not parsed.password
+        and any(
+            hostname == str(domain).casefold().rstrip(".")
+            or hostname.endswith(
+                f".{str(domain).casefold().rstrip('.')}"
+            )
+            for domain in domains
+            if str(domain).strip()
+        )
+    )
+
+
+def _same_field_value(left: Any, right: Any) -> bool:
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError):
+        return left == right
+
+
+def _request_scoped_database_audit(
+    _persisted: dict[str, Any],
+    *,
+    occurrence_id: str,
+    lifecycle_before: dict[str, Any] | None,
+    mapping_selected: str,
+    observed_at: datetime,
+    value_present: bool,
+    request_id: str | None,
+    correlation_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "occurrence_id": occurrence_id,
+        "request_id": request_id,
+        "correlation_id": correlation_id,
+        "lifecycle_before": lifecycle_before,
+        "eligibility": "VALID_DATABASE_RECORD",
+        "reclaim_reason": "CANONICAL_ACTUAL_PRESENT",
+        "resolver_invoked": False,
+        "mapping_selected": mapping_selected,
+        "provider_attempted": False,
+        "provider_call_count": 0,
+        "provider_request_attempted": False,
+        "provider_attempts": [],
+        "provider_http_outcome": "NOT_CALLED_DATABASE_SELECTED",
+        "candidate_count": 0,
+        "candidate_validation": "NOT_REQUESTED",
+        "reconciliation_outcome": "DATABASE_SELECTED",
+        "reason_code": (
+            "VALID_CANONICAL_ACTUAL_SELECTED"
+            if value_present
+            else "CANONICAL_ACTUAL_NOT_AVAILABLE"
+        ),
+        "actual_still_missing": not value_present,
+        "attempted_at": observed_at.replace(
+            microsecond=0
+        ).isoformat(),
+        "canonical_write_count": 0,
+        "lifecycle_write_count": 0,
+        "coverage_write_count": 0,
+        "snapshot_write_count": 0,
+        "outbox_write_count": 0,
+        "finalization_status": "NO_OP",
+        "database_lookup_observed_at": observed_at.replace(
+            microsecond=0
+        ).isoformat(),
+    }
+
+
 def _negative_cache_active(
     item: dict[str, Any] | None,
     *,
@@ -566,6 +2329,9 @@ def _eligibility(
     item: dict[str, Any] | None,
     *,
     now: datetime,
+    force_refresh: bool = False,
+    request_id: str | None = None,
+    correlation_id: str | None = None,
 ) -> tuple[str, str]:
     if not item:
         return "RECLAIMABLE", "MISSING_LIFECYCLE_INITIALIZATION"
@@ -579,6 +2345,20 @@ def _eligibility(
     ):
         return "EXHAUSTED_NO_DATA", "TERMINAL_NO_DATA"
     if _negative_cache_active(item, now=now):
+        persisted = (
+            item.get("payload", {}).get("actual_resolution")
+            if isinstance(item.get("payload"), dict)
+            else None
+        )
+        if force_refresh and not _same_request_provider_audit(
+            persisted,
+            request_id=request_id,
+            correlation_id=correlation_id,
+        ):
+            return (
+                "RECLAIMABLE",
+                "FORCE_REFRESH_PRIOR_REQUEST_NEGATIVE_CACHE_BYPASSED",
+            )
         return "BACKOFF_ACTIVE", "NEXT_RETRY_IN_FUTURE"
     valid_until = parse_datetime(item.get("valid_until"))
     next_refresh = parse_datetime(item.get("next_refresh_at"))
@@ -591,6 +2371,23 @@ def _eligibility(
     ):
         return "FRESH_NO_DATA", "NO_DATA_STILL_FRESH"
     return "RECLAIMABLE", "STALE_NO_DATA_RETRY_DUE"
+
+
+def _same_request_provider_audit(
+    value: Any,
+    *,
+    request_id: str | None,
+    correlation_id: str | None,
+) -> bool:
+    return bool(
+        request_id
+        and correlation_id
+        and isinstance(value, dict)
+        and value.get("request_id") == request_id
+        and value.get("correlation_id") == correlation_id
+        and isinstance(value.get("provider_attempts"), list)
+        and value.get("provider_attempts")
+    )
 
 
 def _lifecycle_before(
@@ -729,9 +2526,12 @@ def _macro_actual_item(
         "occurrence_id": occurrence_id,
         "event_id": occurrence_id,
         "canonical_event_key": occurrence_id,
+        "provider_event_id": event.get("provider_event_id"),
+        "provider_occurrence_id": event.get("provider_occurrence_id"),
         "name": event.get("name") or event.get("event_name"),
         "country": event.get("country"),
         "category": event.get("category"),
+        "metric_id": event.get("metric_id"),
         "date": event.get("date"),
         "release_at": event.get("release_at") or event.get("time_utc"),
         "actual": event.get("actual"),
@@ -757,10 +2557,28 @@ def _macro_actual_item(
             event.get("actual_source_url")
             or actual_lineage.get("source_url")
         ),
-        "actual_is_official": True,
+        "actual_is_official": (
+            event.get("actual_is_official")
+            if event.get("actual_is_official") is not None
+            else True
+        ),
+        "freshness_state": event.get("freshness_state"),
+        "valid_until": (
+            event.get("valid_until")
+            or event.get("content_valid_until")
+        ),
+        "content_valid_until": (
+            event.get("content_valid_until")
+            or event.get("valid_until")
+        ),
+        "next_refresh_at": (
+            event.get("next_refresh_at")
+            or event.get("refresh_due_at")
+        ),
         "awaiting_actual": False,
         "status": "RELEASED",
         "release_status": "RELEASED",
+        "field_lineage": field_lineage,
         "enrichment": {
             "actual": event.get("actual"),
             "forecast": (

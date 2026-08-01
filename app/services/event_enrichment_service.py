@@ -70,6 +70,8 @@ class EventEnrichmentService:
         country: str,
         start: datetime,
         end: datetime,
+        *,
+        force: bool = False,
     ) -> tuple[list[EconomicEvent], dict[str, object]]:
         if not events:
             return [], {
@@ -102,9 +104,10 @@ class EventEnrichmentService:
             start,
             end,
             events_to_enrich,
+            force=force,
         )
         candidates_from_cache = False
-        if not _useful_candidates(candidates):
+        if not force and not _useful_candidates(candidates):
             cached = self._load_cached_candidates(country, start, end)
             if _useful_candidates(cached):
                 candidates = cached
@@ -200,6 +203,8 @@ class EventEnrichmentService:
         start: datetime,
         end: datetime,
         events_to_enrich: list[EconomicEvent],
+        *,
+        force: bool,
     ) -> tuple[list[EnrichmentItem], list[str], bool, list[dict[str, object]]]:
         provider_errors: list[str] = []
         provider_statuses: list[dict[str, object]] = []
@@ -207,7 +212,14 @@ class EventEnrichmentService:
         for provider_index, provider in enumerate(self.providers):
             source = getattr(provider, "source", provider.__class__.__name__)
             failure_key = f"{source}:{provider.__class__.__name__}:{provider_index}"
-            cached_failure = self._provider_failure_cache(failure_key, source)
+            cached_failure = (
+                None
+                if force
+                else self._provider_failure_cache(
+                    failure_key,
+                    source,
+                )
+            )
             if cached_failure:
                 provider_statuses.append(
                     {

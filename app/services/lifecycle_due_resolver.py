@@ -12,6 +12,9 @@ from app.services.data_freshness_service import parse_datetime
 from app.services.event_driven_lifecycle_service import compute_datum_lifecycle
 from app.services.official_actual_semantics import normalize_reference_period
 from app.services.research_agent_enablement import research_agent_enablement
+from app.services.provider_capability_registry import (
+    automatic_ai_delivery_authorized,
+)
 from app.services.source_policy_service import SourcePolicyService
 from app.services.temporal_domain_service import canonical_event_key
 
@@ -586,13 +589,21 @@ class MacroActualLifecycleProviderAdapter:
         if status == "OFFICIAL_FEED_DELAYED" or resolution.get(
             "retryable"
         ) is True:
+            fallback_reason = resolution.get(
+                "fallback_reason_code"
+            )
             return {
                 "status": "DEFERRED",
                 "reason": str(
-                    resolution.get("error")
+                    fallback_reason
+                    or resolution.get("error")
                     or "official_macro_actual_feed_delayed"
                 ),
-                "reason_code": resolution.get("reason_code"),
+                "reason_code": (
+                    fallback_reason
+                    or resolution.get("reason_code")
+                ),
+                "fallback_reason_code": fallback_reason,
                 "provider": resolution.get("provider"),
                 "source_series": resolution.get("source_series"),
                 "provider_http_outcome": resolution.get(
@@ -601,6 +612,14 @@ class MacroActualLifecycleProviderAdapter:
                 "provider_call_count": int(
                     resolution.get("provider_call_count") or 0
                 ),
+                "provider_attempts": [
+                    dict(item)
+                    for item in resolution.get(
+                        "provider_attempts"
+                    )
+                    or []
+                    if isinstance(item, dict)
+                ],
                 "retryable": True,
                 "provider_request_attempted": True,
                 "provider_request_completed": False,
@@ -643,6 +662,10 @@ class MacroActualLifecycleProviderAdapter:
         return {
             "status": "PARTIAL" if missing_fields else "RESOLVED",
             "reason": "official_macro_actual_resolved",
+            "reason_code": resolution.get("reason_code"),
+            "fallback_reason_code": resolution.get(
+                "fallback_reason_code"
+            ),
             "datum": datum,
             "missing_fields": missing_fields,
             "provider_request_attempted": True,
@@ -655,6 +678,11 @@ class MacroActualLifecycleProviderAdapter:
             "provider_call_count": int(
                 resolution.get("provider_call_count") or 0
             ),
+            "provider_attempts": [
+                dict(item)
+                for item in resolution.get("provider_attempts") or []
+                if isinstance(item, dict)
+            ],
             "candidate_validation": resolution.get(
                 "candidate_validation"
             ),
@@ -701,6 +729,7 @@ class DeterministicLifecycleDueResolver:
             "provider_request_failed": False,
             "provider_cache_hit": False,
             "provider_negative_cache_hit": False,
+            "provider_negative_cache_bypassed": False,
         }
         if entity_type == "schedule_only":
             return {
@@ -746,10 +775,16 @@ class DeterministicLifecycleDueResolver:
         cached_until = parse_datetime(
             item.get("negative_cache_expires_at") or item.get("next_retry_at")
         )
+        provider_force_refresh = bool(
+            item.get("force_refresh") is True
+            and str(item.get("resolution_mode") or "")
+            == "prepare_atomic_provider_force"
+        )
         if (
             str(item.get("freshness_state") or "") == "NO_DATA_BACKOFF"
             and cached_until is not None
             and cached_until > now
+            and not provider_force_refresh
         ):
             return {
                 "status": "DEFERRED",
@@ -761,6 +796,13 @@ class DeterministicLifecycleDueResolver:
                     "provider_negative_cache_hit": True,
                 },
             }
+        if (
+            str(item.get("freshness_state") or "") == "NO_DATA_BACKOFF"
+            and cached_until is not None
+            and cached_until > now
+            and provider_force_refresh
+        ):
+            telemetry["provider_negative_cache_bypassed"] = True
 
         adapter = self.adapters.get(entity_type)
         if adapter is None:
@@ -853,6 +895,7 @@ class DeterministicLifecycleDueResolver:
                         "source_series",
                         "provider_http_outcome",
                         "provider_call_count",
+                        "provider_attempts",
                         "retryable",
                     )
                     if result.get(key) is not None
@@ -864,11 +907,27 @@ class DeterministicLifecycleDueResolver:
                 telemetry=failure_telemetry,
             )
         if status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA", "NOT_CONFIGURED"}:
+            exhausted_telemetry = {
+                **telemetry,
+                **{
+                    key: result.get(key)
+                    for key in (
+                        "reason_code",
+                        "provider",
+                        "source_series",
+                        "provider_http_outcome",
+                        "provider_call_count",
+                        "provider_attempts",
+                        "retryable",
+                    )
+                    if result.get(key) is not None
+                },
+            }
             return self._exhausted(
                 item,
                 status="NO_DATA" if status == "NO_DATA" else "EXHAUSTED",
                 reason=str(result.get("reason") or "deterministic_provider_exhausted"),
-                telemetry=telemetry,
+                telemetry=exhausted_telemetry,
             )
         if status not in {"RESOLVED", "FRESH", "SUCCEEDED", "PARTIAL"}:
             return self._temporary_failure(
@@ -903,14 +962,10 @@ class DeterministicLifecycleDueResolver:
             entity_type == "macro_actual"
             and provider_datum.get("actual") not in (None, "")
         ):
-            # An admitted official release is a completed occurrence, not an
-            # expiring quote. Its historical release timestamp must not make a
-            # newly resolved actual fail the generic TTL freshness gate.
+            # Keep the cadence-derived content and refresh deadlines.  A
+            # recent retrieval must never make an old official release fresh.
             lifecycle = replace(
                 lifecycle,
-                freshness_state="FRESH",
-                valid_until=None,
-                next_refresh_at=None,
                 next_retry_at=None,
                 retry_class=None,
                 negative_cache_key=None,
@@ -941,13 +996,20 @@ class DeterministicLifecycleDueResolver:
                         list(item.get("fields_attempted") or []),
                     )
                 ),
-                "ai_eligible": bool(decision["agent_enabled"]),
+                "ai_eligible": bool(
+                    decision["agent_enabled"]
+                    and automatic_ai_delivery_authorized()
+                ),
                 "agent_status": (
-                    "ENABLED" if decision["agent_enabled"] else "DISABLED"
+                    "ENABLED"
+                    if decision["agent_enabled"]
+                    and automatic_ai_delivery_authorized()
+                    else "DISABLED"
                 ),
                 "execution_status": (
                     "ELIGIBLE"
                     if decision["agent_enabled"]
+                    and automatic_ai_delivery_authorized()
                     else "NOT_REQUESTED"
                 ),
                 **telemetry,
@@ -1022,14 +1084,21 @@ class DeterministicLifecycleDueResolver:
             "lifecycle": lifecycle,
             "next_retry_at": lifecycle.next_retry_at,
             "ai_eligible": bool(
-                decision["agent_enabled"] and not terminal
+                decision["agent_enabled"]
+                and not terminal
+                and automatic_ai_delivery_authorized()
             ),
             "agent_status": (
-                "ENABLED" if decision["agent_enabled"] else "DISABLED"
+                "ENABLED"
+                if decision["agent_enabled"]
+                and automatic_ai_delivery_authorized()
+                else "DISABLED"
             ),
             "execution_status": (
                 "ELIGIBLE"
-                if decision["agent_enabled"] and not terminal
+                if decision["agent_enabled"]
+                and not terminal
+                and automatic_ai_delivery_authorized()
                 else "NOT_REQUESTED"
             ),
             "data_outcome": (
@@ -1410,8 +1479,45 @@ def _official_actual_datum(
         candidate.get("source_url")
         or candidate.get("canonical_url")
     )
-    distributor = event.get("source") or event.get("provider")
-    distributor_url = event.get("source_url")
+    distributor = (
+        candidate.get("distribution_source")
+        or candidate.get("acquisition_provider")
+        or event.get("source")
+        or event.get("provider")
+    )
+    distributor_url = (
+        candidate.get("distribution_source_url")
+        or candidate.get("source_url")
+        or event.get("source_url")
+    )
+    acquisition_source = (
+        candidate.get("acquisition_provider")
+        or candidate.get("distribution_source")
+        or source
+    )
+    actual_is_official = bool(
+        candidate.get("actual_is_official", True)
+    )
+    candidate_field_lineage = (
+        dict(candidate.get("field_lineage") or {})
+        if isinstance(candidate.get("field_lineage"), dict)
+        else {}
+    )
+    candidate_actual_lineage = (
+        dict(candidate_field_lineage.get("actual") or {})
+        if isinstance(candidate_field_lineage.get("actual"), dict)
+        else {}
+    )
+    exact_fallback_forecast = bool(
+        candidate.get("canonical_forecast_selection_reason")
+        == "EXACT_OCCURRENCE_MATCH_WITH_SELECTED_ACTUAL"
+        and candidate.get("forecast") not in (None, "")
+    )
+    selected_forecast = (
+        candidate.get("forecast")
+        if exact_fallback_forecast
+        else event.get("forecast")
+    )
     actual_lineage = {
         "source": source,
         "publisher": candidate.get("publisher"),
@@ -1421,7 +1527,12 @@ def _official_actual_datum(
         "canonical_url": candidate.get("canonical_url"),
         "source_tier": candidate.get("source_tier") or 1,
         "source_classification": (
-            candidate.get("source_classification") or "official_source"
+            candidate.get("source_classification")
+            or (
+                "official_source"
+                if actual_is_official
+                else "secondary_market_source"
+            )
         ),
         "provider_adapter": candidate.get("provider_adapter"),
         "metric_id": (
@@ -1429,6 +1540,7 @@ def _official_actual_datum(
             or candidate.get("metric_id")
         ),
         "source_series_id": candidate.get("source_series_id"),
+        "transformation": candidate.get("transformation"),
         "reference_period": (
             candidate.get("reference_period")
             or candidate.get("period")
@@ -1443,6 +1555,14 @@ def _official_actual_datum(
             candidate.get("validation_status") or "accepted"
         ),
         "source_field": "actual",
+        **candidate_actual_lineage,
+        # The resolver has already matched this observation to the exact
+        # canonical occurrence.  Bind the field evidence to that occurrence
+        # after merging provider-supplied metadata so a conflicting provider
+        # identifier cannot replace the verified request target.
+        "occurrence_id": canonical_key,
+        "field_semantics": "actual",
+        "value": value,
     }
     enrichment = (
         dict(event.get("enrichment") or {})
@@ -1458,7 +1578,26 @@ def _official_actual_datum(
     persisted_fields = dict(
         persisted_lineage.get("field_lineage") or {}
     )
-    if "forecast" not in field_lineage:
+    if exact_fallback_forecast and isinstance(
+        candidate_field_lineage.get("forecast"), dict
+    ):
+        field_lineage["forecast"] = {
+            **dict(candidate_field_lineage["forecast"]),
+            "occurrence_id": canonical_key,
+            "metric_id": (
+                candidate.get("event_metric_id")
+                or candidate.get("metric_id")
+            ),
+            "reference_period": (
+                candidate.get("reference_period")
+                or candidate.get("period")
+            ),
+            "frequency": candidate.get("frequency"),
+            "value": selected_forecast,
+            "field_semantics": "forecast",
+            "source_field": "forecast",
+        }
+    elif "forecast" not in field_lineage:
         scheduled_forecast = (
             persisted_fields.get("forecast")
             or persisted_fields.get("consensus")
@@ -1470,12 +1609,25 @@ def _official_actual_datum(
             }
     field_lineage["actual"] = actual_lineage
     if candidate.get("previous") not in (None, ""):
+        candidate_previous_lineage = (
+            dict(candidate_field_lineage.get("previous") or {})
+            if isinstance(
+                candidate_field_lineage.get("previous"),
+                dict,
+            )
+            else {}
+        )
         field_lineage["previous"] = {
             **actual_lineage,
+            **candidate_previous_lineage,
+            "occurrence_id": canonical_key,
             "field_semantics": "previous",
             "source_field": "previous",
             "value": candidate.get("previous"),
             "reference_period": candidate.get(
+                "previous_reference_period"
+            ),
+            "previous_reference_period": candidate.get(
                 "previous_reference_period"
             ),
             "derivation": "previous_official_series_observation",
@@ -1483,7 +1635,7 @@ def _official_actual_datum(
     enrichment.update(
         {
             "actual": value,
-            "forecast": event.get("forecast"),
+            "forecast": selected_forecast,
             "previous": (
                 candidate.get("previous")
                 if candidate.get("previous") not in (None, "")
@@ -1506,7 +1658,12 @@ def _official_actual_datum(
             else event.get("previous")
         ),
         "previous_revised": candidate.get("previous_revised"),
-        "forecast": event.get("forecast"),
+        "forecast": selected_forecast,
+        **(
+            {"consensus": selected_forecast}
+            if exact_fallback_forecast
+            else {}
+        ),
         "metric_id": (
             candidate.get("event_metric_id")
             or candidate.get("metric_id")
@@ -1543,12 +1700,37 @@ def _official_actual_datum(
         "frequency": candidate.get("frequency"),
         "unit": candidate.get("unit"),
         "source": source,
+        "publisher": candidate.get("publisher") or source,
         "source_url": source_url,
         "distributor": distributor,
         "distributor_url": distributor_url,
-        "actual_source": source,
+        "acquisition_provider": acquisition_source,
+        "actual_source": acquisition_source,
         "actual_source_url": source_url,
         "source_lineage": [actual_lineage],
+        **(
+            {"field_lineage": field_lineage}
+            if exact_fallback_forecast
+            else {}
+        ),
+        **(
+            {
+                "provider_event_id": candidate.get("event_id"),
+                "provider_occurrence_id": candidate.get(
+                    "occurrence_id"
+                ),
+                "forecast_observations": candidate.get(
+                    "forecast_observations"
+                ),
+                "canonical_forecast_selection_reason": (
+                    candidate.get(
+                        "canonical_forecast_selection_reason"
+                    )
+                ),
+            }
+            if exact_fallback_forecast
+            else {}
+        ),
         "comparison_lineage": {
             **dict(event.get("comparison_lineage") or {}),
             "scheduled_previous": event.get("previous"),
@@ -1561,7 +1743,7 @@ def _official_actual_datum(
             ),
         },
         "acquisition_method": "api_provider",
-        "actual_is_official": True,
+        "actual_is_official": actual_is_official,
         "awaiting_actual": False,
         "status": "RELEASED",
         "release_status": "RELEASED",

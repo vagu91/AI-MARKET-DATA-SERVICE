@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import uuid
 import logging
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,9 @@ from app.services.provider_observation_repository import ProviderObservationRepo
 from app.services.ai_research_job_service import AIResearchJobService
 from app.services.temporal_domain_service import exact_occurrence_key
 from app.services.execution_context import ExecutionContext
+from app.services.provider_capability_registry import (
+    automatic_ai_delivery_authorized,
+)
 
 
 VALUE_FIELDS = ("forecast", "previous", "consensus", "actual")
@@ -106,29 +110,15 @@ class EnrichmentOrchestrator:
                     metrics=metrics,
                 )
                 if fact:
-                    if freshness.usable and force:
-                        metrics["db_bypassed_force"] += 1
-                        logger.info(
-                            "event_enrichment_cache_bypassed_force",
-                            extra={"event_id": event.event_id, "fact_key": fact_key, "fact_status": fact.get("status")},
-                        )
-                        self.observations.record(
-                            run_id=run_id,
-                            provider_name="market_facts",
-                            provider_type="DB",
-                            status="cache_bypassed_force",
-                            country=event.country,
-                            category=event.category,
-                            query=fact_key,
-                            item_count=1,
-                        )
-                    elif freshness.usable:
+                    if freshness.usable:
                         updated = self.event_materializer.apply_fact(
                             event,
                             fact,
                             cache_status=freshness.cache_status,
                             warnings=freshness.warnings,
-                            refresh_mode="auto",
+                            refresh_mode=(
+                                "force" if force else "auto"
+                            ),
                             metrics=metrics,
                         )
                         enriched_by_id[event.event_id] = updated
@@ -159,13 +149,29 @@ class EnrichmentOrchestrator:
             provider_missing: list[EconomicEvent] = []
             if missing and self.event_enrichment_service:
                 try:
+                    enrich_call = (
+                        self.event_enrichment_service.enrich_events
+                    )
+                    enrich_kwargs = {
+                        "events": missing,
+                        "country": country,
+                        "start": start,
+                        "end": end,
+                    }
+                    parameters = inspect.signature(
+                        enrich_call
+                    ).parameters
+                    if (
+                        "force" in parameters
+                        or any(
+                            parameter.kind
+                            == inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        )
+                    ):
+                        enrich_kwargs["force"] = force
                     provider_events, provider_metadata = await asyncio.wait_for(
-                        self.event_enrichment_service.enrich_events(
-                            events=missing,
-                            country=country,
-                            start=start,
-                            end=end,
-                        ),
+                        enrich_call(**enrich_kwargs),
                         timeout=max(float(self.settings.timeout_events_seconds), 1.0),
                     )
                 except TimeoutError:
@@ -227,7 +233,12 @@ class EnrichmentOrchestrator:
             ai_failure_reason = None
             ai_diagnostic_artifact_dir: str | None = None
             ai_jobs: list[dict[str, Any]] = []
-            if provider_missing and self.settings.enable_ai_researcher:
+            ai_runtime_authorized = automatic_ai_delivery_authorized()
+            if (
+                provider_missing
+                and self.settings.enable_ai_researcher
+                and ai_runtime_authorized
+            ):
                 ai_candidates = self._ai_candidates(provider_missing, limit=False)[: self.settings.ai_researcher_max_events]
                 metrics["ai_events_requested"] = len(ai_candidates)
                 metrics["ai_candidate_event_ids"] = [event.event_id for event in ai_candidates]
@@ -249,9 +260,19 @@ class EnrichmentOrchestrator:
                     raw_payload_json={"job_ids": [job["job_id"] for job in ai_jobs]},
                 )
             else:
-                metrics["ai_research_status"] = "disabled" if not self.settings.enable_ai_researcher else "not_required"
-                if provider_missing and not self.settings.enable_ai_researcher:
-                    metrics["warnings_json"].append("ai_researcher_disabled")
+                metrics["ai_research_status"] = (
+                    "disabled"
+                    if not self.settings.enable_ai_researcher
+                    else "not_authorized"
+                    if not ai_runtime_authorized
+                    else "not_required"
+                )
+                if provider_missing:
+                    metrics["warnings_json"].append(
+                        "ai_researcher_disabled"
+                        if not self.settings.enable_ai_researcher
+                        else "AI_RUNTIME_CAPABILITY_NOT_CERTIFIED"
+                    )
             for event in provider_missing:
                 updated = event.model_copy(deep=True)
                 if ai_jobs:
@@ -265,10 +286,14 @@ class EnrichmentOrchestrator:
                 enriched_by_id[event.event_id] = updated
 
             result = [enriched_by_id.get(event.event_id, event) for event in events]
-            release_jobs = self.ai_jobs.enqueue_temporal_refreshes(
-                result,
-                correlation_id=run_id,
-                execution_context=execution_context,
+            release_jobs = (
+                self.ai_jobs.enqueue_temporal_refreshes(
+                    result,
+                    correlation_id=run_id,
+                    execution_context=execution_context,
+                )
+                if ai_runtime_authorized
+                else []
             )
             if release_jobs:
                 metrics["ai_research_requests"] += len(release_jobs)

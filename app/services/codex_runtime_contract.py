@@ -103,6 +103,7 @@ def _validated_claim_schema() -> dict[str, Any]:
         "ticker",
         "expected_basis",
         "actual_basis",
+        "reason_code",
     }
     return _closed_with_optional(
         {
@@ -149,6 +150,7 @@ def _validated_claim_schema() -> dict[str, Any]:
             "ticker": _string(nullable=True, max_length=16),
             "expected_basis": _string(nullable=True, max_length=120),
             "actual_basis": _string(nullable=True, max_length=120),
+            "reason_code": _string(nullable=True, max_length=120),
         },
         optional=optional,
     )

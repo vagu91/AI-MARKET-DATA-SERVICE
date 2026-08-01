@@ -1,131 +1,223 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date, datetime
 from typing import Any
+from urllib.parse import urlparse
+
+from app.services.provider_capability_registry import (
+    OFFICIAL_METRIC_REGISTRATIONS,
+    OfficialMetricRegistration,
+)
 
 
-@dataclass(frozen=True)
-class OfficialMetricSpec:
-    event_metric_id: str
-    provider: str
-    source_series_id: str
-    transformation: str
-    seasonal_adjustment: str
-    frequency: str
-    unit: str
-    comparison_lag: int
-    precision: str
-    canonical_url: str
+OfficialMetricSpec = OfficialMetricRegistration
+
+_EVENT_FAMILY_MARKERS: dict[str, tuple[str, ...]] = {
+    "cpi": (
+        "cpi",
+        "consumer price index",
+        "prezzi al consumo",
+    ),
+    "ppi": (
+        "ppi",
+        "producer price index",
+        "prezzi alla produzione",
+    ),
+    "pce": (
+        "pce",
+        "personal income and outlays",
+        "personal consumption expenditure",
+        "personal consumption expenditures",
+    ),
+    "new_home_sales": (
+        "new home sales",
+        "new home sale",
+        "new homes sales",
+        "vendita case nuove",
+        "vendite case nuove",
+        "vendita di case nuove",
+        "vendite di nuove abitazioni",
+        "vendite di nuove case",
+    ),
+    "flash_services_pmi": (
+        "flash services pmi",
+        "flash service pmi",
+        "flash us services pmi",
+        "services pmi",
+        "us services pmi",
+        "indice pmi dei servizi",
+        "indice pmi servizi",
+        "pmi dei servizi",
+        "pmi servizi flash",
+    ),
+}
+_STRICT_EVENT_NAME_FAMILIES = frozenset(
+    {"pce", "new_home_sales", "flash_services_pmi"}
+)
+
+
+def _metric_change_basis_markers(value: Any) -> set[str]:
+    text = " ".join(
+        re.findall(
+            r"[a-z0-9]+",
+            str(value or "").casefold(),
+        )
+    )
+    tokens = set(text.split())
+    detected: set[str] = set()
+    if (
+        tokens & {"yoy", "annuale"}
+        or re.search(r"\b(?:a|y)\s+(?:a|y)\b", text)
+        or "anno su anno" in text
+        or "year over year" in text
+    ):
+        detected.add("yoy")
+    if (
+        tokens & {"mom", "mensile"}
+        or re.search(r"\bm\s+m\b", text)
+        or "mese su mese" in text
+        or "month over month" in text
+    ):
+        detected.add("mom")
+    if (
+        tokens & {"qoq"}
+        or re.search(r"\b(?:q\s+q|t\s+t)\b", text)
+        or "trimestre su trimestre" in text
+        or "quarter over quarter" in text
+    ):
+        detected.add("qoq")
+    return detected
+
+
+def metric_change_basis_from_text(value: Any) -> str | None:
+    detected = _metric_change_basis_markers(value)
+    return next(iter(detected)) if len(detected) == 1 else None
+
+
+def metric_semantics_mismatch_reason(
+    metric_id: Any,
+    *,
+    name: Any,
+    frequency_hint: Any = None,
+) -> str | None:
+    metric = str(metric_id or "").strip().lower()
+    if not metric:
+        return None
+    observed_markers = _metric_change_basis_markers(
+        " ".join(
+            str(item or "")
+            for item in (name, frequency_hint)
+        )
+    )
+    if len(observed_markers) > 1:
+        return "EVENT_METRIC_FREQUENCY_AMBIGUOUS"
+    expected_basis = next(
+        (
+            basis
+            for basis in ("mom", "yoy", "qoq")
+            if metric.endswith(f"_{basis}")
+        ),
+        None,
+    )
+    observed_basis = (
+        next(iter(observed_markers))
+        if observed_markers
+        else None
+    )
+    if (
+        expected_basis is not None
+        and observed_basis is not None
+        and expected_basis != observed_basis
+    ):
+        return "EVENT_METRIC_FREQUENCY_MISMATCH"
+
+    expected_family = (
+        metric
+        if metric in {"new_home_sales", "flash_services_pmi"}
+        else next(
+            (
+                family
+                for family in ("cpi", "ppi", "pce")
+                if re.search(rf"(?:^|_){family}(?:_|$)", metric)
+            ),
+            None,
+        )
+    )
+    normalized_name = " ".join(
+        re.findall(r"[a-z0-9]+", str(name or "").casefold())
+    )
+    observed_families = {
+        family
+        for family, markers in _EVENT_FAMILY_MARKERS.items()
+        if any(
+            re.search(rf"\b{re.escape(marker)}\b", normalized_name)
+            for marker in markers
+        )
+    }
+    if len(observed_families) > 1:
+        return "EVENT_METRIC_FAMILY_AMBIGUOUS"
+    observed_family = next(iter(observed_families), None)
+    if (
+        expected_family is not None
+        and observed_family is not None
+        and expected_family != observed_family
+    ):
+        return "EVENT_METRIC_FAMILY_MISMATCH"
+    if (
+        expected_family in _STRICT_EVENT_NAME_FAMILIES
+        and observed_family is None
+    ):
+        return "EVENT_METRIC_FAMILY_NOT_PROVEN"
+    expected_variant = next(
+        (
+            variant
+            for variant in ("core", "headline")
+            if metric.startswith(f"{variant}_")
+        ),
+        None,
+    )
+    core_markers = (
+        "core",
+        "base",
+        "di base",
+        "di fondo",
+        "excluding food and energy",
+        "ex food and energy",
+    )
+    headline_markers = ("headline",)
+    observed_variant = (
+        "core"
+        if any(
+            re.search(
+                rf"\b{re.escape(marker)}\b",
+                normalized_name,
+            )
+            for marker in core_markers
+        )
+        else "headline"
+        if any(
+            re.search(
+                rf"\b{re.escape(marker)}\b",
+                normalized_name,
+            )
+            for marker in headline_markers
+        )
+        else None
+    )
+    if (
+        expected_variant is not None
+        and observed_variant is not None
+        and expected_variant != observed_variant
+    ):
+        return "EVENT_METRIC_VARIANT_MISMATCH"
+    return None
 
 
 OFFICIAL_METRICS: dict[str, OfficialMetricSpec] = {
-    "headline_cpi_mom": OfficialMetricSpec(
-        "headline_cpi_mom", "BLS", "CUSR0000SA0", "pct_change_mom", "SA",
-        "monthly", "percent", 1, "0.1", "https://www.bls.gov/cpi/",
-    ),
-    "headline_cpi_yoy": OfficialMetricSpec(
-        "headline_cpi_yoy", "BLS", "CUUR0000SA0", "pct_change_yoy", "NSA",
-        "monthly", "percent", 12, "0.1", "https://www.bls.gov/cpi/",
-    ),
-    "core_cpi_mom": OfficialMetricSpec(
-        "core_cpi_mom", "BLS", "CUSR0000SA0L1E", "pct_change_mom", "SA",
-        "monthly", "percent", 1, "0.1", "https://www.bls.gov/cpi/",
-    ),
-    "core_cpi_yoy": OfficialMetricSpec(
-        "core_cpi_yoy", "BLS", "CUUR0000SA0L1E", "pct_change_yoy", "NSA",
-        "monthly", "percent", 12, "0.1", "https://www.bls.gov/cpi/",
-    ),
-    "headline_ppi_mom": OfficialMetricSpec(
-        "headline_ppi_mom", "BLS", "WPSFD4", "pct_change_mom", "SA",
-        "monthly", "percent", 1, "0.1", "https://www.bls.gov/ppi/",
-    ),
-    "headline_ppi_yoy": OfficialMetricSpec(
-        "headline_ppi_yoy", "BLS", "WPUFD4", "pct_change_yoy", "NSA",
-        "monthly", "percent", 12, "0.1", "https://www.bls.gov/ppi/",
-    ),
-    "nonfarm_payrolls_change": OfficialMetricSpec(
-        "nonfarm_payrolls_change", "BLS", "CES0000000001", "delta", "SA",
-        "monthly", "thousands of jobs", 1, "1", "https://www.bls.gov/ces/",
-    ),
-    "unemployment_rate": OfficialMetricSpec(
-        "unemployment_rate", "BLS", "LNS14000000", "level", "SA",
-        "monthly", "percent", 0, "0.1", "https://www.bls.gov/cps/",
-    ),
-    "average_hourly_earnings_mom": OfficialMetricSpec(
-        "average_hourly_earnings_mom", "BLS", "CES0500000003", "pct_change_mom", "SA",
-        "monthly", "percent", 1, "0.1", "https://www.bls.gov/ces/",
-    ),
-    "average_hourly_earnings_yoy": OfficialMetricSpec(
-        "average_hourly_earnings_yoy", "BLS", "CES0500000003", "pct_change_yoy", "SA",
-        "monthly", "percent", 12, "0.1", "https://www.bls.gov/ces/",
-    ),
-    "employment_cost_index_qoq": OfficialMetricSpec(
-        "employment_cost_index_qoq", "BLS", "CIU1010000000000A", "pct_change_qoq", "NSA",
-        "quarterly", "percent", 1, "0.1", "https://www.bls.gov/eci/",
-    ),
-    "real_gdp_annualized_qoq": OfficialMetricSpec(
-        "real_gdp_annualized_qoq", "BEA", "BEA:GDP", "official_annualized_qoq_rate", "SAAR",
-        "quarterly", "percent", 0, "0.1", "https://www.bea.gov/data/gdp/gross-domestic-product",
-    ),
-    "real_gdp_yoy": OfficialMetricSpec(
-        "real_gdp_yoy", "BEA", "BEA:REAL_GDP", "pct_change_yoy", "SAAR",
-        "quarterly", "percent", 4, "0.1", "https://www.bea.gov/data/gdp/gross-domestic-product",
-    ),
-    "headline_pce_mom": OfficialMetricSpec(
-        "headline_pce_mom", "BEA", "BEA:PCE_PRICE_INDEX", "pct_change_mom", "SA",
-        "monthly", "percent", 1, "0.1", "https://www.bea.gov/data/consumer-spending/main",
-    ),
-    "headline_pce_yoy": OfficialMetricSpec(
-        "headline_pce_yoy", "BEA", "BEA:PCE_PRICE_INDEX", "pct_change_yoy", "SA",
-        "monthly", "percent", 12, "0.1", "https://www.bea.gov/data/consumer-spending/main",
-    ),
-    "core_pce_mom": OfficialMetricSpec(
-        "core_pce_mom", "BEA", "BEA:CORE_PCE", "pct_change_mom", "SA",
-        "monthly", "percent", 1, "0.1", "https://www.bea.gov/data/personal-consumption-expenditures-price-index-excluding-food-and-energy",
-    ),
-    "core_pce_yoy": OfficialMetricSpec(
-        "core_pce_yoy", "BEA", "BEA:CORE_PCE", "pct_change_yoy", "SA",
-        "monthly", "percent", 12, "0.1", "https://www.bea.gov/data/personal-consumption-expenditures-price-index-excluding-food-and-energy",
-    ),
-    "personal_income_mom": OfficialMetricSpec(
-        "personal_income_mom", "BEA", "BEA:PERSONAL_INCOME", "pct_change_mom", "SAAR",
-        "monthly", "percent", 1, "0.1", "https://www.bea.gov/data/income-saving/personal-income",
-    ),
-    "personal_spending_mom": OfficialMetricSpec(
-        "personal_spending_mom", "BEA", "BEA:PERSONAL_SPENDING", "pct_change_mom", "SAAR",
-        "monthly", "percent", 1, "0.1", "https://www.bea.gov/data/consumer-spending/main",
-    ),
-    "advance_retail_sales": OfficialMetricSpec(
-        "advance_retail_sales", "CENSUS", "CENSUS:MARTS:RETAIL_SALES", "level", "SA",
-        "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/retail/",
-    ),
-    "advance_durable_goods_orders": OfficialMetricSpec(
-        "advance_durable_goods_orders", "CENSUS", "CENSUS:ADVM3:DURABLE_GOODS", "level", "SA",
-        "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/manufacturing/m3/",
-    ),
-    "housing_starts": OfficialMetricSpec(
-        "housing_starts", "CENSUS", "CENSUS:RESCONST:HOUSING_STARTS", "level", "SAAR",
-        "monthly", "thousands_annual_rate", 0, "1", "https://www.census.gov/construction/nrc/",
-    ),
-    "building_permits": OfficialMetricSpec(
-        "building_permits", "CENSUS", "CENSUS:RESCONST:BUILDING_PERMITS", "level", "SAAR",
-        "monthly", "thousands_annual_rate", 0, "1", "https://www.census.gov/construction/nrc/",
-    ),
-    "international_trade_balance": OfficialMetricSpec(
-        "international_trade_balance", "CENSUS", "CENSUS:FTD:TRADE_BALANCE", "level", "SA",
-        "monthly", "millions_usd", 0, "0.1", "https://www.census.gov/foreign-trade/",
-    ),
-    "new_home_sales": OfficialMetricSpec(
-        "new_home_sales", "FRED", "HSN1F", "level", "SAAR",
-        "monthly", "thousands_annual_rate", 1, "1", "https://fred.stlouisfed.org/series/HSN1F",
-    ),
-    "flash_services_pmi": OfficialMetricSpec(
-        "flash_services_pmi", "SPGLOBAL", "SPGLOBAL:US:FLASH_SERVICES_PMI", "level", "SA",
-        "monthly", "index_points", 1, "0.1", "https://www.pmi.spglobal.com/Public/Home/PressRelease",
-    ),
+    specification.canonical_metric_id: specification
+    for specification in OFFICIAL_METRIC_REGISTRATIONS
 }
 
 
@@ -144,6 +236,29 @@ def derive_official_actual(
     retrieved_at: str,
     release_timestamp: str | None,
 ) -> dict[str, Any]:
+    source_series_id = str(series.get("series_id") or "").strip()
+    if source_series_id != spec.source_series_id:
+        raise ValueError("source_series_mismatch")
+    source_candidates = (
+        series.get("source"),
+        series.get("source_originator"),
+    )
+    if not any(
+        _source_identity(candidate)
+        == _source_identity(spec.provider_id)
+        for candidate in source_candidates
+        if candidate
+    ):
+        raise ValueError("source_provider_mismatch")
+    frequency = str(series.get("frequency") or "").strip().lower()
+    if frequency != spec.frequency:
+        raise ValueError("source_frequency_mismatch")
+    seasonal_adjustment = str(
+        series.get("seasonal_adjustment") or ""
+    ).strip().upper()
+    if seasonal_adjustment != spec.seasonal_adjustment:
+        raise ValueError("source_seasonal_adjustment_mismatch")
+
     all_observations = _normalized_observations(series)
     latest_by_period: dict[str, dict[str, Any]] = {}
     for observation in all_observations:
@@ -165,17 +280,52 @@ def derive_official_actual(
     value = _transform(spec, current["value"], previous["value"] if previous else None)
     revisions = [item for item in all_observations if item["period"] == current["period"]]
     warnings = ["official_observation_revised"] if len({item["value"] for item in revisions}) > 1 else []
-    release_vintage = str(current.get("release_vintage") or series.get("release_vintage") or retrieved_at)
-    lineage = {
+    release_vintage = (
+        current.get("release_vintage")
+        or series.get("release_vintage")
+        or None
+    )
+    calculation_lineage = {
         "current_observation": _lineage_observation(current),
         "comparison_observation": _lineage_observation(previous) if previous else None,
         "observation_count": len(observations),
         "formula": _formula(spec.transformation),
     }
+    actual = _decimal_text(value)
+    source_url = str(
+        series.get("source_url")
+        or series.get("canonical_url")
+        or spec.canonical_url
+    )
+    source_domain = str(
+        series.get("source_domain")
+        or urlparse(source_url).hostname
+        or ""
+    ).strip().casefold()
+    field_lineage = {
+        "field": "actual",
+        "value": actual,
+        "metric_id": spec.canonical_metric_id,
+        "source": spec.provider_id,
+        "acquisition_provider": spec.provider_id,
+        "source_series_id": spec.source_series_id,
+        "source_url": source_url,
+        "source_domain": source_domain,
+        "reference_period": current["period"],
+        "frequency": spec.frequency,
+        "transformation": spec.transformation,
+        "seasonal_adjustment": spec.seasonal_adjustment,
+        "unit": spec.unit,
+        "retrieved_at": retrieved_at,
+        "release_timestamp": release_timestamp,
+        "calculation": calculation_lineage,
+        "verification_status": "VERIFIED",
+    }
     return {
         "field": "actual",
         "field_semantics": "actual",
-        "value": _decimal_text(value),
+        "value": actual,
+        "actual": actual,
         "metric_id": spec.event_metric_id,
         "event_metric_id": spec.event_metric_id,
         "source_series_id": spec.source_series_id,
@@ -183,6 +333,10 @@ def derive_official_actual(
         "seasonal_adjustment": spec.seasonal_adjustment,
         "frequency": spec.frequency,
         "unit": spec.unit,
+        "source": spec.provider_id,
+        "acquisition_provider": spec.provider_id,
+        "source_url": source_url,
+        "source_domain": source_domain,
         "period": current["period"],
         "reference_period": current["period"],
         "release_timestamp": release_timestamp,
@@ -200,7 +354,8 @@ def derive_official_actual(
             if previous is not None and spec.transformation == "level"
             else None
         ),
-        "calculation_lineage": lineage,
+        "calculation_lineage": calculation_lineage,
+        "lineage": {"actual": field_lineage},
         "warnings": warnings,
     }
 
@@ -217,28 +372,40 @@ def normalize_reference_period(
     localized_months = {
         "gennaio": 1,
         "january": 1,
+        "jan": 1,
         "febbraio": 2,
         "february": 2,
+        "feb": 2,
         "marzo": 3,
         "march": 3,
+        "mar": 3,
         "aprile": 4,
         "april": 4,
+        "apr": 4,
         "maggio": 5,
         "may": 5,
         "giugno": 6,
         "june": 6,
+        "jun": 6,
         "luglio": 7,
         "july": 7,
+        "jul": 7,
         "agosto": 8,
         "august": 8,
+        "aug": 8,
         "settembre": 9,
         "september": 9,
+        "sep": 9,
+        "sept": 9,
         "ottobre": 10,
         "october": 10,
+        "oct": 10,
         "novembre": 11,
         "november": 11,
+        "nov": 11,
         "dicembre": 12,
         "december": 12,
+        "dec": 12,
     }
     if frequency == "monthly" and text in localized_months and release_date:
         anchor = (
@@ -286,8 +453,14 @@ def _normalized_observations(series: dict[str, Any]) -> list[dict[str, Any]]:
             value = Decimal(str(raw["value"]).replace(",", ""))
         except InvalidOperation:
             continue
-        vintage = str(raw.get("release_vintage") or raw.get("vintage") or position)
-        selected[(period, vintage)] = {**raw, "period": period, "value": value, "release_vintage": vintage}
+        release_vintage = raw.get("release_vintage") or raw.get("vintage")
+        vintage_key = str(release_vintage or position)
+        selected[(period, vintage_key)] = {
+            **raw,
+            "period": period,
+            "value": value,
+            "release_vintage": release_vintage,
+        }
     return sorted(selected.values(), key=lambda item: (_period_key(item["period"]), str(item["release_vintage"])))
 
 
@@ -337,3 +510,7 @@ def _formula(transformation: str) -> str:
 
 def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _source_identity(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())

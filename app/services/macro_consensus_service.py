@@ -14,6 +14,10 @@ from app.models.events import EconomicEvent
 from app.services.data_freshness_service import parse_datetime
 from app.services.economic_event_materialization_service import EconomicEventMaterializationService
 from app.services.market_fact_repository import MarketFactRepository
+from app.services.official_actual_semantics import (
+    metric_change_basis_from_text,
+    metric_semantics_mismatch_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +266,34 @@ def match_consensus_candidate(event: EconomicEvent, candidate: dict[str, Any]) -
     metric_id = candidate_metric_id(candidate)
     if metric_id is None or event_family(event) != candidate_family(candidate):
         return ConsensusMatch(False, rejection_reason="event_family_mismatch")
+    candidate_semantic_reason = metric_semantics_mismatch_reason(
+        metric_id,
+        name=candidate.get("event_name") or candidate.get("name"),
+        frequency_hint=" ".join(
+            str(item or "")
+            for item in (
+                candidate.get("frequency"),
+                candidate.get("evaluation_method"),
+            )
+        ),
+    )
+    if candidate_semantic_reason is not None:
+        return ConsensusMatch(
+            False,
+            metric_id=metric_id,
+            rejection_reason=candidate_semantic_reason.lower(),
+        )
+    semantic_reason = metric_semantics_mismatch_reason(
+        metric_id,
+        name=event.name,
+        frequency_hint=event.frequency,
+    )
+    if semantic_reason is not None:
+        return ConsensusMatch(
+            False,
+            metric_id=metric_id,
+            rejection_reason=semantic_reason.lower(),
+        )
     if str(candidate.get("country") or "").upper() != event.country.upper():
         return ConsensusMatch(False, metric_id=metric_id, rejection_reason="country_mismatch")
     if _number(candidate.get("consensus")) is None:
@@ -322,8 +354,16 @@ def candidate_metric_id(candidate: dict[str, Any]) -> str | None:
     if explicit in METRIC_META:
         return explicit
     text = _normalized(candidate.get("event_name"))
-    compact = text.replace(" ", "")
-    frequency = "mom" if "mom" in compact else "yoy" if "yoy" in compact else "qoq" if "qoq" in compact else None
+    frequency = metric_change_basis_from_text(
+        " ".join(
+            str(item or "")
+            for item in (
+                candidate.get("event_name"),
+                candidate.get("frequency"),
+                candidate.get("evaluation_method"),
+            )
+        )
+    )
     if "cleveland" in text or "index n s a" in text or "index s a" in text:
         return None
     if "average hourly earnings" in text:
@@ -427,6 +467,19 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
                 "source": source,
                 "source_url": source_url,
                 "provider_type": ProviderType.API.value,
+                "source_field": field,
+                "occurrence_id": (
+                    event.occurrence_id
+                    or event.event_id
+                ),
+                "metric_id": metric_id,
+                "reference_period": (
+                    candidate.get("previous_reference_period")
+                    if field == "previous"
+                    else candidate.get("reference_period")
+                ),
+                "frequency": frequency,
+                "value": candidate.get(field),
                 "confidence": reliability,
                 "reliability": reliability,
                 "validation": {"status": "deterministic_verified"},
@@ -511,6 +564,19 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
                 "source": existing.get(f"{field}_source") or existing.get("source"),
                 "source_url": existing.get(f"{field}_source_url") or existing.get("source_url"),
                 "provider_type": existing.get("provider_type"),
+                "source_field": field,
+                "occurrence_id": (
+                    event.occurrence_id
+                    or event.event_id
+                ),
+                "metric_id": metric_id,
+                "reference_period": (
+                    event.reference_period
+                    if field != "previous"
+                    else None
+                ),
+                "frequency": frequency,
+                "value": existing.get(field),
                 "confidence": existing.get("confidence"),
                 "reliability": existing.get("reliability"),
                 "evidence": existing.get("evidence") or existing.get("evidence_text"),
@@ -521,6 +587,15 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
             "source": existing.get("consensus_source") or existing.get("source"),
             "source_url": existing.get("consensus_source_url") or existing.get("source_url"),
             "provider_type": existing.get("provider_type"),
+            "source_field": "consensus",
+            "occurrence_id": (
+                event.occurrence_id
+                or event.event_id
+            ),
+            "metric_id": metric_id,
+            "reference_period": event.reference_period,
+            "frequency": frequency,
+            "value": existing.get("consensus"),
             "confidence": existing.get("confidence"),
             "reliability": existing.get("reliability"),
             "evidence": existing.get("evidence") or existing.get("evidence_text"),
@@ -531,6 +606,15 @@ def _merge_candidate(event: EconomicEvent, candidate: dict[str, Any], metric_id:
             "source": incoming["source"],
             "source_url": incoming["source_url"],
             "provider_type": ProviderType.API.value,
+            "source_field": "consensus",
+            "occurrence_id": (
+                event.occurrence_id
+                or event.event_id
+            ),
+            "metric_id": metric_id,
+            "reference_period": candidate.get("reference_period"),
+            "frequency": frequency,
+            "value": candidate.get("consensus"),
             "confidence": incoming["confidence"],
             "reliability": incoming["reliability"],
             "evidence": candidate.get("evidence") or candidate.get("evidence_text"),
@@ -569,8 +653,7 @@ def _dedupe_provenance(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _promote_primary_metric(event: EconomicEvent) -> None:
-    family = event_family(event)
-    primary_id = PRIMARY_METRIC.get(family or "")
+    primary_id = _primary_metric_id(event)
     primary = next((metric for metric in event.enrichment.metrics if metric.get("metric_id") == primary_id), None)
     if primary is None:
         return
@@ -603,6 +686,63 @@ def _promote_primary_metric(event: EconomicEvent) -> None:
         enrichment.provider_type = ProviderType(str(primary.get("provider_type") or enrichment.provider_type or ProviderType.API.value))
     except ValueError:
         enrichment.provider_type = ProviderType.MIXED
+
+
+def _primary_metric_id(event: EconomicEvent) -> str | None:
+    explicit = str(event.metric_id or "")
+    if (
+        explicit in METRIC_META
+        and metric_semantics_mismatch_reason(
+            explicit,
+            name=event.name,
+            frequency_hint=event.frequency,
+        )
+        is None
+    ):
+        return explicit
+    family = event_family(event)
+    basis = metric_change_basis_from_text(
+        f"{event.name} {event.frequency or ''}"
+    )
+    if family in {"CPI", "PPI", "PCE"} and basis in {"mom", "yoy"}:
+        normalized_name = _normalized(event.name)
+        prefix = (
+            "core"
+            if any(
+                token in normalized_name
+                for token in ("core", "di fondo", "base")
+            )
+            else "headline"
+        )
+        candidate = f"{prefix}_{family.lower()}_{basis}"
+        if candidate in METRIC_META:
+            return candidate
+    if family in {"CPI", "PPI", "PCE"}:
+        verified_candidates = {
+            metric_id
+            for metric in event.enrichment.metrics
+            if isinstance(metric, dict)
+            and (
+                metric.get("consensus_verified") is True
+                or (
+                    metric.get("field_semantics") or {}
+                ).get("consensus_verified")
+                is True
+            )
+            and (metric_id := str(metric.get("metric_id") or ""))
+            in METRIC_META
+            and METRIC_META[metric_id][0] == family
+            and metric_semantics_mismatch_reason(
+                metric_id,
+                name=event.name,
+                frequency_hint=metric.get("frequency"),
+            )
+            is None
+        }
+        if len(verified_candidates) == 1:
+            return next(iter(verified_candidates))
+        return None
+    return PRIMARY_METRIC.get(family or "")
 
 
 def _has_verified_consensus(event: EconomicEvent) -> bool:

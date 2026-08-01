@@ -1,0 +1,283 @@
+{
+  "fixture_contract": "SeniorAnalystSecondLiveReadinessRegressionFixture",
+  "fixture_version": 1,
+  "metadata": {
+    "description": "Compact exact-field extraction retaining only the second LIVE nodes needed to reproduce the readiness classification defects.",
+    "origin": {
+      "run_id": "20260730T151138Z",
+      "path": "data/senior-analyst-live-validation/20260730T151138Z/response-body.json",
+      "http_status": 200,
+      "content_type": "application/json",
+      "body_size_bytes": 157162,
+      "body_sha256": "68506c6d54ecd25429286d905c50aa1c49985aff33fd47c2f570f4ead6e6a6e0",
+      "body_sha256_scope": "EXACT_HTTP_RESPONSE_BODY_BYTES"
+    },
+    "derivation": {
+      "method": "Exact object-field selection from the immutable HTTP body; retained scalar values were not synthesized or time-shifted.",
+      "retained_defects": [
+        "substantive current-news headline counted as zero and classified unavailable",
+        "PARTIAL macro and Nasdaq sections listed as both available and degraded",
+        "readiness counts and lists not mutually coherent"
+      ],
+      "source_json_object_roots": [
+        "/contract",
+        "/schema_version",
+        "/symbol",
+        "/snapshot_id",
+        "/snapshot_revision",
+        "/generated_at",
+        "/readiness",
+        "/analytics/macro/status",
+        "/analytics/macro/metrics/0",
+        "/analytics/calendar/status",
+        "/analytics/calendar/next_24h_events/0",
+        "/analytics/fomc/status",
+        "/analytics/nasdaq/status",
+        "/analytics/nasdaq/components/0",
+        "/analytics/market_internals",
+        "/analytics/news/status",
+        "/analytics/news/current_news/0",
+        "/analytics/vix/status",
+        "/analytics/risk/status",
+        "/analytics/rates/status",
+        "/analytics/rates/metrics/0",
+        "/analytics/positioning/status",
+        "/analytics/earnings/status",
+        "/analytics/options_positioning",
+        "/analytics/market_schedule"
+      ]
+    },
+    "fixture_payload_sha256": "bc44dd273251adf7f6f5c59a39b046e83f9cb3ac6c859b7ba71887aaa4abaf6f",
+    "fixture_payload_sha256_scope": "CANONICAL_JSON_OF_PAYLOAD"
+  },
+  "payload": {
+    "contract": "SeniorAnalystPayloadV1",
+    "schema_version": "1.0",
+    "symbol": "MNQ",
+    "snapshot_id": "mcs-d80a1e8f-862e-488e-bb05-3af5a5d7a89a",
+    "snapshot_revision": 100,
+    "generated_at": "2026-07-30T15:12:41.116023+00:00",
+    "readiness": {
+      "status": "PARTIAL",
+      "calculated_from_delivered_payload": true,
+      "available_section_count": 7,
+      "degraded_section_count": 2,
+      "unavailable_section_count": 6,
+      "section_count": 13,
+      "coverage_ratio": 0.5385,
+      "sections_available": [
+        "macro",
+        "calendar",
+        "nasdaq",
+        "market_internals",
+        "rates",
+        "options_positioning",
+        "market_schedule"
+      ],
+      "sections_degraded": [
+        "macro",
+        "nasdaq"
+      ],
+      "sections_unavailable": [
+        "fomc",
+        "news",
+        "vix",
+        "risk",
+        "positioning",
+        "earnings"
+      ],
+      "section_status": {
+        "macro": "PARTIAL",
+        "calendar": "AVAILABLE",
+        "fomc": "UNAVAILABLE_AFTER_RELEASE",
+        "nasdaq": "PARTIAL",
+        "market_internals": "AVAILABLE",
+        "news": "AVAILABLE",
+        "vix": "UNAVAILABLE",
+        "risk": "UNAVAILABLE",
+        "rates": "AVAILABLE",
+        "positioning": "UNAVAILABLE",
+        "earnings": "NO_DATA",
+        "options_positioning": "AVAILABLE",
+        "market_schedule": "AVAILABLE"
+      },
+      "delivered_value_counts": {
+        "macro": 4,
+        "calendar": 14,
+        "fomc": 0,
+        "nasdaq": 18,
+        "market_internals": 5,
+        "news": 0,
+        "vix": 0,
+        "risk": 0,
+        "rates": 1,
+        "positioning": 0,
+        "earnings": 0,
+        "options_positioning": 8,
+        "market_schedule": 1
+      },
+      "excluded_values_contribute": false
+    },
+    "analytics": {
+      "macro": {
+        "status": "PARTIAL",
+        "metrics": [
+          {
+            "series_id": "BEA:CORE_PCE",
+            "metric_id": "core_pce_price_index",
+            "name": "Core PCE Price Index",
+            "value": 130.266,
+            "unit": "Level",
+            "transformation": "level",
+            "reference_period": "2026M06",
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "data_as_of": "2026M06",
+            "content_valid_until": "2026-09-13T15:12:41.116023+00:00"
+          }
+        ]
+      },
+      "calendar": {
+        "status": "AVAILABLE",
+        "next_24h_events": [
+          {
+            "occurrence_id": "bls:bls-c4adba9878647aba:2026-07-31",
+            "metric_id": "employment_cost_index_second_quarter_2026",
+            "name": "Employment Cost Index (Second Quarter 2026)",
+            "release_at": "2026-07-31T12:30:00+00:00",
+            "reference_period": "Second Quarter 2026",
+            "release_status": "PRE_RELEASE",
+            "impact": "MEDIUM",
+            "actual": null,
+            "consensus": null,
+            "previous": null,
+            "freshness": "LIVE",
+            "invalid_period_mapping": false,
+            "source": {
+              "publisher": "BLS Release Calendar",
+              "distributor": null,
+              "acquisition_provider": "BLS",
+              "source_url": "https://www.bls.gov/schedule/2026/07_sched_list.htm"
+            }
+          }
+        ]
+      },
+      "fomc": {
+        "status": "UNAVAILABLE_AFTER_RELEASE"
+      },
+      "nasdaq": {
+        "status": "PARTIAL",
+        "components": [
+          {
+            "symbol": "AAPL",
+            "price": 332.4132,
+            "change_pct": -1.71,
+            "weight_pct": 12.55398139,
+            "quote_occurrence": "Jul 30, 2026 11:12 AM",
+            "status": "AVAILABLE",
+            "freshness": "CURRENT",
+            "data_as_of": "Jul 30, 2026 11:12 AM",
+            "content_valid_until": "2026-07-30T17:12:41.116023+00:00"
+          }
+        ]
+      },
+      "market_internals": {
+        "status": "AVAILABLE",
+        "advance_decline_ratio": 0.6885245901639344,
+        "advancers": 42,
+        "decliners": 61,
+        "percent_advancers": 40.776699,
+        "weighted_breadth": 0.15492502186197002
+      },
+      "news": {
+        "status": "AVAILABLE",
+        "current_news": [
+          {
+            "article_id": "092366e1fcd604129bf5e7d5db28f7f1aaa0d1dfdf437501dfcd1b3b54c8c0e3",
+            "headline": "Why Investors Are Getting More Bullish on Marvell Technology (MRVL)",
+            "summary": null,
+            "published_at": "2026-07-30T15:12:09+00:00",
+            "symbols": [],
+            "source": {
+              "publisher": "Insider Monkey",
+              "distributor": "Yahoo Finance",
+              "acquisition_provider": "Yahoo Finance RSS",
+              "source_url": "https://finance.yahoo.com/markets/stocks/articles/why-investors-getting-more-bullish-143805536.html"
+            },
+            "freshness": "CURRENT",
+            "status": "AVAILABLE",
+            "reason_code": null
+          }
+        ]
+      },
+      "vix": {
+        "status": "UNAVAILABLE"
+      },
+      "risk": {
+        "status": "UNAVAILABLE"
+      },
+      "rates": {
+        "status": "AVAILABLE",
+        "metrics": [
+          {
+            "series_id": "DFEDTARL",
+            "metric_id": "dfedtarl",
+            "value": 3.5,
+            "unit": "percent",
+            "transformation": "level",
+            "reference_period": "2026-07-29",
+            "status": "AVAILABLE",
+            "freshness": "LAST_AVAILABLE_OFFICIAL_CLOSE",
+            "data_as_of": "2026-07-29T00:00:00+00:00",
+            "content_valid_until": "2026-07-31T00:00:00+00:00"
+          }
+        ]
+      },
+      "positioning": {
+        "status": "UNAVAILABLE"
+      },
+      "earnings": {
+        "status": "NO_DATA"
+      },
+      "options_positioning": {
+        "status": "AVAILABLE",
+        "iv_atm": 0.35195,
+        "open_interest": {
+          "calls": 837318.0,
+          "put_call_ratio": 1.1014954891689896,
+          "puts": 922302.0
+        },
+        "volume": {
+          "calls": 1507891.0,
+          "put_call_ratio": 1.0573449937694435,
+          "puts": 1594361.0
+        },
+        "skew": {
+          "convention": "mean_put_iv_minus_mean_call_iv_within_10pct_spot",
+          "value": 0.09532038043478253
+        }
+      },
+      "market_schedule": {
+        "status": "AVAILABLE",
+        "context_date": "2026-07-30",
+        "market_session_status": "open",
+        "nasdaq_cash_session": {
+          "status": "Market Open",
+          "is_open": true,
+          "next_open": "2026-07-31T13:30:00+00:00",
+          "next_close": "2026-07-30T20:00:00+00:00",
+          "reason_code": null
+        },
+        "mnq_futures_session": {
+          "status": "GLOBEX_OPEN",
+          "is_open": true,
+          "next_open": "2026-07-30T15:13:40.989427+00:00",
+          "next_close": "2026-07-30T21:00:00+00:00",
+          "reason_code": null
+        }
+      }
+    },
+    "missing_data": [],
+    "provider_accounting": []
+  }
+}

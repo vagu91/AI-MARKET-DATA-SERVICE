@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.config import Settings
-from app.providers.hacker_news_social_sentiment_provider import HackerNewsSocialSentimentProvider
 from app.services.market_fact_repository import MarketFactRepository
+from app.services.provider_adapter_factory import create_registered_adapter
 from app.services.provider_observation_repository import ProviderObservationRepository
 
 
@@ -14,15 +14,29 @@ class SocialSentimentService:
         self.settings = settings
         self.facts = MarketFactRepository(settings)
         self.observations = ProviderObservationRepository(settings)
-        self.provider = HackerNewsSocialSentimentProvider(settings)
+        self.provider = create_registered_adapter("HACKER_NEWS", settings)
 
     async def snapshot(self, *, refresh: str = "auto") -> dict[str, Any]:
-        cached = [] if refresh == "force" else self.facts.get_valid_facts_by_type("social_sentiment")
+        cached = self.facts.get_valid_facts_by_type("social_sentiment")
+        cache_rejection_reason = None
+        if cached and not _social_cache_provenance_valid(
+            cached[0],
+            algolia_url=self.settings.hacker_news_algolia_url,
+        ):
+            cache_rejection_reason = "SOCIAL_CACHE_PROVENANCE_NOT_CERTIFIED"
+            cached = []
         if cached:
             raw = cached[0].get("raw_payload") if isinstance(cached[0].get("raw_payload"), dict) else {}
             return {**raw, "cache_used": True, "provider_calls": 0}
         if refresh == "false":
-            return _empty("not_found", "social_sentiment_not_in_db_refresh_false", provider_calls=0)
+            return {
+                **_empty(
+                    "not_found",
+                    "social_sentiment_not_in_db_refresh_false",
+                    provider_calls=0,
+                ),
+                "cache_rejection_reason": cache_rejection_reason,
+            }
         result = await self.provider.fetch()
         self.observations.record(
             provider_name="hacker_news_social_sentiment",
@@ -58,7 +72,12 @@ class SocialSentimentService:
                     "errors_json": result.get("errors") or [],
                 }
             )
-        return {**result, "cache_used": False, "provider_calls": 1}
+        return {
+            **result,
+            "cache_used": False,
+            "provider_calls": 1,
+            "cache_rejection_reason": cache_rejection_reason,
+        }
 
 
 def _empty(status: str, warning: str, *, provider_calls: int) -> dict[str, Any]:
@@ -77,3 +96,25 @@ def _empty(status: str, warning: str, *, provider_calls: int) -> dict[str, Any]:
         "provider_calls": provider_calls,
         "service_role": "data provider only",
     }
+
+
+def _social_cache_provenance_valid(
+    row: dict[str, Any],
+    *,
+    algolia_url: str,
+) -> bool:
+    """Reject persisted values produced by the uncertified RSS fallback."""
+
+    raw = row.get("raw_payload")
+    if not isinstance(raw, dict):
+        return False
+    return bool(
+        str(raw.get("provider") or "").strip()
+        == "hacker_news_social_sentiment"
+        and str(raw.get("source") or "").strip()
+        == "Hacker News Algolia public API"
+        and str(raw.get("source_url") or "").strip()
+        == str(algolia_url).strip()
+        and str(row.get("source_url") or "").strip()
+        == str(algolia_url).strip()
+    )

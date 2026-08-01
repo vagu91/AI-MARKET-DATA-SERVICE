@@ -107,6 +107,33 @@ async def test_hacker_news_social_sentiment_provider_mock(tmp_path: Path) -> Non
     assert result["social_market_sentiment"]["discussion_volume"] == 2
 
 
+@pytest.mark.asyncio
+async def test_hacker_news_runtime_never_calls_uncertified_rss_fallback(
+    tmp_path: Path,
+) -> None:
+    cfg = Settings(
+        _env_file=None,
+        database_path=tmp_path / "market.sqlite",
+        hacker_news_algolia_url="https://hn.test/search",
+        hacker_news_rss_url="https://hn.test/rss",
+    )
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://hn.test/search").mock(
+            side_effect=httpx.ConnectError("algolia unavailable")
+        )
+        rss = router.get("https://hn.test/rss").mock(
+            return_value=httpx.Response(200, text="<rss />")
+        )
+        result = await HackerNewsSocialSentimentProvider(cfg).fetch()
+
+    assert rss.call_count == 0
+    assert result["status"] == "provider_failed"
+    assert any(
+        "rss_fallback_disabled_uncertified_runtime_leaf" in item
+        for item in result["errors"]
+    )
+
+
 def test_deprecated_consumer_contract_preserves_material_source_arrays() -> None:
     full = {
         "symbol": "MNQ",
@@ -442,13 +469,19 @@ def test_ai_event_and_field_counts_are_semantically_distinct_and_attempts_are_pr
 
 
 def _event() -> EconomicEvent:
+    release = (datetime.now(UTC) + timedelta(days=1)).replace(
+        hour=12,
+        minute=30,
+        second=0,
+        microsecond=0,
+    )
     return EconomicEvent(
         event_id="evt-cpi",
         name="Consumer Price Index",
         country="US",
         category="CPI",
-        date="2099-07-14",
-        time_utc=datetime(2099, 7, 14, 12, 30, tzinfo=UTC),
+        date=release.date().isoformat(),
+        time_utc=release,
         impact=Impact.HIGH,
         source="BLS",
         source_url="https://bls.test",

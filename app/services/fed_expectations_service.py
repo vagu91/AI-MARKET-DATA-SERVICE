@@ -6,15 +6,20 @@ import logging
 import math
 import re
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
-from app.services.data_freshness_service import parse_datetime
+from app.services.data_freshness_service import (
+    CanonicalFreshnessResult,
+    DataFreshnessService,
+    parse_datetime,
+)
 from app.services.fed_expectations_repository import FedExpectationsRepository
 
 
 logger = logging.getLogger(__name__)
 CALCULATION_VERSION = "fed_expectations_v1"
+FED_EXPECTATIONS_MAX_AGE = timedelta(hours=2)
 SOURCE_RANK = {
     "not_found": 0,
     "last_known_good_vendor": 1,
@@ -27,9 +32,39 @@ SOURCE_RANK = {
 
 
 class FedExpectationsService:
-    def __init__(self, settings: Settings, repository: FedExpectationsRepository | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: FedExpectationsRepository | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.repository = repository or FedExpectationsRepository(settings)
+        self.freshness = DataFreshnessService(
+            settings,
+            clock=self.clock,
+        )
+        self.last_database_lookup: dict[str, Any] | None = None
+
+    def lookup_canonical(
+        self,
+    ) -> tuple[dict[str, Any] | None, CanonicalFreshnessResult]:
+        latest = self.repository.latest()
+        freshness = self.freshness.evaluate_canonical(
+            latest,
+            max_age=FED_EXPECTATIONS_MAX_AGE,
+            data_reference_mode="point_in_time",
+            data_as_of_fields=(
+                "database_data_as_of",
+                "data_as_of",
+            ),
+        )
+        self.last_database_lookup = _database_lookup_evidence(
+            freshness
+        )
+        return latest, freshness
 
     def snapshot(
         self,
@@ -39,14 +74,44 @@ class FedExpectationsService:
         macro_snapshot: dict[str, Any],
         event_calendar: dict[str, Any],
         legacy_block: dict[str, Any] | None = None,
+        canonical_preflight: (
+            tuple[
+                dict[str, Any] | None,
+                CanonicalFreshnessResult,
+            ]
+            | None
+        ) = None,
     ) -> dict[str, Any]:
         logger.info("fed_expectations_lookup_started", extra={"refresh": refresh})
-        latest = self.repository.latest()
-        if refresh == "false" or (refresh == "auto" and latest and not _is_stale(latest)):
-            return _runtime_view(latest, refresh=refresh) if latest else not_found_snapshot(
+        latest, freshness = (
+            canonical_preflight
+            if canonical_preflight is not None
+            else self.lookup_canonical()
+        )
+        self.last_database_lookup = _database_lookup_evidence(
+            freshness
+        )
+        if freshness.usable and latest:
+            return _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            )
+        if refresh == "false":
+            return not_found_snapshot(
                 refresh=refresh,
                 legacy_block=legacy_block,
-                warning="fed_expectations_not_in_db_refresh_false" if refresh == "false" else "fed_expectations_not_in_db",
+                warning=(
+                    "fed_expectations_canonical_record_rejected_refresh_false"
+                    if latest
+                    else "fed_expectations_not_in_db_refresh_false"
+                ),
+                reason_code=(
+                    freshness.reason_code
+                    if latest
+                    else "FED_EXPECTATIONS_NOT_IN_DATABASE"
+                ),
+                now=self.clock(),
             )
 
         provider_payload = provider_payload or {}
@@ -56,15 +121,31 @@ class FedExpectationsService:
             event_calendar=event_calendar,
             legacy_block=legacy_block,
             history=self.repository.history(),
+            now=self.clock(),
         )
         expected_history_depth = self.repository.count() + (1 if candidate.get("status") == "available" else 0)
         candidate.setdefault("diagnostics", {})["history_snapshot_count"] = expected_history_depth
         candidate.setdefault("quality", {})["history_depth"] = expected_history_depth
         candidate_rank = SOURCE_RANK.get((candidate.get("source_summary") or {}).get("ranking_class"), 0)
         latest_rank = SOURCE_RANK.get((latest or {}).get("source_summary", {}).get("ranking_class"), 0)
-        if latest and (candidate.get("status") != "available" or candidate_rank < latest_rank):
-            fallback = _runtime_view(latest, refresh=refresh)
-            fallback["status"] = "stale_acceptable" if _is_stale(latest) else "available"
+        if (
+            latest
+            and freshness.usable
+            and (
+                candidate.get("status") != "available"
+                or candidate_rank < latest_rank
+            )
+        ):
+            fallback = _runtime_view(
+                latest,
+                refresh=refresh,
+                now=self.clock(),
+            )
+            fallback["status"] = (
+                "stale_acceptable"
+                if not freshness.usable
+                else "available"
+            )
             fallback["source_summary"]["last_known_good_used"] = True
             fallback["diagnostics"]["last_known_good_used"] = True
             fallback["diagnostics"]["source_failure_count"] = 1
@@ -87,7 +168,12 @@ class FedExpectationsService:
         )
         logger.info("fed_expectations_persisted", extra={"source": read_back.get("source_summary", {}).get("selected_source")})
         logger.info("fed_expectations_read_back", extra={"meeting_count": len(read_back.get("meetings") or [])})
-        return _runtime_view(read_back, refresh=refresh, force_read_back=True)
+        return _runtime_view(
+            read_back,
+            refresh=refresh,
+            force_read_back=True,
+            now=self.clock(),
+        )
 
 
 def canonicalize_investing_monitor(
@@ -121,7 +207,16 @@ def canonicalize_investing_monitor(
             valid_until=payload.get("valid_until"),
             now=now,
         )
-        if canonical:
+        if (
+            canonical
+            and canonical["validation"].get(
+                "meeting_date_match"
+            )
+            is False
+        ):
+            invalid += 1
+            warnings.append("meeting_mapping_failed")
+        elif canonical:
             meetings.append(canonical)
             normalized_count += int(validation["probabilities_normalized"])
         else:
@@ -129,25 +224,106 @@ def canonicalize_investing_monitor(
             warnings.extend(validation["errors"])
 
     meetings.sort(key=lambda item: item["meeting_date"])
-    repricing = calculate_repricing(meetings, history or [], now=now)
-    available = bool(meetings)
     source = str(payload.get("source") or "Investing.com Fed Rate Monitor")
-    retrieved_at = str(payload.get("retrieved_at") or _iso(now))
-    valid_until = str(payload.get("valid_until") or _iso(now + timedelta(minutes=30)))
-    stale = _date_or_none(valid_until) is not None and now >= _date_or_none(valid_until)
-    mapped_count = sum(1 for item in meetings if item["validation"]["meeting_date_match"] is True)
-    mapping_evaluated_count = sum(1 for item in meetings if item["validation"]["meeting_date_match"] is not None)
+    retrieved_at = payload.get("retrieved_at")
+    valid_until = (
+        payload.get("content_valid_until")
+        or payload.get("valid_until")
+    )
+    retrieved_at = (
+        str(retrieved_at)
+        if retrieved_at not in (None, "")
+        else None
+    )
+    valid_until = (
+        str(valid_until)
+        if valid_until not in (None, "")
+        else None
+    )
+    meeting_observations = [
+        _date_or_none(item.get("data_as_of"))
+        for item in meetings
+    ]
+    meeting_observations_complete = bool(meetings) and all(
+        item is not None
+        for item in meeting_observations
+    )
+    data_as_of = (
+        _oldest_meeting_observation(meetings)
+        if meeting_observations_complete
+        else None
+    )
+    refresh_due_at = (
+        payload.get("refresh_due_at")
+        or payload.get("next_refresh_at")
+    )
+    lifecycle_evidence_complete = bool(
+        _date_or_none(retrieved_at)
+        and _date_or_none(valid_until)
+        and _date_or_none(refresh_due_at)
+    )
+    meeting_freshness_valid = bool(
+        lifecycle_evidence_complete
+        and
+        meeting_observations_complete
+        and all(
+            not _is_stale(
+                {
+                    "data_as_of": item.get("data_as_of"),
+                    "content_valid_until": (
+                        item.get("valid_until")
+                        or valid_until
+                    ),
+                    "refresh_due_at": refresh_due_at,
+                },
+                now=now,
+            )
+            for item in meetings
+        )
+    )
+    stale = bool(meetings) and not meeting_freshness_valid
+    available = bool(meetings) and not stale
+    delivered_meetings = meetings if available else []
+    if meetings and stale:
+        warnings.append(
+            (
+                "fed_expectations_lifecycle_evidence_not_proved"
+                if not lifecycle_evidence_complete
+                else "fed_expectations_observation_outside_dataset_sla"
+                if meeting_observations_complete
+                else "fed_expectations_meeting_observation_not_proved"
+            )
+        )
+    repricing = calculate_repricing(
+        delivered_meetings,
+        history or [],
+        now=now,
+    )
+    mapped_count = sum(
+        1
+        for item in delivered_meetings
+        if item["validation"]["meeting_date_match"] is True
+    )
+    mapping_evaluated_count = sum(
+        1
+        for item in delivered_meetings
+        if item["validation"]["meeting_date_match"] is not None
+    )
     current_fields = ("current_target_lower_bound", "current_target_upper_bound", "effective_fed_funds_rate", "sofr")
     current_complete = sum(current_state.get(key) is not None for key in current_fields) / len(current_fields) * 100
     source_quality = 0.72
-    distribution_coverage = 100.0 if meetings else 0.0
+    distribution_coverage = 100.0 if delivered_meetings else 0.0
     mapping_valid_pct = (mapped_count / mapping_evaluated_count * 100) if mapping_evaluated_count else 0.0
     quality_score = 0.0
     if available:
         quality_score = source_quality * 0.35 + distribution_coverage / 100 * 0.25 + current_complete / 100 * 0.2
         quality_score += (mapping_valid_pct / 100 * 0.1) + (0.05 if not stale else 0.0)
         quality_score = round(min(quality_score, 0.79), 3)
-    next_meeting = meetings[0] if meetings else None
+    next_meeting = (
+        delivered_meetings[0]
+        if delivered_meetings
+        else None
+    )
     diagnostics = {
         "source_attempt_count": int(payload.get("provider_calls") or (1 if payload else 0)),
         "source_success_count": 1 if available else 0,
@@ -156,9 +332,14 @@ def canonicalize_investing_monitor(
         "vendor_source_success": available,
         "reconstruction_used": False,
         "last_known_good_used": False,
-        "meeting_count": len(meetings),
-        "contract_count": sum(1 for item in meetings if item.get("contract_symbols")),
-        "valid_distribution_count": len(meetings),
+        "meeting_count": len(delivered_meetings),
+        "observed_meeting_count": len(meetings),
+        "contract_count": sum(
+            1
+            for item in delivered_meetings
+            if item.get("contract_symbols")
+        ),
+        "valid_distribution_count": len(delivered_meetings),
         "invalid_distribution_count": invalid,
         "missing_contract_count": 0,
         "probability_normalization_count": normalized_count,
@@ -178,7 +359,9 @@ def canonicalize_investing_monitor(
             "current_range_missing": int(current_midpoint is None),
             "calendar_mismatch": max(mapping_evaluated_count - mapped_count, 0),
             "stale_source": int(stale),
-            "partial_response": int(bool(meetings) and invalid > 0),
+            "partial_response": int(
+                bool(delivered_meetings) and invalid > 0
+            ),
             "history_insufficient": int(not repricing["history_available"]),
         },
     }
@@ -186,7 +369,7 @@ def canonicalize_investing_monitor(
         "status": "available" if available else "not_found",
         "current_fed_state": current_state,
         "next_meeting": _next_meeting_summary(next_meeting),
-        "meetings": meetings,
+        "meetings": delivered_meetings,
         "repricing": repricing,
         "source_summary": {
             "selected_source": source if available else None,
@@ -200,7 +383,9 @@ def canonicalize_investing_monitor(
             "last_known_good_used": False,
         },
         "quality": {
-            "meeting_coverage_pct": 100.0 if meetings else 0.0,
+            "meeting_coverage_pct": (
+                100.0 if delivered_meetings else 0.0
+            ),
             "probability_distribution_coverage_pct": distribution_coverage,
             "official_source_coverage_pct": 0.0,
             "current_state_completeness_pct": round(current_complete, 2),
@@ -211,10 +396,23 @@ def canonicalize_investing_monitor(
             "quality_score": quality_score,
         },
         "diagnostics": diagnostics,
-        "data_as_of": payload.get("data_as_of") or (meetings[0].get("data_as_of") if meetings else None),
+        "data_as_of": data_as_of,
         "retrieved_at": retrieved_at,
         "valid_until": valid_until,
-        "age_minutes": max(0.0, round((now - (_date_or_none(retrieved_at) or now)).total_seconds() / 60, 2)),
+        "age_minutes": (
+            max(
+                0.0,
+                round(
+                    (
+                        now - _date_or_none(retrieved_at)
+                    ).total_seconds()
+                    / 60,
+                    2,
+                ),
+            )
+            if _date_or_none(retrieved_at)
+            else None
+        ),
         "stale": stale,
         "last_successful_refresh_at": retrieved_at if available else None,
         "next_refresh_at": valid_until,
@@ -222,15 +420,46 @@ def canonicalize_investing_monitor(
         "calculation_method": "vendor_probability_normalization",
         "calculation_version": CALCULATION_VERSION,
         "contract_symbols": [],
-        "raw_prices": [item.get("future_price") for item in meetings if item.get("future_price") is not None],
+        "raw_prices": [
+            item.get("future_price")
+            for item in delivered_meetings
+            if item.get("future_price") is not None
+        ],
         "confidence": quality_score,
         "warnings": list(dict.fromkeys(warnings)),
-        "errors": [] if available else ["fed_expectations_not_available"],
+        "errors": (
+            []
+            if available
+            else ["fed_expectations_not_available"]
+        ),
+        "reason_code": (
+            "FED_EXPECTATIONS_AVAILABLE"
+            if available
+            else "FED_EXPECTATIONS_OBSERVATION_OUTSIDE_SLA"
+            if meetings and stale
+            else "FED_EXPECTATIONS_NOT_AVAILABLE"
+        ),
         "fed_funds_futures": _legacy_fed_funds_block(payload, legacy_block),
         "service_role": "data provider only",
     }
     result["sanity_check"] = build_fed_sanity_check(result, macro_snapshot=macro_snapshot)
     return result
+
+
+def _oldest_meeting_observation(
+    meetings: list[dict[str, Any]],
+) -> str | None:
+    observations = [
+        parsed
+        for meeting in meetings
+        if (
+            parsed := _date_or_none(meeting.get("data_as_of"))
+        )
+        is not None
+    ]
+    if len(observations) != len(meetings) or not observations:
+        return None
+    return _iso(min(observations).astimezone(UTC))
 
 
 def build_fed_sanity_check(
@@ -436,7 +665,7 @@ def canonicalize_meeting(
     meeting_time_utc = None
     if parsed := _date_or_none(meeting_at):
         meeting_time_utc = _iso(parsed.astimezone(UTC))
-    data_as_of = raw.get("updated_at") or retrieved_at
+    data_as_of = raw.get("updated_at")
     freshness = "STALE" if (_date_or_none(valid_until) and now >= _date_or_none(valid_until)) else "RECENT"
     meeting_date_match: bool | None = None
     if meeting_date in official_dates:
@@ -730,29 +959,62 @@ def classify_change(change_bps: float | None) -> str:
     return "cut" if change_bps < 0 else "hike"
 
 
-def not_found_snapshot(*, refresh: str, legacy_block: dict[str, Any] | None, warning: str) -> dict[str, Any]:
-    now = _iso(datetime.now(UTC))
+def not_found_snapshot(
+    *,
+    refresh: str,
+    legacy_block: dict[str, Any] | None,
+    warning: str,
+    reason_code: str,
+    cache_used: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    observed = _iso(now or datetime.now(UTC))
     return {
         "status": "not_found", "current_fed_state": {}, "next_meeting": None, "meetings": [],
         "repricing": {"history_available": False, "history_status": "history_insufficient"},
         "source_summary": {"selected_source": None, "selected_source_type": "not_found", "ranking_class": "not_found", "is_official_source": False, "is_reconstructed": False, "last_known_good_used": False},
         "quality": {"meeting_coverage_pct": 0.0, "probability_distribution_coverage_pct": 0.0, "official_source_coverage_pct": 0.0, "current_state_completeness_pct": 0.0, "mapping_valid_pct": 0.0, "history_depth": 0, "stale_snapshot_count": 0, "missing_contract_count": 0, "quality_score": 0.0},
-        "diagnostics": {"source_attempt_count": 0, "source_success_count": 0, "source_failure_count": 0, "official_source_success": False, "vendor_source_success": False, "reconstruction_used": False, "last_known_good_used": False, "meeting_count": 0, "contract_count": 0, "valid_distribution_count": 0, "invalid_distribution_count": 0, "missing_contract_count": 0, "probability_normalization_count": 0, "history_snapshot_count": 0, "provider_calls": 0, "browser_calls": 0, "AI_called": False, "cache_used": refresh == "false"},
-        "retrieved_at": now, "valid_until": None, "stale": False, "warnings": [warning], "errors": [],
+        "diagnostics": {"source_attempt_count": 0, "source_success_count": 0, "source_failure_count": 0, "official_source_success": False, "vendor_source_success": False, "reconstruction_used": False, "last_known_good_used": False, "meeting_count": 0, "contract_count": 0, "valid_distribution_count": 0, "invalid_distribution_count": 0, "missing_contract_count": 0, "probability_normalization_count": 0, "history_snapshot_count": 0, "provider_calls": 0, "browser_calls": 0, "AI_called": False, "cache_used": cache_used},
+        "retrieved_at": observed, "valid_until": None, "stale": False, "warnings": [warning], "errors": [],
+        "reason_code": reason_code,
         "fed_funds_futures": copy.deepcopy(legacy_block or {}), "service_role": "data provider only",
     }
 
 
-def _runtime_view(payload: dict[str, Any], *, refresh: str, force_read_back: bool = False) -> dict[str, Any]:
+def _runtime_view(
+    payload: dict[str, Any],
+    *,
+    refresh: str,
+    force_read_back: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(UTC)
     output = copy.deepcopy(payload)
     diagnostics = output.setdefault("diagnostics", {})
-    diagnostics["provider_calls"] = 0 if refresh == "false" else diagnostics.get("provider_calls", 0)
+    diagnostics["provider_calls"] = (
+        0
+        if not force_read_back
+        else diagnostics.get("provider_calls", 0)
+    )
     diagnostics["browser_calls"] = 0
     diagnostics["AI_called"] = False
-    diagnostics["cache_used"] = refresh == "false" or force_read_back
+    diagnostics["cache_used"] = True
     output["cache_status"] = "DB_READ_BACK" if force_read_back else "DB"
-    output["stale"] = _is_stale(output)
-    output["age_minutes"] = max(0.0, round((datetime.now(UTC) - (_date_or_none(output.get("retrieved_at")) or datetime.now(UTC))).total_seconds() / 60, 2))
+    output["stale"] = _is_stale(output, now=current)
+    output["age_minutes"] = max(
+        0.0,
+        round(
+            (
+                current
+                - (
+                    _date_or_none(output.get("retrieved_at"))
+                    or current
+                )
+            ).total_seconds()
+            / 60,
+            2,
+        ),
+    )
     for meeting in output.get("meetings") or []:
         meeting["cache_status"] = output["cache_status"]
     return output
@@ -801,9 +1063,48 @@ def _date_or_none(value: Any) -> datetime | None:
     return parsed
 
 
-def _is_stale(payload: dict[str, Any]) -> bool:
-    valid_until = _date_or_none(payload.get("valid_until"))
-    return bool(valid_until and datetime.now(UTC) >= valid_until)
+def _is_stale(
+    payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = now or datetime.now(UTC)
+    valid_until = _date_or_none(
+        payload.get("content_valid_until")
+        or payload.get("valid_until")
+    )
+    refresh_due_at = _date_or_none(
+        payload.get("refresh_due_at")
+        or payload.get("next_refresh_at")
+    )
+    data_as_of = _date_or_none(
+        payload.get("database_data_as_of")
+        or payload.get("data_as_of")
+    )
+    return bool(
+        valid_until is None
+        or refresh_due_at is None
+        or data_as_of is None
+        or current >= valid_until
+        or current >= refresh_due_at
+        or current - data_as_of > FED_EXPECTATIONS_MAX_AGE
+    )
+
+
+def _database_lookup_evidence(
+    result: CanonicalFreshnessResult,
+) -> dict[str, Any]:
+    return {
+        "performed": True,
+        "found": result.found,
+        "data_as_of": result.data_as_of,
+        "content_valid_until": result.content_valid_until,
+        "refresh_due_at": result.refresh_due_at,
+        "lifecycle_status": result.lifecycle,
+        "expired": result.expired,
+        "freshness": result.evaluation,
+        "reason_code": result.reason_code,
+    }
 
 
 def _delta(current: Any, previous: Any) -> float | None:

@@ -28,14 +28,12 @@ FRED_SERIES = {
     "T10Y2Y": "10-Year Treasury Minus 2-Year Treasury",
     "T10Y3M": "10-Year Treasury Minus 3-Month Treasury",
     "ICSA": "Initial Claims",
-    "WALCL": "Federal Reserve Total Assets",
     "HSN1F": "New One Family Houses Sold: United States",
 }
 FRED_FREQUENCIES = {
     "FEDFUNDS": "monthly",
     "NFCI": "weekly",
     "ICSA": "weekly",
-    "WALCL": "weekly",
     "HSN1F": "monthly",
 }
 FRED_UNITS = {
@@ -48,6 +46,18 @@ class FredProvider(BaseProvider):
     provider_type = ProviderType.API
     reliability = 0.95
     cache_key = "provider:fred:macro_latest"
+
+    @classmethod
+    def runtime_default_series_ids(cls) -> tuple[str, ...]:
+        from app.services.provider_capability_registry import (
+            provider_default_runtime_metric_ids,
+        )
+
+        return provider_default_runtime_metric_ids("FRED")
+
+    @classmethod
+    def runtime_supported_series_ids(cls) -> tuple[str, ...]:
+        return tuple(FRED_SERIES)
 
     def __init__(
         self,
@@ -77,11 +87,19 @@ class FredProvider(BaseProvider):
             follow_redirects=False,
             transport=self.transport,
         ) as client:
-            selected = tuple(series_ids or FRED_SERIES)
+            selected = (
+                self.runtime_default_series_ids()
+                if series_ids is None
+                else tuple(series_ids)
+            )
+            unsupported = sorted(set(selected) - set(FRED_SERIES))
+            if unsupported:
+                raise ProviderError(
+                    "FRED series not implemented by runtime adapter: "
+                    + ",".join(unsupported)
+                )
             for series_id in selected:
-                name = FRED_SERIES.get(series_id)
-                if name is None:
-                    continue
+                name = FRED_SERIES[series_id]
                 response = await client.get(
                     f"{self.settings.fred_base_url}/series/observations",
                     params={

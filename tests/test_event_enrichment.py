@@ -27,8 +27,10 @@ class FakeEnrichmentProvider:
         self.items = items or []
         self.errors = errors or []
         self.source = source
+        self.calls = 0
 
     async def fetch(self, country: str, start: datetime, end: datetime):
+        self.calls += 1
         return self.items, self.errors
 
 
@@ -542,6 +544,41 @@ async def test_all_providers_fail_with_cache_uses_cached_enrichment(tmp_path) ->
     assert enriched[0].enrichment.provider_type == ProviderType.CACHE
     assert enriched[0].enrichment.forecast == "0.3%"
     assert metadata["cache_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_force_ignores_candidate_and_failure_caches(tmp_path) -> None:
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
+    event = make_event()
+    cache.set(
+        "macro_event_enrichment:v1:US:2099-07-14",
+        [make_item().model_dump(mode="json")],
+    )
+    provider = FakeEnrichmentProvider(
+        errors=["provider_failed: timeout"]
+    )
+    service = EventEnrichmentService(cache, providers=[provider])
+
+    cached, cached_metadata = await service.enrich_events(
+        [event],
+        country="US",
+        start=event.time_utc - timedelta(days=1),
+        end=event.time_utc + timedelta(days=1),
+    )
+    forced, forced_metadata = await service.enrich_events(
+        [event],
+        country="US",
+        start=event.time_utc - timedelta(days=1),
+        end=event.time_utc + timedelta(days=1),
+        force=True,
+    )
+
+    assert cached[0].enrichment.provider_type == ProviderType.CACHE
+    assert cached_metadata["cache_used"] is True
+    assert forced[0].enrichment.source is None
+    assert forced_metadata["cache_used"] is False
+    assert forced_metadata["provider_statuses"][0]["status"] != "skipped"
+    assert provider.calls == 2
 
 
 @pytest.mark.asyncio

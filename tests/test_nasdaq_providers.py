@@ -26,6 +26,7 @@ from app.providers.news_provider import (
     relevance,
     tag_topics,
 )
+from app.providers.nasdaq_earnings_provider import NasdaqEarningsProvider
 from app.providers.qqq_holdings_provider import (
     QQQHoldingsProvider,
     is_alpha_vantage_daily_rate_limited,
@@ -80,6 +81,69 @@ def test_alpha_vantage_daily_rate_limit_payload_detected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_nasdaq_earnings_emits_explicit_lifecycle_and_field_lineage(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_path=tmp_path / "market.sqlite",
+        enable_nasdaq_earnings=True,
+        nasdaq_earnings_calendar_url="https://nasdaq.test/earnings",
+    )
+    payload = {
+        "data": {
+            "rows": [
+                {
+                    "symbol": "NVDA",
+                    "name": "NVIDIA",
+                    "time": "time-after-hours",
+                    "epsForecast": "$1.25",
+                    "marketCap": "$1T",
+                },
+                {
+                    "symbol": "MSFT",
+                    "name": "Microsoft",
+                    "time": "time-after-hours",
+                    "epsForecast": "$3.10",
+                    "marketCap": "$3T",
+                },
+            ]
+        }
+    }
+    with respx.mock(assert_all_called=True) as router:
+        router.get(
+            "https://nasdaq.test/earnings"
+            f"?date={datetime.now(UTC).date().isoformat()}",
+        ).mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        result = await NasdaqEarningsProvider(settings).fetch(days=1)
+
+    event = result["events"][0]
+    assert event["event_date"] == event["date"]
+    assert event["event_at"] is None
+    assert event["temporal_precision"] == "DATE_ONLY"
+    assert event["eps_estimate"] == event["eps_consensus"] == 1.25
+    assert event["data_as_of"] == result["data_as_of"]
+    assert event["content_valid_until"] == result["content_valid_until"]
+    assert event["refresh_due_at"] == event["content_valid_until"]
+    assert event["acquisition_provider"] == "NASDAQ"
+    assert result["selection_counts"] == {
+        "total_available": 2,
+        "relevant_count": 1,
+        "delivered_count": 1,
+        "excluded_count": 1,
+    }
+    assert result["diagnostics"]["events_fetched"] == 2
+    assert {item["field"] for item in event["lineage"]} >= {
+        "symbol",
+        "event_date",
+        "timing",
+        "eps_estimate",
+    }
+
+
+@pytest.mark.asyncio
 async def test_qqq_equal_weight_proxy_is_runtime_only_after_upstream_failures(tmp_path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("ALPHA_VANTAGE_API_KEY=test-key\n", encoding="utf-8")
@@ -127,6 +191,22 @@ async def test_qqq_equal_weight_proxy_is_runtime_only_after_upstream_failures(tm
     assert quality["alpha_vantage_rate_limited"] is True
     assert quality["nasdaq_proxy_used"] is True
     assert len(quality["warnings"]) == 1
+    accounting = quality["provider_accounting"]
+    assert [
+        item["provider"]
+        for item in accounting
+    ] == ["INVESCO", "ALPHA_VANTAGE", "NASDAQ", "SEC"]
+    assert [
+        (item["called"], item["calls"])
+        for item in accounting
+    ] == [(True, 1), (True, 1), (True, 1), (False, 0)]
+    assert accounting[0]["status"] == "ACCESS_RESTRICTED"
+    assert accounting[1]["status"] == "RATE_LIMITED"
+    assert accounting[2]["status"] == "PARTIAL"
+    assert (
+        accounting[3]["reason_code"]
+        == "SEC_NOT_REQUIRED_FOR_CONSTITUENT_SET"
+    )
 
 
 @pytest.mark.asyncio
@@ -161,6 +241,72 @@ async def test_qqq_holdings_no_retry_when_alpha_negative_cache_is_open(tmp_path)
     assert alpha.call_count == 0
     assert result.data["data_quality"]["alpha_vantage_status"] == "rate_limited"
     assert "alpha_vantage_negative_cache" in result.data["data_quality"]["provider_attempts"]
+
+
+@pytest.mark.asyncio
+async def test_qqq_force_bypasses_alpha_negative_cache(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ALPHA_VANTAGE_API_KEY=test-key\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        _env_file=env_file,
+        alpha_vantage_base_url="https://alpha.test/query",
+        invesco_qqq_holdings_url="https://invesco.test/qqq.csv",
+        nasdaq_100_constituents_url=(
+            "https://nasdaq.test/constituents"
+        ),
+    )
+    cache = ProviderCacheRepository(tmp_path / "cache.sqlite3")
+    provider = QQQHoldingsProvider(cache, settings)
+    cache.set(
+        provider.alpha_negative_cache_key,
+        {
+            "status": "rate_limited",
+            "negative_cache_reason": "provider_daily_rate_limit",
+            "next_retry_at": (
+                datetime.now(UTC) + timedelta(hours=2)
+            ).isoformat(),
+        },
+    )
+
+    with respx.mock(
+        assert_all_mocked=True,
+        assert_all_called=False,
+    ) as router:
+        router.get(
+            "https://invesco.test/qqq.csv"
+        ).mock(return_value=httpx.Response(403, text="Forbidden"))
+        alpha = router.get(
+            "https://alpha.test/query"
+        ).mock(return_value=httpx.Response(503, text="unavailable"))
+        router.get(
+            "https://nasdaq.test/constituents"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "rows": [
+                            {
+                                "symbol": "AAPL",
+                                "companyName": "Apple",
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+        result = await provider.fetch_safe(force=True)
+
+    assert alpha.call_count == 1
+    assert "alpha_vantage" in result.data[
+        "data_quality"
+    ]["provider_attempts"]
+    assert "alpha_vantage_negative_cache" not in result.data[
+        "data_quality"
+    ]["provider_attempts"]
 
 
 @pytest.mark.asyncio
@@ -304,6 +450,9 @@ def test_parse_yahoo_chart_fixture() -> None:
                 {
                     "meta": {
                         "regularMarketPrice": 102.0,
+                        "regularMarketTime": int(
+                            datetime.now(UTC).timestamp()
+                        ),
                         "chartPreviousClose": 100.0,
                         "regularMarketVolume": 12345,
                         "currency": "USD",
@@ -323,38 +472,49 @@ def test_parse_yahoo_chart_fixture() -> None:
 
 
 def test_parse_alpha_vantage_earnings_calendar_csv_fixture() -> None:
-    csv_text = """symbol,name,reportDate,fiscalDateEnding,estimate,currency
-MSFT,Microsoft Corp,2099-07-29,2099-06-30,3.21,USD
-IBM,International Business Machines,2099-07-30,2099-06-30,2.00,USD
+    now = datetime.now(UTC)
+    report_date = (now + timedelta(days=4)).date().isoformat()
+    fiscal_date = (now - timedelta(days=30)).date().isoformat()
+    csv_text = f"""symbol,name,reportDate,fiscalDateEnding,estimate,currency
+AAPL,Apple Inc,{report_date},{fiscal_date},3.21,USD
+IBM,International Business Machines,{report_date},{fiscal_date},2.00,USD
 """
 
-    events = parse_alpha_vantage_earnings_calendar(csv_text, datetime.now(UTC))
+    events = parse_alpha_vantage_earnings_calendar(csv_text, now)
 
     assert len(events) == 1
-    assert events[0]["symbol"] == "MSFT"
+    assert events[0]["symbol"] == "AAPL"
     assert events[0]["eps_estimate"] == 3.21
     assert events[0]["timing"] == "UNKNOWN"
 
 
 @pytest.mark.asyncio
-async def test_earnings_no_events_does_not_call_yahoo_fallback(tmp_path) -> None:
+async def test_legacy_earnings_wrapper_never_calls_uncertified_alpha_leaf(
+    tmp_path,
+) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("ALPHA_VANTAGE_API_KEY=test-key\n", encoding="utf-8")
     settings = Settings(
         _env_file=env_file,
+        fmp_api_key="fmp-key",
+        fmp_earnings_calendar_url="https://fmp.test/calendar",
         alpha_vantage_base_url="https://alpha.test/query",
         yahoo_quote_summary_url="https://yahoo.test/v10/finance/quoteSummary",
     )
     provider = EarningsProvider(ProviderCacheRepository(tmp_path / "cache.sqlite3"), settings)
-    csv_text = "symbol,name,reportDate,fiscalDateEnding,estimate,currency\nIBM,IBM,2099-07-30,2099-06-30,2.00,USD\n"
 
-    with respx.mock(base_url="https://alpha.test", assert_all_mocked=True) as router:
-        router.get("/query").mock(return_value=httpx.Response(200, text=csv_text))
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.get("https://fmp.test/calendar").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        alpha = router.get("https://alpha.test/query").mock(
+            return_value=httpx.Response(200, text="symbol,reportDate\n")
+        )
         result = await provider.fetch()
 
     assert result.data["events"] == []
-    assert result.data["data_quality"]["errors"] == ["No watchlist earnings found in requested window"]
-    assert result.data["data_quality"]["fallback_used"] is False
+    assert result.data["status"] == "not_found"
+    assert alpha.call_count == 0
 
 
 def test_parse_alpha_vantage_news_sentiment_fixture() -> None:
@@ -512,6 +672,9 @@ async def test_snapshot_uses_yahoo_chart_without_stooq_noise(tmp_path) -> None:
                 {
                     "meta": {
                         "regularMarketPrice": 102.0,
+                        "regularMarketTime": int(
+                            datetime.now(UTC).timestamp()
+                        ),
                         "chartPreviousClose": 100.0,
                         "regularMarketVolume": 12345,
                         "currency": "USD",
@@ -534,6 +697,31 @@ async def test_snapshot_uses_yahoo_chart_without_stooq_noise(tmp_path) -> None:
     assert result.data["data_quality"]["errors"] == []
     assert result.data["data_quality"]["warnings"] == []
     assert not any("Stooq" in error for error in result.metadata.errors)
+    accounting = result.data["data_quality"][
+        "provider_accounting"
+    ]
+    assert [
+        item["provider"]
+        for item in accounting
+    ] == [
+        "YAHOO_FINANCE_CHART",
+        "STOOQ",
+        "ALPHA_VANTAGE",
+        "YAHOO_FINANCE_QUOTE",
+    ]
+    assert accounting[0] == {
+        "provider": "YAHOO_FINANCE_CHART",
+        "called": True,
+        "calls": len(MEGA_CAP_TICKERS),
+        "status": "SUCCESS",
+        "reason_code": None,
+    }
+    assert all(
+        item["called"] is False
+        and item["calls"] == 0
+        and item["reason_code"] == "PRIOR_PROVIDER_SUCCEEDED"
+        for item in accounting[1:]
+    )
 
 
 def test_news_topic_tagging_is_keyword_based() -> None:

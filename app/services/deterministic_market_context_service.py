@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Mapping
 
 
@@ -49,6 +49,13 @@ AUTHORIZED_QUALITATIVE_AI_FIELDS = {
     "official_guidance_summary",
     "residual_risk_interpretation",
 }
+_CURRENT_QUOTE_FRESHNESS = {
+    "CURRENT",
+    "DELAYED",
+    "FRESH",
+    "VALID",
+}
+_MAX_CURRENT_QUOTE_AGE = timedelta(minutes=20)
 
 
 def compute_options_positioning(
@@ -68,6 +75,17 @@ def compute_options_positioning(
         expirations[str(expiration)] = _expiration_metrics(
             contracts,
             spot=spot,
+        )
+    quote_rejection = _quote_rejection_reason(
+        quote,
+        evaluated_at=retrieved,
+    )
+    if quote_rejection is not None:
+        return _empty_options_positioning(
+            quote=quote,
+            retrieved=retrieved,
+            observed_contract_count=len(all_contracts),
+            reason_code=quote_rejection,
         )
     call_volume = _sum(all_contracts, "volume", option_type="call")
     put_volume = _sum(all_contracts, "volume", option_type="put")
@@ -95,6 +113,9 @@ def compute_options_positioning(
         warnings.append("empty_option_chain")
     return {
         "status": "AVAILABLE" if all_contracts else "NO_DATA",
+        "reason_code": (
+            None if all_contracts else "OPTION_CHAIN_NO_CONTRACTS"
+        ),
         "underlying": "QQQ",
         "target_context": "MNQ",
         "relationship": "Nasdaq-100 liquid ETF proxy",
@@ -102,6 +123,7 @@ def compute_options_positioning(
         "provider": "TRADIER",
         "environment": quote.get("environment"),
         "observed_at": quote.get("observed_at"),
+        "data_as_of": quote.get("observed_at"),
         "retrieved_at": retrieved.isoformat(),
         "freshness": quote.get("freshness_state") or "UNKNOWN",
         "trigger_class": "REFRESH_ON_TRIGGER",
@@ -146,12 +168,81 @@ def compute_options_positioning(
     }
 
 
+def _empty_options_positioning(
+    *,
+    quote: Mapping[str, Any],
+    retrieved: datetime,
+    observed_contract_count: int,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "status": "NO_DATA",
+        "reason_code": reason_code,
+        "underlying": "QQQ",
+        "target_context": "MNQ",
+        "relationship": "Nasdaq-100 liquid ETF proxy",
+        "proxy_used": True,
+        "provider": "TRADIER",
+        "environment": quote.get("environment"),
+        "observed_at": quote.get("observed_at"),
+        "data_as_of": None,
+        "retrieved_at": retrieved.isoformat(),
+        "freshness": quote.get("freshness_state") or "UNKNOWN",
+        "trigger_class": "REFRESH_ON_TRIGGER",
+        "methodology": "deterministic_option_chain_aggregation_v1",
+        "contract_count": 0,
+        "observed_contract_count": observed_contract_count,
+        "selected_expirations": [],
+        "volume": {
+            "calls": None,
+            "puts": None,
+            "put_call_ratio": None,
+            "ratio_reason_code": reason_code,
+        },
+        "open_interest": {
+            "calls": None,
+            "puts": None,
+            "put_call_ratio": None,
+            "ratio_reason_code": reason_code,
+        },
+        "top_strikes_by_open_interest": [],
+        "top_strikes_by_volume": [],
+        "expirations": {},
+        "iv_atm": None,
+        "skew": {"value": None, "reason_code": reason_code},
+        "spread_liquidity": {
+            "quoted_contract_count": 0,
+            "mean_absolute_spread": None,
+            "median_absolute_spread": None,
+            "crossed_market_count": 0,
+        },
+        "greeks_coverage": 0.0,
+        "open_interest_coverage": 0.0,
+        "gamma_proxy": {
+            "absolute_gamma_open_interest": None,
+            "signed_gamma_proxy": None,
+            "coverage": 0.0,
+            "eligible_contracts": 0,
+            "total_contracts": 0,
+            "excluded_missing_contract_size": 0,
+        },
+        "warnings": [reason_code.lower()],
+        "lineage": {
+            "quote_request_fingerprint": quote.get(
+                "request_fingerprint"
+            ),
+            "chain_request_fingerprints": [],
+        },
+    }
+
+
 def compute_market_internals(
     *,
     constituents: Iterable[str | Mapping[str, Any]],
     holdings: Iterable[Mapping[str, Any]],
     quotes: Iterable[Mapping[str, Any]],
     minimum_coverage: float = 0.8,
+    evaluated_at: datetime | None = None,
 ) -> dict[str, Any]:
     universe = _constituent_symbols(constituents)
     quote_by_symbol = _deduplicate_by_symbol(quotes)
@@ -165,15 +256,23 @@ def compute_market_internals(
         if quote is None:
             missing.append(symbol)
             continue
+        freshness_state = str(
+            quote.get("freshness_state") or "UNKNOWN"
+        ).upper()
+        freshness_rejection = _quote_rejection_reason(
+            quote,
+            evaluated_at=evaluated_at,
+        )
+        if freshness_rejection is not None:
+            if freshness_state in {"STALE", "REJECTED_FUTURE"}:
+                stale.append(symbol)
+            else:
+                rejected.append(symbol)
+            continue
         change = _quote_return(quote)
         if change is None:
             rejected.append(symbol)
             continue
-        if str(quote.get("freshness_state") or "").upper() in {
-            "STALE",
-            "REJECTED_FUTURE",
-        }:
-            stale.append(symbol)
         weight = _finite(
             (holding_by_symbol.get(symbol) or {}).get("weight_pct")
             or (holding_by_symbol.get(symbol) or {}).get("weight")
@@ -185,6 +284,7 @@ def compute_market_internals(
                 "return_pct": change,
                 "weight_pct": weight,
                 "volume": volume,
+                "observed_at": quote.get("observed_at"),
                 "contribution": (
                     change * weight / 100
                     if weight is not None
@@ -233,8 +333,26 @@ def compute_market_internals(
         warnings.append("constituent_coverage_insufficient")
     if set(holding_by_symbol).difference(universe):
         warnings.append("holdings_universe_mismatch")
+    available = bool(accepted)
+    reason_code = (
+        None
+        if available
+        else "MARKET_INTERNALS_NO_CURRENT_QUOTES"
+    )
+    if reason_code is not None:
+        warnings.append(reason_code.lower())
+    observations = [
+        value
+        for item in accepted
+        if (
+            value := _observation_datetime(item.get("observed_at"))
+        )
+        is not None
+    ]
+    data_as_of = min(observations).isoformat() if observations else None
     return {
-        "status": "AVAILABLE" if accepted else "NO_DATA",
+        "status": "AVAILABLE" if available else "NO_DATA",
+        "reason_code": reason_code,
         "label": "Nasdaq-100 constituent breadth proxy",
         "source_universe": "Nasdaq-100 constituents with QQQ weights",
         "provider": "TRADIER",
@@ -243,34 +361,61 @@ def compute_market_internals(
         "coverage": round(coverage, 6),
         "covered_constituents": len(accepted),
         "universe_size": len(universe),
-        "advancers": advancers,
-        "decliners": decliners,
-        "unchanged": unchanged,
-        "advance_decline_ratio": ad_ratio,
-        "advance_decline_reason_code": ad_reason,
+        "data_as_of": data_as_of if available else None,
+        "observed_at": data_as_of if available else None,
+        "advancers": advancers if available else None,
+        "decliners": decliners if available else None,
+        "unchanged": unchanged if available else None,
+        "advance_decline_ratio": ad_ratio if available else None,
+        "advance_decline_reason_code": (
+            ad_reason if available else reason_code
+        ),
         "percent_advancers": (
-            round(advancers / len(accepted) * 100, 6) if accepted else None
+            round(advancers / len(accepted) * 100, 6)
+            if available
+            else None
         ),
-        "weighted_breadth": weighted_breadth,
-        "up_volume_proxy": up_volume,
-        "down_volume_proxy": down_volume,
+        "weighted_breadth": weighted_breadth if available else None,
+        "up_volume_proxy": up_volume if available else None,
+        "down_volume_proxy": down_volume if available else None,
         "dispersion": (
-            statistics.pstdev(returns) if len(returns) > 1 else 0.0 if returns else None
+            statistics.pstdev(returns)
+            if available and len(returns) > 1
+            else 0.0
+            if available and returns
+            else None
         ),
-        "top_positive_contributions": sorted(
-            contributions,
-            key=lambda item: float(item["contribution"]),
-            reverse=True,
-        )[:10],
-        "top_negative_contributions": sorted(
-            contributions,
-            key=lambda item: float(item["contribution"]),
-        )[:10],
+        "top_positive_contributions": (
+            sorted(
+                contributions,
+                key=lambda item: float(item["contribution"]),
+                reverse=True,
+            )[:10]
+            if available
+            else []
+        ),
+        "top_negative_contributions": (
+            sorted(
+                contributions,
+                key=lambda item: float(item["contribution"]),
+            )[:10]
+            if available
+            else []
+        ),
         "mega_cap_concentration": {
-            "symbols_covered": [item["symbol"] for item in mega_caps],
-            "weight_pct": mega_weight,
-            "weighted_contribution": sum(
-                float(item["contribution"] or 0) for item in mega_caps
+            "symbols_covered": (
+                [item["symbol"] for item in mega_caps]
+                if available
+                else []
+            ),
+            "weight_pct": mega_weight if available else None,
+            "weighted_contribution": (
+                sum(
+                    float(item["contribution"] or 0)
+                    for item in mega_caps
+                )
+                if available
+                else None
             ),
         },
         "stale_quote_count": len(stale),
@@ -302,11 +447,13 @@ def compute_cross_asset_context(
     hyg = changes.get("HYG")
     lqd = changes.get("LQD")
     credit = round(hyg - lqd, 6) if hyg is not None and lqd is not None else None
+    usd_sign = _sign(changes.get("UUP"))
+    duration_sign = _sign(changes.get("TLT"))
     risk_score_inputs = [
         _sign(sum(equity) / len(equity)) if equity else None,
         _sign(credit),
-        -_sign(changes.get("UUP")),
-        -_sign(changes.get("TLT")),
+        -usd_sign if usd_sign is not None else None,
+        -duration_sign if duration_sign is not None else None,
     ]
     usable = [item for item in risk_score_inputs if item is not None]
     risk_score = sum(usable) / len(usable) if usable else None
@@ -697,6 +844,43 @@ def _quote_return(quote: Mapping[str, Any]) -> float | None:
     if last is None or close in (None, 0):
         return None
     return (last - close) / abs(close) * 100
+
+
+def _quote_rejection_reason(
+    quote: Mapping[str, Any],
+    *,
+    evaluated_at: datetime | None,
+) -> str | None:
+    freshness = str(
+        quote.get("freshness_state") or "UNKNOWN"
+    ).upper()
+    if freshness not in _CURRENT_QUOTE_FRESHNESS:
+        return f"QUOTE_FRESHNESS_{freshness}_REJECTED"
+    observation = _observation_datetime(quote.get("observed_at"))
+    if observation is None:
+        return "QUOTE_OBSERVATION_TIME_MISSING"
+    if evaluated_at is None:
+        return None
+    current = _aware(evaluated_at)
+    if observation > current:
+        return "QUOTE_OBSERVATION_FROM_FUTURE"
+    if current - observation > _MAX_CURRENT_QUOTE_AGE:
+        return "QUOTE_OBSERVATION_OUTSIDE_CURRENT_WINDOW"
+    return None
+
+
+def _observation_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _aware(value)
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
+    return _aware(parsed)
 
 
 def _finite(value: Any) -> float | None:

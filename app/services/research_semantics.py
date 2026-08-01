@@ -22,6 +22,7 @@ AI_RESEARCH_SEMANTICS = (
     "forecast",
     "consensus",
     "previous",
+    "previous_revised",
     "outcome",
     "transcript_url",
 )
@@ -46,6 +47,7 @@ EVENT_VALUE_SEMANTICS = {
     "forecast",
     "consensus",
     "previous",
+    "previous_revised",
     "outcome",
     "transcript_url",
 }

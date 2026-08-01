@@ -88,10 +88,10 @@ async def test_fmp_200_filters_14d_watchlist_deduplicates_and_preserves_nulls(tm
     today = datetime.now(UTC).date()
     settings = cfg(tmp_path, fmp_api_key="secret", fmp_earnings_calendar_url="https://fmp.test/stable/earnings-calendar")
     rows = [
-        fmp_row("NFLX", (today + timedelta(days=4)).isoformat(), epsEstimated=None, revenueEstimated=None),
-        fmp_row("NFLX", (today + timedelta(days=4)).isoformat(), epsEstimated=None, revenueEstimated=None),
-        fmp_row("GOOG", (today + timedelta(days=8)).isoformat()),
-        fmp_row("GOOGL", (today + timedelta(days=8)).isoformat()),
+        fmp_row("AAPL", (today + timedelta(days=4)).isoformat(), epsEstimated=None, revenueEstimated=None),
+        fmp_row("AAPL", (today + timedelta(days=4)).isoformat(), epsEstimated=None, revenueEstimated=None),
+        fmp_row("AMD", (today + timedelta(days=8)).isoformat()),
+        fmp_row("NVDA", (today + timedelta(days=8)).isoformat()),
         fmp_row("SMALL", (today + timedelta(days=3)).isoformat()),
         fmp_row("TSLA", (today + timedelta(days=15)).isoformat()),
     ]
@@ -103,14 +103,47 @@ async def test_fmp_200_filters_14d_watchlist_deduplicates_and_preserves_nulls(tm
     assert route.calls[0].request.url.params["from"] == today.isoformat()
     assert route.calls[0].request.url.params["to"] == (today + timedelta(days=14)).isoformat()
     assert [(event["symbol"], event["date"]) for event in events] == [
-        ("NFLX", (today + timedelta(days=4)).isoformat()),
-        ("GOOG", (today + timedelta(days=8)).isoformat()),
-        ("GOOGL", (today + timedelta(days=8)).isoformat()),
+        ("AAPL", (today + timedelta(days=4)).isoformat()),
+        ("AMD", (today + timedelta(days=8)).isoformat()),
+        ("NVDA", (today + timedelta(days=8)).isoformat()),
     ]
+    assert result.data["selection_counts"] == {
+        "total_available": 6,
+        "relevant_count": 3,
+        "delivered_count": 3,
+        "excluded_count": 3,
+    }
+    assert result.data["data_quality"][
+        "policy_filtered_or_invalid_count"
+    ] == 2
+    assert result.data["data_quality"]["deduplicated_count"] == 1
     assert events[0]["eps_estimate"] is None
     assert events[0]["revenue_estimate"] is None
     assert events[0]["eps_actual"] is None
-    assert events[0]["lineage"]["eps_estimate"]["source_field"] == "epsEstimated"
+    assert events[0]["event_date"] == events[0]["date"]
+    assert events[0]["event_at"] is None
+    assert events[0]["temporal_precision"] == "DATE_ONLY"
+    assert events[0]["acquisition_provider"] == "FMP_EARNINGS_CALENDAR"
+    assert events[0]["field_lineage"]["event_date"]["source_field"] == "date"
+    assert (
+        events[0]["field_lineage"]["eps_estimate"]["source_field"]
+        == "epsEstimated"
+    )
+    assert {
+        item["field"]
+        for item in events[0]["lineage"]
+    } >= {"event_date", "eps_estimate", "revenue_estimate"}
+    acquired_at = datetime.fromisoformat(
+        events[0]["data_as_of"].replace("Z", "+00:00")
+    )
+    valid_until = datetime.fromisoformat(
+        events[0]["content_valid_until"].replace("Z", "+00:00")
+    )
+    assert events[0]["retrieved_at_utc"] == events[0]["data_as_of"]
+    assert events[0]["refresh_due_at"] == events[0]["content_valid_until"]
+    assert valid_until - acquired_at == timedelta(
+        hours=settings.earnings_ttl_hours
+    )
 
 
 @pytest.mark.asyncio
@@ -185,7 +218,7 @@ async def test_fmp_earnings_persist_read_back_and_refresh_false(tmp_path) -> Non
         "retrieved_at": retrieved_at,
         "days": 14,
         "events": [{
-            "symbol": "NFLX",
+            "symbol": "AMD",
             "date": datetime.now(UTC).date().isoformat(),
             "source": "Financial Modeling Prep Earnings Calendar",
             "source_url": "https://financialmodelingprep.com/stable/earnings-calendar",
@@ -199,7 +232,9 @@ async def test_fmp_earnings_persist_read_back_and_refresh_false(tmp_path) -> Non
     fact = service.facts.get_valid_facts_by_type("earnings_event")[0]
     assert fact["raw_payload"]["events"][0]["source"] == "Financial Modeling Prep Earnings Calendar"
     materialized, quality = await service._nasdaq_db_first(symbol="MNQ", fetch_missing=False)
-    assert materialized["earnings"]["upcoming"][0]["symbol"] == "NFLX"
+    assert materialized is None
+    preloaded = quality["_earnings_preloaded_blocks"]
+    assert preloaded["nasdaq_earnings"]["events"][0]["symbol"] == "AMD"
     assert quality["provider_calls"] == 0
     assert quality["actual_network_calls"] == 0
 
@@ -236,6 +271,10 @@ def test_xtb_mapping_actual_forecast_previous_timezone_and_all_day() -> None:
     [
         ("Core CPI A/A", "core_cpi_yoy"),
         ("Indice dei prezzi alla produzione M/M", "headline_ppi_mom"),
+        ("PCE A/A", "headline_pce_yoy"),
+        ("PCE M/M", "headline_pce_mom"),
+        ("PCE annuale", "headline_pce_yoy"),
+        ("PCE mensile", "headline_pce_mom"),
         ("Richieste iniziali di sussidi di disoccupazione", "initial_jobless_claims"),
     ],
 )

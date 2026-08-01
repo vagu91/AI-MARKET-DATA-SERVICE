@@ -147,6 +147,8 @@ def current_ratio(value: float = 1.0, observed: str = "2026-07-10") -> dict:
         "basis": "volume",
         "ratio": value,
         "data_as_of": observed,
+        "content_valid_until": "2026-07-13T21:00:00Z",
+        "refresh_due_at": "2026-07-13T13:30:00Z",
     }
 
 

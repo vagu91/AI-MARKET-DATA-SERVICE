@@ -50,27 +50,21 @@ class AaiiSentimentProvider:
         parsed, parse_diagnostics = _parse_aaii_sentiment_with_diagnostics(response_text)
         diagnostics.update(parse_diagnostics)
         if not parsed:
-            browser_html, browser_diagnostics = await fetch_aaii_with_browser(
-                AAII_SENTIMENT_URL,
-                timeout_seconds=min(float(self.settings.timeout_sentiment_seconds), 12.0),
+            diagnostics["browser_attempted"] = False
+            diagnostics["browser_error"] = (
+                "browser_fallback_disabled_uncertified_runtime_leaf"
             )
-            diagnostics.update(browser_diagnostics)
-            if browser_html:
-                parsed, parse_diagnostics = _parse_aaii_sentiment_with_diagnostics(browser_html)
-                diagnostics.update(parse_diagnostics)
-                diagnostics["browser_success"] = bool(parsed)
-                if not parsed and not diagnostics.get("browser_error"):
-                    diagnostics["browser_error"] = (
-                        "browser_page_loaded_but_sentiment_selectors_not_found"
-                        if not diagnostics.get("selector_found")
-                        else "browser_page_loaded_but_sentiment_values_not_parsed"
-                    )
-            elif not diagnostics.get("browser_error"):
-                diagnostics["browser_error"] = "browser_returned_no_html"
-            if not parsed:
-                status = "access_restricted" if diagnostics.get("http_blocked") else "not_found"
-                reason = diagnostics.get("browser_error") or "AAII sentiment percentages were not visible in the public page."
-                return _status(status, str(reason), started, diagnostics=diagnostics)
+            status = (
+                "access_restricted"
+                if diagnostics.get("http_blocked")
+                else "not_found"
+            )
+            return _status(
+                status,
+                "AAII direct HTTP response did not contain auditable survey values.",
+                started,
+                diagnostics=diagnostics,
+            )
         total = parsed["bullish_pct"] + parsed["neutral_pct"] + parsed["bearish_pct"]
         if not 98.5 <= total <= 101.5:
             return _status("rejected_invalid_sentiment_total", f"AAII percentages total {total:.2f}, outside tolerance.", started, diagnostics=diagnostics)
@@ -155,48 +149,6 @@ def _parse_aaii_sentiment_with_diagnostics(text: str) -> tuple[dict[str, Any] | 
         "bearish_pct": values["bearish"],
         "historical_averages": averages,
     }, diagnostics
-
-
-async def fetch_aaii_with_browser(url: str, *, timeout_seconds: float) -> tuple[str | None, dict[str, Any]]:
-    diagnostics: dict[str, Any] = {
-        "browser_attempted": True,
-        "browser_success": False,
-        "browser_error": None,
-        "browser_closed": False,
-        "selector_found": False,
-    }
-    browser = None
-    playwright = None
-    try:
-        from playwright.async_api import async_playwright  # type: ignore
-    except Exception as exc:
-        diagnostics["browser_error"] = f"playwright_unavailable:{exc or type(exc).__name__}"
-        diagnostics["browser_closed"] = True
-        return None, diagnostics
-    try:
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
-        try:
-            await page.wait_for_selector("section.results, .weekending", timeout=int(min(timeout_seconds, 8.0) * 1000))
-            diagnostics["selector_found"] = True
-        except Exception:
-            diagnostics["selector_found"] = False
-        html = await page.content()
-        diagnostics["browser_success"] = bool(html)
-        return html, diagnostics
-    except Exception as exc:
-        diagnostics["browser_error"] = str(exc) or type(exc).__name__
-        return None, diagnostics
-    finally:
-        try:
-            if browser is not None:
-                await browser.close()
-        finally:
-            if playwright is not None:
-                await playwright.stop()
-            diagnostics["browser_closed"] = True
 
 
 def is_aaii_blocked_html(text: str) -> bool:

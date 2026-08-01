@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -94,15 +97,18 @@ class FakeProcess:
         command: list[str],
         *,
         payload: dict[str, Any] | None,
+        output_bytes: bytes | None = None,
         stdout: str = "",
         stderr: str = "",
         returncode: int = 0,
     ) -> None:
         self.command = command
         self.payload = payload
+        self.output_bytes = output_bytes
         self.stdout = stdout
         self.stderr = stderr
-        self.returncode = returncode
+        self.returncode: int | None = None
+        self.communicate_returncode = returncode
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
         self.stdin_value: str | None = None
@@ -110,13 +116,92 @@ class FakeProcess:
     def communicate(self, input: str | None = None, timeout: int | None = None):
         del timeout
         self.stdin_value = input
-        if self.payload is not None:
+        if self.output_bytes is not None:
+            index = self.command.index("--output-last-message")
+            Path(self.command[index + 1]).write_bytes(self.output_bytes)
+        elif self.payload is not None:
             index = self.command.index("--output-last-message")
             Path(self.command[index + 1]).write_text(json.dumps(self.payload), encoding="utf-8")
+        self.returncode = self.communicate_returncode
         return self.stdout, self.stderr
 
     def poll(self):
         return self.returncode
+
+
+class UnobservedSuccessfulProcess(FakeProcess):
+    def poll(self):
+        return None
+
+
+class TimeoutProcess:
+    next_pid = 5100
+
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        self.command = command
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode: int | None = None
+        self.pid = TimeoutProcess.next_pid
+        TimeoutProcess.next_pid += 1
+        self.stdin_value: str | None = None
+        self.wait_calls = 0
+        self.kill_calls = 0
+        self.signals: list[int] = []
+        self.communicate_timeouts: list[int | None] = []
+        self.wait_timeouts: list[int | None] = []
+
+    def communicate(self, input: str | None = None, timeout: int | None = None):
+        self.communicate_timeouts.append(timeout)
+        if input is not None:
+            self.stdin_value = input
+        if timeout is not None and self.returncode is None:
+            raise subprocess.TimeoutExpired(
+                self.command,
+                timeout,
+                output=self.stdout,
+                stderr=self.stderr,
+            )
+        return self.stdout, self.stderr
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout: int | None = None):
+        self.wait_calls += 1
+        self.wait_timeouts.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(self.command, timeout)
+        return self.returncode
+
+    def send_signal(self, value: int) -> None:
+        self.signals.append(value)
+        self.returncode = -1
+
+    def receive_posix_signal(self, value: int) -> None:
+        self.signals.append(value)
+        self.returncode = -int(value)
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+
+class StubbornTimeoutProcess(TimeoutProcess):
+    def send_signal(self, value: int) -> None:
+        self.signals.append(value)
+
+    def receive_posix_signal(self, value: int) -> None:
+        self.signals.append(value)
+
+    def kill(self) -> None:
+        self.kill_calls += 1
 
 
 def test_windows_cmd_command_is_isolated_and_prompt_is_stdin(
@@ -177,6 +262,462 @@ def test_windows_cmd_command_is_isolated_and_prompt_is_stdin(
     assert "PHASE\nPLAN" in str(created[0].stdin_value)
     assert all("PHASE\nPLAN" not in item for item in command)
     assert result["topics"] == ["macro"]
+
+
+def test_success_attestation_binds_exact_original_subprocess_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    raw_output = (
+        b'{\r\n'
+        b'  "warnings" : [],\r\n'
+        b'  "claims" : [],\r\n'
+        b'  "acquisition_requests" : [],\r\n'
+        b'  "searches" : [],\r\n'
+        b'  "plan" : {"stop_conditions": [], "queries": [], "topics": []},\r\n'
+        b'  "status" : "NO_DATA"\r\n'
+        b'}\r\n'
+    )
+    created: list[FakeProcess] = []
+
+    def fake_popen(command, **kwargs):
+        del kwargs
+        process = FakeProcess(
+            command,
+            payload=None,
+            output_bytes=raw_output,
+        )
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    workspace = tmp_path / "successful-research"
+    result = PersistentAIJobExecutor(cfg).execute_research(
+        job=job,
+        run=run,
+        profile={"profile_id": "NEWS_RESEARCH"},
+        workspace=workspace,
+        watchdog_seconds=5,
+        effective_budget={
+            "max_searches": 1,
+            "max_opened_sources": 1,
+        },
+    )
+
+    assert len(created) == 1
+    attestation = result.transport_attestation
+    attested_path = Path(result.output_path or "")
+    application_path = workspace / "agentic_research_output.json"
+    assert attestation["process_observed"] is True
+    assert attestation["process_terminated"] is True
+    assert attestation["process_id"] == created[0].pid
+    assert attestation["exit_code"] == 0
+    assert attested_path.name == "agentic_research_subprocess_output.json"
+    assert attested_path.read_bytes() == raw_output
+    assert attestation["output_size_bytes"] == len(raw_output)
+    assert attestation["output_sha256"] == hashlib.sha256(raw_output).hexdigest()
+    assert application_path.read_bytes() != raw_output
+    assert json.loads(application_path.read_text(encoding="utf-8")) == json.loads(
+        raw_output
+    )
+
+
+def test_success_without_observed_process_exit_is_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    raw_output = (
+        b'{"status":"NO_DATA","plan":{"topics":[],"queries":[],'
+        b'"stop_conditions":[]},"searches":[],"acquisition_requests":[],'
+        b'"claims":[],"warnings":[]}'
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        lambda command, **kwargs: UnobservedSuccessfulProcess(
+            command,
+            payload=None,
+            output_bytes=raw_output,
+        ),
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    workspace = tmp_path / "unobserved-exit"
+    with pytest.raises(CodexCLIError) as raised:
+        PersistentAIJobExecutor(cfg).execute_research(
+            job=job,
+            run=run,
+            profile={"profile_id": "NEWS_RESEARCH"},
+            workspace=workspace,
+            watchdog_seconds=5,
+            effective_budget={
+                "max_searches": 1,
+                "max_opened_sources": 1,
+            },
+        )
+
+    assert raised.value.category == "PROCESS_ATTESTATION"
+    assert raised.value.retryable is False
+    attestation = raised.value.diagnostic["process_attestation"]
+    attested_path = Path(attestation["output_path"])
+    assert attestation["process_terminated"] is False
+    assert attestation["failure_reason"] == (
+        "codex_cli_process_termination_unobserved"
+    )
+    assert attested_path.read_bytes() == raw_output
+    assert attestation["output_sha256"] == hashlib.sha256(raw_output).hexdigest()
+
+
+def test_schema_invalid_output_attests_process_and_exact_cli_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    raw_output = (
+        b'{\r\n  "status":"NO_DATA",\r\n'
+        b'  "plan":{"topics":[],"queries":[],"stop_conditions":[]},\r\n'
+        b'  "searches":[],"acquisition_requests":[],"claims":[],\r\n'
+        b'  "warnings":[],"unexpected":"schema violation"\r\n}\r\n'
+    )
+    created: list[FakeProcess] = []
+
+    def fake_popen(command, **kwargs):
+        del kwargs
+        process = FakeProcess(
+            command,
+            payload=None,
+            output_bytes=raw_output,
+        )
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    workspace = tmp_path / "schema-invalid-research"
+    with pytest.raises(CodexCLIError) as raised:
+        PersistentAIJobExecutor(cfg).execute_research(
+            job=job,
+            run=run,
+            profile={"profile_id": "NEWS_RESEARCH"},
+            workspace=workspace,
+            watchdog_seconds=5,
+            effective_budget={
+                "max_searches": 1,
+                "max_opened_sources": 1,
+            },
+        )
+
+    attestation = raised.value.diagnostic["process_attestation"]
+    attested_path = Path(attestation["output_path"])
+    assert len(created) == 1
+    assert raised.value.category == "OUTPUT_CONTRACT"
+    assert attestation["failure_reason"] == "codex_cli_output_schema_invalid"
+    assert attestation["process_observed"] is True
+    assert attestation["process_id"] == created[0].pid
+    assert attestation["exit_code"] == 0
+    assert attestation["process_terminated"] is True
+    assert attestation["output_kind"] == "SUBPROCESS_OUTPUT"
+    assert attested_path.read_bytes() == raw_output
+    assert attestation["output_size_bytes"] == len(raw_output)
+    assert attestation["output_sha256"] == hashlib.sha256(raw_output).hexdigest()
+
+
+def test_event_observer_abort_attests_and_reaps_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    event_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "search-2",
+                "type": "web_search",
+                "query": "second bounded query",
+            },
+        }
+    )
+
+    class ObserverAbort(RuntimeError):
+        reason_code = "RESEARCH_TOOL_BUDGET_EXCEEDED"
+
+    class IncrementalProcess:
+        def __init__(self, command: list[str]) -> None:
+            self.command = command
+            self.pid = 6123
+            self.returncode: int | None = None
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO(f"{event_line}\n")
+            self.stderr = io.StringIO("")
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process: IncrementalProcess | None = None
+
+    def fake_popen(command: list[str], **_: Any) -> IncrementalProcess:
+        nonlocal process
+        process = IncrementalProcess(command)
+        return process
+
+    def terminate_observed(candidate: IncrementalProcess) -> bool:
+        candidate.returncode = 17
+        return True
+
+    def reject_event(_: dict[str, Any]) -> None:
+        raise ObserverAbort("audit tool budget exceeded")
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._terminate_process_group",
+        terminate_observed,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+
+    with pytest.raises(ObserverAbort) as raised:
+        PersistentAIJobExecutor(cfg).execute_research(
+            job=job,
+            run=run,
+            profile={"profile_id": "NEWS_RESEARCH"},
+            workspace=tmp_path / "observer-abort",
+            watchdog_seconds=5,
+            effective_budget={
+                "max_searches": 1,
+                "max_opened_sources": 1,
+            },
+            event_observer=reject_event,
+        )
+
+    assert process is not None
+    assert process.poll() == 17
+    diagnostic = raised.value.diagnostic
+    attestation = diagnostic["process_attestation"]
+    assert diagnostic["category"] == "POLICY_ABORT"
+    assert diagnostic["observer_reason_code"] == (
+        "RESEARCH_TOOL_BUDGET_EXCEEDED"
+    )
+    assert attestation["process_observed"] is True
+    assert attestation["process_id"] == process.pid
+    assert attestation["exit_code"] == 17
+    assert attestation["process_terminated"] is True
+    assert attestation["status"] == "POLICY_ABORTED"
+    assert attestation["failure_reason"] == (
+        "research_tool_budget_exceeded"
+    )
+    assert Path(attestation["output_path"]).is_file()
+
+
+def test_timeout_emits_bound_attestation_and_reaps_mocked_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    secret = "sk-timeout-secret-must-not-persist"
+    stdout = '{"type":"turn.started"}\n'
+    stderr = f"request timed out token={secret}"
+    created: list[TimeoutProcess] = []
+
+    def fake_popen(command, **kwargs):
+        del kwargs
+        process = TimeoutProcess(command, stdout=stdout, stderr=stderr)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+    if os.name != "nt":
+        def fake_killpg(process_id: int, signal_value: int) -> None:
+            process = created[0]
+            assert process_id == process.pid
+            process.receive_posix_signal(signal_value)
+
+        monkeypatch.setattr(
+            "app.services.ai_research_job_executor.os.killpg",
+            fake_killpg,
+        )
+
+    with pytest.raises(CodexCLIError) as raised:
+        PersistentAIJobExecutor(cfg).execute_step(
+            job=job,
+            run=run,
+            step_name="PLAN",
+            context={},
+            workspace=tmp_path / "timeout-job",
+            watchdog_seconds=7,
+        )
+
+    assert len(created) == 1
+    process = created[0]
+    assert process.stdin_value is not None
+    assert process.poll() is not None
+    assert process.wait_calls >= 2
+    assert process.communicate_timeouts
+    assert all(value is not None for value in process.communicate_timeouts)
+    assert process.wait_timeouts
+    assert all(value is not None for value in process.wait_timeouts)
+    diagnostic = raised.value.diagnostic
+    attestation = diagnostic["process_attestation"]
+    artifact_path = Path(attestation["output_path"])
+    artifact_bytes = artifact_path.read_bytes()
+    assert diagnostic["category"] == "TIMEOUT"
+    assert diagnostic["retryable"] is True
+    assert attestation["schema_version"] == "codex-cli-process-attestation-v1"
+    assert attestation["status"] == "TIMED_OUT"
+    assert attestation["failure_reason"] == "codex_cli_timeout"
+    assert attestation["timeout_seconds"] == 7
+    assert attestation["process_observed"] is True
+    assert attestation["process_id"] == process.pid
+    assert attestation["exit_code"] == process.returncode
+    assert attestation["process_terminated"] is True
+    assert attestation["output_size_bytes"] == len(artifact_bytes)
+    assert attestation["output_sha256"] == hashlib.sha256(artifact_bytes).hexdigest()
+    assert attestation["stdout_sha256"] == hashlib.sha256(stdout.encode()).hexdigest()
+    assert attestation["stderr_sha256"] == hashlib.sha256(stderr.encode()).hexdigest()
+    for field in (
+        "command_sha256",
+        "output_sha256",
+        "stderr_sha256",
+        "stdout_sha256",
+    ):
+        assert len(attestation[field]) == 64
+        int(attestation[field], 16)
+    assert artifact_path.parent == (tmp_path / "timeout-job").resolve()
+    assert artifact_path.name == "plan_output.process-attestation.json"
+    assert attestation["output_kind"] == "PROCESS_ATTESTATION_ENVELOPE"
+    assert secret not in json.dumps(diagnostic)
+    assert secret.encode() not in artifact_bytes
+    assert stdout.encode() not in artifact_bytes
+
+
+def test_timeout_reap_deadline_is_fail_closed_without_unbounded_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    job, run = make_job_and_run(cfg)
+    created: list[StubbornTimeoutProcess] = []
+    helper_wait_timeouts: list[int | None] = []
+
+    def fake_popen(command, **kwargs):
+        del kwargs
+        if str(command[0]).casefold() == "taskkill":
+            return SimpleNamespace(
+                wait=lambda timeout: helper_wait_timeouts.append(timeout) or 0,
+            )
+        process = StubbornTimeoutProcess(
+            command,
+            stdout="partial",
+            stderr="deadline exceeded",
+        )
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor._resolve_command",
+        lambda _command: [str(tmp_path / "codex.CMD")],
+    )
+    monkeypatch.setattr(
+        "app.services.ai_research_job_executor.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        PersistentAIJobExecutor,
+        "_executable_version",
+        lambda self, command: "codex-cli fake",
+    )
+    if os.name != "nt":
+        def fake_killpg(process_id: int, signal_value: int) -> None:
+            process = created[0]
+            assert process_id == process.pid
+            process.receive_posix_signal(signal_value)
+
+        monkeypatch.setattr(
+            "app.services.ai_research_job_executor.os.killpg",
+            fake_killpg,
+        )
+
+    with pytest.raises(CodexCLIError) as raised:
+        PersistentAIJobExecutor(cfg).execute_step(
+            job=job,
+            run=run,
+            step_name="PLAN",
+            context={},
+            workspace=tmp_path / "stubborn-timeout-job",
+            watchdog_seconds=3,
+        )
+
+    process = created[0]
+    assert process.poll() is None
+    assert process.kill_calls == 1
+    assert process.communicate_timeouts
+    assert all(value is not None for value in process.communicate_timeouts)
+    assert process.wait_timeouts
+    assert all(value is not None for value in process.wait_timeouts)
+    assert all(value is not None for value in helper_wait_timeouts)
+    assert raised.value.diagnostic["process_attestation"][
+        "process_terminated"
+    ] is False
 
 
 def test_relative_workspace_is_canonical_once_for_cwd_and_all_codex_paths(
@@ -400,6 +941,7 @@ def test_executor_maps_windows_os_error_3_to_non_retryable_path_invalid(
     assert raised.value.category == "PATH_INVALID"
     assert raised.value.retryable is False
     assert raised.value.retry_classification == "NON_RETRYABLE"
+    assert "process_attestation" not in raised.value.diagnostic
     persisted_shape = raised.value.diagnostic["command_shape"]
     for path_flag in ("--cd", "--output-schema", "--output-last-message"):
         value = Path(persisted_shape[persisted_shape.index(path_flag) + 1])
@@ -519,11 +1061,24 @@ def test_cli_failure_keeps_redacted_stderr_jsonl_and_classification(
         )
     diagnostic = raised.value.diagnostic
     serialized = json.dumps(diagnostic)
+    attestation = diagnostic["process_attestation"]
+    attested_path = Path(attestation["output_path"])
     assert diagnostic["category"] == "AUTH_UNAVAILABLE"
     assert diagnostic["retry_classification"] == "NON_RETRYABLE"
     assert diagnostic["exit_code"] == 1
     assert diagnostic["error_events"]
+    assert attestation["process_observed"] is True
+    assert attestation["process_id"] > 0
+    assert attestation["exit_code"] == 1
+    assert attestation["process_terminated"] is True
+    assert attestation["failure_reason"] == "codex_cli_auth_unavailable"
+    assert attestation["subprocess_output_observed"] is False
+    assert attestation["output_kind"] == "PROCESS_ATTESTATION_ENVELOPE"
+    assert attestation["output_sha256"] == hashlib.sha256(
+        attested_path.read_bytes()
+    ).hexdigest()
     assert secret not in serialized
+    assert secret.encode() not in attested_path.read_bytes()
     assert "<redacted>" in serialized
 
 

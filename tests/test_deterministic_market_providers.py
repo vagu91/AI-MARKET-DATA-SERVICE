@@ -349,6 +349,11 @@ async def test_finnhub_earnings_zero_null_sessions_and_news_candidates(
         symbols=["NVDA", "AMD"],
     )
     assert [item["session"] for item in earnings] == ["BMO", "AMC"]
+    assert all(item["event_at"] is None for item in earnings)
+    assert all(
+        item["temporal_precision"] == "SESSION_ONLY"
+        for item in earnings
+    )
     assert earnings[0]["eps_actual"] == 0
     assert earnings[0]["eps_surprise"] is None
     assert earnings[1]["eps_surprise"] == 20
@@ -547,8 +552,22 @@ def test_market_internals_and_cross_asset_proxies() -> None:
         {"symbol": "MSFT", "weight_pct": 40},
     ]
     quotes = [
-        {"symbol": "AAPL", "last": 102, "close": 100, "volume": 100},
-        {"symbol": "MSFT", "last": 99, "close": 100, "volume": 200},
+        {
+            "symbol": "AAPL",
+            "last": 102,
+            "close": 100,
+            "volume": 100,
+            "observed_at": NOW.isoformat(),
+            "freshness_state": "FRESH",
+        },
+        {
+            "symbol": "MSFT",
+            "last": 99,
+            "close": 100,
+            "volume": 200,
+            "observed_at": NOW.isoformat(),
+            "freshness_state": "FRESH",
+        },
     ]
     internals = compute_market_internals(
         constituents=["AAPL", "AAPL", "MSFT", "NVDA"],
@@ -580,6 +599,21 @@ def test_market_internals_and_cross_asset_proxies() -> None:
     assert cross["relative_strength_vs_qqq"]["SPY"] == -0.5
     assert "equity_credit_divergence" in cross["warnings"]
     assert "stale_rate_series" in cross["warnings"]
+
+
+def test_cross_asset_context_fails_closed_when_proxies_are_missing() -> None:
+    cross = compute_cross_asset_context(
+        quotes=[
+            {"symbol": "QQQ", "change_percentage": 1},
+            {"symbol": "SPY", "change_percentage": 0.5},
+        ],
+        fred_series={},
+    )
+
+    assert cross["status"] == "AVAILABLE"
+    assert cross["duration_proxy_tlt"] is None
+    assert cross["usd_proxy_uup"] is None
+    assert {"TLT", "UUP"} <= set(cross["missing_proxies"])
 
 
 def test_provider_first_planner_never_routes_numeric_gaps_to_ai() -> None:

@@ -172,6 +172,10 @@ class Settings(BaseSettings):
     sp_global_pmi_enabled: bool = Field(
         default=True, validation_alias="AI_MARKET_SP_GLOBAL_PMI_ENABLED"
     )
+    investing_flash_services_pmi_enabled: bool = Field(
+        default=True,
+        validation_alias="AI_MARKET_INVESTING_FLASH_SERVICES_PMI_ENABLED",
+    )
     finnhub_enabled: bool = Field(default=True, validation_alias="AI_MARKET_FINNHUB_ENABLED")
     tradier_enabled: bool = Field(default=False, validation_alias="AI_MARKET_TRADIER_ENABLED")
     deterministic_options_positioning_enabled: bool = Field(
@@ -1092,6 +1096,17 @@ class Settings(BaseSettings):
     )
     sp_global_pmi_timeout_seconds: float = Field(
         default=10.0, validation_alias="AI_MARKET_SP_GLOBAL_PMI_TIMEOUT_SECONDS"
+    )
+    investing_flash_services_pmi_url: str = Field(
+        default=(
+            "https://endpoints.investing.com/pd-instruments/v1/calendars/"
+            "economic/events/1062/occurrences?domain_id=1&limit=1000"
+        ),
+        validation_alias="AI_MARKET_INVESTING_FLASH_SERVICES_PMI_URL",
+    )
+    investing_flash_services_pmi_timeout_seconds: float = Field(
+        default=10.0,
+        validation_alias="AI_MARKET_INVESTING_FLASH_SERVICES_PMI_TIMEOUT_SECONDS",
     )
     fred_retry_attempts: int = Field(
         default=3, ge=1, le=6, validation_alias="AI_MARKET_FRED_RETRY_ATTEMPTS"

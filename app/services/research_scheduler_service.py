@@ -16,6 +16,9 @@ from app.infrastructure.persistence.migrations import migrate_database
 from app.models.events import EconomicEvent
 from app.services.ai_research_job_repository import ACTIVE_JOB_STATUSES, AIResearchJobRepository
 from app.services.ai_research_job_service import AIResearchJobService
+from app.services.provider_capability_registry import (
+    automatic_ai_delivery_authorized,
+)
 from app.services.market_context_snapshot_repository import MarketContextSnapshotRepository
 from app.services.market_fact_repository import MarketFactRepository
 from app.services.event_calendar_coverage_repository import (
@@ -701,8 +704,9 @@ class ResearchSchedulerService:
             if (
                 resolver is not None
                 and provider_status in {"EXHAUSTED", "NOT_FOUND", "NO_DATA"}
-                and provider_result.get("ai_eligible", True) is True
+                and provider_result.get("ai_eligible", False) is True
                 and allow_ai_residual
+                and automatic_ai_delivery_authorized()
             ):
                 ai_eligible.append(unresolved)
         if provider_resolution_batch:
@@ -728,6 +732,7 @@ class ResearchSchedulerService:
             ai_eligible
             and ai_enqueue is not None
             and ai_authorized
+            and automatic_ai_delivery_authorized()
         ):
             enqueue_result = ai_enqueue(ai_eligible)
             ai_invocations = 1
@@ -1160,6 +1165,7 @@ class ResearchSchedulerService:
         schedule_coverage = self._seed_canonical_schedule_gaps(
             schedule_acquire=schedule_acquire,
             now=now,
+            execution_context=execution_context,
         )
         due_before = self.lifecycle.count_due(
             now=now,
@@ -1477,12 +1483,14 @@ class ResearchSchedulerService:
         schedule_acquire: Callable[..., Any] | None,
         now: datetime,
         materialize_snapshot: bool = True,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         if schedule_acquire is None:
             return self._seed_canonical_schedule_gaps_unleased(
                 schedule_acquire=None,
                 now=now,
                 materialize_snapshot=materialize_snapshot,
+                execution_context=execution_context,
             )
         if not self._canonical_schedule_has_due_dates(
             now=now,
@@ -1495,6 +1503,7 @@ class ResearchSchedulerService:
                 schedule_acquire=schedule_acquire,
                 now=now,
                 materialize_snapshot=materialize_snapshot,
+                execution_context=execution_context,
             )
         lease_owner = f"schedule-catchup-{uuid.uuid4()}"
         lease = self._acquire_schedule_seed_lease(
@@ -1516,6 +1525,7 @@ class ResearchSchedulerService:
                 schedule_acquire=schedule_acquire,
                 now=now,
                 materialize_snapshot=materialize_snapshot,
+                execution_context=execution_context,
             )
         except BaseException:
             self._complete_schedule_seed_lease(
@@ -1636,6 +1646,7 @@ class ResearchSchedulerService:
         schedule_acquire: Callable[..., Any] | None,
         now: datetime,
         materialize_snapshot: bool = True,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         timezone = ZoneInfo(
             str(
@@ -1684,15 +1695,26 @@ class ResearchSchedulerService:
         if not coverage_targets:
             coverage_targets = [
                 {
+                    "provider_id": (
+                        "economic_calendar_composite"
+                    ),
                     "provider_name": "economic_calendar_composite",
                     "query_scope": "country=US",
                 }
             ]
         missing_by_target: dict[tuple[str, str], list[date]] = {}
+        provider_id_by_target: dict[
+            tuple[str, str],
+            str,
+        ] = {}
         for target in coverage_targets:
             target_key = (
                 str(target["provider_name"]),
                 str(target["query_scope"]),
+            )
+            provider_id_by_target[target_key] = str(
+                target.get("provider_id")
+                or target["provider_name"]
             )
             missing_by_target[target_key] = (
                 self.calendar_coverage.missing_dates(
@@ -1734,6 +1756,23 @@ class ResearchSchedulerService:
             "requested_dates": [
                 day.isoformat() for day in requested_days
             ],
+            "expected_provider_ids": sorted(
+                set(provider_id_by_target.values())
+            ),
+            "expected_provider_names": sorted(
+                {
+                    provider_name
+                    for provider_name, _query_scope
+                    in missing_by_target
+                }
+            ),
+            "provider_id_by_name": {
+                provider_name: provider_id_by_target[
+                    (provider_name, query_scope)
+                ]
+                for provider_name, query_scope
+                in missing_by_target
+            },
             "targeted_gap_dates": [
                 day.isoformat() for day in missing_days
             ],
@@ -1755,7 +1794,82 @@ class ResearchSchedulerService:
             "outbox_writes": 0,
             "materialization_deferred": not materialize_snapshot,
         }
+        provider_attempts_by_target = {
+            target_key: {
+                "provider_id": provider_id_by_target[
+                    target_key
+                ],
+                "provider_name": target_key[0],
+                "query_scope": target_key[1],
+                "request_id": (
+                    execution_context.correlation_id
+                    if execution_context is not None
+                    else None
+                ),
+                "correlation_id": (
+                    execution_context.correlation_id
+                    if execution_context is not None
+                    else None
+                ),
+                "started_at": (
+                    None
+                    if target_days
+                    else now.astimezone(UTC).isoformat()
+                ),
+                "observed_at": (
+                    None
+                    if target_days
+                    else now.astimezone(UTC).isoformat()
+                ),
+                "called": False,
+                "attempts": 0,
+                "successful_attempts": 0,
+                "failed_attempts": 0,
+                "result": "NOT_CALLED",
+                "not_called_reason": (
+                    "VALID_DATABASE_COVERAGE"
+                    if not target_days
+                    else "PROVIDER_ATTEMPT_PENDING"
+                ),
+            }
+            for target_key, target_days
+            in missing_by_target.items()
+        }
+        coverage["provider_attempts"] = list(
+            provider_attempts_by_target.values()
+        )
+        preflight_matrices = {
+            provider_name: self.calendar_coverage.matrix(
+                start_date=previous_start,
+                end_date=next_end_date,
+                provider_name=provider_name,
+                query_scope=query_scope,
+                now=now,
+                policy_version=policy_version,
+            )
+            for provider_name, query_scope in missing_by_target
+        }
+        coverage["database_lookup_daily_matrix"] = {
+            "by_provider": preflight_matrices,
+            "requested_dates": coverage["requested_dates"],
+            "expected_provider_ids": coverage[
+                "expected_provider_ids"
+            ],
+            "expected_provider_names": coverage[
+                "expected_provider_names"
+            ],
+            "provider_id_by_name": coverage[
+                "provider_id_by_name"
+            ],
+        }
         if missing_days and schedule_acquire is None:
+            for attempt in provider_attempts_by_target.values():
+                if attempt["not_called_reason"] == (
+                    "PROVIDER_ATTEMPT_PENDING"
+                ):
+                    attempt["not_called_reason"] = (
+                        "SCHEDULE_ACQUIRER_NOT_CONFIGURED"
+                    )
             coverage["status"] = "UNVERIFIED_EMPTY"
             coverage["reason"] = "schedule_acquirer_not_configured"
             return coverage
@@ -1769,13 +1883,23 @@ class ResearchSchedulerService:
         for (provider_name, query_scope), target_days in (
             missing_by_target.items()
         ):
+            provider_attempt = provider_attempts_by_target[
+                (provider_name, query_scope)
+            ]
             for segment_start, segment_end in _contiguous_date_segments(
                 target_days,
                 timezone=timezone,
                 upper_bound=window_end,
             ):
+                if not provider_attempt["called"]:
+                    provider_attempt["started_at"] = (
+                        self.clock().astimezone(UTC).isoformat()
+                    )
                 coverage["provider_calls"] += 1
                 coverage["provider_calls_executed"] += 1
+                provider_attempt["called"] = True
+                provider_attempt["attempts"] += 1
+                provider_attempt["not_called_reason"] = None
                 call_kwargs: dict[str, Any] = {
                     "country": "US",
                     "start": segment_start,
@@ -1785,10 +1909,31 @@ class ResearchSchedulerService:
                 if provider_name != "economic_calendar_composite":
                     call_kwargs["provider_names"] = [provider_name]
                 try:
+                    if (
+                        "force"
+                        in inspect.signature(
+                            schedule_acquire
+                        ).parameters
+                    ):
+                        call_kwargs["force"] = True
+                except (TypeError, ValueError):
+                    pass
+                try:
                     output = schedule_acquire(**call_kwargs)
                     if inspect.isawaitable(output):
                         output = asyncio.run(output)
                 except Exception as exc:
+                    provider_attempt["failed_attempts"] += 1
+                    provider_attempt["observed_at"] = (
+                        self.clock().astimezone(UTC).isoformat()
+                    )
+                    provider_attempt["result"] = (
+                        "PARTIAL"
+                        if provider_attempt[
+                            "successful_attempts"
+                        ]
+                        else "FAILED"
+                    )
                     failed_segments.append(
                         (
                             segment_start,
@@ -1844,6 +1989,17 @@ class ResearchSchedulerService:
                     if not list(getattr(result, "errors", []) or [])
                 )
                 if segment_results and segment_successes == 0:
+                    provider_attempt["failed_attempts"] += 1
+                    provider_attempt["observed_at"] = (
+                        self.clock().astimezone(UTC).isoformat()
+                    )
+                    provider_attempt["result"] = (
+                        "PARTIAL"
+                        if provider_attempt[
+                            "successful_attempts"
+                        ]
+                        else "FAILED"
+                    )
                     failed_segments.append(
                         (
                             segment_start,
@@ -1853,6 +2009,15 @@ class ResearchSchedulerService:
                     )
                     continue
                 provider_successes += max(segment_successes, 1)
+                provider_attempt["successful_attempts"] += 1
+                provider_attempt["observed_at"] = (
+                    self.clock().astimezone(UTC).isoformat()
+                )
+                provider_attempt["result"] = (
+                    "PARTIAL"
+                    if provider_attempt["failed_attempts"]
+                    else "SUCCESS"
+                )
                 rows.extend(
                     (
                         item.model_dump(mode="json")
@@ -2234,6 +2399,15 @@ class ResearchSchedulerService:
             "unknown_coverage_days": unknown_days,
             "partial_coverage_days": partial_days,
             "by_provider": matrices,
+            "expected_provider_ids": coverage[
+                "expected_provider_ids"
+            ],
+            "expected_provider_names": coverage[
+                "expected_provider_names"
+            ],
+            "provider_id_by_name": coverage[
+                "provider_id_by_name"
+            ],
         }
         coverage["daily_matrix"] = matrix
         coverage["unknown_coverage_days"] = unknown_days

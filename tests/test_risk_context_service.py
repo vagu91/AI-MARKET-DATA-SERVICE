@@ -10,7 +10,11 @@ from app.providers.cboe_put_call_provider import (
     normalize_cboe_put_call,
     parse_cboe_daily_statistics_html,
 )
-from app.providers.cboe_risk_indices_provider import parse_index_history_csv
+from app.providers.cboe_risk_indices_provider import (
+    _aggregate_data_as_of,
+    _normalize,
+    parse_index_history_csv,
+)
 from app.providers.cboe_vix_futures_provider import parse_vix_futures_csv
 from app.services.ai_trader_contract_service import build_ai_trader_market_context
 from app.services.risk_context_normalization_service import (
@@ -51,7 +55,9 @@ def history(count: int = 260, *, start: float = 80.0, step: float = 0.1) -> list
 def risk_indices_payload() -> dict:
     return {
         "status": "found",
+        "attempted": True,
         "provider_calls": 1,
+        "cache_used": False,
         "indices": {
             "vvix": {
                 "current_price": 90.0,
@@ -60,6 +66,8 @@ def risk_indices_payload() -> dict:
                 "percentage_change": 1.1236,
                 "provider_timestamp": "2026-07-10 16:15:00",
                 "retrieved_at": "2026-07-11T12:00:00Z",
+                "valid_until": "2099-01-01T00:00:00Z",
+                "refresh_due_at": "2099-01-01T00:00:00Z",
                 "source": "CBOE",
                 "source_url": "https://cboe.test/vvix",
                 "reliability": 0.86,
@@ -72,6 +80,8 @@ def risk_indices_payload() -> dict:
                 "percentage_change": 0.6944,
                 "provider_timestamp": "2026-07-10 17:00:00",
                 "retrieved_at": "2026-07-11T12:00:00Z",
+                "valid_until": "2099-01-01T00:00:00Z",
+                "refresh_due_at": "2099-01-01T00:00:00Z",
                 "source": "CBOE",
                 "source_url": "https://cboe.test/skew",
                 "reliability": 0.86,
@@ -114,6 +124,7 @@ def futures_payload(prices=(17.0, 18.0, 19.0, 20.0, 21.0, 22.0)) -> dict:
         "data_as_of": "2026-07-10",
         "retrieved_at": "2026-07-11T12:00:00Z",
         "valid_until": "2099-01-01T00:00:00Z",
+        "refresh_due_at": "2099-01-01T00:00:00Z",
         "contracts": contracts,
         "warnings": [],
         "errors": [],
@@ -144,6 +155,7 @@ def cboe_ratios_payload() -> dict:
                 "provider_type": "OFFICIAL_EXCHANGE_STATISTICS",
                 "retrieved_at": "2026-07-11T12:00:00Z",
                 "valid_until": "2099-01-01T00:00:00Z",
+                "refresh_due_at": "2099-01-01T00:00:00Z",
                 "freshness": "END_OF_DAY",
                 "reliability": 0.96,
                 "confidence": 0.95,
@@ -165,10 +177,13 @@ def qqq_payload(*, complete: bool = True) -> dict:
     }
     return {
         "status": "found" if complete else "partial",
+        "attempted": True,
         "provider_calls": 1,
+        "cache_used": False,
         "source_url": "https://nasdaq.test/qqq",
         "retrieved_at": "2026-07-11T12:00:00Z",
         "valid_until": "2099-01-01T00:00:00Z",
+        "refresh_due_at": "2099-01-01T00:00:00Z",
         "snapshot": {"source_timestamp": "2026-07-10T20:00:00Z"},
         "global_aggregates": aggregates if complete else None,
         "observed_aggregates": {
@@ -193,6 +208,8 @@ def macro_snapshot() -> dict:
                 "actual_is_official": True,
                 "reliability": 0.95,
                 "freshness": "RECENT",
+                "valid_until": "2099-01-01T00:00:00Z",
+                "refresh_due_at": "2099-01-01T00:00:00Z",
             }
         }
     }
@@ -224,6 +241,82 @@ def test_cboe_history_parser_rejects_invalid_values(bad) -> None:
     assert parse_index_history_csv(f"DATE,VVIX\n07/10/2026,{bad}\n", key="vvix") == []
 
 
+def test_cboe_vvix_without_observation_time_is_not_delivered() -> None:
+    raw = _normalize(
+        "vvix",
+        {
+            "data": {
+                "symbol": "VVIX",
+                "current_price": 98.5,
+            }
+        },
+        "https://cboe.test/vvix",
+        now=NOW,
+    )
+
+    assert raw["status"] == "not_found"
+    assert raw["current_price"] is None
+    assert raw["data_as_of"] is None
+    assert raw["valid_from"] is None
+    assert raw["freshness"] == "UNKNOWN"
+    assert raw["validation"]["reason"] == (
+        "provider_observation_time_not_proved"
+    )
+    assert _aggregate_data_as_of({"vvix": raw}) is None
+
+    normalized = normalize_risk_index(
+        "VVIX",
+        {
+            "current_price": 98.5,
+            "retrieved_at": NOW.isoformat(),
+            "source": "CBOE",
+        },
+        history=history(),
+        history_min=60,
+        now=NOW,
+    )
+    assert normalized["status"] == "not_found"
+    assert normalized["value"] is None
+    assert normalized["data_as_of"] is None
+    assert normalized["freshness"] == "UNKNOWN"
+    assert "observation_time_not_proved" in normalized["errors"]
+
+
+def test_cboe_vvix_preserves_real_last_trade_time() -> None:
+    raw = _normalize(
+        "vvix",
+        {
+            "data": {
+                "symbol": "VVIX",
+                "current_price": 98.5,
+                "last_trade_time": "2026-07-11T11:58:00Z",
+            }
+        },
+        "https://cboe.test/vvix",
+        now=NOW,
+    )
+
+    assert raw["status"] == "found"
+    assert raw["current_price"] == 98.5
+    assert raw["data_as_of"] == "2026-07-11T11:58:00Z"
+    assert raw["valid_from"] == "2026-07-11T11:58:00Z"
+    assert _aggregate_data_as_of({"vvix": raw}) == (
+        "2026-07-11T11:58:00Z"
+    )
+
+    normalized = normalize_risk_index(
+        "VVIX",
+        raw,
+        history=history(),
+        history_min=60,
+        now=NOW,
+    )
+    assert normalized["status"] == "found"
+    assert normalized["value"] == 98.5
+    assert normalized["data_as_of"] == "2026-07-11T11:58:00Z"
+    assert normalized["freshness"] == "RECENT"
+
+
 def test_vvix_valid_previous_change_and_official_source() -> None:
     item = normalize_risk_index("VVIX", risk_indices_payload()["indices"]["vvix"], history=history(), history_min=60, now=NOW)
     assert item["status"] == "found"
@@ -252,12 +345,86 @@ def test_inconsistent_previous_close_is_reconstructed_with_warning() -> None:
     assert "provider_previous_close_inconsistent_derived_from_change" in item["warnings"]
 
 
-def test_stale_index_retained_with_lower_confidence() -> None:
+def test_stale_index_is_excluded_fail_closed() -> None:
     raw = {**risk_indices_payload()["indices"]["skew"], "stale": True}
     item = normalize_risk_index("SKEW", raw, history=history(), history_min=60, now=NOW)
-    assert item["status"] == "found"
+    assert item["status"] == "not_found"
+    assert item["value"] is None
     assert item["freshness"] == "STALE"
-    assert item["confidence"] == 0.55
+    assert item["confidence"] == 0.0
+    assert "provider_marked_observation_stale" in item["errors"]
+
+
+def test_expired_metric_deadlines_are_fail_closed() -> None:
+    vvix_raw = {
+        **risk_indices_payload()["indices"]["vvix"],
+        "provider_timestamp": (
+            NOW - timedelta(minutes=5)
+        ).isoformat(),
+        "content_valid_until": (
+            NOW - timedelta(minutes=1)
+        ).isoformat(),
+        "refresh_due_at": (
+            NOW - timedelta(minutes=1)
+        ).isoformat(),
+    }
+    vvix = normalize_risk_index(
+        "VVIX",
+        vvix_raw,
+        history=history(),
+        history_min=60,
+        now=NOW,
+    )
+    macro = macro_snapshot()
+    macro["financial_conditions"]["VIXCLS"].update(
+        {
+            "data_as_of": (
+                NOW - timedelta(minutes=5)
+            ).isoformat(),
+            "content_valid_until": (
+                NOW - timedelta(minutes=1)
+            ).isoformat(),
+            "refresh_due_at": (
+                NOW - timedelta(minutes=1)
+            ).isoformat(),
+        }
+    )
+    vix = RiskContextNormalizationService(
+        Settings(_env_file=None)
+    ).build(
+        risk_indices={"indices": {}, "history": {}},
+        vix_futures={},
+        cboe_put_call={},
+        qqq_options={},
+        macro_snapshot=macro,
+        snapshot_history=[],
+        now=NOW,
+    )["vix"]
+
+    assert vvix["status"] == "not_found"
+    assert vvix["value"] is None
+    assert "observation_lifecycle_expired" in vvix["errors"]
+    assert vix["status"] == "not_found"
+    assert vix["value"] is None
+    assert "vix_observation_lifecycle_expired" in vix["errors"]
+
+
+def test_missing_metric_deadlines_are_fail_closed() -> None:
+    raw = dict(risk_indices_payload()["indices"]["vvix"])
+    raw.pop("valid_until")
+    raw.pop("refresh_due_at")
+
+    item = normalize_risk_index(
+        "VVIX",
+        raw,
+        history=history(),
+        history_min=60,
+        now=NOW,
+    )
+
+    assert item["status"] == "not_found"
+    assert item["value"] is None
+    assert "observation_lifecycle_expired" in item["errors"]
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 5, 20, 59])
@@ -357,6 +524,65 @@ def test_curve_missing_m2_is_partial() -> None:
     assert curve["structure"] == "UNKNOWN"
 
 
+def test_curve_retrieval_time_cannot_replace_observation_time() -> None:
+    payload = futures_payload()
+    payload.pop("data_as_of")
+    payload["retrieved_at"] = NOW.isoformat()
+    for contract in payload["contracts"]:
+        contract.pop("data_as_of")
+
+    curve = normalize_vix_curve(
+        payload["contracts"],
+        vix_spot=15,
+        flat_tolerance_pct=.25,
+        source_payload=payload,
+        now=NOW,
+    )
+
+    assert curve["status"] == "not_found"
+    assert curve["contracts"] == []
+    assert curve["data_as_of"] is None
+    assert curve["freshness"] == "UNKNOWN"
+    assert curve["errors"] == [
+        "curve_observation_time_not_proved"
+    ]
+    assert calculate_temporal_alignment(
+        [
+            {
+                "status": "found",
+                "data_as_of": None,
+                "retrieved_at": NOW.isoformat(),
+            }
+        ],
+        now=NOW,
+        max_gap_minutes=1440,
+    )["aligned"] is False
+
+
+def test_fresh_curve_header_cannot_mask_old_contract_observations() -> None:
+    payload = futures_payload()
+    payload["data_as_of"] = (
+        NOW - timedelta(minutes=5)
+    ).isoformat()
+    for contract in payload["contracts"]:
+        contract["data_as_of"] = "2026-06-01"
+
+    curve = normalize_vix_curve(
+        payload["contracts"],
+        vix_spot=15,
+        flat_tolerance_pct=.25,
+        source_payload=payload,
+        now=NOW,
+    )
+
+    assert curve["status"] == "not_found"
+    assert curve["contracts"] == []
+    assert curve["freshness"] == "STALE"
+    assert curve["errors"] == [
+        "curve_observation_outside_risk_sla"
+    ]
+
+
 def test_curve_m1_m3_m6_slopes_and_optional_fields() -> None:
     payload = futures_payload()
     curve = normalize_vix_curve(payload["contracts"], vix_spot=15, flat_tolerance_pct=.25, source_payload=payload, now=NOW)
@@ -413,7 +639,33 @@ def test_qqq_volume_and_open_interest_ratios_are_separate_and_scoped(complete, r
     assert all(row["scope"] == "qqq" for row in rows)
     assert all(row["reliability"] == reliability for row in rows)
     assert bool(rows[0]["warnings"]) is warning
-    assert all(row["data_as_of"] == "2026-07-10" for row in rows)
+    assert all(
+        row["data_as_of"] == "2026-07-10T20:00:00Z"
+        for row in rows
+    )
+
+
+def test_qqq_retrieval_time_cannot_replace_source_timestamp() -> None:
+    payload = qqq_payload()
+    payload["snapshot"] = {}
+    payload["retrieved_at"] = NOW.isoformat()
+
+    assert qqq_put_call_ratios(payload, now=NOW) == []
+
+
+def test_qqq_expired_lifecycle_is_excluded() -> None:
+    payload = qqq_payload()
+    payload["snapshot"]["source_timestamp"] = (
+        NOW - timedelta(minutes=5)
+    ).isoformat()
+    payload["valid_until"] = (
+        NOW - timedelta(minutes=1)
+    ).isoformat()
+    payload["refresh_due_at"] = (
+        NOW - timedelta(minutes=1)
+    ).isoformat()
+
+    assert qqq_put_call_ratios(payload, now=NOW) == []
 
 
 def test_ratio_history_never_mixes_equity_and_index() -> None:
@@ -500,6 +752,37 @@ def test_canonical_semantics_vvix_skew_and_curve_are_explicit() -> None:
     assert result["vix_term_structure"]["spot"] != result["vix_term_structure"]["front_month"]["last_price"]
 
 
+def test_old_vix_is_not_masked_by_fresh_risk_siblings() -> None:
+    macro = macro_snapshot()
+    macro["financial_conditions"]["VIXCLS"].update(
+        {
+            "data_as_of": "2026-06-30",
+            "retrieved_at": NOW.isoformat(),
+            "freshness": "RECENT",
+        }
+    )
+
+    result = RiskContextNormalizationService(
+        Settings(_env_file=None)
+    ).build(
+        risk_indices=risk_indices_payload(),
+        vix_futures=futures_payload(),
+        cboe_put_call=cboe_ratios_payload(),
+        qqq_options=qqq_payload(),
+        macro_snapshot=macro,
+        snapshot_history=[],
+        now=NOW,
+    )
+
+    assert result["vix"]["status"] == "not_found"
+    assert result["vix"]["value"] is None
+    assert result["vix"]["stale"] is True
+    assert "vix_observation_outside_risk_sla" in (
+        result["vix"]["errors"]
+    )
+    assert result["data_as_of"] != "2026-06-30"
+
+
 @pytest.mark.parametrize("missing", ["vix", "vvix", "skew", "curve", "put_call", "alignment"])
 def test_quality_penalties_and_composite_degrade_for_missing_components(missing) -> None:
     result = canonical()
@@ -560,7 +843,17 @@ def test_repository_persistence_readback_history_and_provenance_survive(tmp_path
 @pytest.mark.asyncio
 async def test_runtime_force_persists_reads_back_and_deduplicates_preloaded_providers(tmp_path) -> None:
     cfg = settings(tmp_path)
-    service = RiskContextRuntimeService(cfg)
+    service = RiskContextRuntimeService(
+        cfg,
+        clock=lambda: datetime(
+            2026,
+            7,
+            10,
+            21,
+            30,
+            tzinfo=UTC,
+        ),
+    )
 
     async def fail_preloaded():
         raise AssertionError("preloaded providers must not be called")
@@ -585,11 +878,18 @@ async def test_runtime_force_persists_reads_back_and_deduplicates_preloaded_prov
 @pytest.mark.asyncio
 async def test_restart_refresh_false_is_zero_network_browser_ai_and_same_data(tmp_path) -> None:
     cfg = settings(tmp_path)
-    first = RiskContextRuntimeService(cfg)
+    fresh_now = datetime(2026, 7, 10, 17, 30, tzinfo=UTC)
+    first = RiskContextRuntimeService(
+        cfg,
+        clock=lambda: fresh_now,
+    )
     first.vix_futures_provider.fetch = lambda: _async_value(futures_payload())
     first.put_call_provider.fetch = lambda: _async_value(cboe_ratios_payload())
     forced, _ = await first.snapshot(refresh="force", macro_snapshot=macro_snapshot(), preloaded_risk_indices=risk_indices_payload(), preloaded_qqq_options=qqq_payload())
-    restarted = RiskContextRuntimeService(cfg)
+    restarted = RiskContextRuntimeService(
+        cfg,
+        clock=lambda: fresh_now,
+    )
     restarted.vix_futures_provider.fetch = _fail_network
     restarted.put_call_provider.fetch = _fail_network
     cached, _ = await restarted.snapshot(refresh="false", macro_snapshot={})
@@ -605,13 +905,46 @@ async def test_restart_refresh_false_is_zero_network_browser_ai_and_same_data(tm
 
 
 @pytest.mark.asyncio
-async def test_auto_uses_valid_cache_and_force_bypasses_it(tmp_path) -> None:
+async def test_auto_uses_valid_cache_after_forced_acquisition(tmp_path) -> None:
     cfg = settings(tmp_path)
-    service = RiskContextRuntimeService(cfg)
+
+    def clock() -> datetime:
+        return datetime(2026, 7, 10, 21, 30, tzinfo=UTC)
+
+    service = RiskContextRuntimeService(cfg, clock=clock)
     service.vix_futures_provider.fetch = lambda: _async_value(futures_payload())
     service.put_call_provider.fetch = lambda: _async_value(cboe_ratios_payload())
-    await service.snapshot(refresh="force", macro_snapshot=macro_snapshot(), preloaded_risk_indices=risk_indices_payload(), preloaded_qqq_options=qqq_payload())
-    restarted = RiskContextRuntimeService(cfg)
+    risk_indices = risk_indices_payload()
+    risk_indices["indices"]["vvix"][
+        "provider_timestamp"
+    ] = "2026-07-10T21:00:00Z"
+    risk_indices["indices"]["skew"][
+        "provider_timestamp"
+    ] = "2026-07-10T21:00:00Z"
+    risk_indices.update(
+        {
+            "data_as_of": "2026-07-10T21:00:00Z",
+            "retrieved_at": "2026-07-10T21:05:00Z",
+            "content_valid_until": "2026-07-10T22:30:00Z",
+            "refresh_due_at": "2026-07-10T22:30:00Z",
+        }
+    )
+    qqq_options = qqq_payload()
+    qqq_options.update(
+        {
+            "data_as_of": "2026-07-10T20:00:00Z",
+            "retrieved_at": "2026-07-10T21:05:00Z",
+            "content_valid_until": "2026-07-10T22:30:00Z",
+            "refresh_due_at": "2026-07-10T22:30:00Z",
+        }
+    )
+    await service.snapshot(
+        refresh="force",
+        macro_snapshot=macro_snapshot(),
+        preloaded_risk_indices=risk_indices,
+        preloaded_qqq_options=qqq_options,
+    )
+    restarted = RiskContextRuntimeService(cfg, clock=clock)
     restarted.vix_futures_provider.fetch = _fail_network
     cached, _ = await restarted.snapshot(refresh="auto", macro_snapshot={})
     assert cached["status"] == "available"
@@ -619,7 +952,9 @@ async def test_auto_uses_valid_cache_and_force_bypasses_it(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_last_known_good_is_preserved_when_new_candidate_is_worse(tmp_path) -> None:
+async def test_expired_last_known_good_is_not_delivered_when_providers_fail(
+    tmp_path,
+) -> None:
     cfg = settings(tmp_path)
     repo = RiskContextHistoryRepository(cfg)
     good = canonical(cfg)
@@ -630,8 +965,46 @@ async def test_last_known_good_is_preserved_when_new_candidate_is_worse(tmp_path
     service.risk_indices_provider.fetch = lambda: _async_value({"status": "not_found", "indices": {}, "history": {}, "diagnostics": {}})
     service.qqq_options_provider.fetch = lambda: _async_value({"status": "not_found", "contracts": [], "diagnostics": {}})
     result, _ = await service.snapshot(refresh="force", macro_snapshot={}, preloaded_risk_indices={"status": "not_found"}, preloaded_qqq_options={"status": "not_found"})
-    assert result["diagnostics"]["last_known_good_used"] is True
+    assert result["status"] == "not_found"
+    assert result["vix"]["value"] is None
+    assert result["vvix"]["value"] is None
+    assert result["diagnostics"]["last_known_good_used"] is False
+    assert result["source_summary"]["last_known_good_used"] is False
     assert repo.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_false_does_not_deliver_expired_canonical_risk(
+    tmp_path,
+) -> None:
+    cfg = settings(tmp_path)
+    repo = RiskContextHistoryRepository(cfg)
+    repo.append(canonical(cfg))
+    service = RiskContextRuntimeService(
+        cfg,
+        repository=repo,
+        clock=lambda: NOW + timedelta(hours=3),
+    )
+    service.vix_futures_provider.fetch = _fail_network
+    service.put_call_provider.fetch = _fail_network
+    service.risk_indices_provider.fetch = _fail_network
+    service.qqq_options_provider.fetch = _fail_network
+
+    result, _legacy = await service.snapshot(
+        refresh="false",
+        macro_snapshot={},
+    )
+
+    assert result["status"] == "not_found"
+    assert result["vix"]["value"] is None
+    assert result["vvix"]["value"] is None
+    assert result["reason_code"] == (
+        "CANONICAL_CONTENT_VALID_UNTIL_EXPIRED"
+    )
+    assert result["diagnostics"]["cache_used"] is False
+    assert result["diagnostics"]["database_record_rejected"] is True
+    assert service.last_database_lookup["found"] is True
+    assert service.last_database_lookup["expired"] is True
 
 
 def test_http_consumer_serializes_canonical_and_legacy_blocks() -> None:

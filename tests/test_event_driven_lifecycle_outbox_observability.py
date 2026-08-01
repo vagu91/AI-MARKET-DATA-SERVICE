@@ -138,7 +138,15 @@ def test_provider_resolution_results_in_zero_ai(tmp_path: Path) -> None:
     assert (result["ai_invocations"], calls["ai"]) == (0, 0)
 
 
-def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:
+def test_unresolved_eligible_gap_invokes_ai_once(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,
@@ -149,7 +157,7 @@ def test_unresolved_eligible_gap_invokes_ai_once(tmp_path: Path) -> None:
     calls: list[list[dict[str, Any]]] = []
     result = ResearchSchedulerService(settings, clock=lambda: NOW).scan_due_items(
         owner="test",
-        resolver=lambda _: {"status": "EXHAUSTED"},
+        resolver=lambda _: {"status": "EXHAUSTED", "ai_eligible": True},
         ai_enqueue=lambda items: calls.append(items),
         trigger_type="macro_actual",
         execution_context=ExecutionContext.explicit_ai(
@@ -217,7 +225,15 @@ def test_expired_negative_cache_allows_new_attempt(tmp_path: Path) -> None:
     ) is None
 
 
-def test_two_due_items_are_coalesced_into_one_ai_enqueue(tmp_path: Path) -> None:
+def test_two_due_items_are_coalesced_into_one_ai_enqueue(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
     settings = cfg(
         tmp_path,
         enable_scheduler=True,
@@ -229,7 +245,7 @@ def test_two_due_items_are_coalesced_into_one_ai_enqueue(tmp_path: Path) -> None
     calls: list[Any] = []
     result = ResearchSchedulerService(settings, clock=lambda: NOW).scan_due_items(
         owner="test",
-        resolver=lambda _: {"status": "EXHAUSTED"},
+        resolver=lambda _: {"status": "EXHAUSTED", "ai_eligible": True},
         ai_enqueue=lambda items: calls.append(items),
         trigger_type="macro_actual",
         execution_context=ExecutionContext.explicit_ai(
@@ -333,6 +349,53 @@ def test_cot_valid_until_next_configured_publication(tmp_path: Path) -> None:
         settings=settings,
         now=NOW,
     ).isoformat()
+
+
+def test_monthly_actual_deadline_is_anchored_to_release_cadence(
+    tmp_path: Path,
+) -> None:
+    release = NOW - timedelta(days=4)
+    item = lifecycle(
+        cfg(tmp_path),
+        "macro_actual",
+        "flash-services-pmi:2026-07",
+        {
+            "actual": 53.6,
+            "release_at": release.isoformat(),
+            "retrieved_at": NOW.isoformat(),
+            "frequency": "monthly",
+            "source": "SPGLOBAL",
+        },
+    )
+
+    expected_deadline = (release + timedelta(days=45)).isoformat()
+    assert item.freshness_state == "FRESH"
+    assert item.valid_until == expected_deadline
+    assert item.next_refresh_at == expected_deadline
+
+
+def test_old_monthly_actual_is_not_refreshed_by_recent_retrieval(
+    tmp_path: Path,
+) -> None:
+    release = NOW - timedelta(days=60)
+    item = lifecycle(
+        cfg(tmp_path),
+        "macro_actual",
+        "flash-services-pmi:old-release",
+        {
+            "actual": 49.2,
+            "release_at": release.isoformat(),
+            "retrieved_at": NOW.isoformat(),
+            "frequency": "monthly",
+            "source": "SPGLOBAL",
+        },
+    )
+
+    assert item.freshness_state == "DUE"
+    assert item.valid_until == (
+        release + timedelta(days=45)
+    ).isoformat()
+    assert item.next_refresh_at == item.valid_until
 
 
 def test_cftc_holiday_delay_is_configurable(tmp_path: Path) -> None:

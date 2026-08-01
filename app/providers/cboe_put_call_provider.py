@@ -43,7 +43,12 @@ class CboePutCallProvider:
             return _status("provider_failed", str(exc) or "cboe_put_call_failed", started)
         parsed = parse_cboe_daily_statistics_html(response.text)
         now = datetime.now(UTC)
-        ratios, rejected = normalize_cboe_put_call(parsed, retrieved_at=_iso(now), valid_until=_iso(now + timedelta(hours=18)))
+        valid_until = _iso(now + timedelta(hours=18))
+        ratios, rejected = normalize_cboe_put_call(
+            parsed,
+            retrieved_at=_iso(now),
+            valid_until=valid_until,
+        )
         if rejected:
             logger.warning("put_call_scope_rejected", extra={"source": self.source, "scope": None, "basis": None, "value": rejected, "fallback_reason": "invalid_or_zero_call_denominator"})
         return {
@@ -55,7 +60,9 @@ class CboePutCallProvider:
             "is_official_source": True,
             "data_as_of": parsed.get("selectedDate"),
             "retrieved_at": _iso(now),
-            "valid_until": _iso(now + timedelta(hours=18)),
+            "valid_until": valid_until,
+            "content_valid_until": valid_until,
+            "refresh_due_at": valid_until,
             "ratios": ratios,
             "diagnostics": {
                 "actual_network_calls": 1,
@@ -146,6 +153,8 @@ def normalize_cboe_put_call(
                     "provider_type": "OFFICIAL_EXCHANGE_STATISTICS",
                     "retrieved_at": retrieved_at,
                     "valid_until": valid_until,
+                    "content_valid_until": valid_until,
+                    "refresh_due_at": valid_until,
                     "freshness": "END_OF_DAY",
                     "reliability": 0.96,
                     "confidence": 0.95,

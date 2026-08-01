@@ -122,6 +122,8 @@ class EventCalendarCoverageRepository:
             raise ValueError("verified_empty_requires_authentic_empty_proof")
         if normalized_status == "VERIFIED_COMPLETE" and record_count <= 0:
             raise ValueError("verified_complete_requires_records")
+        if verified and next_revision_check_at is None:
+            next_revision_check_at = valid_until
         now_text = self.clock().astimezone(UTC).replace(
             microsecond=0
         ).isoformat()

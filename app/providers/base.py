@@ -38,7 +38,12 @@ class BaseProvider(ABC):
     async def fetch(self) -> ProviderResult:
         raise NotImplementedError
 
-    async def fetch_safe(self, *, force: bool = False) -> ProviderResult:
+    async def fetch_safe(
+        self,
+        *,
+        force: bool = False,
+        **fetch_parameters: Any,
+    ) -> ProviderResult:
         now = datetime.now(UTC)
         operational_cache_key = ParametricProviderCache.key(
             self.source,
@@ -46,7 +51,10 @@ class BaseProvider(ABC):
             environment=str(
                 getattr(getattr(self, "settings", None), "environment", "default")
             ),
-            parameters={"dataset_or_series": self.cache_key},
+            parameters={
+                "dataset_or_series": self.cache_key,
+                **fetch_parameters,
+            },
         )
         ttl = max(
             0,
@@ -60,17 +68,16 @@ class BaseProvider(ABC):
         )
         if not force and ttl:
             entry = self.cache.get_entry(operational_cache_key)
-            if entry is None:
+            if entry is None and not fetch_parameters:
                 entry = self.cache.get_entry(self.cache_key)
             if entry and entry.get("status") in {"valid_cache", "last_known_good"}:
                 valid_until = _parse_cache_time(entry.get("valid_until"))
                 if valid_until is not None and valid_until > now:
                     result = ProviderResult.model_validate(entry["payload"])
                     result.metadata.provider_type = ProviderType.CACHE
-                    result.metadata.retrieved_at = now
                     return result
         try:
-            result = await self.fetch()
+            result = await self.fetch(**fetch_parameters)
             valid_until = now + timedelta(seconds=ttl)
             self.cache.set(
                 operational_cache_key,
@@ -104,9 +111,11 @@ class BaseProvider(ABC):
                 "provider_failed",
                 extra={"_provider": self.source, "_error": error},
             )
-            entry = self.cache.get_entry(operational_cache_key)
-            if entry is None:
-                entry = self.cache.get_entry(self.cache_key)
+            entry = None
+            if not force:
+                entry = self.cache.get_entry(operational_cache_key)
+                if entry is None and not fetch_parameters:
+                    entry = self.cache.get_entry(self.cache_key)
             stale_until = _parse_cache_time(entry.get("stale_until")) if entry else None
             if entry and (stale_until is None or stale_until > now):
                 result = ProviderResult.model_validate(entry["payload"])
@@ -114,7 +123,6 @@ class BaseProvider(ABC):
                 result.metadata.is_fallback = True
                 result.metadata.freshness = Freshness.STALE
                 result.metadata.errors.append(error)
-                result.metadata.retrieved_at = datetime.now(UTC)
                 return result
             return ProviderResult(
                 metadata=ProviderMetadata(

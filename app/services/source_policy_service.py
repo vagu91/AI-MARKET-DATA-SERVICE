@@ -245,6 +245,35 @@ class SourcePolicyService:
         ]
         return min(matches, key=lambda item: int(item["tier"])) if matches else None
 
+    def publisher_matches_url(
+        self,
+        publisher: str | None,
+        url: str | None,
+    ) -> bool:
+        """Verify publisher/host identity using the versioned policy aliases.
+
+        This deliberately does not infer an acronym from arbitrary publisher
+        text.  Direct official sources, configured issuer channels and known
+        distribution relationships are resolved by the same policy used by
+        the production source gate.
+        """
+
+        if not str(publisher or "").strip() or self.rule_for(
+            url,
+            publisher,
+        ) is None:
+            return False
+        lineage = self.news_lineage(
+            {
+                "publisher": str(publisher).strip(),
+                "source_url": str(url or "").strip(),
+            }
+        )
+        return (
+            lineage.get("source_verification_status") == "VERIFIED"
+            and lineage.get("publisher_status") == "VERIFIED"
+        )
+
     def news_lineage(self, candidate: dict[str, Any]) -> dict[str, Any]:
         """Return explicit, audit-safe publisher/distributor/provider lineage states."""
 

@@ -38,6 +38,19 @@ ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 7, 24, 12, tzinfo=UTC)
 
 
+def _allow_certified_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.services.lifecycle_due_resolver."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
+    monkeypatch.setattr(
+        "app.services.research_scheduler_service."
+        "automatic_ai_delivery_authorized",
+        lambda **_: True,
+    )
+
+
 class ResearchSchedulerService(BaseResearchSchedulerService):
     @staticmethod
     def _context() -> ExecutionContext:
@@ -190,7 +203,9 @@ class _OfflineTriggerMaterializer:
 
 async def test_real_due_scan_preserves_trigger_through_offline_ai_completion(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _allow_certified_ai(monkeypatch)
     settings = cfg(tmp_path)
     snapshots = MarketContextSnapshotRepository(settings)
     seed_snapshot(settings)
@@ -256,7 +271,9 @@ async def test_real_due_scan_preserves_trigger_through_offline_ai_completion(
 
 def test_coalesced_residuals_preserve_per_item_trigger_and_suppress_nontriggering(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _allow_certified_ai(monkeypatch)
     settings = cfg(tmp_path, lifecycle_due_max_concurrency=5)
     macro = seed_due_trigger(
         settings,
@@ -316,7 +333,9 @@ def test_coalesced_residuals_preserve_per_item_trigger_and_suppress_nontriggerin
 
 def test_provider_absent_enabled_enqueues_once_and_second_tick_is_idempotent(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _allow_certified_ai(monkeypatch)
     settings = cfg(tmp_path)
     seed_due_vix(settings)
     scheduler = ResearchSchedulerService(settings, clock=lambda: NOW)
@@ -518,7 +537,9 @@ class _FailingProvider:
 
 def test_mixed_deferred_and_ai_eligible_batch_reports_backoff_consistently(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _allow_certified_ai(monkeypatch)
     settings = cfg(tmp_path, lifecycle_no_data_retry_seconds="60")
     deferred_item = seed_due_trigger(
         settings,

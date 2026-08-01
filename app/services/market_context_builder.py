@@ -23,6 +23,10 @@ from app.services.data_integrity_service import (
 from app.services.bls_required_series import normalize_bls_series_id
 from app.services.context_extensions_service import apply_context_extensions
 from app.services.news_intelligence_service import build_news_context as build_intelligence_news_context
+from app.services.official_actual_semantics import (
+    metric_change_basis_from_text,
+    metric_semantics_mismatch_reason,
+)
 from app.services.qqq_weight_intelligence_service import weight_quality_score
 
 logger = logging.getLogger(__name__)
@@ -759,8 +763,7 @@ def _legacy_metric(event: EconomicEvent) -> list[dict[str, Any]]:
     enrichment = event.enrichment
     if not enrichment.source_url or not any([enrichment.forecast, enrichment.previous, enrichment.consensus, enrichment.actual]):
         return []
-    category = _category_key(event)
-    metric_id, label, unit, frequency = _primary_metric(category)
+    metric_id, label, unit, frequency = _event_primary_metric(event)
     if not metric_id:
         return []
     return [
@@ -789,6 +792,72 @@ def _legacy_metric(event: EconomicEvent) -> list[dict[str, Any]]:
             "warnings": enrichment.warnings,
         }
     ]
+
+
+def _event_primary_metric(
+    event: EconomicEvent,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    category = _category_key(event)
+    explicit = str(event.metric_id or "").strip()
+    frequency_hint = " ".join(
+        str(item or "")
+        for item in (
+            event.frequency,
+            (event.enrichment.summary or {}).get("evaluation_method"),
+        )
+    )
+    if explicit:
+        if metric_semantics_mismatch_reason(
+            explicit,
+            name=event.name,
+            frequency_hint=frequency_hint,
+        ):
+            return None, None, None, None
+        explicit_metric = _inflation_metric(explicit)
+        if explicit_metric is not None:
+            return explicit_metric
+
+    basis = metric_change_basis_from_text(f"{event.name} {frequency_hint}")
+    if category in {"CPI", "PPI", "PCE"} and basis in {"mom", "yoy"}:
+        prefix = "core" if "core" in event.name.casefold() else "headline"
+        metric = _inflation_metric(f"{prefix}_{category.casefold()}_{basis}")
+        if metric is not None:
+            return metric
+    if category in {"CPI", "PPI", "PCE"}:
+        return None, None, None, None
+
+    default = _primary_metric(category)
+    if default[0] and metric_semantics_mismatch_reason(
+        default[0],
+        name=event.name,
+        frequency_hint=frequency_hint,
+    ):
+        return None, None, None, None
+    return default
+
+
+def _inflation_metric(
+    metric_id: str,
+) -> tuple[str, str, str, str] | None:
+    labels = {
+        "headline_cpi_mom": "Headline CPI MoM",
+        "headline_cpi_yoy": "Headline CPI YoY",
+        "core_cpi_mom": "Core CPI MoM",
+        "core_cpi_yoy": "Core CPI YoY",
+        "headline_ppi_mom": "Headline PPI MoM",
+        "headline_ppi_yoy": "Headline PPI YoY",
+        "core_ppi_mom": "Core PPI MoM",
+        "core_ppi_yoy": "Core PPI YoY",
+        "headline_pce_mom": "Headline PCE MoM",
+        "headline_pce_yoy": "Headline PCE YoY",
+        "core_pce_mom": "Core PCE MoM",
+        "core_pce_yoy": "Core PCE YoY",
+    }
+    label = labels.get(metric_id)
+    if label is None:
+        return None
+    frequency = "YoY" if metric_id.endswith("_yoy") else "MoM"
+    return metric_id, label, "percent", frequency
 
 
 def _enrichment_summary(enrichment: dict[str, Any]) -> dict[str, Any]:
