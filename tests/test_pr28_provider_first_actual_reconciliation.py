@@ -90,13 +90,48 @@ def test_new_home_sales_exact_occurrence_uses_official_series_and_localized_peri
     )
     assert result["status"] == "SUCCEEDED"
     candidate = result["results"][0]
-    assert (candidate["value"], candidate["previous"], candidate["reference_period"]) == (
+    assert (candidate["value"], candidate["reference_period"]) == (
         "628",
-        "618",
         "2026-06",
     )
+    assert candidate.get("previous") is None
+    assert candidate.get("previous_reference_period") is None
     assert candidate["source_series_id"] == "HSN1F"
     assert candidate["provider_adapter"] == "FRED_OFFICIAL_API"
+
+
+def test_reused_new_home_actual_does_not_promote_legacy_series_previous(
+    tmp_path: Path,
+) -> None:
+    resolver = DeterministicActualResolver(settings(tmp_path), providers={})
+    resolver.candidates = SimpleNamespace(
+        accepted_official_actual=lambda _event_key: {
+            "field": "actual",
+            "value": "628",
+            "event_metric_id": "new_home_sales",
+            "source_series_id": "HSN1F",
+            "reference_period": "2026-06",
+            "previous": "618",
+            "previous_reference_period": "2026-05",
+            "validation_status": "accepted",
+        }
+    )
+
+    result = resolver.resolve_event(
+        event_key="xtb:146392:2026-07-24",
+        event={
+            "event_id": "xtb:146392:2026-07-24",
+            "name": "New Home Sales",
+        },
+        temporal_state={"release_at": RELEASED.isoformat()},
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["resolution"] == "persisted_candidate"
+    candidate = result["results"][0]
+    assert candidate["value"] == "628"
+    assert candidate.get("previous") is None
+    assert candidate.get("previous_reference_period") is None
 
 
 def test_official_derived_actual_preserves_series_and_transformation() -> None:

@@ -32,6 +32,20 @@ FLASH_SERVICES_PMI_DATASET_ID = "flash_services_pmi"
 _FLASH_SERVICES_PMI_DISPATCH_IDS = frozenset(
     {"SPGLOBAL", INVESTING_FLASH_SOURCE}
 )
+_ACTUAL_ONLY_OFFICIAL_METRICS = frozenset({"new_home_sales"})
+
+
+def _actual_field_scoped_candidate(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    scoped = dict(candidate)
+    metric_id = str(
+        scoped.get("event_metric_id") or scoped.get("metric_id") or ""
+    )
+    if metric_id in _ACTUAL_ONLY_OFFICIAL_METRICS:
+        scoped.pop("previous", None)
+        scoped.pop("previous_reference_period", None)
+    return scoped
 
 
 def _declared_flash_services_pmi_provider_order() -> tuple[str, ...]:
@@ -142,6 +156,7 @@ class DeterministicActualResolver:
             else None
         )
         if existing is not None:
+            existing = _actual_field_scoped_candidate(existing)
             return {
                 "status": "SUCCEEDED",
                 "results": [existing],
@@ -427,12 +442,14 @@ class DeterministicActualResolver:
                 }
             retrieved_at = result.metadata.retrieved_at.isoformat()
             try:
-                candidate = derive_official_actual(
-                    spec,
-                    series,
-                    expected_period=expected_period,
-                    retrieved_at=retrieved_at,
-                    release_timestamp=release_timestamp,
+                candidate = _actual_field_scoped_candidate(
+                    derive_official_actual(
+                        spec,
+                        series,
+                        expected_period=expected_period,
+                        retrieved_at=retrieved_at,
+                        release_timestamp=release_timestamp,
+                    )
                 )
             except ValueError as exc:
                 failure = _redacted_provider_result(str(exc))
@@ -655,6 +672,7 @@ class DeterministicActualResolver:
                         )
                     ],
                 }
+            accepted = _actual_field_scoped_candidate(accepted)
             break
         return {
             "status": "SUCCEEDED",
