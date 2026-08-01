@@ -297,7 +297,7 @@ LAST_LIVE_BASELINE_PATH = (
 # unset until a strongly verified full LIVE audit is imported.  Updating the
 # baseline therefore requires an explicit, reviewable code-pin change instead
 # of trusting hashes stored inside the same JSON document.
-LAST_LIVE_BASELINE_FILE_SHA256: str | None = "54d4dba3b0f4b73bf9435b368d15202dc165aa1ab3730b28e13f6fdfaef7149e"
+LAST_LIVE_BASELINE_FILE_SHA256: str | None = "b5b781bb4f1a086555315f72660c36fdbd7573a4df06adc9618174772262ad86"
 # These schemas are part of the central capability registry rather than a
 # parallel audit-only allow-list.  They describe the fields that each named
 # validator can actually assess.  Registry validation rejects a capability
